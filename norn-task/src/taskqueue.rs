@@ -107,7 +107,7 @@ impl Shared {
     #[inline]
     fn push_runnable(&self, runnable: Runnable) {
         unsafe {
-            (&mut *self.runqueue.get()).push_back(runnable);
+            (*self.runqueue.get()).push_back(runnable);
         }
     }
 
@@ -117,7 +117,7 @@ impl Shared {
     /// See [`Shared::push_runnable`].
     #[inline]
     fn pop_runnable(&self) -> Option<Runnable> {
-        unsafe { (&mut *self.runqueue.get()).pop_front() }
+        unsafe { (*self.runqueue.get()).pop_front() }
     }
 
     /// Return the number of queued runnables.
@@ -126,7 +126,7 @@ impl Shared {
     /// See [`Shared::push_runnable`].
     #[inline]
     fn runnable_len(&self) -> usize {
-        unsafe { (&*self.runqueue.get()).len() }
+        unsafe { (*self.runqueue.get()).len() }
     }
 
     /// Clear the runqueue and drop all queued runnables.
@@ -136,7 +136,7 @@ impl Shared {
     #[inline]
     fn clear_runqueue(&self) {
         unsafe {
-            (&mut *self.runqueue.get()).clear();
+            (*self.runqueue.get()).clear();
         }
     }
 }

@@ -1,4 +1,4 @@
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, UnsafeCell};
 use std::future::Future;
 use std::marker::PhantomData;
 
@@ -9,7 +9,7 @@ use crate::{JoinHandle, RegisteredTask, Runnable, Schedule};
 ///
 /// It can be used to cancel all tasks, such as during shutdown.
 pub struct TaskSet {
-    inner: RefCell<Inner>,
+    inner: UnsafeCell<Inner>,
     size: Cell<usize>,
     // !Send
     _m: PhantomData<*const ()>,
@@ -30,7 +30,7 @@ impl TaskSet {
     /// Construct a new [`TaskSet`].
     pub fn new() -> Self {
         Self {
-            inner: RefCell::new(Inner {
+            inner: UnsafeCell::new(Inner {
                 closed: false,
                 list: cordyceps::List::new(),
             }),
@@ -64,7 +64,8 @@ impl TaskSet {
         T: Future,
     {
         let (task, handle) = crate::task_cell::TaskCell::allocate(future, scheduler);
-        let mut this = self.inner.borrow_mut();
+        // Safety: `TaskSet` is `!Send` and only accessed from one thread.
+        let this = unsafe { &mut *self.inner.get() };
         if this.closed {
             task.shutdown();
             return (None, JoinHandle::from(handle));
@@ -79,7 +80,8 @@ impl TaskSet {
     ///
     /// This will prevent any new tasks from being added to the [`TaskSet`].
     pub fn shutdown(&self) {
-        let mut this = self.inner.borrow_mut();
+        // Safety: `TaskSet` is `!Send` and only accessed from one thread.
+        let this = unsafe { &mut *self.inner.get() };
         this.closed = true;
 
         while let Some(task) = this.list.pop_front() {
@@ -94,7 +96,8 @@ impl TaskSet {
     /// The provided [`RegisteredTask`] must have been returned from a previous call to [`TaskSet::bind`]
     /// on this [`TaskSet`]. Do not use [`RegisteredTask`]s from other [`TaskSet`]s.
     pub unsafe fn remove(&self, task: &RegisteredTask) -> Option<RegisteredTask> {
-        let mut inner = self.inner.borrow_mut();
+        // Safety: `TaskSet` is `!Send` and only accessed from one thread.
+        let inner = unsafe { &mut *self.inner.get() };
         let task = unsafe { inner.list.remove(task.as_ptr()) };
         if task.is_some() {
             self.size.set(self.size.get() - 1);
