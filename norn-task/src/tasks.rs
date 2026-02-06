@@ -63,14 +63,13 @@ impl TaskSet {
         S: Schedule,
         T: Future,
     {
-        let (task, handle) = crate::task_cell::TaskCell::allocate(future, scheduler);
+        let (task, bound, handle) = crate::task_cell::TaskCell::allocate(future, scheduler);
         // Safety: `TaskSet` is `!Send` and only accessed from one thread.
         let this = unsafe { &mut *self.inner.get() };
         if this.closed {
             task.shutdown();
             return (None, JoinHandle::from(handle));
         }
-        let bound = RegisteredTask::from(task.clone());
         this.list.push_back(bound);
         self.size.set(self.size.get() + 1);
         (Some(Runnable::from(task)), JoinHandle::from(handle))

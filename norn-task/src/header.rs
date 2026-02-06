@@ -10,7 +10,7 @@ pub struct Header {
     state: StateCell,
     vtable: &'static VTable,
     waker: UnsafeCell<Option<Waker>>,
-    pub(crate) thread: Option<std::thread::ThreadId>,
+    pub(crate) thread: std::thread::ThreadId,
     pub(crate) links: cordyceps::list::Links<Self>,
 }
 
@@ -26,7 +26,7 @@ impl Header {
             state,
             vtable,
             waker: UnsafeCell::new(None),
-            thread: Some(std::thread::current().id()),
+            thread: std::thread::current().id(),
             links: Links::default(),
         }
     }

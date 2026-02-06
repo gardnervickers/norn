@@ -35,8 +35,12 @@ where
     const TASK_VTABLE: VTable = Self::vtable();
     const WAKER_VTABLE: RawWakerVTable = Self::waker_vtable();
 
-    pub(crate) fn allocate(future: F, scheduler: S) -> (TaskRef, JoinHandleRef<F::Output>) {
-        let state = StateCell::new();
+    pub(crate) fn allocate(
+        future: F,
+        scheduler: S,
+    ) -> (TaskRef, crate::RegisteredTask, JoinHandleRef<F::Output>) {
+        // Pre-reserve refs for runnable + registered + join-handle.
+        let state = StateCell::new(3);
         let header = header::Header::new(state, &Self::TASK_VTABLE);
         let future = future_cell::FutureCell::new(future);
         let task = TaskCell {
@@ -49,10 +53,11 @@ where
         // Safety: `raw` is a valid pointer to a `TaskCell`, which is `repr(C)`.
         //         This means that `raw` is a valid pointer to a `Header`.
         unsafe {
-            let r1 = TaskRef(NonNull::new_unchecked(raw.cast()));
-            let r2 = TaskRef(NonNull::new_unchecked(raw.cast()));
-            let r2 = JoinHandleRef(r2, PhantomData);
-            (r1, r2)
+            let runnable = TaskRef(NonNull::new_unchecked(raw.cast()));
+            let registered = TaskRef(NonNull::new_unchecked(raw.cast()));
+            let join = TaskRef(NonNull::new_unchecked(raw.cast()));
+            let join = JoinHandleRef(join, PhantomData);
+            (runnable, crate::RegisteredTask::from(registered), join)
         }
     }
 
@@ -112,7 +117,7 @@ where
         let state = this.as_ref().state();
         match state.update(state::State::notify) {
             state::NotifyResult::DoNothing => {
-                Self::waker_drop(ptr);
+                Self::drop_task_ref(p, this);
             }
             state::NotifyResult::SubmitTask => {
                 // `wake` consumes this waker, so we can transfer its refcount
@@ -143,12 +148,7 @@ where
         let ptr = ptr::NonNull::new_unchecked(ptr as *mut header::Header);
         Self::check_caller(ptr);
         let this = Self::from_raw_header(ptr);
-        match this.as_ref().state().update(state::State::drop_ref) {
-            DropRefResult::DropTask =>
-            // Safety: The reference count is zero so it is safe to drop the task.
-            unsafe { (this.as_ref().header().vtable().dealloc)(ptr) },
-            DropRefResult::KeepTask => {}
-        }
+        Self::drop_task_ref(ptr, this);
     }
 
     /// Create a borrowed [`Waker`] from the provided `ptr`.
@@ -288,12 +288,21 @@ where
     }
 
     #[inline]
+    unsafe fn drop_task_ref(ptr: NonNull<header::Header>, this: NonNull<Self>) {
+        match this.as_ref().state().update(state::State::drop_ref) {
+            DropRefResult::DropTask =>
+            // Safety: The reference count is zero so it is safe to drop the task.
+            unsafe { (this.as_ref().header().vtable().dealloc)(ptr) },
+            DropRefResult::KeepTask => {}
+        }
+    }
+
+    #[inline]
     unsafe fn check_caller(ptr: NonNull<header::Header>) {
-        if let Some(tid) = ptr.as_ref().thread {
-            let caller_thread = std::thread::current().id();
-            if tid != caller_thread {
-                std::process::abort();
-            }
+        let tid = ptr.as_ref().thread;
+        let caller_thread = std::thread::current().id();
+        if tid != caller_thread {
+            std::process::abort();
         }
     }
 }

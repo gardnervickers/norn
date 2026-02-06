@@ -28,10 +28,10 @@ pub(crate) struct StateCell {
 impl StateCell {
     /// Build a new [`StateCell`] with the [`JOIN_HANDLE`] and [`NOTIFIED`] flags set.
     ///
-    /// The initial reference count is 2.
-    pub(crate) fn new() -> Self {
+    /// The initial reference count is `initial_refcount`.
+    pub(crate) fn new(initial_refcount: u32) -> Self {
         Self {
-            state: Cell::new(State::new()),
+            state: Cell::new(State::new(initial_refcount)),
         }
     }
 
@@ -66,12 +66,16 @@ pub(crate) struct State {
 
 impl State {
     /// Create a new [`State`] with the [`JOIN_HANDLE`] and [`NOTIFIED`]
-    /// flags set and a reference count of 2.
-    fn new() -> Self {
+    /// flags set and a reference count of `initial_refcount`.
+    fn new(initial_refcount: u32) -> Self {
+        assert!(initial_refcount > 0);
         let mut flags = Flags::empty();
         flags.insert(Flags::JOIN_HANDLE);
         flags.insert(Flags::NOTIFIED);
-        Self { flags, refcount: 2 }
+        Self {
+            flags,
+            refcount: initial_refcount,
+        }
     }
 
     /// Prepare the task for polling.
