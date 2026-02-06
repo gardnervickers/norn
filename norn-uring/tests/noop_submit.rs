@@ -1,3 +1,5 @@
+#![cfg(target_os = "linux")]
+
 use std::pin::pin;
 
 use futures_core::Future;

@@ -8,9 +8,11 @@ edition = "2021"
 
 [dependencies]
 norn-task = { path = "../norn-task" }
-norn-uring = { path = "../norn-uring" }
 norn-executor = { path = "../norn-executor" }
 norn-timer = { path = "../norn-timer" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+norn-uring = { path = "../norn-uring" }
 io-uring = "0.7"
 hyper = { version = "1", features = ["client", "server", "http2"] }
 pin-project-lite = "0.2.13"
@@ -39,4 +41,9 @@ harness = false
 [[bench]]
 name = "hyper"
 path = "hyper.rs"
+harness = false
+
+[[bench]]
+name = "task_state"
+path = "task_state.rs"
 harness = false

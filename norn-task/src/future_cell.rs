@@ -8,19 +8,20 @@
 use std::any::Any;
 use std::cell::RefCell;
 use std::future::Future;
+use std::panic;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::{fmt, mem, panic};
+use std::{fmt, mem};
 
 use crate::util::abort_on_panic;
 
-const ABORT_ON_FUTURE_PANIC: bool = true;
+const ABORT_ON_DROP_PANIC: bool = true;
 
 fn safe_drop_state<F>(value: State<F>)
 where
     F: Future,
 {
-    if ABORT_ON_FUTURE_PANIC {
+    if ABORT_ON_DROP_PANIC {
         abort_on_panic(|| drop(value));
     } else if let Err(panic) = panic::catch_unwind(panic::AssertUnwindSafe(|| drop(value))) {
         eprintln!("drop panic: {panic:?}");
@@ -148,12 +149,12 @@ pub struct TaskError {
 }
 
 impl TaskError {
-    /// Returns `true` if the task was cancelled.
+    /// Returns `true` if the task panicked.
     pub fn is_panic(&self) -> bool {
         matches!(self.inner, Kind::Panic(_))
     }
 
-    /// Returns `true` if the task panicked.
+    /// Returns `true` if the task was cancelled.
     pub fn is_cancelled(&self) -> bool {
         matches!(self.inner, Kind::Cancelled)
     }

@@ -1,3 +1,5 @@
+#![cfg(target_os = "linux")]
+
 use norn_uring::fs;
 
 mod util;

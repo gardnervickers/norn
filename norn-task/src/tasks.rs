@@ -64,19 +64,15 @@ impl TaskSet {
         T: Future,
     {
         let (task, handle) = crate::task_cell::TaskCell::allocate(future, scheduler);
-        if self.is_closed() {
+        let mut this = self.inner.borrow_mut();
+        if this.closed {
             task.shutdown();
             return (None, JoinHandle::from(handle));
         }
-        let mut this = self.inner.borrow_mut();
         let bound = RegisteredTask::from(task.clone());
         this.list.push_back(bound);
         self.size.set(self.size.get() + 1);
         (Some(Runnable::from(task)), JoinHandle::from(handle))
-    }
-
-    fn is_closed(&self) -> bool {
-        self.inner.borrow_mut().closed
     }
 
     /// Shutdown all tasks in the [`TaskSet`].

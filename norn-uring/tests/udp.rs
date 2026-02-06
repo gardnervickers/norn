@@ -1,3 +1,5 @@
+#![cfg(target_os = "linux")]
+
 use bytes::{Bytes, BytesMut};
 use norn_uring::bufring::BufRing;
 use norn_uring::net::UdpSocket;

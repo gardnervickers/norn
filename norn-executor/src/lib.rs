@@ -69,14 +69,16 @@ impl<P: park::Park> LocalExecutor<P> {
             if let Some(result) = root.try_poll() {
                 return result;
             }
+            let mut has_remaining_tasks = false;
             while let Some(next) = self.taskqueue.next() {
                 next.run();
                 if self.park.needs_park() {
+                    has_remaining_tasks = self.taskqueue.runnable() > 0;
                     break;
                 }
             }
             let mut mode = park::ParkMode::NextCompletion;
-            if root.is_notified() {
+            if root.is_notified() || has_remaining_tasks {
                 mode = park::ParkMode::NoPark;
             }
             self.park.park(mode).unwrap();

@@ -5,6 +5,7 @@
 //! and call any [`TaskCell`] methods via the type-erased `NonNull<Header>` pointer.
 use std::future::Future;
 use std::marker::PhantomData;
+use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use std::{mem, ptr};
@@ -114,11 +115,11 @@ where
                 Self::waker_drop(ptr);
             }
             state::NotifyResult::SubmitTask => {
-                state.update(state::State::clone_ref);
+                // `wake` consumes this waker, so we can transfer its refcount
+                // directly into the scheduled runnable instead of clone+drop.
                 let taskref = TaskRef::from_ptr(p);
                 let scheduler = this.as_ref().scheduler();
                 scheduler.schedule(crate::Runnable::from(taskref));
-                Self::waker_drop(ptr);
             }
         }
     }
@@ -128,10 +129,9 @@ where
         Self::check_caller(ptr);
         let this = Self::from_raw_header(ptr);
         let state = this.as_ref().state();
-        match state.update(state::State::notify) {
+        match state.update(state::State::notify_and_clone) {
             state::NotifyResult::DoNothing => (),
             state::NotifyResult::SubmitTask => {
-                state.update(state::State::clone_ref);
                 let taskref = TaskRef::from_ptr(ptr);
                 let scheduler = this.as_ref().scheduler();
                 scheduler.schedule(crate::Runnable::from(taskref));
@@ -151,17 +151,17 @@ where
         }
     }
 
-    /// Create a new [`Waker`] from the provided `ptr`.
+    /// Create a borrowed [`Waker`] from the provided `ptr`.
     ///
-    /// This will bump the reference count of the task by one.
+    /// Unlike an owned waker, this does not adjust the task refcount. This is
+    /// used only while polling the future and never moved out of this scope.
     ///
     /// # Safety
-    /// Callers must ensure that `ptr` is a valid pointer to the `TaskCell`.
-    unsafe fn new_waker(ptr: NonNull<header::Header>) -> Waker {
-        let this = Self::from_raw_header(ptr);
-        this.as_ref().state().update(state::State::clone_ref);
+    /// Callers must ensure that `ptr` is valid for the lifetime of the returned
+    /// waker and that the returned waker is not moved out and dropped.
+    unsafe fn borrowed_waker(ptr: NonNull<header::Header>) -> ManuallyDrop<Waker> {
         let raw = RawWaker::new(ptr.as_ptr() as _, &Self::WAKER_VTABLE);
-        Waker::from_raw(raw)
+        ManuallyDrop::new(Waker::from_raw(raw))
     }
 
     unsafe fn poll(ptr: NonNull<header::Header>) {
@@ -175,14 +175,18 @@ where
                 PollResult::Complete
             }
             state::PreparePollResult::Ok => {
-                let waker = Self::new_waker(ptr);
+                let waker = Self::borrowed_waker(ptr);
                 let cx = Context::from_waker(&waker);
                 let future_cell = this.as_ref().future_cell();
 
                 if future_cell.poll(cx).is_ready() {
                     PollResult::Complete
                 } else {
-                    match this.as_ref().state().update(state::State::complete_poll) {
+                    match this
+                        .as_ref()
+                        .state()
+                        .update(state::State::complete_poll_and_clone)
+                    {
                         state::CompletePollResult::NotifiedDuringPoll => PollResult::Notified,
                         state::CompletePollResult::Cancelled => {
                             this.as_ref().future_cell().cancel();
@@ -200,7 +204,6 @@ where
             }
             PollResult::Done => {}
             PollResult::Notified => {
-                state.update(state::State::clone_ref);
                 let taskref = TaskRef::from_ptr(ptr);
                 let scheduler = this.as_ref().scheduler();
                 scheduler.schedule(crate::Runnable::from(taskref));
@@ -240,11 +243,9 @@ where
 
     unsafe fn abort(ptr: NonNull<header::Header>) {
         let this = Self::from_raw_header(ptr);
-        match this.as_ref().state().update(state::State::abort) {
+        match this.as_ref().state().update(state::State::abort_and_clone) {
             state::AbortResult::DoNothing => (),
             state::AbortResult::SubmitTask => {
-                // Submitting a task, make a clone.
-                this.as_ref().state().update(state::State::clone_ref);
                 let taskref = TaskRef::from_ptr(ptr);
                 let scheduler = this.as_ref().scheduler();
                 scheduler.schedule(crate::Runnable::from(taskref));
@@ -288,12 +289,12 @@ where
 
     #[inline]
     unsafe fn check_caller(ptr: NonNull<header::Header>) {
-        crate::util::abort_on_panic(|| {
-            if let Some(tid) = ptr.as_ref().thread {
-                let caller_thread = std::thread::current().id();
-                assert_eq!(tid, caller_thread);
+        if let Some(tid) = ptr.as_ref().thread {
+            let caller_thread = std::thread::current().id();
+            if tid != caller_thread {
+                std::process::abort();
             }
-        });
+        }
     }
 }
 

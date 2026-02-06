@@ -1,3 +1,5 @@
+#![cfg(target_os = "linux")]
+
 use std::io;
 use std::net::SocketAddr;
 use std::pin::pin;

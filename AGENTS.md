@@ -1,48 +1,146 @@
 # Repository Guidelines
 
-## Project Structure & Module Organization
+## What This Repository Is
 
-Rust workspace (`Cargo.toml`) with crate-per-module organization:
+Norn is an experimental set of Rust crates for building **single-threaded async runtimes** with explicit layering:
 
-- `norn-task/`: task primitives (`TaskQueue`, `TaskSet`, `JoinHandle`, `Schedule`/`Runnable`). Tests in `norn-task/src/tests/` cover wake/abort/panic behavior.
-- `norn-executor/`: `LocalExecutor<P: Park>` event loop + TLS handle access. `norn-executor/src/park/` defines the `Park` layering model (`SpinPark`, `ThreadPark`).
-- `norn-timer/`: timer `Park` wrapper (`Driver<P>`) that produces `Sleep` futures; uses `Clock::{system,simulated}` and a hierarchical wheel. Includes `proptest`-based checks.
-- `norn-uring/`: `io_uring` `Park` driver plus higher-level APIs: `operation/` (op lifecycle/cancel), `buf`/`bufring` (stable/registered buffers), `fs/` (files), `net/` (TCP/UDP). Integration tests live in `norn-uring/tests/` (see `tests/util.rs`).
-- `norn-util/`: `PollSet` (a `Future` that runs a scoped set of local tasks).
-- `benches/`: `bencher`-based microbenchmarks (`benches/*.rs`).
+1. `norn-task`: intrusive, refcounted local task system.
+2. `norn-executor`: `LocalExecutor<P: Park>` event loop over a `TaskQueue`.
+3. `norn-timer`: `Park` wrapper that adds timer-wheel scheduling.
+4. `norn-uring`: `Park` implementation backed by `io_uring` plus fs/net APIs.
+5. `norn-util`: scoped task polling utility (`PollSet`).
 
-Tooling/ops: `hack/` (dev scripts), `flake.nix`/`default.nix`/`.envrc` (Nix + direnv).
+The project is intentionally not general-purpose today; APIs are still in flux in executor/uring layers.
 
-## Build, Test, and Development Commands
+## Workspace Layout
 
-- `nix develop`: enter the Nix dev shell (tooling includes `cargo`, `rustfmt`, `clippy`, `miri`).
-- `cargo build`: build the workspace (default members).
-- `cargo test`: run unit + integration tests.
-- `cargo test -p norn-timer`: run tests for a single crate.
-- `cargo bench -p benches -- bench_join`: run a filtered benchmark (the `bencher` harness uses the first arg as a filter).
-- `./hack/miri.sh`: run `cargo miri test` (slower, catches UB).
-- `./hack/coverage.sh`: produce `lcov.info` via `cargo llvm-cov` (requires `cargo-llvm-cov`).
+- `norn-task/`: local-only task runtime primitives (`TaskQueue`, `TaskSet`, `JoinHandle`, `Runnable`, `Schedule`).
+- `norn-executor/`: single-thread executor and `Park` abstraction (`SpinPark`, `ThreadPark`).
+- `norn-timer/`: timer wheel + `Clock::{system, simulated}` as a `Park` wrapper.
+- `norn-uring/`: `io_uring` reactor, operation lifecycle, stable buffers, bufring, fs, tcp/udp.
+- `norn-util/`: `PollSet` future for scoped local task orchestration.
+- `benches/`: `bencher` harness (`schedule_task`, `noop_submit`, `timers`, `hyper`).
+- `hack/`: helper scripts (`miri.sh`, `coverage.sh`).
+- `.github/workflows/`: CI (`cargo build`, `cargo test`, `nix build` on Ubuntu).
 
-## Coding Style & Naming Conventions
+## Runtime Architecture (Important)
 
-- Rust 2021 edition; format with `cargo fmt` (rustfmt defaults; 4-space indentation).
-- Keep clippy clean: `cargo clippy --all-targets --all-features -- -D warnings`.
-- Naming: crates `norn-*`, modules/functions `snake_case`, types `CamelCase`, constants `SCREAMING_SNAKE_CASE`.
-- Most crates deny `missing_docs`; add rustdoc when introducing new public items.
+### `norn-task` invariants
 
-## Testing Guidelines
+- Tasks are single-allocation (`TaskCell`) objects with type-erased vtables.
+- Wakers and scheduling are **thread-affine**. `task_cell::check_caller` asserts same thread id.
+- State machine is in `state.rs` (`NOTIFIED`, `RUNNING`, `COMPLETE`, `JOIN_HANDLE`, `CANCELLED`) with strict assertions.
+- `abort_on_panic` is used in core state paths; invariant violations abort the process.
+- `FutureCell` captures task panics into `TaskError::Panic`, and cancellation as `TaskError::Cancelled`.
+- `TaskSet::bind` is `unsafe`; caller must guarantee captured lifetimes outlive task execution.
 
-- Unit tests live inline (`mod tests`) and in `*/src/tests/`.
-- Integration tests live in `norn-uring/tests/` where appropriate.
-- Prefer targeted runs while iterating (e.g., `cargo test -p norn-task`).
-- `norn-uring` tests require a working `io_uring` environment; CI runs on Ubuntu.
+### `norn-executor` model
 
-## Commit & Pull Request Guidelines
+- `LocalExecutor::block_on` runs:
+  1. root future harness poll,
+  2. runnable task drain loop,
+  3. `park(mode)`.
+- `Handle::current()` comes from TLS context and panics outside executor context.
+- `block_on` currently does `self.park.park(mode).unwrap()`: park errors panic.
+- `Drop` enters context, shuts down `TaskQueue`, then calls `Park::shutdown`.
 
-- Git history contains many `WIP` commits; for PRs, use descriptive, imperative subjects (e.g., `timer: fix wheel rollover`).
-- PRs should include: purpose, approach, how to test (`cargo test ...`), and any platform constraints (notably `io_uring`).
-- CI runs `cargo build`, `cargo test`, and `nix build`; keep these passing.
+### `norn-timer` model
 
-## Agent-Specific Instructions
+- `Driver<P>` wraps another `Park`, advances wheels each park cycle, and clamps timeout to next timer expiration.
+- Hierarchical wheel: 6 levels, 64 slots per level, millisecond ticks.
+- `Sleep` futures resolve to `Result<(), norn_timer::Error>`; shutdown path returns shutdown errors.
+- Simulated clock is heavily used in tests/benchmarks.
+- Known gap: dropping timer driver does not currently fire all outstanding sleepers (tracked TODO in tests/comments).
 
-- Keep changes minimal and localized; update/add tests when behavior changes.
+### `norn-uring` model
+
+- `Driver` owns ring + backpressure notifier + status (`Running`, `Draining`, `Shutdown`).
+- Submission queue pressure is handled by `PushFuture` waiting on `Notify`.
+- Driver park loop retries `EBUSY`, loops on `EINTR`, drains CQ before parking.
+- Remote unpark is eventfd-based (`driver/unpark.rs`).
+- `Driver::drop` calls `Park::shutdown`; shutdown path uses cancellation + IO_DRAIN token.
+- Special CQE user_data tokens are reserved (`<= 1024`).
+
+### `norn-uring` operation lifecycle
+
+- `Op<T>` has staged state:
+  - `Unsubmitted` (waiting for SQ space),
+  - `Submitted` (awaiting completions).
+- Dropping submitted `Op` attempts cancellation (`cancel(user_data)`).
+- `Operation::cleanup` is used for resource cleanup of dropped/unconsumed completions.
+- `UnsubmittedOp` currently expects push success and can panic if polled during shutdown.
+
+### FD and buffer lifetime constraints
+
+- `NornFd` is refcounted and waits for `strong_count == 1` before close submission.
+- `NornFd::Inner::drop` and `BufRing::drop` call `Handle::current()`; dropping outside driver context is unsafe/panic-prone.
+- I/O buffers must implement `StableBuf`/`StableBufMut` (stable pointer guarantees).
+- Bufring uses registered kernel buffer rings and returns buffers to ring on `BufRingBuf::drop`.
+
+## Platform and Build Constraints
+
+- `norn-uring` depends on `io-uring`; this workspace is effectively Linux-first.
+- The crate is not yet gated with `cfg(target_os = "linux")`; non-Linux builds are known pain points.
+- CI runs on Ubuntu:
+  - `.github/workflows/rust.yml`: `cargo build`, `cargo test`.
+  - `.github/workflows/build_nix.yml`: `nix build`.
+
+## Build, Test, and Benchmark Commands
+
+- `nix develop`: enter dev shell (fenix nightly toolchain + miri + rustfmt + clippy + cargo-udeps/outdated).
+- `cargo build`: build workspace default members.
+- `cargo test`: run all tests (requires Linux/io_uring for `norn-uring` tests).
+- `cargo test -p norn-task`: targeted task runtime tests.
+- `cargo test -p norn-timer`: timer wheel tests including proptests.
+- `cargo test -p norn-uring --test udp`: targeted integration test.
+- `cargo bench -p benches --bench schedule_task -- bench_join`: filtered bench via bencher filter arg.
+- `./hack/miri.sh`: run `cargo miri test`.
+- `./hack/coverage.sh`: run `cargo llvm-cov --lcov --output-path lcov.info`.
+
+## Test Coverage Map
+
+- `norn-task/src/tests/`:
+  - abort/drop/wake interactions,
+  - panic behavior,
+  - Tokio-inspired task combination matrix.
+- `norn-executor/src/lib.rs` tests:
+  - basic `block_on`,
+  - spawn timing (before/in/after runtime),
+  - context-based spawn.
+- `norn-timer/src/tests/`:
+  - smoke tests with simulated clock,
+  - wheel property tests (`proptest`) for advance behavior/termination.
+- `norn-uring/tests/`:
+  - noop submission pressure,
+  - file open/read/write,
+  - tcp accept/echo,
+  - udp send/recv, bufring usage, exhaustion, close behavior.
+
+## Coding and Documentation Standards
+
+- Rust 2021, `cargo fmt`.
+- Prefer clippy-clean changes: `cargo clippy --all-targets --all-features -- -D warnings`.
+- Public API additions usually require rustdoc; crates generally deny `missing_docs`.
+- Naming follows Rust defaults:
+  - modules/functions: `snake_case`,
+  - types/traits: `CamelCase`,
+  - constants: `SCREAMING_SNAKE_CASE`.
+
+## Change Guidance for Agents
+
+- Keep edits localized and behavior-preserving unless explicitly requested otherwise.
+- When changing semantics, add or update tests in the crate that owns the behavior.
+- For `norn-uring`, validate shutdown/cancel/drop implications explicitly; many paths are panic-sensitive.
+- Avoid introducing cross-thread assumptions; core runtime is single-thread/local by design.
+- Respect existing layering:
+  - `norn-task` should not depend on executor/uring specifics,
+  - `Park` integration belongs in executor/timer/uring boundaries.
+
+## PR Expectations
+
+- Use descriptive imperative commit subjects (avoid generic `WIP` for final PR commits).
+- Include:
+  - intent,
+  - key design decisions,
+  - exact test/bench commands run,
+  - platform notes (especially Linux/io_uring constraints).

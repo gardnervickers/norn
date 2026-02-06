@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::UnsafeCell;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::rc::Rc;
@@ -33,7 +33,7 @@ impl std::fmt::Debug for TaskQueue {
 }
 
 struct Shared {
-    runqueue: RefCell<VecDeque<Runnable>>,
+    runqueue: UnsafeCell<VecDeque<Runnable>>,
     taskset: TaskSet,
 }
 
@@ -41,7 +41,7 @@ impl TaskQueue {
     /// Construct a new [`TaskQueue`].
     pub fn new() -> Self {
         let shared = Shared {
-            runqueue: RefCell::new(VecDeque::with_capacity(1024)),
+            runqueue: UnsafeCell::new(VecDeque::with_capacity(1024)),
             taskset: TaskSet::default(),
         };
         Self {
@@ -64,20 +64,19 @@ impl TaskQueue {
         //         all references it captures.
         let (runnable, handle) = unsafe { self.shared.taskset.bind(future, sched) };
         if let Some(runnable) = runnable {
-            self.shared.schedule(runnable);
+            self.shared.push_runnable(runnable);
         }
         handle
     }
 
     /// Returns the next [`Runnable`] to be executed.
     pub fn next(&self) -> Option<Runnable> {
-        let next = self.shared.runqueue.borrow_mut().pop_front();
-        next
+        self.shared.pop_runnable()
     }
 
     /// Returns the number of [`Runnable`]s in the queue.
     pub fn runnable(&self) -> usize {
-        self.shared.runqueue.borrow().len()
+        self.shared.runnable_len()
     }
 
     /// Shutdown the [`TaskQueue`].
@@ -85,16 +84,59 @@ impl TaskQueue {
     /// Cancels all tasks and drops their [`Future`]s.
     pub fn shutdown(&self) {
         self.shared.taskset.shutdown();
-        drop(self.shared.runqueue.take());
+        self.shared.clear_runqueue();
     }
 }
 
 impl Schedule for Rc<Shared> {
     fn schedule(&self, runnable: Runnable) {
-        self.runqueue.borrow_mut().push_back(runnable);
+        self.push_runnable(runnable);
     }
 
     fn unbind(&self, registered: &crate::RegisteredTask) {
         unsafe { self.taskset.remove(registered) };
+    }
+}
+
+impl Shared {
+    /// Push a runnable into the queue.
+    ///
+    /// # Safety
+    /// `TaskQueue` is single-threaded and these methods only create short-lived
+    /// mutable references that do not escape the function.
+    #[inline]
+    fn push_runnable(&self, runnable: Runnable) {
+        unsafe {
+            (&mut *self.runqueue.get()).push_back(runnable);
+        }
+    }
+
+    /// Pop the next runnable from the queue.
+    ///
+    /// # Safety
+    /// See [`Shared::push_runnable`].
+    #[inline]
+    fn pop_runnable(&self) -> Option<Runnable> {
+        unsafe { (&mut *self.runqueue.get()).pop_front() }
+    }
+
+    /// Return the number of queued runnables.
+    ///
+    /// # Safety
+    /// See [`Shared::push_runnable`].
+    #[inline]
+    fn runnable_len(&self) -> usize {
+        unsafe { (&*self.runqueue.get()).len() }
+    }
+
+    /// Clear the runqueue and drop all queued runnables.
+    ///
+    /// # Safety
+    /// See [`Shared::push_runnable`].
+    #[inline]
+    fn clear_runqueue(&self) {
+        unsafe {
+            (&mut *self.runqueue.get()).clear();
+        }
     }
 }

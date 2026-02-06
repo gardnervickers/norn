@@ -3,6 +3,7 @@
 //!
 //! [`Park`]: norn_executor::park::Park
 //! [io_uring](https://kernel.dk/io_uring.pdf)
+#![cfg(target_os = "linux")]
 #![deny(
     missing_docs,
     missing_debug_implementations,

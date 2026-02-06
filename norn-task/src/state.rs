@@ -116,6 +116,16 @@ impl State {
         CompletePollResult::Ok
     }
 
+    /// Conclude polling for a task and clone the task ref if it must be rescheduled.
+    #[inline]
+    pub(crate) fn complete_poll_and_clone(&mut self) -> CompletePollResult {
+        let res = self.complete_poll();
+        if matches!(res, CompletePollResult::NotifiedDuringPoll) {
+            self.clone_ref();
+        }
+        res
+    }
+
     /// Mark the task as complete.
     ///
     /// Returns whether the task output should be dropped or if the join
@@ -174,6 +184,16 @@ impl State {
         }
     }
 
+    /// Notify the task and clone the task ref if it should be submitted.
+    #[inline]
+    pub(crate) fn notify_and_clone(&mut self) -> NotifyResult {
+        let res = self.notify();
+        if matches!(res, NotifyResult::SubmitTask) {
+            self.clone_ref();
+        }
+        res
+    }
+
     /// Shutdown the task.
     ///
     /// This is to be called from the executor during shutdown. As a result,
@@ -218,6 +238,16 @@ impl State {
         }
         self.flags.insert(Flags::NOTIFIED);
         AbortResult::SubmitTask
+    }
+
+    /// Abort the task and clone the task ref if it should be submitted.
+    #[inline]
+    pub(crate) fn abort_and_clone(&mut self) -> AbortResult {
+        let res = self.abort();
+        if matches!(res, AbortResult::SubmitTask) {
+            self.clone_ref();
+        }
+        res
     }
 
     /// Mark the task as having it's [`JoinHandle`] dropped.

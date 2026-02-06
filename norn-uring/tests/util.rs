@@ -1,3 +1,5 @@
+#![cfg(target_os = "linux")]
+
 use std::ops;
 use std::path::{Path, PathBuf};
 
