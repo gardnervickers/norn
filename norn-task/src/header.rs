@@ -21,12 +21,16 @@ impl std::fmt::Debug for Header {
 }
 
 impl Header {
-    pub(crate) fn new(state: StateCell, vtable: &'static VTable) -> Self {
+    pub(crate) fn new(
+        state: StateCell,
+        vtable: &'static VTable,
+        thread: std::thread::ThreadId,
+    ) -> Self {
         Self {
             state,
             vtable,
             waker: UnsafeCell::new(None),
-            thread: std::thread::current().id(),
+            thread,
             links: Links::default(),
         }
     }

@@ -15,6 +15,10 @@ use crate::header;
 use crate::state::{self, DropRefResult, StateCell};
 use crate::Schedule;
 
+thread_local! {
+    static CURRENT_THREAD_ID: std::thread::ThreadId = std::thread::current().id();
+}
+
 /// [`TaskCell`] serves a the allocated type which olds the [`Future`] and
 /// all related data.
 #[repr(C)]
@@ -35,13 +39,18 @@ where
     const TASK_VTABLE: VTable = Self::vtable();
     const WAKER_VTABLE: RawWakerVTable = Self::waker_vtable();
 
+    #[inline]
+    fn current_thread_id() -> std::thread::ThreadId {
+        CURRENT_THREAD_ID.with(|id| *id)
+    }
+
     pub(crate) fn allocate(
         future: F,
         scheduler: S,
     ) -> (TaskRef, crate::RegisteredTask, JoinHandleRef<F::Output>) {
         // Pre-reserve refs for runnable + registered + join-handle.
         let state = StateCell::new(3);
-        let header = header::Header::new(state, &Self::TASK_VTABLE);
+        let header = header::Header::new(state, &Self::TASK_VTABLE, Self::current_thread_id());
         let future = future_cell::FutureCell::new(future);
         let task = TaskCell {
             header,
@@ -300,7 +309,7 @@ where
     #[inline]
     unsafe fn check_caller(ptr: NonNull<header::Header>) {
         let tid = ptr.as_ref().thread;
-        let caller_thread = std::thread::current().id();
+        let caller_thread = Self::current_thread_id();
         if tid != caller_thread {
             std::process::abort();
         }
