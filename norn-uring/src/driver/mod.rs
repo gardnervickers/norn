@@ -316,6 +316,10 @@ impl Park for Driver {
             if self.shared.status() == Status::Running {
                 self.unparker.wake();
                 if let Err(err) = self.shared.submit(ParkMode::NoPark) {
+                    // Fail-soft shutdown path: if we can't submit during teardown,
+                    // stop driving the ring instead of panicking in Drop.
+                    // This may abandon in-flight work, but avoids use-after-free style
+                    // teardown hazards by not forcing partially-failed transitions.
                     warn!(target: LOG, "shutdown.submit.failed {:?}", err);
                     self.shared.set_status(Status::Shutdown);
                     return;
@@ -336,6 +340,8 @@ impl Park for Driver {
             }
             if self.shared.status() == Status::Draining {
                 if let Err(err) = self.park(ParkMode::NextCompletion) {
+                    // Same fail-soft policy as above: prefer an explicit shutdown stop
+                    // over panic while dropping the driver.
                     warn!(target: LOG, "shutdown.park.failed {:?}", err);
                     self.shared.set_status(Status::Shutdown);
                     return;

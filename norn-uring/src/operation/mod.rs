@@ -300,6 +300,8 @@ where
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
         if let Err(err) = ready!(this.future.poll(cx)) {
+            // Submission failed (typically during driver shutdown). Synthesize a completion
+            // error so the op follows normal completion/drop lifetimes instead of panicking.
             let op = this
                 .handle
                 .as_ref()

@@ -100,6 +100,7 @@ impl Drop for NornFd {
 impl Drop for Inner {
     fn drop(&mut self) {
         if !self.closed.get() {
+            // Best-effort close on drop. Errors are logged because drop cannot report them.
             if let Err(err) = self.handle.close_fd(&self.kind) {
                 warn!(target: "norn_uring::fd", "close_fd.failed: {}", err);
             }

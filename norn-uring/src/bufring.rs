@@ -435,6 +435,8 @@ impl InnerBufRing {
 
 impl Drop for InnerBufRing {
     fn drop(&mut self) {
+        // Best-effort unregister on drop. If this fails we prefer logging over panicking
+        // during teardown; the process can still exit safely.
         if let Err(err) = self.handle.with_submitter(|s| self.unregister(s)) {
             warn!(target: "norn_uring::bufring", "unregister.failed: {}", err);
         }
