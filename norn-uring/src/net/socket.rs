@@ -527,11 +527,7 @@ impl Operation for Connect {
         }
     }
 
-    fn cleanup(&mut self, res: crate::operation::CQEResult) {
-        if let Ok(fd) = res.result {
-            NornFd::from_fd(fd as i32);
-        }
-    }
+    fn cleanup(&mut self, _: crate::operation::CQEResult) {}
 }
 
 impl Singleshot for Connect {

@@ -39,3 +39,19 @@ fn read_write() -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     })
 }
+
+#[test]
+fn create_remove_dir() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let dir = util::ThreadNameTestDir::new();
+        let path = dir.join("subdir");
+
+        fs::create_dir(&path).await?;
+        assert!(path.is_dir());
+
+        fs::remove_dir(&path).await?;
+        assert!(!path.exists());
+
+        Ok(())
+    })
+}
