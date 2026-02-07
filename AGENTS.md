@@ -100,6 +100,19 @@ The project is intentionally not general-purpose today; APIs are still in flux i
 - `./hack/miri.sh`: run `cargo miri test`.
 - `./hack/coverage.sh`: run `cargo llvm-cov --lcov --output-path lcov.info`.
 
+### Lima Workflow for macOS (`norn-uring`)
+
+- `norn-uring` must be developed/tested on Linux. On macOS, use Lima and run Linux commands via flake apps.
+- First ensure `limactl` is installed on macOS (`brew install lima`).
+- `nix run .#uring-vm-up`: create/start the `norn-uring` Lima VM, ensure writable host mount, and install Nix in the guest when missing.
+- `nix run .#uring-shell`: open a Linux shell in this repo path and enter `nix develop`.
+- `nix run .#uring-test`: run `nix develop -c cargo test -p norn-uring` inside the Lima VM.
+- Under the hood these commands call `hack/lima-norn-uring.sh`.
+- Optional environment variables:
+  - `LIMA_INSTANCE_NAME` (default `norn-uring`).
+  - `LIMA_HOST_MOUNT` (default `$HOME`; mounted writable into guest).
+  - `REPO_HOST_PATH` (default git root / current directory).
+
 ## Benchmarking Methodology (Performance Changes)
 
 - Always benchmark before and after with the same command/filter.

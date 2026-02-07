@@ -30,10 +30,35 @@
           fx.latest.rust-src
           fx.latest.miri
         ];
+        mkLimaApp =
+          command:
+          {
+            type = "app";
+            program = toString (
+              pkgs.writeShellScript "norn-${command}" ''
+                set -euo pipefail
+                repo_root="$(${pkgs.git}/bin/git -C "$PWD" rev-parse --show-toplevel 2>/dev/null || pwd)"
+                script="$repo_root/hack/lima-norn-uring.sh"
+
+                if [ ! -x "$script" ]; then
+                  echo "missing script: $script" >&2
+                  exit 1
+                fi
+
+                exec "$script" ${command}
+              ''
+            );
+          };
       in
       {
         # Keep `nix build` working for legacy workflows / flake-compat.
         packages.default = self.devShells.${system}.default;
+
+        apps = {
+          uring-vm-up = mkLimaApp "up";
+          uring-shell = mkLimaApp "shell";
+          uring-test = mkLimaApp "test";
+        };
 
         devShells.default = pkgs.mkShell {
           nativeBuildInputs = [
