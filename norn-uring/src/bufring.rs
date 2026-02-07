@@ -10,6 +10,7 @@ use std::{fmt, io, ops, ptr};
 
 use io_uring::types::{self, BufRingEntry};
 use io_uring::Submitter;
+use log::warn;
 
 use crate::Handle;
 
@@ -207,14 +208,17 @@ impl Builder {
         // wrap calculation trivial.
         b.ring_entries = b.ring_entries.next_power_of_two();
 
-        let inner = InnerBufRing::new(b.bgid, b.ring_entries, b.buf_cnt, b.buf_len)?;
         let handle = crate::Handle::current();
+        let inner =
+            InnerBufRing::new(b.bgid, b.ring_entries, b.buf_cnt, b.buf_len, handle.clone())?;
         handle.with_submitter(|s| inner.register(s))?;
         Ok(BufRing::new(inner))
     }
 }
 
 struct InnerBufRing {
+    handle: Handle,
+
     // All these fields are constant once the struct is instantiated except the one of type Cell<u16>.
     bgid: Bgid,
 
@@ -247,6 +251,7 @@ impl InnerBufRing {
         ring_entries: u16,
         buf_cnt: u16,
         buf_len: usize,
+        handle: Handle,
     ) -> io::Result<InnerBufRing> {
         // Check that none of the important args are zero and the ring_entries is at least large
         // enough to hold all the buffers and that ring_entries is a power of 2.
@@ -266,7 +271,7 @@ impl InnerBufRing {
         // The memory is required to be page aligned and zero-filled by the uring buf_ring
         // interface. Anonymous mmap promises both of those things.
         // https://man7.org/linux/man-pages/man2/mmap.2.html
-        let ring_start = AnonymousMmap::new(ring_size).unwrap();
+        let ring_start = AnonymousMmap::new(ring_size)?;
 
         // Probably some functional way to do this.
         let buf_list: Vec<Vec<u8>> = {
@@ -285,6 +290,7 @@ impl InnerBufRing {
         assert!((ring_entries & ring_entries_mask) == 0);
 
         let buf_ring = InnerBufRing {
+            handle,
             bgid,
             ring_entries_mask,
             buf_cnt,
@@ -429,8 +435,11 @@ impl InnerBufRing {
 
 impl Drop for InnerBufRing {
     fn drop(&mut self) {
-        let handle = Handle::current();
-        handle.with_submitter(|s| self.unregister(s).unwrap());
+        // Best-effort unregister on drop. If this fails we prefer logging over panicking
+        // during teardown; the process can still exit safely.
+        if let Err(err) = self.handle.with_submitter(|s| self.unregister(s)) {
+            warn!(target: "norn_uring::bufring", "unregister.failed: {}", err);
+        }
     }
 }
 

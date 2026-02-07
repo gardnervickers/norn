@@ -55,3 +55,18 @@ fn create_remove_dir() -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     })
 }
+
+#[test]
+fn drop_file_outside_runtime() -> Result<(), Box<dyn std::error::Error>> {
+    let file = util::with_test_env(|| async {
+        let dir = util::ThreadNameTestDir::new();
+        let path = dir.join("drop-outside-runtime");
+        let mut opts = fs::OpenOptions::new();
+        opts.create(true).write(true);
+        let file = opts.open(path).await?;
+        Ok(file)
+    })?;
+
+    drop(file);
+    Ok(())
+}

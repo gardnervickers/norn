@@ -74,12 +74,17 @@ impl std::fmt::Debug for Driver {
 }
 
 impl Handle {
+    /// Returns a handle to the current driver if one is set in TLS context.
+    pub(crate) fn try_current() -> Option<Self> {
+        context::DriverContext::handle()
+    }
+
     /// Returns a handle to the current driver.
     ///
     /// If the current thread is not in a driver context, this will panic.
     #[track_caller]
     pub fn current() -> Self {
-        context::DriverContext::handle().expect("not in driver context")
+        Self::try_current().expect("not in driver context")
     }
 
     pub(crate) fn submit<T>(&self, op: T) -> Op<T>
@@ -315,18 +320,37 @@ impl Park for Driver {
             }
             if self.shared.status() == Status::Running {
                 self.unparker.wake();
-                self.shared.submit(ParkMode::NoPark).unwrap();
-                self.shared.cancel_all().unwrap();
+                if let Err(err) = self.shared.submit(ParkMode::NoPark) {
+                    // Fail-soft shutdown path: if we can't submit during teardown,
+                    // stop driving the ring instead of panicking in Drop.
+                    // This may abandon in-flight work, but avoids use-after-free style
+                    // teardown hazards by not forcing partially-failed transitions.
+                    warn!(target: LOG, "shutdown.submit.failed {:?}", err);
+                    self.shared.set_status(Status::Shutdown);
+                    return;
+                }
+                if let Err(err) = self.shared.cancel_all() {
+                    warn!(target: LOG, "shutdown.cancel_all.failed {:?}", err);
+                }
                 let opcode = io_uring::opcode::Nop::new()
                     .build()
                     .flags(io_uring::squeue::Flags::IO_DRAIN)
                     .user_data(Self::DRAIN_TOKEN as u64);
                 if unsafe { self.shared.try_push_raw(&opcode) }.is_ok() {
                     self.shared.set_status(Status::Draining);
+                } else {
+                    let drained = self.drain::<32>(usize::MAX);
+                    trace!(target: LOG, "shutdown.push_drain.retry drained={}", drained);
                 }
             }
             if self.shared.status() == Status::Draining {
-                self.park(ParkMode::NextCompletion).unwrap();
+                if let Err(err) = self.park(ParkMode::NextCompletion) {
+                    // Same fail-soft policy as above: prefer an explicit shutdown stop
+                    // over panic while dropping the driver.
+                    warn!(target: LOG, "shutdown.park.failed {:?}", err);
+                    self.shared.set_status(Status::Shutdown);
+                    return;
+                }
             }
         }
     }
@@ -460,6 +484,8 @@ impl Shared {
         .flags(Flags::SKIP_SUCCESS)
         .user_data(Driver::CLOSE_FD_TOKEN as u64);
         unsafe { self.try_push_raw_submit(&entry) }?;
+        // Ensure close requests are not stranded in SQ if no further park cycle happens.
+        self.submit(ParkMode::NoPark)?;
         Ok(())
     }
 
