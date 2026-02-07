@@ -74,12 +74,17 @@ impl std::fmt::Debug for Driver {
 }
 
 impl Handle {
+    /// Returns a handle to the current driver if one is set in TLS context.
+    pub(crate) fn try_current() -> Option<Self> {
+        context::DriverContext::handle()
+    }
+
     /// Returns a handle to the current driver.
     ///
     /// If the current thread is not in a driver context, this will panic.
     #[track_caller]
     pub fn current() -> Self {
-        context::DriverContext::handle().expect("not in driver context")
+        Self::try_current().expect("not in driver context")
     }
 
     pub(crate) fn submit<T>(&self, op: T) -> Op<T>
@@ -479,6 +484,8 @@ impl Shared {
         .flags(Flags::SKIP_SUCCESS)
         .user_data(Driver::CLOSE_FD_TOKEN as u64);
         unsafe { self.try_push_raw_submit(&entry) }?;
+        // Ensure close requests are not stranded in SQ if no further park cycle happens.
+        self.submit(ParkMode::NoPark)?;
         Ok(())
     }
 

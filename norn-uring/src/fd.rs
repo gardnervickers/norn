@@ -30,7 +30,7 @@ pub(crate) struct NornFd {
 #[derive(Debug)]
 struct Inner {
     kind: FdKind,
-    handle: Handle,
+    handle: Option<Handle>,
     notify: Notify,
     closed: Cell<bool>,
 }
@@ -56,7 +56,7 @@ impl NornFd {
     }
 
     fn new(kind: FdKind) -> Self {
-        let handle = Handle::current();
+        let handle = Handle::try_current();
         let inner = Inner {
             kind,
             handle,
@@ -77,12 +77,21 @@ impl NornFd {
                 return Ok(());
             }
             if Rc::strong_count(&self.inner) == 1 {
-                self.inner
-                    .handle
-                    .submit(CloseFd {
-                        fd: self.inner.kind,
-                    })
-                    .await?;
+                if let Some(handle) = &self.inner.handle {
+                    if let Err(_err) = handle
+                        .submit(CloseFd {
+                            fd: self.inner.kind,
+                        })
+                        .await
+                    {
+                        // Fall back to best-effort direct close if the reactor is shutting down.
+                        self.inner.close_direct()?;
+                        self.inner.closed.set(true);
+                        return Ok(());
+                    }
+                } else {
+                    self.inner.close_direct()?;
+                }
                 self.inner.closed.set(true);
             } else {
                 self.inner.notify.wait().await;
@@ -101,9 +110,35 @@ impl Drop for Inner {
     fn drop(&mut self) {
         if !self.closed.get() {
             // Best-effort close on drop. Errors are logged because drop cannot report them.
-            if let Err(err) = self.handle.close_fd(&self.kind) {
-                warn!(target: "norn_uring::fd", "close_fd.failed: {}", err);
+            let reactor_res = self
+                .handle
+                .as_ref()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no driver handle"))
+                .and_then(|handle| handle.close_fd(&self.kind));
+            if let Err(err) = reactor_res {
+                if let Err(direct_err) = self.close_direct() {
+                    warn!(target: "norn_uring::fd", "close_fd.failed: {}; direct_close.failed: {}", err, direct_err);
+                }
             }
+        }
+    }
+}
+
+impl Inner {
+    fn close_direct(&self) -> io::Result<()> {
+        match self.kind {
+            FdKind::Fd(fd) => {
+                let res = unsafe { libc::close(fd.0) };
+                if res == 0 {
+                    Ok(())
+                } else {
+                    Err(io::Error::last_os_error())
+                }
+            }
+            FdKind::Fixed(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "cannot directly close fixed descriptor",
+            )),
         }
     }
 }
@@ -130,5 +165,32 @@ impl Singleshot for CloseFd {
     fn complete(self, result: crate::operation::CQEResult) -> Self::Output {
         result.result?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drop_fd_without_runtime_context_closes_descriptor() {
+        let mut fds = [0; 2];
+        let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(rc, 0);
+
+        let read_end = fds[0];
+        let write_end = fds[1];
+        let fd = NornFd::from_fd(read_end);
+
+        drop(fd);
+
+        // Pipe read-end should be closed by NornFd drop fallback.
+        let check = unsafe { libc::fcntl(read_end, libc::F_GETFD) };
+        assert_eq!(check, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+
+        unsafe {
+            libc::close(write_end);
+        }
     }
 }
