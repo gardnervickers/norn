@@ -153,3 +153,14 @@ fn close_socket() -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     })
 }
+
+#[test]
+fn drop_bufring_outside_runtime() -> Result<(), Box<dyn std::error::Error>> {
+    let ring = util::with_test_env(|| async {
+        let ring = BufRing::builder(3).buf_cnt(8).buf_len(1024).build()?;
+        Ok(ring)
+    })?;
+
+    drop(ring);
+    Ok(())
+}

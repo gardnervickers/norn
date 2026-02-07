@@ -315,18 +315,31 @@ impl Park for Driver {
             }
             if self.shared.status() == Status::Running {
                 self.unparker.wake();
-                self.shared.submit(ParkMode::NoPark).unwrap();
-                self.shared.cancel_all().unwrap();
+                if let Err(err) = self.shared.submit(ParkMode::NoPark) {
+                    warn!(target: LOG, "shutdown.submit.failed {:?}", err);
+                    self.shared.set_status(Status::Shutdown);
+                    return;
+                }
+                if let Err(err) = self.shared.cancel_all() {
+                    warn!(target: LOG, "shutdown.cancel_all.failed {:?}", err);
+                }
                 let opcode = io_uring::opcode::Nop::new()
                     .build()
                     .flags(io_uring::squeue::Flags::IO_DRAIN)
                     .user_data(Self::DRAIN_TOKEN as u64);
                 if unsafe { self.shared.try_push_raw(&opcode) }.is_ok() {
                     self.shared.set_status(Status::Draining);
+                } else {
+                    let drained = self.drain::<32>(usize::MAX);
+                    trace!(target: LOG, "shutdown.push_drain.retry drained={}", drained);
                 }
             }
             if self.shared.status() == Status::Draining {
-                self.park(ParkMode::NextCompletion).unwrap();
+                if let Err(err) = self.park(ParkMode::NextCompletion) {
+                    warn!(target: LOG, "shutdown.park.failed {:?}", err);
+                    self.shared.set_status(Status::Shutdown);
+                    return;
+                }
             }
         }
     }

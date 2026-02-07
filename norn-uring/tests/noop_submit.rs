@@ -35,6 +35,20 @@ fn concurrent_submit() -> Result<(), Box<dyn std::error::Error>> {
     })
 }
 
+#[test]
+fn shutdown_with_detached_noops() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        for _ in 0..2048 {
+            norn_executor::spawn(async {
+                let _ = norn_uring::noop().await;
+            })
+            .detach();
+        }
+        norn_uring::noop().await;
+        Ok(())
+    })
+}
+
 async fn race(f1: impl Future, f2: impl Future) {
     futures_util::future::select(pin!(f1), pin!(f2)).await;
 }

@@ -253,7 +253,7 @@ pin_project_lite::pin_project! {
 
 impl<T> Stage<T>
 where
-    T: 'static,
+    T: Operation + 'static,
 {
     fn new(handle: TypedHandle<T>, future: PushFuture) -> Self {
         Self::Unsubmitted {
@@ -293,14 +293,20 @@ pin_project_lite::pin_project! {
 
 impl<T> Future for UnsubmittedOp<T>
 where
-    T: 'static,
+    T: Operation + 'static,
 {
     type Output = TypedHandle<T>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
-        ready!(this.future.poll(cx))
-            .expect("push future failed, future should not be polled during shutdown");
+        if let Err(err) = ready!(this.future.poll(cx)) {
+            let op = this
+                .handle
+                .as_ref()
+                .expect("operation handle must exist until submission completes")
+                .untyped();
+            op.complete(CQEResult::new(Err(err.into()), 0));
+        }
         Poll::Ready(this.handle.take().unwrap())
     }
 }

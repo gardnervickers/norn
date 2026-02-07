@@ -30,6 +30,7 @@ pub(crate) struct NornFd {
 #[derive(Debug)]
 struct Inner {
     kind: FdKind,
+    handle: Handle,
     notify: Notify,
     closed: Cell<bool>,
 }
@@ -55,8 +56,10 @@ impl NornFd {
     }
 
     fn new(kind: FdKind) -> Self {
+        let handle = Handle::current();
         let inner = Inner {
             kind,
+            handle,
             notify: Notify::default(),
             closed: Cell::new(false),
         };
@@ -74,8 +77,8 @@ impl NornFd {
                 return Ok(());
             }
             if Rc::strong_count(&self.inner) == 1 {
-                let handle = Handle::current();
-                handle
+                self.inner
+                    .handle
                     .submit(CloseFd {
                         fd: self.inner.kind,
                     })
@@ -97,8 +100,7 @@ impl Drop for NornFd {
 impl Drop for Inner {
     fn drop(&mut self) {
         if !self.closed.get() {
-            let handle = Handle::current();
-            if let Err(err) = handle.close_fd(&self.kind) {
+            if let Err(err) = self.handle.close_fd(&self.kind) {
                 warn!(target: "norn_uring::fd", "close_fd.failed: {}", err);
             }
         }
