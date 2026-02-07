@@ -6,6 +6,7 @@
 
   outputs =
     {
+      self,
       nixpkgs,
       fenix,
       utils,
@@ -31,6 +32,9 @@
         ];
       in
       {
+        # Keep `nix build` working for legacy workflows / flake-compat.
+        packages.default = self.devShells.${system}.default;
+
         devShells.default = pkgs.mkShell {
           nativeBuildInputs = [
             pkgs.cargo-udeps
