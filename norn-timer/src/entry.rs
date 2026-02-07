@@ -60,7 +60,12 @@ where
                 State::Registered => {
                     debug_assert!(me.entry.is_registered());
                     let mut w = me.entry.waker.borrow_mut();
-                    *w = Some(cx.waker().clone());
+                    if !w
+                        .as_ref()
+                        .is_some_and(|existing| existing.will_wake(cx.waker()))
+                    {
+                        *w = Some(cx.waker().clone());
+                    }
                     return Poll::Pending;
                 }
                 State::Fired => {

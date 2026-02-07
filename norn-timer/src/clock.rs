@@ -49,8 +49,13 @@ impl Clock {
 
     /// Return the current tick.
     pub(crate) fn tick(&self) -> u64 {
-        let now = self.now();
-        self.instant_to_tick(now)
+        match &self.time {
+            TimeSource::System => self.instant_to_tick(Instant::now()),
+            TimeSource::Simulated { offset } => {
+                let ms = offset.get().as_millis();
+                ms.try_into().expect("Duration too far into the future")
+            }
+        }
     }
 
     /// Return the current instant.

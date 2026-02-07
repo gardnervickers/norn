@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::UnsafeCell;
 
 use crate::Handle;
 
@@ -7,19 +7,21 @@ thread_local! {
 }
 
 pub(crate) struct Context {
-    handle: RefCell<Option<Handle>>,
+    handle: UnsafeCell<Option<Handle>>,
 }
 
 impl Context {
     fn new() -> Self {
         Self {
-            handle: Default::default(),
+            handle: UnsafeCell::new(None),
         }
     }
 
     pub(crate) fn enter(handle: Handle) -> ContextGuard {
         CURRENT.with(|current| {
-            let mut old = current.handle.borrow_mut();
+            // Safety: This context is thread-local and only accessed on the
+            // current thread.
+            let old = unsafe { &mut *current.handle.get() };
             assert!(old.is_none(), "executor already set");
             *old = Some(handle);
         });
@@ -28,7 +30,10 @@ impl Context {
 
     /// Returns a reference to the current executor.
     pub(crate) fn handle() -> Option<Handle> {
-        CURRENT.with(|c| c.handle.borrow().clone())
+        CURRENT.with(|c| {
+            // Safety: See [`Context::enter`].
+            unsafe { (*c.handle.get()).clone() }
+        })
     }
 }
 
@@ -38,7 +43,8 @@ pub struct ContextGuard;
 impl Drop for ContextGuard {
     fn drop(&mut self) {
         CURRENT.with(|current| {
-            let mut handle = current.handle.borrow_mut();
+            // Safety: See [`Context::enter`].
+            let handle = unsafe { &mut *current.handle.get() };
             assert!(handle.is_some(), "timer not set");
             *handle = None;
         });

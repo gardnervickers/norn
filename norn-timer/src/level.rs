@@ -70,11 +70,12 @@ impl Level {
         let slot = self.next_occupied_slot(now)?;
         let level_range = level_range(self.level);
         let slot_range = slot_range(self.level);
-        let level_start = now - (now % level_range);
+        let level_shift = level_shift(self.level);
+        let level_start = now & !(level_range - 1);
         // Return the deadline corresponding to the target level + slot
         // rather than the exact deadline for the slot. This is because
         // we will either fire the entire slot in one shot, or cascade it down.
-        let mut deadline = level_start + (slot as u64 * slot_range);
+        let mut deadline = level_start + ((slot as u64) << level_shift);
 
         if deadline <= now {
             // From the Tokio implementation:
@@ -125,10 +126,10 @@ impl Level {
             return None;
         }
 
-        let now_slot = (now / slot_range(self.level)) as usize;
+        let now_slot = ((now >> level_shift(self.level)) as usize) & (Level::LEVEL_MULT - 1);
         let occupied = self.bitfield.rotate_right(now_slot as u32);
         let zeros = occupied.trailing_zeros() as usize;
-        let slot = (zeros + now_slot) % 64;
+        let slot = (zeros + now_slot) & (Level::LEVEL_MULT - 1);
         Some(slot)
     }
 
@@ -164,17 +165,21 @@ impl Level {
     }
 }
 
+const fn level_shift(level: usize) -> usize {
+    level * 6
+}
+
 const fn slot_range(level: usize) -> u64 {
-    Level::LEVEL_MULT.pow(level as u32) as u64
+    1 << level_shift(level)
 }
 
 const fn level_range(level: usize) -> u64 {
-    Level::LEVEL_MULT as u64 * slot_range(level)
+    1 << (level_shift(level) + 6)
 }
 
 /// Convert a duration (milliseconds) and a level to a slot position
 const fn slot_for(duration: u64, level: usize) -> usize {
-    ((duration >> (level * 6)) % Level::LEVEL_MULT as u64) as usize
+    ((duration >> level_shift(level)) & (Level::LEVEL_MULT as u64 - 1)) as usize
 }
 
 const fn occupied_bit(slot: usize) -> u64 {

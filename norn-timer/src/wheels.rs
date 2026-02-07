@@ -112,10 +112,10 @@ impl Wheels {
     }
 
     fn next_expiration(&self) -> Option<level::Expiration> {
+        let now = self.elapsed.get();
+        let wheels = self.wheels.borrow();
         for level in 0..NUM_LEVELS {
-            if let Some(expiration) =
-                self.wheels.borrow()[level].next_expiration(self.elapsed.get())
-            {
+            if let Some(expiration) = wheels[level].next_expiration(now) {
                 return Some(expiration);
             }
         }
