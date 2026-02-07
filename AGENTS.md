@@ -79,8 +79,10 @@ The project is intentionally not general-purpose today; APIs are still in flux i
 
 ## Platform and Build Constraints
 
-- `norn-uring` depends on `io-uring`; this workspace is effectively Linux-first.
-- The crate is not yet gated with `cfg(target_os = "linux")`; non-Linux builds are known pain points.
+- This repo is actively developed on both macOS and Linux.
+- `norn-task`, `norn-executor`, `norn-timer`, and `norn-util` are expected to build and benchmark on macOS and Linux.
+- `norn-uring` is Linux-only and is explicitly gated with `cfg(target_os = "linux")` (crate + integration tests).
+- On macOS, `norn-uring` is compiled out; workspace checks should still pass for non-uring crates.
 - CI runs on Ubuntu:
   - `.github/workflows/rust.yml`: `cargo build`, `cargo test`.
   - `.github/workflows/build_nix.yml`: `nix build`.
@@ -94,8 +96,25 @@ The project is intentionally not general-purpose today; APIs are still in flux i
 - `cargo test -p norn-timer`: timer wheel tests including proptests.
 - `cargo test -p norn-uring --test udp`: targeted integration test.
 - `cargo bench -p benches --bench schedule_task -- bench_join`: filtered bench via bencher filter arg.
+- `cargo bench -p benches --bench timers -- bench_timers`: timer wheel/executor integration benchmarks.
 - `./hack/miri.sh`: run `cargo miri test`.
 - `./hack/coverage.sh`: run `cargo llvm-cov --lcov --output-path lcov.info`.
+
+## Benchmarking Methodology (Performance Changes)
+
+- Always benchmark before and after with the same command/filter.
+- Use the `bencher` harness filters for focused cases (for example `bench_spawn/num_tasks=1024`).
+- Collect a baseline full matrix first, then repeat key hot cases at least 3 times and compare medians.
+- Keep runtime checks consistent for perf branches:
+  - `cargo fmt --all`
+  - `cargo test` (or targeted crate tests during iteration, full/expanded before commit)
+  - `cargo clippy --all-targets --all-features -- -D warnings`
+- Use profiling to pick targets instead of guessing:
+  - macOS: `sample <bench-binary-name> 8 1 -wait -mayDie -file /tmp/<name>.sample.txt`
+  - Build debuginfo bench binaries for readable symbols: `CARGO_PROFILE_BENCH_DEBUG=true cargo bench -p benches --bench <name> --no-run`
+  - Use the `Sort by top of stack` section to identify dominant functions.
+  - Linux (when available): use `perf record`/`perf report` for equivalent sampling.
+- Only checkpoint a perf commit when the gain is material and repeatable; include exact before/after numbers and commands in the commit body.
 
 ## Test Coverage Map
 
