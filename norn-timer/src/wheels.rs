@@ -12,6 +12,8 @@ pub(crate) struct Wheels {
     elapsed: Cell<u64>,
     shutdown: Cell<bool>,
     wheels: RefCell<Vec<level::Level>>,
+    next_expiration_hint: Cell<Option<level::Expiration>>,
+    next_expiration_dirty: Cell<bool>,
 }
 
 impl entry::TimerList for Rc<Wheels> {
@@ -38,6 +40,8 @@ impl Wheels {
             elapsed: Cell::new(0),
             shutdown: Cell::new(false),
             wheels: RefCell::new(levels),
+            next_expiration_hint: Cell::new(None),
+            next_expiration_dirty: Cell::new(false),
         }
     }
 
@@ -101,17 +105,48 @@ impl Wheels {
             unsafe { entry.as_ref().fire(Ok(())) };
         } else {
             let wheel = wheel_for(self.elapsed(), expiration);
-            self.wheels.borrow_mut()[wheel].add_entry(entry);
+            let slot = self.wheels.borrow_mut()[wheel].add_entry(entry);
+            if !self.next_expiration_dirty.get() {
+                if let Some(current) = self.next_expiration_hint.get() {
+                    // A newly inserted timer may only invalidate the hint if
+                    // it expires no later than the hinted deadline.
+                    if expiration <= current.deadline() {
+                        self.next_expiration_dirty.set(true);
+                    }
+                } else {
+                    let candidate = level::expiration_for_slot(wheel, slot, self.elapsed());
+                    self.next_expiration_hint.set(Some(candidate));
+                }
+            }
         }
     }
 
     fn remove(&self, entry: ptr::NonNull<entry::Entry>) -> Option<ptr::NonNull<entry::Entry>> {
         let expiration = unsafe { entry.as_ref().expiration() };
         let wheel = wheel_for(self.elapsed(), expiration);
-        unsafe { self.wheels.borrow_mut()[wheel].remove_entry(entry) }
+        let slot = level::slot_for(expiration, wheel);
+        let removed = unsafe { self.wheels.borrow_mut()[wheel].remove_entry(entry) };
+        if removed.is_some() {
+            if let Some(next) = self.next_expiration_hint.get() {
+                if next.level() == wheel && next.slot() == slot {
+                    self.next_expiration_dirty.set(true);
+                }
+            }
+        }
+        removed
     }
 
     fn next_expiration(&self) -> Option<level::Expiration> {
+        if !self.next_expiration_dirty.get() {
+            return self.next_expiration_hint.get();
+        }
+        let next = self.scan_next_expiration();
+        self.next_expiration_hint.set(next);
+        self.next_expiration_dirty.set(false);
+        next
+    }
+
+    fn scan_next_expiration(&self) -> Option<level::Expiration> {
         let now = self.elapsed.get();
         let wheels = self.wheels.borrow();
         for level in 0..NUM_LEVELS {
@@ -135,10 +170,19 @@ impl Wheels {
         );
         if when > self.elapsed.get() {
             self.elapsed.set(when);
+            // Advancing time alone does not invalidate the hint while it still
+            // points to a future deadline and no structural wheel changes were
+            // made (insert/remove/take mark the hint dirty themselves).
+            if let Some(next) = self.next_expiration_hint.get() {
+                if when >= next.deadline() {
+                    self.next_expiration_dirty.set(true);
+                }
+            }
         }
     }
 
     fn take_entries(&self, expiration: &level::Expiration) -> cordyceps::List<entry::Entry> {
+        self.next_expiration_dirty.set(true);
         self.wheels.borrow_mut()[expiration.level()].take_slot(expiration.slot())
     }
 
