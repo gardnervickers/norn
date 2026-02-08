@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{ready, Context, Poll, Waker};
@@ -42,6 +43,18 @@ pub trait Multishot: Operation {
     type Item;
 
     fn update(&mut self, result: CQEResult) -> Self::Item;
+
+    /// Called when the final completion for this operation is received.
+    ///
+    /// The final completion is identified by `!result.more()`.
+    fn complete(self, result: CQEResult) -> Option<Self::Item>
+    where
+        Self: Sized,
+    {
+        debug_assert!(!result.more());
+        let _ = result;
+        None
+    }
 }
 
 pub(crate) struct ConfiguredEntry {
@@ -174,7 +187,7 @@ where
         self.inner.clone()
     }
 
-    fn take_completions(&self) -> smallvec::SmallVec<[CQEResult; 4]> {
+    fn take_completions(&self) -> VecDeque<CQEResult> {
         let handle = self.untyped();
         let mut completions = handle.header().completions().borrow_mut();
         mem::take(&mut *completions)
@@ -183,7 +196,7 @@ where
     fn pop_completion(&self) -> Option<CQEResult> {
         let handle = self.untyped();
         let mut completions = handle.header().completions().borrow_mut();
-        completions.pop()
+        completions.pop_front()
     }
 
     /// Returns true if this operation is complete.
@@ -349,8 +362,12 @@ where
         T: Multishot,
     {
         let completion = self.inner.pop_completion()?;
-        let data = unsafe { self.inner.data_mut() }.expect("operation already completed");
-        Some(data.update(completion))
+        if completion.more() {
+            let data = unsafe { self.inner.data_mut() }.expect("operation already completed");
+            return Some(data.update(completion));
+        }
+        let data = unsafe { self.inner.try_take() }.expect("operation already completed");
+        data.complete(completion)
     }
 }
 
@@ -401,7 +418,11 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::future::Future;
     use std::pin::Pin;
+    use std::rc::Rc;
+    use std::task::Poll;
 
     use super::*;
 
@@ -449,5 +470,140 @@ mod tests {
         let handle_usize = handle.into_raw_usize();
         let handle = unsafe { RawOpRef::from_raw_usize(handle_usize) };
         drop(handle);
+    }
+
+    #[derive(Debug, Default)]
+    struct TestMultishot;
+
+    impl Operation for TestMultishot {
+        fn cleanup(&mut self, _: CQEResult) {}
+
+        fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+            unimplemented!()
+        }
+    }
+
+    impl Multishot for TestMultishot {
+        type Item = u32;
+
+        fn update(&mut self, result: CQEResult) -> Self::Item {
+            result.result.unwrap()
+        }
+
+        fn complete(self, result: CQEResult) -> Option<Self::Item> {
+            Some(result.result.unwrap())
+        }
+    }
+
+    fn more_flag() -> u32 {
+        (0..=u32::MAX)
+            .find(|flags| io_uring::cqueue::more(*flags))
+            .expect("missing CQE more flag")
+    }
+
+    #[test]
+    fn multishot_completions_are_fifo() {
+        let typed = TypedHandle::new(TestMultishot);
+        let more = more_flag();
+        typed.untyped().complete(CQEResult::new(Ok(10), more));
+        typed.untyped().complete(CQEResult::new(Ok(20), more));
+        typed.untyped().complete(CQEResult::new(Ok(30), 0));
+
+        let mut submitted = SubmittedOp { inner: typed };
+
+        assert_eq!(submitted.try_next(), Some(10));
+        assert_eq!(submitted.try_next(), Some(20));
+        assert_eq!(submitted.try_next(), Some(30));
+        assert_eq!(submitted.try_next(), None);
+        assert!(submitted.inner.is_complete());
+    }
+
+    #[test]
+    fn submit_failure_returns_error_instead_of_panicking() {
+        #[derive(Debug)]
+        struct SubmitFailureOp;
+
+        impl Operation for SubmitFailureOp {
+            fn cleanup(&mut self, _: CQEResult) {}
+
+            fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+                io_uring::opcode::Nop::new().build()
+            }
+        }
+
+        impl Singleshot for SubmitFailureOp {
+            type Output = io::Result<()>;
+
+            fn complete(self, result: CQEResult) -> Self::Output {
+                result.result.map(drop)
+            }
+        }
+
+        let mut driver = crate::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let handle = driver.handle();
+        norn_executor::park::Park::shutdown(&mut driver);
+
+        let mut op = std::pin::pin!(handle.submit(SubmitFailureOp));
+        let waker = futures_test::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+
+        let poll_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Future::poll(op.as_mut(), &mut cx)
+        }))
+        .expect("poll should not panic");
+
+        match poll_result {
+            Poll::Ready(Err(_)) => {}
+            other => panic!("expected ready error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multishot_terminal_completion_is_not_sent_to_update() {
+        #[derive(Debug)]
+        struct TerminalMultishot {
+            updates: Rc<Cell<usize>>,
+            complete: Rc<Cell<usize>>,
+        }
+
+        impl Operation for TerminalMultishot {
+            fn cleanup(&mut self, _: CQEResult) {}
+
+            fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+                unimplemented!()
+            }
+        }
+
+        impl Multishot for TerminalMultishot {
+            type Item = ();
+
+            fn update(&mut self, result: CQEResult) -> Self::Item {
+                assert!(result.more(), "terminal completion must not call update");
+                self.updates.set(self.updates.get() + 1);
+            }
+
+            fn complete(self, result: CQEResult) -> Option<Self::Item> {
+                assert!(!result.more());
+                self.complete.set(self.complete.get() + 1);
+                None
+            }
+        }
+
+        let updates = Rc::new(Cell::new(0));
+        let complete = Rc::new(Cell::new(0));
+        let typed = TypedHandle::new(TerminalMultishot {
+            updates: Rc::clone(&updates),
+            complete: Rc::clone(&complete),
+        });
+        typed.untyped().complete(CQEResult::new(
+            Err(io::Error::from_raw_os_error(libc::ECANCELED)),
+            0,
+        ));
+
+        let mut submitted = SubmittedOp { inner: typed };
+        assert_eq!(submitted.try_next(), None);
+        assert_eq!(updates.get(), 0);
+        assert_eq!(complete.get(), 1);
+        assert!(submitted.inner.is_complete());
     }
 }
