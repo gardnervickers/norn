@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{ready, Context, Poll, Waker};
@@ -46,12 +47,13 @@ pub trait Multishot: Operation {
     /// Called when the final completion for this operation is received.
     ///
     /// The final completion is identified by `!result.more()`.
-    fn complete(self, result: CQEResult)
+    fn complete(self, result: CQEResult) -> Option<Self::Item>
     where
         Self: Sized,
     {
         debug_assert!(!result.more());
         let _ = result;
+        None
     }
 }
 
@@ -185,7 +187,7 @@ where
         self.inner.clone()
     }
 
-    fn take_completions(&self) -> smallvec::SmallVec<[CQEResult; 4]> {
+    fn take_completions(&self) -> VecDeque<CQEResult> {
         let handle = self.untyped();
         let mut completions = handle.header().completions().borrow_mut();
         mem::take(&mut *completions)
@@ -194,11 +196,7 @@ where
     fn pop_completion(&self) -> Option<CQEResult> {
         let handle = self.untyped();
         let mut completions = handle.header().completions().borrow_mut();
-        if completions.is_empty() {
-            None
-        } else {
-            Some(completions.remove(0))
-        }
+        completions.pop_front()
     }
 
     /// Returns true if this operation is complete.
@@ -369,8 +367,7 @@ where
             return Some(data.update(completion));
         }
         let data = unsafe { self.inner.try_take() }.expect("operation already completed");
-        data.complete(completion);
-        None
+        data.complete(completion)
     }
 }
 
@@ -492,6 +489,10 @@ mod tests {
         fn update(&mut self, result: CQEResult) -> Self::Item {
             result.result.unwrap()
         }
+
+        fn complete(self, result: CQEResult) -> Option<Self::Item> {
+            Some(result.result.unwrap())
+        }
     }
 
     fn more_flag() -> u32 {
@@ -512,6 +513,7 @@ mod tests {
 
         assert_eq!(submitted.try_next(), Some(10));
         assert_eq!(submitted.try_next(), Some(20));
+        assert_eq!(submitted.try_next(), Some(30));
         assert_eq!(submitted.try_next(), None);
         assert!(submitted.inner.is_complete());
     }
@@ -580,9 +582,10 @@ mod tests {
                 self.updates.set(self.updates.get() + 1);
             }
 
-            fn complete(self, result: CQEResult) {
+            fn complete(self, result: CQEResult) -> Option<Self::Item> {
                 assert!(!result.more());
                 self.complete.set(self.complete.get() + 1);
+                None
             }
         }
 

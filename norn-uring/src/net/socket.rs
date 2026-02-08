@@ -498,6 +498,10 @@ impl Multishot for Accept<true> {
         let fd = result.result?;
         Ok(NornFd::from_fd(fd as i32))
     }
+
+    fn complete(self, result: crate::operation::CQEResult) -> Option<Self::Item> {
+        Some(result.result.map(|fd| NornFd::from_fd(fd as i32)))
+    }
 }
 
 struct Connect {
@@ -697,6 +701,11 @@ impl Multishot for Poll<true> {
         let res = result.result?;
         let event = Event::new(res as i16);
         Ok(event)
+    }
+
+    fn complete(self, result: crate::operation::CQEResult) -> Option<Self::Item> {
+        let res = result.result.map(|res| Event::new(res as i16));
+        Some(res)
     }
 }
 

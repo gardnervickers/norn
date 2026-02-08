@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::ptr::NonNull;
 use std::task::Waker;
 
@@ -13,7 +14,7 @@ use super::CQEResult;
 pub(crate) struct Header {
     refcount: Cell<usize>,
     waker: RefCell<Option<Waker>>,
-    completions: RefCell<smallvec::SmallVec<[CQEResult; 4]>>,
+    completions: RefCell<VecDeque<CQEResult>>,
     complete: Cell<bool>,
     pub(crate) vtable: &'static VTable,
 }
@@ -62,7 +63,7 @@ impl Header {
         Self {
             refcount: Cell::new(1),
             waker: Default::default(),
-            completions: RefCell::new(smallvec::SmallVec::new()),
+            completions: RefCell::new(VecDeque::new()),
             complete: Cell::new(false),
             vtable,
         }
@@ -89,12 +90,12 @@ impl Header {
     }
 
     /// Returns a reference to the completion list.
-    pub(crate) fn completions(&self) -> &RefCell<smallvec::SmallVec<[CQEResult; 4]>> {
+    pub(crate) fn completions(&self) -> &RefCell<VecDeque<CQEResult>> {
         &self.completions
     }
 
     /// Returns a mutable reference to the completion list.
-    pub(crate) fn completions_mut(&mut self) -> &mut RefCell<smallvec::SmallVec<[CQEResult; 4]>> {
+    pub(crate) fn completions_mut(&mut self) -> &mut RefCell<VecDeque<CQEResult>> {
         &mut self.completions
     }
 
