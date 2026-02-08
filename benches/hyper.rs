@@ -60,6 +60,7 @@ impl bencher::TDynBenchFn for HyperBench {
                     handle.await.unwrap().unwrap();
                 }
             })
+            .unwrap()
         })
     }
 }

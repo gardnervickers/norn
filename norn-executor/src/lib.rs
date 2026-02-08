@@ -7,6 +7,7 @@
     clippy::missing_safety_doc
 )]
 use std::future::Future;
+use std::io;
 use std::pin::pin;
 
 use norn_task::JoinHandle;
@@ -57,7 +58,9 @@ impl<P: park::Park> LocalExecutor<P> {
     ///
     /// This will run all tasks which have been spawned onto the [`LocalExecutor`]
     /// and drive the [`park::Park`] instance.
-    pub fn block_on<F>(&mut self, fut: F) -> F::Output
+    ///
+    /// Returns an error if [`park::Park::park`] fails.
+    pub fn block_on<F>(&mut self, fut: F) -> io::Result<F::Output>
     where
         F: Future,
     {
@@ -67,7 +70,7 @@ impl<P: park::Park> LocalExecutor<P> {
 
         loop {
             if let Some(result) = root.try_poll() {
-                return result;
+                return Ok(result);
             }
             let mut has_remaining_tasks = false;
             while let Some(next) = self.taskqueue.next() {
@@ -81,7 +84,7 @@ impl<P: park::Park> LocalExecutor<P> {
             if root.is_notified() || has_remaining_tasks {
                 mode = park::ParkMode::NoPark;
             }
-            self.park.park(mode).unwrap();
+            self.park.park(mode)?;
         }
     }
 
@@ -139,6 +142,8 @@ impl<P: park::Park> Drop for LocalExecutor<P> {
 
 #[cfg(test)]
 mod tests {
+    use std::future;
+    use std::io;
     use std::task::Poll;
 
     use crate::park::SpinPark;
@@ -149,7 +154,7 @@ mod tests {
     fn block_on() {
         let mut executor = LocalExecutor::new(SpinPark);
 
-        let res = executor.block_on(async { 1 + 1 });
+        let res = executor.block_on(async { 1 + 1 }).unwrap();
         assert_eq!(res, 2);
     }
 
@@ -164,7 +169,7 @@ mod tests {
                 handle.spawn(async move { 1 + 1 }).await
             })
             .unwrap();
-        assert_eq!(res, 2);
+        assert_eq!(res.unwrap(), 2);
     }
 
     #[test]
@@ -173,10 +178,12 @@ mod tests {
         let handle = executor.handle();
 
         let f1 = handle.spawn(async { 1 + 1 });
-        executor.block_on(async move {
-            let res = f1.await.unwrap();
-            assert_eq!(res, 2);
-        });
+        executor
+            .block_on(async move {
+                let res = f1.await.unwrap();
+                assert_eq!(res, 2);
+            })
+            .unwrap();
     }
 
     #[test]
@@ -201,10 +208,56 @@ mod tests {
     fn spawn_from_context() {
         let mut executor = LocalExecutor::new(SpinPark);
 
-        executor.block_on(async {
-            let f1 = crate::spawn(async { 1 + 1 });
-            let res = f1.await.unwrap();
-            assert_eq!(res, 2);
-        })
+        executor
+            .block_on(async {
+                let f1 = crate::spawn(async { 1 + 1 });
+                let res = f1.await.unwrap();
+                assert_eq!(res, 2);
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn block_on_does_not_panic_on_park_error() {
+        #[derive(Clone, Copy, Debug)]
+        struct TestUnparker;
+
+        impl park::Unpark for TestUnparker {
+            fn unpark(&self) {}
+        }
+
+        #[derive(Debug)]
+        struct FailingPark;
+
+        impl park::Park for FailingPark {
+            type Unparker = TestUnparker;
+            type Guard = ();
+
+            fn park(&mut self, _: park::ParkMode) -> io::Result<()> {
+                Err(io::Error::other("park failed"))
+            }
+
+            fn enter(&self) -> Self::Guard {}
+
+            fn unparker(&self) -> Self::Unparker {
+                TestUnparker
+            }
+
+            fn needs_park(&self) -> bool {
+                false
+            }
+
+            fn shutdown(&mut self) {}
+        }
+
+        let mut executor = LocalExecutor::new(FailingPark);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            executor.block_on(async {
+                future::pending::<()>().await;
+            })
+        }));
+        assert!(result.is_ok(), "block_on should not panic on park error");
+        let err = result.unwrap().expect_err("expected park error");
+        assert_eq!(err.kind(), io::ErrorKind::Other);
     }
 }

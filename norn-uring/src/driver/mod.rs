@@ -12,7 +12,7 @@ use norn_executor::park::{Park, ParkMode};
 use crate::fd;
 use crate::operation::{complete_operation, ConfiguredEntry, Op, Operation};
 use crate::util::notify::Notify;
-pub(crate) use futures::PushFuture;
+pub(crate) use futures::{AdmissionFuture, PushFuture, SubmissionPermit};
 
 mod context;
 mod futures;
@@ -48,6 +48,9 @@ struct Shared {
     ring: RefCell<IoUring>,
     backpressure: Notify,
     status: Cell<Status>,
+    submission_limit: usize,
+    admitted: Cell<usize>,
+    submit_error: RefCell<Option<(io::ErrorKind, String)>>,
 }
 
 /// The status of the driver.
@@ -112,12 +115,21 @@ impl Handle {
         PushFuture::new(Rc::clone(&self.shared), entry)
     }
 
+    pub(crate) fn admit(&self) -> AdmissionFuture {
+        AdmissionFuture::new(Rc::clone(&self.shared))
+    }
+
     pub(crate) fn close_fd(&self, kind: &fd::FdKind) -> io::Result<()> {
         self.shared.close_fd(kind)
     }
 
     pub(crate) fn with_submitter<U>(&self, f: impl FnOnce(&Submitter<'_>) -> U) -> U {
         self.shared.with_submitter(f)
+    }
+
+    /// Returns the first recorded fatal driver submit error, if any.
+    pub fn health_error(&self) -> Option<io::Error> {
+        self.shared.health_error()
     }
 }
 
@@ -142,6 +154,9 @@ impl Driver {
                 ring: RefCell::new(ring),
                 backpressure: Notify::default(),
                 status: Cell::new(Status::Running),
+                submission_limit: size as usize,
+                admitted: Cell::new(0),
+                submit_error: RefCell::new(None),
             }),
             unparker: Arc::new(unpark::Unparker::new()?),
             unparker_buf: mem::ManuallyDrop::new(Box::new(UnsafeCell::new([0; 8]))),
@@ -179,6 +194,9 @@ impl Driver {
             //         requirements from prepare_unparker to ensure another [io_uring::SubmissionQueue] does not exist.
 
             if unsafe { self.shared.try_push_raw(&opcode) }.is_err() {
+                // We were not able to arm the eventfd read, so we must not leave the
+                // reactor marked as parked.
+                self.unparker.clear_parked();
                 return false;
             }
         }
@@ -362,6 +380,22 @@ impl Shared {
         self.status.get()
     }
 
+    fn health_error(&self) -> Option<io::Error> {
+        self.submit_error
+            .borrow()
+            .as_ref()
+            .map(|(kind, message)| io::Error::new(*kind, message.clone()))
+    }
+
+    fn record_submit_error(&self, err: &io::Error) {
+        let mut slot = self.submit_error.borrow_mut();
+        if slot.is_none() {
+            *slot = Some((err.kind(), err.to_string()));
+        }
+        drop(slot);
+        self.set_status(Status::Shutdown);
+    }
+
     /// Set the status of the driver.
     ///
     /// All waiters will be notified of the status change.
@@ -424,16 +458,26 @@ impl Shared {
         f(&sq)
     }
 
-    /// Submit all entries in the submission queue.
-    ///
-    /// The provided `ParkMode` is used to determine if the
-    /// submission should block on new completions or not.
-    ///
-    /// Returns the number of entries which were submitted.
-    fn submit(&self, mode: ParkMode) -> io::Result<usize> {
+    fn try_acquire_submission_slot(&self) -> bool {
+        let admitted = self.admitted.get();
+        if admitted >= self.submission_limit {
+            return false;
+        }
+        self.admitted.set(admitted + 1);
+        true
+    }
+
+    fn release_submission_slot(&self) {
+        let admitted = self.admitted.get();
+        assert!(admitted > 0, "submission slot underflow");
+        self.admitted.set(admitted - 1);
+        self.backpressure.notify(1);
+    }
+
+    fn submit_once(&self, mode: ParkMode) -> io::Result<usize> {
         let ring = self.ring.borrow();
         let submitter = ring.submitter();
-        let submitted = match mode {
+        Ok(match mode {
             ParkMode::Timeout(duration) => {
                 let ts = Timespec::new()
                     .sec(duration.as_secs())
@@ -446,9 +490,38 @@ impl Shared {
                 submitter.submit_with_args(1, &args)?
             }
             ParkMode::NoPark => submitter.submit()?,
-        };
-        self.backpressure.notify(submitted);
-        Ok(submitted)
+        })
+    }
+
+    /// Submit all entries in the submission queue.
+    ///
+    /// The provided `ParkMode` is used to determine if the
+    /// submission should block on new completions or not.
+    ///
+    /// Returns the number of entries which were submitted.
+    fn submit(&self, mode: ParkMode) -> io::Result<usize> {
+        let mut ebusy_retries = 0usize;
+        loop {
+            match self.submit_once(mode) {
+                Ok(submitted) => {
+                    self.backpressure.notify(submitted);
+                    return Ok(submitted);
+                }
+                Err(err) if err.raw_os_error() == Some(libc::EINTR) => {
+                    trace!(target: LOG, "submit.eintr");
+                    continue;
+                }
+                Err(err) if err.raw_os_error() == Some(libc::EBUSY) && ebusy_retries < 8 => {
+                    ebusy_retries += 1;
+                    trace!(target: LOG, "submit.ebusy retry={}", ebusy_retries);
+                    continue;
+                }
+                Err(err) => {
+                    self.record_submit_error(&err);
+                    return Err(err);
+                }
+            }
+        }
     }
 
     /// Cancel a specific request synchronously.
@@ -530,5 +603,96 @@ impl Shared {
 impl Drop for Driver {
     fn drop(&mut self) {
         Park::shutdown(self);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::Future;
+    use std::pin::Pin;
+
+    use super::*;
+    use crate::operation::{CQEResult, Operation, Singleshot};
+
+    #[test]
+    fn prepare_park_sq_full_clears_parked_state() {
+        let driver = Driver::new(io_uring::IoUring::builder(), 2).unwrap();
+        let entry = io_uring::opcode::Nop::new()
+            .build()
+            .user_data(Driver::CANCELLATION_TOKEN as u64);
+
+        loop {
+            // Safety: test-only queue filling with a trivially valid NOP entry.
+            if unsafe { driver.shared.try_push_raw(&entry) }.is_err() {
+                break;
+            }
+        }
+
+        assert!(!driver.unparker.state().is_parked());
+
+        let should_park = driver.prepare_park();
+        assert!(!should_park);
+        assert!(
+            !driver.unparker.state().is_parked(),
+            "prepare_park must not leave the unparker parked when enqueue fails"
+        );
+
+        driver.unparker.wake_inner();
+        assert!(
+            driver.unparker.state().woken(),
+            "remote wake should still be observable after prepare_park failure"
+        );
+    }
+
+    #[test]
+    fn health_error_is_exposed_and_submit_fails_fast() {
+        #[derive(Debug)]
+        struct NopOp;
+
+        impl Operation for NopOp {
+            fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+                io_uring::opcode::Nop::new().build()
+            }
+
+            fn cleanup(&mut self, _: CQEResult) {}
+        }
+
+        impl Singleshot for NopOp {
+            type Output = io::Result<()>;
+
+            fn complete(self, result: CQEResult) -> Self::Output {
+                result.result.map(drop)
+            }
+        }
+
+        let driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let handle = driver.handle();
+        driver
+            .shared
+            .record_submit_error(&io::Error::from_raw_os_error(libc::EIO));
+
+        let health = handle
+            .health_error()
+            .expect("driver should expose health error");
+        assert!(
+            health.to_string().contains("Input/output error"),
+            "unexpected health error message: {}",
+            health
+        );
+
+        let mut op = std::pin::pin!(handle.submit(NopOp));
+        let waker = futures_test::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+
+        let poll = Future::poll(op.as_mut(), &mut cx);
+        let err = match poll {
+            std::task::Poll::Ready(Err(err)) => err,
+            other => panic!("expected ready error, got: {other:?}"),
+        };
+        assert!(
+            err.to_string().contains("submit path failed"),
+            "unexpected submit error: {}",
+            err
+        );
     }
 }

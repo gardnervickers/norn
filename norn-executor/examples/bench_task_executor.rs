@@ -85,7 +85,8 @@ fn bench_executor_spawn() {
                 for handle in handles {
                     handle.await.unwrap();
                 }
-            });
+            })
+            .unwrap();
         }
         let elapsed = start.elapsed();
         samples.push(elapsed.as_secs_f64() * 1e9 / ITERS as f64);

@@ -17,7 +17,7 @@ where
     let builder = io_uring::IoUring::builder();
     let driver = norn_uring::Driver::new(builder, 32)?;
     let mut ex = norn_executor::LocalExecutor::new(driver);
-    ex.block_on((f)())
+    Ok(ex.block_on((f)())??)
 }
 
 /// [`ThreadNameTestDir`] creates a test directory under /tmp
