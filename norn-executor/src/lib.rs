@@ -7,7 +7,6 @@
     clippy::missing_safety_doc
 )]
 use std::future::Future;
-use std::io;
 use std::pin::pin;
 
 use norn_task::JoinHandle;
@@ -58,9 +57,7 @@ impl<P: park::Park> LocalExecutor<P> {
     ///
     /// This will run all tasks which have been spawned onto the [`LocalExecutor`]
     /// and drive the [`park::Park`] instance.
-    ///
-    /// Returns an error if [`park::Park::park`] fails.
-    pub fn block_on<F>(&mut self, fut: F) -> io::Result<F::Output>
+    pub fn block_on<F>(&mut self, fut: F) -> F::Output
     where
         F: Future,
     {
@@ -70,7 +67,7 @@ impl<P: park::Park> LocalExecutor<P> {
 
         loop {
             if let Some(result) = root.try_poll() {
-                return Ok(result);
+                return result;
             }
             let mut has_remaining_tasks = false;
             while let Some(next) = self.taskqueue.next() {
@@ -84,7 +81,7 @@ impl<P: park::Park> LocalExecutor<P> {
             if root.is_notified() || has_remaining_tasks {
                 mode = park::ParkMode::NoPark;
             }
-            self.park.park(mode)?;
+            self.park.park(mode).unwrap();
         }
     }
 
@@ -154,7 +151,7 @@ mod tests {
     fn block_on() {
         let mut executor = LocalExecutor::new(SpinPark);
 
-        let res = executor.block_on(async { 1 + 1 }).unwrap();
+        let res = executor.block_on(async { 1 + 1 });
         assert_eq!(res, 2);
     }
 
@@ -163,12 +160,10 @@ mod tests {
         let mut executor = LocalExecutor::new(SpinPark);
 
         let handle = executor.handle();
-        let res = executor
-            .block_on(async move {
-                let handle = handle.clone();
-                handle.spawn(async move { 1 + 1 }).await
-            })
-            .unwrap();
+        let res = executor.block_on(async move {
+            let handle = handle.clone();
+            handle.spawn(async move { 1 + 1 }).await
+        });
         assert_eq!(res.unwrap(), 2);
     }
 
@@ -178,12 +173,10 @@ mod tests {
         let handle = executor.handle();
 
         let f1 = handle.spawn(async { 1 + 1 });
-        executor
-            .block_on(async move {
-                let res = f1.await.unwrap();
-                assert_eq!(res, 2);
-            })
-            .unwrap();
+        executor.block_on(async move {
+            let res = f1.await.unwrap();
+            assert_eq!(res, 2);
+        });
     }
 
     #[test]
@@ -208,17 +201,15 @@ mod tests {
     fn spawn_from_context() {
         let mut executor = LocalExecutor::new(SpinPark);
 
-        executor
-            .block_on(async {
-                let f1 = crate::spawn(async { 1 + 1 });
-                let res = f1.await.unwrap();
-                assert_eq!(res, 2);
-            })
-            .unwrap()
+        executor.block_on(async {
+            let f1 = crate::spawn(async { 1 + 1 });
+            let res = f1.await.unwrap();
+            assert_eq!(res, 2);
+        })
     }
 
     #[test]
-    fn block_on_does_not_panic_on_park_error() {
+    fn block_on_panics_on_park_error() {
         #[derive(Clone, Copy, Debug)]
         struct TestUnparker;
 
@@ -256,8 +247,6 @@ mod tests {
                 future::pending::<()>().await;
             })
         }));
-        assert!(result.is_ok(), "block_on should not panic on park error");
-        let err = result.unwrap().expect_err("expected park error");
-        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert!(result.is_err(), "block_on should panic on park error");
     }
 }

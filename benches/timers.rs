@@ -21,25 +21,23 @@ impl bencher::TDynBenchFn for TimerBench {
         b.iter(|| {
             let tasks = self.tasks;
             let timers = self.timers;
-            executor
-                .block_on(async {
-                    let mut handles = vec![];
-                    for _ in 0..tasks {
-                        let handle = spawn(async move {
-                            for _ in 0..timers {
-                                Handle::current()
-                                    .sleep(Duration::from_secs(1))
-                                    .await
-                                    .unwrap();
-                            }
-                        });
-                        handles.push(handle);
-                    }
-                    for handle in handles {
-                        handle.await.unwrap();
-                    }
-                })
-                .unwrap()
+            executor.block_on(async {
+                let mut handles = vec![];
+                for _ in 0..tasks {
+                    let handle = spawn(async move {
+                        for _ in 0..timers {
+                            Handle::current()
+                                .sleep(Duration::from_secs(1))
+                                .await
+                                .unwrap();
+                        }
+                    });
+                    handles.push(handle);
+                }
+                for handle in handles {
+                    handle.await.unwrap();
+                }
+            })
         });
     }
 }

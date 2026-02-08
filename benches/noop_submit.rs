@@ -30,22 +30,20 @@ impl bencher::TDynBenchFn for NoopBench {
             let tasks = self.0;
             let n = self.1;
 
-            executor
-                .block_on(async {
-                    let mut handles = vec![];
-                    for _ in 0..tasks {
-                        let handle = spawn(async move {
-                            for _ in 0..n {
-                                noop().await;
-                            }
-                        });
-                        handles.push(handle);
-                    }
-                    for handle in handles {
-                        handle.await.unwrap();
-                    }
-                })
-                .unwrap()
+            executor.block_on(async {
+                let mut handles = vec![];
+                for _ in 0..tasks {
+                    let handle = spawn(async move {
+                        for _ in 0..n {
+                            noop().await;
+                        }
+                    });
+                    handles.push(handle);
+                }
+                for handle in handles {
+                    handle.await.unwrap();
+                }
+            })
         });
     }
 }

@@ -13,18 +13,16 @@ fn smoke() {
     let timer = Driver::new(park, clock);
     let mut executor = LocalExecutor::new(timer);
 
-    executor
-        .block_on(async {
-            let handle = Handle::current();
-            let time = handle.clock().now();
-            for _ in 0..5 {
-                let sleep = handle.sleep(std::time::Duration::from_secs(1));
-                sleep.await.unwrap();
-            }
-            let elapsed = handle.clock().now() - time;
-            assert!(elapsed == std::time::Duration::from_secs(5));
-        })
-        .unwrap();
+    executor.block_on(async {
+        let handle = Handle::current();
+        let time = handle.clock().now();
+        for _ in 0..5 {
+            let sleep = handle.sleep(std::time::Duration::from_secs(1));
+            sleep.await.unwrap();
+        }
+        let elapsed = handle.clock().now() - time;
+        assert!(elapsed == std::time::Duration::from_secs(5));
+    });
 }
 
 #[test]
@@ -34,13 +32,11 @@ fn zero_duration() {
     let timer = Driver::new(park, clock);
     let mut executor = LocalExecutor::new(timer);
 
-    executor
-        .block_on(async {
-            let handle = Handle::current();
-            let sleep = handle.sleep(Duration::from_millis(0));
-            sleep.await.unwrap();
-        })
-        .unwrap();
+    executor.block_on(async {
+        let handle = Handle::current();
+        let sleep = handle.sleep(Duration::from_millis(0));
+        sleep.await.unwrap();
+    });
 }
 
 struct FastPark(Clock);
