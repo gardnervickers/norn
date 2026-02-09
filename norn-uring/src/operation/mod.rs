@@ -73,6 +73,10 @@ impl ConfiguredEntry {
 }
 
 pin_project_lite::pin_project! {
+    /// Wrapper that binds an operation to a submission admission permit.
+    ///
+    /// Keeping the permit inside the operation data ensures the admission slot
+    /// is released only when the operation reaches final cleanup/drop.
     struct Admitted<T> {
         #[pin]
         inner: T,

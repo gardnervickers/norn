@@ -115,6 +115,10 @@ impl Handle {
         PushFuture::new(Rc::clone(&self.shared), entry)
     }
 
+    /// Wait for admission to start configuring/submitting a new operation.
+    ///
+    /// This enforces a global cap on concurrently admitted operations, which
+    /// keeps operation setup bounded relative to ring capacity.
     pub(crate) fn admit(&self) -> AdmissionFuture {
         AdmissionFuture::new(Rc::clone(&self.shared))
     }

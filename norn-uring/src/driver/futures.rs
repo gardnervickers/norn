@@ -83,6 +83,11 @@ impl Drop for SubmissionPermit {
 }
 
 pin_project_lite::pin_project! {
+    /// Future that waits for one global submission admission slot.
+    ///
+    /// The slot is returned as a [`SubmissionPermit`], which must stay alive
+    /// until operation cleanup so admission pressure reflects true in-flight
+    /// operation count instead of just queued SQ entries.
     pub(crate) struct AdmissionFuture {
         shared: Option<&'static Shared>,
         #[pin]
