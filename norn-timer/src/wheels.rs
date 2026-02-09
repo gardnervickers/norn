@@ -222,6 +222,7 @@ const fn wheel_for(elapsed: u64, when: u64) -> usize {
 mod tests {
     use std::future::Future;
     use std::pin::pin;
+    use std::task::Poll;
     use std::time::Duration;
 
     use crate::clock::Clock;
@@ -257,8 +258,17 @@ mod tests {
         assert!(sleep.as_mut().poll(&mut cx).is_pending());
         drop(timer);
         drop(handle);
-        // TODO: We need to fire everything on drop.
-        assert!(sleep.as_mut().poll(&mut cx).is_pending());
+        let poll = sleep.as_mut().poll(&mut cx);
+        match poll {
+            Poll::Ready(Err(err)) => {
+                assert!(
+                    err.to_string().contains("shut down"),
+                    "unexpected timer drop error: {}",
+                    err
+                );
+            }
+            other => panic!("expected shutdown error after timer drop, got: {other:?}"),
+        }
     }
 
     #[test]

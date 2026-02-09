@@ -10,21 +10,31 @@ use crate::util::notify::Notified;
 
 use super::LOG;
 
+fn into_static_shared(shared: Rc<Shared>) -> &'static Shared {
+    let shared = Rc::into_raw(shared);
+    // Safety: we leaked the Rc via into_raw and only reconstruct it from this
+    // pointer in the associated Drop impl.
+    unsafe { &*shared }
+}
+
+fn drop_static_shared(shared: &'static Shared) {
+    // Safety: this pointer came from Rc::into_raw in into_static_shared.
+    let shared = unsafe { Rc::from_raw(shared) };
+    drop(shared);
+}
+
 pin_project_lite::pin_project! {
     struct PushFutureInner<'a> {
         shared: &'a Shared,
         #[pin]
         notify: Option<Notified<'a>>,
-        entry: Option<ConfiguredEntry>
+        entry: Option<ConfiguredEntry>,
     }
 }
 
 impl PushFuture {
     pub(super) fn new(shared: Rc<Shared>, entry: ConfiguredEntry) -> Self {
-        let shared = Rc::into_raw(shared);
-        // Safety: We leak the Rc via into_raw, so we know that the reference will
-        // be alive for 'static.
-        let shared: &'static Shared = unsafe { &*shared };
+        let shared = into_static_shared(shared);
         let inner = PushFutureInner {
             shared,
             notify: None,
@@ -46,6 +56,9 @@ impl Future for PushFutureInner<'_> {
         loop {
             if this.shared.status() != Status::Running {
                 log::trace!(target: LOG, "ring.push.sutting_down");
+                if let Some(err) = this.shared.health_error() {
+                    return Poll::Ready(Err(SubmitError::broken(err)));
+                }
                 return Poll::Ready(Err(SubmitError::shutting_down()));
             }
             if let Some(notify) = this.notify.as_mut().as_pin_mut() {
@@ -80,15 +93,11 @@ pin_project_lite::pin_project! {
 
     impl PinnedDrop for PushFuture {
         fn drop(this: Pin<&mut Self>) {
-            // First we need to drop the future, which will drop the shared reference.
             let mut me = this.project();
             me.fut.set(None);
-            // Now we can reconstruct the Rc and drop it.
-            let shared = me.shared.take().unwrap();
-            // Safety: We previously leaked the Rc via into_raw, so we know that the reference will
-            // be valid.
-            let shared = unsafe { Rc::from_raw(shared) };
-            drop(shared)
+            if let Some(shared) = me.shared.take() {
+                drop_static_shared(shared);
+            }
         }
     }
 }

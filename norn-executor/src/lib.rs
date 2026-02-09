@@ -139,6 +139,8 @@ impl<P: park::Park> Drop for LocalExecutor<P> {
 
 #[cfg(test)]
 mod tests {
+    use std::future;
+    use std::io;
     use std::task::Poll;
 
     use crate::park::SpinPark;
@@ -158,13 +160,11 @@ mod tests {
         let mut executor = LocalExecutor::new(SpinPark);
 
         let handle = executor.handle();
-        let res = executor
-            .block_on(async move {
-                let handle = handle.clone();
-                handle.spawn(async move { 1 + 1 }).await
-            })
-            .unwrap();
-        assert_eq!(res, 2);
+        let res = executor.block_on(async move {
+            let handle = handle.clone();
+            handle.spawn(async move { 1 + 1 }).await
+        });
+        assert_eq!(res.unwrap(), 2);
     }
 
     #[test]
@@ -206,5 +206,47 @@ mod tests {
             let res = f1.await.unwrap();
             assert_eq!(res, 2);
         })
+    }
+
+    #[test]
+    fn block_on_panics_on_park_error() {
+        #[derive(Clone, Copy, Debug)]
+        struct TestUnparker;
+
+        impl park::Unpark for TestUnparker {
+            fn unpark(&self) {}
+        }
+
+        #[derive(Debug)]
+        struct FailingPark;
+
+        impl park::Park for FailingPark {
+            type Unparker = TestUnparker;
+            type Guard = ();
+
+            fn park(&mut self, _: park::ParkMode) -> io::Result<()> {
+                Err(io::Error::other("park failed"))
+            }
+
+            fn enter(&self) -> Self::Guard {}
+
+            fn unparker(&self) -> Self::Unparker {
+                TestUnparker
+            }
+
+            fn needs_park(&self) -> bool {
+                false
+            }
+
+            fn shutdown(&mut self) {}
+        }
+
+        let mut executor = LocalExecutor::new(FailingPark);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            executor.block_on(async {
+                future::pending::<()>().await;
+            })
+        }));
+        assert!(result.is_err(), "block_on should panic on park error");
     }
 }

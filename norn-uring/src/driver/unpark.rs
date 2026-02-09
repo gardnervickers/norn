@@ -112,6 +112,16 @@ impl Unparker {
         );
     }
 
+    /// Clear the parked bit without touching remote wake requests.
+    ///
+    /// This is used when park preparation fails before an eventfd read is
+    /// successfully queued.
+    pub(crate) fn clear_parked(&self) {
+        self.inner
+            .flag
+            .fetch_and(!Self::REACTOR_PARK_BIT, Ordering::Release);
+    }
+
     /// Wake this unparker from a remote thread.
     pub(crate) fn wake_inner(&self) {
         use io::Write;
