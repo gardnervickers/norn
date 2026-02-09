@@ -437,13 +437,15 @@ impl Singleshot for RecvFromRing {
 pub(crate) struct Accept<const MULTI: bool> {
     fd: NornFd,
     addr: SockAddr,
+    addr_len: libc::socklen_t,
 }
 
 impl<const MULTI: bool> Accept<MULTI> {
     pub(crate) fn new(fd: NornFd) -> Self {
         // Safety: We won't read from the socket addr until it's initialized.
         let addr = unsafe { SockAddr::try_init(|_, _| Ok(())) }.unwrap().1;
-        Self { fd, addr }
+        let addr_len = addr.len();
+        Self { fd, addr, addr_len }
     }
 }
 
@@ -457,18 +459,26 @@ impl<const MULTI: bool> Operation for Accept<MULTI> {
                 if MULTI {
                     opcode::AcceptMulti::new(*fd).flags(O_NONBLOCK).build()
                 } else {
-                    opcode::Accept::new(*fd, this.addr.as_ptr() as *mut _, this.addr.len() as _)
-                        .flags(O_NONBLOCK)
-                        .build()
+                    opcode::Accept::new(
+                        *fd,
+                        this.addr.as_ptr() as *mut _,
+                        &mut this.addr_len as *mut _,
+                    )
+                    .flags(O_NONBLOCK)
+                    .build()
                 }
             }
             crate::fd::FdKind::Fixed(fd) => {
                 if MULTI {
                     opcode::AcceptMulti::new(*fd).flags(O_NONBLOCK).build()
                 } else {
-                    opcode::Accept::new(*fd, this.addr.as_ptr() as *mut _, this.addr.len() as _)
-                        .flags(O_NONBLOCK)
-                        .build()
+                    opcode::Accept::new(
+                        *fd,
+                        this.addr.as_ptr() as *mut _,
+                        &mut this.addr_len as *mut _,
+                    )
+                    .flags(O_NONBLOCK)
+                    .build()
                 }
             }
         }
@@ -485,8 +495,11 @@ impl Singleshot for Accept<false> {
     type Output = io::Result<(NornFd, SocketAddr)>;
 
     fn complete(self, result: crate::operation::CQEResult) -> Self::Output {
+        let mut this = self;
         let fd = result.result?;
-        let addr = self.addr.as_socket().unwrap();
+        // Safety: the kernel wrote at most `addr_len` bytes into `addr`.
+        unsafe { this.addr.set_length(this.addr_len) };
+        let addr = this.addr.as_socket().unwrap();
         Ok((NornFd::from_fd(fd as i32), addr))
     }
 }
