@@ -33,6 +33,25 @@ fn incoming_connections() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn single_accept_connection() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let listener = TcpListener::bind("127.0.0.1:0".parse()?, 32).await?;
+        let addr = listener.local_addr()?;
+
+        let handle = spawn(async move { TcpSocket::connect(addr).await });
+
+        let (socket, peer_addr) = listener.accept().await?;
+        let client = handle.await??;
+        assert_eq!(peer_addr, client.local_addr()?);
+
+        socket.close().await?;
+        client.close().await?;
+
+        Ok(())
+    })
+}
+
+#[test]
 fn echo() -> Result<(), Box<dyn std::error::Error>> {
     util::with_test_env(|| async {
         let server = EchoServer::new().await?;

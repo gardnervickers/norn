@@ -47,3 +47,8 @@ harness = false
 name = "task_state"
 path = "task_state.rs"
 harness = false
+
+[[bench]]
+name = "io_uring_accept_recv"
+path = "io_uring_accept_recv.rs"
+harness = false
