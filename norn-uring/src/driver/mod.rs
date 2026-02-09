@@ -367,6 +367,10 @@ impl Park for Driver {
 }
 
 impl Shared {
+    fn should_record_submit_error(err: &io::Error) -> bool {
+        !matches!(err.raw_os_error(), Some(libc::EBUSY | libc::EINTR))
+    }
+
     /// Get the current status of the driver.
     fn status(&self) -> Status {
         self.status.get()
@@ -492,8 +496,14 @@ impl Shared {
                     trace!(target: LOG, "submit.ebusy retry={}", ebusy_retries);
                     continue;
                 }
+                Err(err) if err.raw_os_error() == Some(libc::EBUSY) => {
+                    trace!(target: LOG, "submit.ebusy retries_exhausted");
+                    return Err(err);
+                }
                 Err(err) => {
-                    self.record_submit_error(&err);
+                    if Self::should_record_submit_error(&err) {
+                        self.record_submit_error(&err);
+                    }
                     return Err(err);
                 }
             }
@@ -669,6 +679,27 @@ mod tests {
             err.to_string().contains("submit path failed"),
             "unexpected submit error: {}",
             err
+        );
+    }
+
+    #[test]
+    fn submit_error_classification_keeps_ebusy_nonfatal() {
+        let ebusy = io::Error::from_raw_os_error(libc::EBUSY);
+        assert!(
+            !Shared::should_record_submit_error(&ebusy),
+            "EBUSY should remain a transient submit condition"
+        );
+
+        let eintr = io::Error::from_raw_os_error(libc::EINTR);
+        assert!(
+            !Shared::should_record_submit_error(&eintr),
+            "EINTR should remain retryable"
+        );
+
+        let eio = io::Error::from_raw_os_error(libc::EIO);
+        assert!(
+            Shared::should_record_submit_error(&eio),
+            "hard submit failures should still transition driver health"
         );
     }
 }
