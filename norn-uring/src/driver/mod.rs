@@ -12,7 +12,7 @@ use norn_executor::park::{Park, ParkMode};
 use crate::fd;
 use crate::operation::{complete_operation, ConfiguredEntry, Op, Operation};
 use crate::util::notify::Notify;
-pub(crate) use futures::{AdmissionFuture, PushFuture, SubmissionPermit};
+pub(crate) use futures::PushFuture;
 
 mod context;
 mod futures;
@@ -48,8 +48,6 @@ struct Shared {
     ring: RefCell<IoUring>,
     backpressure: Notify,
     status: Cell<Status>,
-    submission_limit: usize,
-    admitted: Cell<usize>,
     submit_error: RefCell<Option<(io::ErrorKind, String)>>,
 }
 
@@ -115,14 +113,6 @@ impl Handle {
         PushFuture::new(Rc::clone(&self.shared), entry)
     }
 
-    /// Wait for admission to start configuring/submitting a new operation.
-    ///
-    /// This enforces a global cap on concurrently admitted operations, which
-    /// keeps operation setup bounded relative to ring capacity.
-    pub(crate) fn admit(&self) -> AdmissionFuture {
-        AdmissionFuture::new(Rc::clone(&self.shared))
-    }
-
     pub(crate) fn close_fd(&self, kind: &fd::FdKind) -> io::Result<()> {
         self.shared.close_fd(kind)
     }
@@ -158,8 +148,6 @@ impl Driver {
                 ring: RefCell::new(ring),
                 backpressure: Notify::default(),
                 status: Cell::new(Status::Running),
-                submission_limit: size as usize,
-                admitted: Cell::new(0),
                 submit_error: RefCell::new(None),
             }),
             unparker: Arc::new(unpark::Unparker::new()?),
@@ -460,22 +448,6 @@ impl Shared {
         let ring = self.ring.borrow();
         let sq = ring.submitter();
         f(&sq)
-    }
-
-    fn try_acquire_submission_slot(&self) -> bool {
-        let admitted = self.admitted.get();
-        if admitted >= self.submission_limit {
-            return false;
-        }
-        self.admitted.set(admitted + 1);
-        true
-    }
-
-    fn release_submission_slot(&self) {
-        let admitted = self.admitted.get();
-        assert!(admitted > 0, "submission slot underflow");
-        self.admitted.set(admitted - 1);
-        self.backpressure.notify(1);
     }
 
     fn submit_once(&self, mode: ParkMode) -> io::Result<usize> {

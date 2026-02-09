@@ -12,7 +12,7 @@ pub(crate) use raw::{CQEResult, RawOpRef};
 
 use futures_core::Stream;
 
-use crate::driver::{AdmissionFuture, PushFuture, SubmissionPermit};
+use crate::driver::PushFuture;
 
 pub trait Operation {
     /// Configure a new [`io_uring::squeue::Entry`] for this operation.
@@ -73,70 +73,6 @@ impl ConfiguredEntry {
 }
 
 pin_project_lite::pin_project! {
-    /// Wrapper that binds an operation to a submission admission permit.
-    ///
-    /// Keeping the permit inside the operation data ensures the admission slot
-    /// is released only when the operation reaches final cleanup/drop.
-    struct Admitted<T> {
-        #[pin]
-        inner: T,
-        _permit: Option<SubmissionPermit>,
-    }
-}
-
-impl<T> Admitted<T> {
-    fn new(inner: T, permit: Option<SubmissionPermit>) -> Self {
-        Self {
-            inner,
-            _permit: permit,
-        }
-    }
-}
-
-impl<T> Operation for Admitted<T>
-where
-    T: Operation,
-{
-    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
-        self.project().inner.configure()
-    }
-
-    fn cleanup(&mut self, result: CQEResult) {
-        self.inner.cleanup(result);
-    }
-}
-
-impl<T> Singleshot for Admitted<T>
-where
-    T: Singleshot,
-{
-    type Output = T::Output;
-
-    fn complete(self, result: CQEResult) -> Self::Output {
-        self.inner.complete(result)
-    }
-
-    fn update(&mut self, result: CQEResult) {
-        self.inner.update(result);
-    }
-}
-
-impl<T> Multishot for Admitted<T>
-where
-    T: Multishot,
-{
-    type Item = T::Item;
-
-    fn update(&mut self, result: CQEResult) -> Self::Item {
-        self.inner.update(result)
-    }
-
-    fn complete(self, result: CQEResult) -> Option<Self::Item> {
-        self.inner.complete(result)
-    }
-}
-
-pin_project_lite::pin_project! {
     #[must_use = "future does nothing unless you `.await` or poll them"]
     pub struct Op<T>
     where
@@ -174,7 +110,17 @@ where
     T: Operation + 'static,
 {
     pub(crate) fn new(data: T, reactor: crate::Handle) -> Self {
-        let inner = Stage::new(data, reactor.admit(), reactor.clone());
+        let mut handle = TypedHandle::new(data);
+        let data =
+            // Safety: We will not move `data` after this point, so it is safe to create a pin. The only time
+            // we will move `data` is when the operation is complete. That will only happen after all sqes have
+            // been submitted and completed.
+            unsafe { Pin::new_unchecked(handle.data_mut().expect("operation already completed")) };
+
+        let entry = T::configure(data);
+        let entry = ConfiguredEntry::new(handle.untyped(), entry);
+        let submit_future = reactor.push(entry);
+        let inner = Stage::new(handle, submit_future);
 
         Self {
             stage: inner,
@@ -322,14 +268,11 @@ impl<T> Stage<T>
 where
     T: Operation + 'static,
 {
-    fn new(data: T, admission: AdmissionFuture, reactor: crate::Handle) -> Self {
+    fn new(handle: TypedHandle<T>, future: PushFuture) -> Self {
         Self::Unsubmitted {
             unsubmitted: UnsubmittedOp {
-                data: Some(data),
-                reactor,
-                handle: None,
-                admission: Some(admission),
-                push: None,
+                handle: Some(handle),
+                future,
             },
         }
     }
@@ -355,13 +298,9 @@ where
 pin_project_lite::pin_project! {
     #[must_use = "futures do nothing unless you `.await` or poll them"]
     struct UnsubmittedOp<T> where T: 'static {
-        data: Option<T>,
-        reactor: crate::Handle,
-        handle: Option<TypedHandle<Admitted<T>>>,
+        handle: Option<TypedHandle<T>>,
         #[pin]
-        admission: Option<AdmissionFuture>,
-        #[pin]
-        push: Option<PushFuture>,
+        future: PushFuture,
     }
 }
 
@@ -369,60 +308,27 @@ impl<T> Future for UnsubmittedOp<T>
 where
     T: Operation + 'static,
 {
-    type Output = TypedHandle<Admitted<T>>;
+    type Output = TypedHandle<T>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut this = self.project();
-        if this.handle.is_none() {
-            let permit = if let Some(admission) = this.admission.as_mut().as_pin_mut() {
-                match ready!(admission.poll(cx)) {
-                    Ok(permit) => Some(permit),
-                    Err(err) => {
-                        let handle =
-                            TypedHandle::new(Admitted::new(this.data.take().unwrap(), None));
-                        let op = handle.untyped();
-                        op.complete(CQEResult::new(Err(err.into()), 0));
-                        return Poll::Ready(handle);
-                    }
-                }
-            } else {
-                None
-            };
-            Pin::set(&mut this.admission, None);
-
-            let mut handle = TypedHandle::new(Admitted::new(this.data.take().unwrap(), permit));
-            let data =
-                // Safety: We will not move `data` after this point, so it is safe to create a pin. The only time
-                // we will move `data` is when the operation is complete. That will only happen after all sqes have
-                // been submitted and completed.
-                unsafe { Pin::new_unchecked(handle.data_mut().expect("operation already completed")) };
-
-            let entry = Admitted::<T>::configure(data);
-            let entry = ConfiguredEntry::new(handle.untyped(), entry);
-            Pin::set(&mut this.push, Some(this.reactor.push(entry)));
-            this.handle.replace(handle);
+        let this = self.project();
+        if let Err(err) = ready!(this.future.poll(cx)) {
+            // Submission failed (typically during driver shutdown). Synthesize a completion
+            // error so the op follows normal completion/drop lifetimes instead of panicking.
+            let op = this
+                .handle
+                .as_ref()
+                .expect("operation handle must exist until submission completes")
+                .untyped();
+            op.complete(CQEResult::new(Err(err.into()), 0));
         }
-
-        if let Some(push) = this.push.as_mut().as_pin_mut() {
-            if let Err(err) = ready!(push.poll(cx)) {
-                // Submission failed (typically during driver shutdown). Synthesize a completion
-                // error so the op follows normal completion/drop lifetimes instead of panicking.
-                let op = this
-                    .handle
-                    .as_ref()
-                    .expect("operation handle must exist until submission completes")
-                    .untyped();
-                op.complete(CQEResult::new(Err(err.into()), 0));
-            }
-        }
-        Pin::set(&mut this.push, None);
         Poll::Ready(this.handle.take().unwrap())
     }
 }
 
 #[must_use = "futures do nothing unless you `.await` or poll them"]
 struct SubmittedOp<T> {
-    inner: TypedHandle<Admitted<T>>,
+    inner: TypedHandle<T>,
 }
 
 impl<T> SubmittedOp<T>
@@ -597,7 +503,7 @@ mod tests {
 
     #[test]
     fn multishot_completions_are_fifo() {
-        let typed = TypedHandle::new(Admitted::new(TestMultishot, None));
+        let typed = TypedHandle::new(TestMultishot);
         let more = more_flag();
         typed.untyped().complete(CQEResult::new(Ok(10), more));
         typed.untyped().complete(CQEResult::new(Ok(20), more));
@@ -685,13 +591,10 @@ mod tests {
 
         let updates = Rc::new(Cell::new(0));
         let complete = Rc::new(Cell::new(0));
-        let typed = TypedHandle::new(Admitted::new(
-            TerminalMultishot {
-                updates: Rc::clone(&updates),
-                complete: Rc::clone(&complete),
-            },
-            None,
-        ));
+        let typed = TypedHandle::new(TerminalMultishot {
+            updates: Rc::clone(&updates),
+            complete: Rc::clone(&complete),
+        });
         typed.untyped().complete(CQEResult::new(
             Err(io::Error::from_raw_os_error(libc::ECANCELED)),
             0,
@@ -702,103 +605,5 @@ mod tests {
         assert_eq!(updates.get(), 0);
         assert_eq!(complete.get(), 1);
         assert!(submitted.inner.is_complete());
-    }
-
-    #[test]
-    fn submit_is_lazy_before_polling() {
-        #[derive(Debug)]
-        struct LazySubmitOp {
-            configured: Rc<Cell<usize>>,
-        }
-
-        impl Operation for LazySubmitOp {
-            fn cleanup(&mut self, _: CQEResult) {}
-
-            fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
-                self.configured.set(self.configured.get() + 1);
-                io_uring::opcode::Nop::new().build()
-            }
-        }
-
-        impl Singleshot for LazySubmitOp {
-            type Output = io::Result<()>;
-
-            fn complete(self, result: CQEResult) -> Self::Output {
-                result.result.map(drop)
-            }
-        }
-
-        let configured = Rc::new(Cell::new(0));
-        let driver = crate::Driver::new(io_uring::IoUring::builder(), 2).unwrap();
-        let handle = driver.handle();
-
-        let mut ops = Vec::new();
-        for _ in 0..64 {
-            ops.push(handle.submit(LazySubmitOp {
-                configured: Rc::clone(&configured),
-            }));
-        }
-
-        assert_eq!(
-            configured.get(),
-            0,
-            "building Op futures should not configure/allocate submission entries until poll"
-        );
-
-        drop(ops);
-        drop(driver);
-    }
-
-    #[test]
-    fn admission_limits_configured_operations_to_ring_depth() {
-        #[derive(Debug)]
-        struct CountedOp {
-            configured: Rc<Cell<usize>>,
-        }
-
-        impl Operation for CountedOp {
-            fn cleanup(&mut self, _: CQEResult) {}
-
-            fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
-                self.configured.set(self.configured.get() + 1);
-                io_uring::opcode::Nop::new().build()
-            }
-        }
-
-        impl Singleshot for CountedOp {
-            type Output = io::Result<()>;
-
-            fn complete(self, result: CQEResult) -> Self::Output {
-                result.result.map(drop)
-            }
-        }
-
-        let configured = Rc::new(Cell::new(0));
-        let driver = crate::Driver::new(io_uring::IoUring::builder(), 2).unwrap();
-        let handle = driver.handle();
-
-        let mut ops = (0..4)
-            .map(|_| {
-                Box::pin(handle.submit(CountedOp {
-                    configured: Rc::clone(&configured),
-                }))
-            })
-            .collect::<Vec<_>>();
-
-        let waker = futures_test::task::noop_waker();
-        let mut cx = std::task::Context::from_waker(&waker);
-
-        for op in &mut ops {
-            assert!(Future::poll(op.as_mut(), &mut cx).is_pending());
-        }
-
-        assert_eq!(
-            configured.get(),
-            2,
-            "ring depth should cap how many operations can be configured/in-flight"
-        );
-
-        drop(ops);
-        drop(driver);
     }
 }
