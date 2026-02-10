@@ -70,6 +70,28 @@ impl File {
         self.handle.submit(write).await
     }
 
+    /// Read bytes from the file into a set of buffers.
+    ///
+    /// The read starts at the provided offset and fills each buffer in order.
+    pub async fn readv_at<B>(&self, bufs: Vec<B>, offset: u64) -> (io::Result<usize>, Vec<B>)
+    where
+        B: StableBufMut + 'static,
+    {
+        let read = ReadVectoredAt::new(self.fd.clone(), bufs, offset);
+        self.handle.submit(read).await
+    }
+
+    /// Write bytes from a set of buffers to the file.
+    ///
+    /// The write starts at the provided offset and consumes each buffer in order.
+    pub async fn writev_at<B>(&self, bufs: Vec<B>, offset: u64) -> (io::Result<usize>, Vec<B>)
+    where
+        B: StableBuf + 'static,
+    {
+        let write = WriteVectoredAt::new(self.fd.clone(), bufs, offset);
+        self.handle.submit(write).await
+    }
+
     /// Sync the file and metadata to disk.
     pub async fn sync(&self) -> io::Result<()> {
         let flags = FsyncFlags::empty();
@@ -95,6 +117,13 @@ impl File {
         let fallocate = Fallocate::new(self.fd.clone(), offset, len, mode);
         self.handle.submit(fallocate).await
     }
+
+    /// Truncate or extend the underlying file, updating the file length.
+    pub async fn set_len(&self, len: u64) -> io::Result<()> {
+        let truncate = Truncate::new(self.fd.clone(), len);
+        self.handle.submit(truncate).await
+    }
+
     /// Allocate additional space in the file without changing the file length metadata.
     ///
     /// This is akin to fallocate with `FALLOC_FL_ZERO_RANGE` and `FALLOC_FL_KEEP_SIZE` set.
@@ -268,6 +297,139 @@ where
     }
 }
 
+struct ReadVectoredAt<B> {
+    fd: NornFd,
+    bufs: Vec<B>,
+    iovecs: Vec<libc::iovec>,
+    offset: u64,
+}
+
+impl<B> ReadVectoredAt<B> {
+    fn new(fd: NornFd, bufs: Vec<B>, offset: u64) -> Self {
+        Self {
+            fd,
+            bufs,
+            iovecs: Vec::new(),
+            offset,
+        }
+    }
+}
+
+impl<B> Operation for ReadVectoredAt<B>
+where
+    B: StableBufMut,
+{
+    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+        let this = self.get_mut();
+        this.iovecs.clear();
+        this.iovecs.reserve(this.bufs.len());
+        for buf in &mut this.bufs {
+            this.iovecs.push(libc::iovec {
+                iov_base: buf.stable_ptr_mut() as *mut libc::c_void,
+                iov_len: buf.bytes_remaining(),
+            });
+        }
+
+        let ptr = this.iovecs.as_ptr();
+        let len = this.iovecs.len() as u32;
+        match this.fd.kind() {
+            FdKind::Fd(fd) => opcode::Readv::new(*fd, ptr, len),
+            FdKind::Fixed(fd) => opcode::Readv::new(*fd, ptr, len),
+        }
+        .offset(this.offset)
+        .build()
+    }
+
+    fn cleanup(&mut self, _: CQEResult) {}
+}
+
+impl<B> Singleshot for ReadVectoredAt<B>
+where
+    B: StableBufMut,
+{
+    type Output = (io::Result<usize>, Vec<B>);
+
+    fn complete(mut self, result: CQEResult) -> Self::Output {
+        match result.result {
+            Ok(n) => {
+                let mut remaining = n as usize;
+                for buf in &mut self.bufs {
+                    let init = remaining.min(buf.bytes_remaining());
+                    unsafe {
+                        buf.set_init(init);
+                    }
+                    remaining = remaining.saturating_sub(init);
+                    if remaining == 0 {
+                        break;
+                    }
+                }
+                (Ok(n as usize), self.bufs)
+            }
+            Err(err) => (Err(err), self.bufs),
+        }
+    }
+}
+
+struct WriteVectoredAt<B> {
+    fd: NornFd,
+    bufs: Vec<B>,
+    iovecs: Vec<libc::iovec>,
+    offset: u64,
+}
+
+impl<B> WriteVectoredAt<B> {
+    fn new(fd: NornFd, bufs: Vec<B>, offset: u64) -> Self {
+        Self {
+            fd,
+            bufs,
+            iovecs: Vec::new(),
+            offset,
+        }
+    }
+}
+
+impl<B> Operation for WriteVectoredAt<B>
+where
+    B: StableBuf,
+{
+    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+        let this = self.get_mut();
+        this.iovecs.clear();
+        this.iovecs.reserve(this.bufs.len());
+        for buf in &this.bufs {
+            this.iovecs.push(libc::iovec {
+                iov_base: buf.stable_ptr() as *mut libc::c_void,
+                iov_len: buf.bytes_init(),
+            });
+        }
+
+        let ptr = this.iovecs.as_ptr();
+        let len = this.iovecs.len() as u32;
+        match this.fd.kind() {
+            FdKind::Fd(fd) => opcode::Writev::new(*fd, ptr, len),
+            FdKind::Fixed(fd) => opcode::Writev::new(*fd, ptr, len),
+        }
+        .offset(this.offset)
+        .build()
+    }
+
+    fn cleanup(&mut self, _: CQEResult) {}
+}
+
+impl<B> Singleshot for WriteVectoredAt<B>
+where
+    B: StableBuf,
+{
+    type Output = (io::Result<usize>, Vec<B>);
+
+    fn complete(self, result: CQEResult) -> Self::Output {
+        match result.result {
+            Ok(n) => (Ok(n as usize), self.bufs),
+            Err(err) => (Err(err), self.bufs),
+        }
+    }
+}
+
 struct Sync {
     fd: NornFd,
     flags: FsyncFlags,
@@ -372,6 +534,37 @@ impl Operation for Fallocate {
 }
 
 impl Singleshot for Fallocate {
+    type Output = io::Result<()>;
+
+    fn complete(self, result: CQEResult) -> Self::Output {
+        result.result.map(|_| ())
+    }
+}
+
+struct Truncate {
+    fd: NornFd,
+    len: u64,
+}
+
+impl Truncate {
+    fn new(fd: NornFd, len: u64) -> Self {
+        Self { fd, len }
+    }
+}
+
+impl Operation for Truncate {
+    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+        match self.fd.kind() {
+            FdKind::Fd(fd) => opcode::Ftruncate::new(*fd, self.len),
+            FdKind::Fixed(fd) => opcode::Ftruncate::new(*fd, self.len),
+        }
+        .build()
+    }
+
+    fn cleanup(&mut self, _: CQEResult) {}
+}
+
+impl Singleshot for Truncate {
     type Output = io::Result<()>;
 
     fn complete(self, result: CQEResult) -> Self::Output {

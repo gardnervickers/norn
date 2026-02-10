@@ -93,7 +93,7 @@ impl Socket {
     where
         B: StableBufMut + 'static,
     {
-        let op = RecvFrom::new(self.fd.clone(), buf);
+        let op = RecvFrom::new(self.fd.clone(), buf, 0);
         self.handle.submit(op).await
     }
 
@@ -101,7 +101,32 @@ impl Socket {
     where
         B: StableBuf + 'static,
     {
-        let op = SendTo::new(self.fd.clone(), buf, Some(addr));
+        let op = SendTo::new(self.fd.clone(), buf, Some(addr), 0);
+        self.handle.submit(op).await
+    }
+
+    pub(crate) async fn recv_from_with_flags<B>(
+        &self,
+        buf: B,
+        flags: i32,
+    ) -> (io::Result<(usize, SocketAddr)>, B)
+    where
+        B: StableBufMut + 'static,
+    {
+        let op = RecvFrom::new(self.fd.clone(), buf, flags as u32);
+        self.handle.submit(op).await
+    }
+
+    pub(crate) async fn send_to_with_flags<B>(
+        &self,
+        buf: B,
+        addr: SocketAddr,
+        flags: i32,
+    ) -> (io::Result<usize>, B)
+    where
+        B: StableBuf + 'static,
+    {
+        let op = SendTo::new(self.fd.clone(), buf, Some(addr), flags as u32);
         self.handle.submit(op).await
     }
 
@@ -109,7 +134,7 @@ impl Socket {
     where
         B: StableBufMut + 'static,
     {
-        let op = Recv::new(self.fd.clone(), buf);
+        let op = Recv::new(self.fd.clone(), buf, 0);
         self.handle.submit(op)
     }
 
@@ -117,7 +142,23 @@ impl Socket {
     where
         B: StableBuf + 'static,
     {
-        let op = Send::new(self.fd.clone(), buf);
+        let op = Send::new(self.fd.clone(), buf, 0);
+        self.handle.submit(op)
+    }
+
+    pub(crate) fn recv_with_flags<B>(&self, buf: B, flags: i32) -> Op<Recv<B>>
+    where
+        B: StableBufMut + 'static,
+    {
+        let op = Recv::new(self.fd.clone(), buf, flags);
+        self.handle.submit(op)
+    }
+
+    pub(crate) fn send_with_flags<B>(&self, buf: B, flags: i32) -> Op<Send<B>>
+    where
+        B: StableBuf + 'static,
+    {
+        let op = Send::new(self.fd.clone(), buf, flags);
         self.handle.submit(op)
     }
 
@@ -212,6 +253,7 @@ struct SendTo<B> {
     fd: NornFd,
     buf: B,
     addr: Option<SockAddr>,
+    flags: u32,
     msghdr: MaybeUninit<libc::msghdr>,
     slices: MaybeUninit<[io::IoSlice<'static>; 1]>,
 }
@@ -220,12 +262,13 @@ impl<B> SendTo<B>
 where
     B: StableBuf,
 {
-    pub(crate) fn new(fd: NornFd, buf: B, addr: Option<SocketAddr>) -> Self {
+    pub(crate) fn new(fd: NornFd, buf: B, addr: Option<SocketAddr>, flags: u32) -> Self {
         let addr = addr.map(SockAddr::from);
         Self {
             fd,
             buf,
             addr,
+            flags,
             msghdr: MaybeUninit::zeroed(),
             slices: MaybeUninit::zeroed(),
         }
@@ -276,6 +319,7 @@ where
             crate::fd::FdKind::Fd(fd) => opcode::SendMsg::new(types::Fd(fd.0), msghdr),
             crate::fd::FdKind::Fixed(fd) => opcode::SendMsg::new(types::Fixed(fd.0), msghdr),
         }
+        .flags(this.flags)
         .build()
     }
 
@@ -297,6 +341,7 @@ struct RecvFrom<B> {
     fd: NornFd,
     buf: B,
     addr: SockAddr,
+    flags: u32,
     msghdr: MaybeUninit<libc::msghdr>,
     slices: MaybeUninit<[io::IoSliceMut<'static>; 1]>,
 }
@@ -305,13 +350,14 @@ impl<B> RecvFrom<B>
 where
     B: StableBufMut,
 {
-    pub(crate) fn new(fd: NornFd, buf: B) -> Self {
+    pub(crate) fn new(fd: NornFd, buf: B, flags: u32) -> Self {
         // Safety: We won't read from the socket addr until it's initialized.
         let addr = unsafe { SockAddr::try_init(|_, _| Ok(())) }.unwrap().1;
         Self {
             fd,
             buf,
             addr,
+            flags,
             msghdr: MaybeUninit::zeroed(),
             slices: MaybeUninit::zeroed(),
         }
@@ -347,6 +393,7 @@ where
             crate::fd::FdKind::Fd(fd) => opcode::RecvMsg::new(types::Fd(fd.0), msghdr),
             crate::fd::FdKind::Fixed(fd) => opcode::RecvMsg::new(types::Fixed(fd.0), msghdr),
         }
+        .flags(this.flags)
         .build()
     }
 
@@ -576,14 +623,15 @@ impl Singleshot for Shutdown {
 pub struct Recv<B> {
     fd: NornFd,
     buf: B,
+    flags: i32,
 }
 
 impl<B> Recv<B>
 where
     B: StableBufMut,
 {
-    pub(crate) fn new(fd: NornFd, buf: B) -> Self {
-        Self { fd, buf }
+    pub(crate) fn new(fd: NornFd, buf: B, flags: i32) -> Self {
+        Self { fd, buf, flags }
     }
 }
 
@@ -597,9 +645,11 @@ where
 
         // Finally we create the operation.
         match self.fd.kind() {
-            crate::fd::FdKind::Fd(fd) => opcode::Recv::new(*fd, ptr, len as _).build(),
-            crate::fd::FdKind::Fixed(fd) => opcode::Recv::new(*fd, ptr, len as _).build(),
+            crate::fd::FdKind::Fd(fd) => opcode::Recv::new(*fd, ptr, len as _),
+            crate::fd::FdKind::Fixed(fd) => opcode::Recv::new(*fd, ptr, len as _),
         }
+        .flags(self.flags)
+        .build()
     }
 
     fn cleanup(&mut self, _: crate::operation::CQEResult) {}
@@ -627,14 +677,15 @@ where
 pub struct Send<B> {
     fd: NornFd,
     buf: B,
+    flags: i32,
 }
 
 impl<B> Send<B>
 where
     B: StableBuf,
 {
-    pub(crate) fn new(fd: NornFd, buf: B) -> Self {
-        Self { fd, buf }
+    pub(crate) fn new(fd: NornFd, buf: B, flags: i32) -> Self {
+        Self { fd, buf, flags }
     }
 }
 
@@ -648,9 +699,11 @@ where
 
         // Finally we create the operation.
         match self.fd.kind() {
-            crate::fd::FdKind::Fd(fd) => opcode::Send::new(*fd, ptr, len as _).build(),
-            crate::fd::FdKind::Fixed(fd) => opcode::Send::new(*fd, ptr, len as _).build(),
+            crate::fd::FdKind::Fd(fd) => opcode::Send::new(*fd, ptr, len as _),
+            crate::fd::FdKind::Fixed(fd) => opcode::Send::new(*fd, ptr, len as _),
         }
+        .flags(self.flags)
+        .build()
     }
 
     fn cleanup(&mut self, _: crate::operation::CQEResult) {}
