@@ -178,12 +178,32 @@ impl TcpSocket {
         self.socket.recv(buf)
     }
 
+    /// Recv data into the given buffer with recv flags.
+    pub fn recv_with_flags<B: StableBufMut>(&self, buf: B, flags: i32) -> Op<socket::Recv<B>> {
+        self.socket.recv_with_flags(buf, flags)
+    }
+
     /// Send data from the given buffer.
     ///
     /// This takes ownership of the buffer, and returns a future which resolves
     /// to a tuple of the original buffer and the number of bytes sent.
     pub fn send<B: StableBuf>(&self, buf: B) -> Op<socket::Send<B>> {
         self.socket.send(buf)
+    }
+
+    /// Send data from the given buffer with send flags.
+    pub fn send_with_flags<B: StableBuf>(&self, buf: B, flags: i32) -> Op<socket::Send<B>> {
+        self.socket.send_with_flags(buf, flags)
+    }
+
+    /// Send a message from the given buffer with message-style flags.
+    pub fn send_msg<B: StableBuf>(&self, buf: B, flags: i32) -> Op<socket::Send<B>> {
+        self.send_with_flags(buf, flags)
+    }
+
+    /// Receive a message into the given buffer with message-style flags.
+    pub fn recv_msg<B: StableBufMut>(&self, buf: B, flags: i32) -> Op<socket::Recv<B>> {
+        self.recv_with_flags(buf, flags)
     }
 
     /// Recv data using the given buffer ring.
