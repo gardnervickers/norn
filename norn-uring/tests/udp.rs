@@ -34,6 +34,58 @@ fn send_recv() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn connected_send_recv() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let s1 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let s2 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+
+        s1.connect(s2.local_addr()?).await?;
+        s2.connect(s1.local_addr()?).await?;
+
+        assert_eq!(s1.peer_addr()?, s2.local_addr()?);
+        assert_eq!(s2.peer_addr()?, s1.local_addr()?);
+
+        let req = Bytes::from_static(b"ping");
+        let (res, req) = s1.send(req).await;
+        assert_eq!(req.len(), res?);
+
+        let (res, buf) = s2.recv(BytesMut::with_capacity(16)).await;
+        let n = res?;
+        assert_eq!(&buf[..n], b"ping");
+
+        let rsp = Bytes::from_static(b"pong");
+        let (res, rsp) = s2.send(rsp).await;
+        assert_eq!(rsp.len(), res?);
+
+        let (res, buf) = s1.recv(BytesMut::with_capacity(16)).await;
+        let n = res?;
+        assert_eq!(&buf[..n], b"pong");
+
+        Ok(())
+    })
+}
+
+#[test]
+fn send_recv_msg() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let s1 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let s2 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+
+        let (res, sent) = s1
+            .send_msg(Bytes::from_static(b"hello"), Some(s2.local_addr()?), 0)
+            .await;
+        assert_eq!(res?, sent.len());
+
+        let (res, buf) = s2.recv_msg(BytesMut::with_capacity(16), 0).await;
+        let (n, addr) = res?;
+        assert_eq!(addr, s1.local_addr()?);
+        assert_eq!(&buf[..n], b"hello");
+
+        Ok(())
+    })
+}
+
+#[test]
 fn send_recv_ring() -> Result<(), Box<dyn std::error::Error>> {
     util::with_test_env(|| async {
         let ring = BufRing::builder(1).buf_cnt(32).buf_len(1024 * 16).build()?;

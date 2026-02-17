@@ -151,6 +151,14 @@ impl<P> Driver<P> {
     }
 }
 
+impl<P> Drop for Driver<P> {
+    fn drop(&mut self) {
+        // Always wake outstanding sleepers even if callers drop the timer
+        // driver directly without going through Park::shutdown.
+        self.wheels.shutdown();
+    }
+}
+
 impl<P> Park for Driver<P>
 where
     P: Park,

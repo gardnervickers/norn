@@ -1,5 +1,5 @@
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
 use io_uring::{opcode, types};
@@ -34,6 +34,61 @@ pub async fn remove_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
     let remove = UnlinkAt::remove_dir(&path)?;
     handle.submit(remove).await?;
     Ok(())
+}
+
+/// Rename a file or directory.
+///
+/// This is equivalent to `renameat2` with no special flags.
+pub async fn rename<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Result<()> {
+    let from = from.as_ref().to_owned();
+    let to = to.as_ref().to_owned();
+    let handle = Handle::current();
+    let rename = RenameAt::new(&from, &to, 0)?;
+    handle.submit(rename).await?;
+    Ok(())
+}
+
+/// Create a symbolic link at `linkpath` pointing to `target`.
+pub async fn symlink<P: AsRef<Path>, Q: AsRef<Path>>(target: P, linkpath: Q) -> io::Result<()> {
+    let target = target.as_ref().to_owned();
+    let linkpath = linkpath.as_ref().to_owned();
+    let handle = Handle::current();
+    let link = SymlinkAt::new(&target, &linkpath)?;
+    handle.submit(link).await?;
+    Ok(())
+}
+
+/// Create a hard link at `newpath` for `oldpath`.
+pub async fn hard_link<P: AsRef<Path>, Q: AsRef<Path>>(oldpath: P, newpath: Q) -> io::Result<()> {
+    let oldpath = oldpath.as_ref().to_owned();
+    let newpath = newpath.as_ref().to_owned();
+    let handle = Handle::current();
+    let link = LinkAt::new(&oldpath, &newpath, 0)?;
+    handle.submit(link).await?;
+    Ok(())
+}
+
+/// Read metadata using `statx(2)`.
+///
+/// `flags` and `mask` map directly to the `statx(2)` system call arguments.
+pub async fn statx<P: AsRef<Path>>(path: P, flags: i32, mask: u32) -> io::Result<libc::statx> {
+    let path = path.as_ref().to_owned();
+    let handle = Handle::current();
+    let statx = Statx::new(&path, flags, mask)?;
+    handle.submit(statx).await
+}
+
+/// Read file metadata with `STATX_BASIC_STATS`.
+pub async fn metadata<P: AsRef<Path>>(path: P) -> io::Result<libc::statx> {
+    statx(path, libc::AT_STATX_SYNC_AS_STAT, libc::STATX_BASIC_STATS).await
+}
+
+/// Read a symbolic link target.
+///
+/// Note: `io_uring` does not currently expose a `readlinkat` opcode in this version of the
+/// dependency, so this uses `std::fs::read_link` directly.
+pub async fn read_link<P: AsRef<Path>>(path: P) -> io::Result<PathBuf> {
+    std::fs::read_link(path)
 }
 
 struct UnlinkAt {
@@ -112,4 +167,171 @@ impl Singleshot for MkDirAt {
     fn complete(self, result: crate::operation::CQEResult) -> Self::Output {
         result.result.map(drop)
     }
+}
+
+struct RenameAt {
+    oldpath: std::ffi::CString,
+    newpath: std::ffi::CString,
+    flags: u32,
+}
+
+impl RenameAt {
+    fn new(oldpath: &Path, newpath: &Path, flags: u32) -> io::Result<Self> {
+        Ok(Self {
+            oldpath: path_to_cstring(oldpath)?,
+            newpath: path_to_cstring(newpath)?,
+            flags,
+        })
+    }
+}
+
+impl Operation for RenameAt {
+    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+        let this = self.get_mut();
+        opcode::RenameAt::new(
+            types::Fd(libc::AT_FDCWD),
+            this.oldpath.as_ptr(),
+            types::Fd(libc::AT_FDCWD),
+            this.newpath.as_ptr(),
+        )
+        .flags(this.flags)
+        .build()
+    }
+
+    fn cleanup(&mut self, _: crate::operation::CQEResult) {}
+}
+
+impl Singleshot for RenameAt {
+    type Output = io::Result<()>;
+
+    fn complete(self, result: crate::operation::CQEResult) -> Self::Output {
+        result.result.map(drop)
+    }
+}
+
+struct SymlinkAt {
+    target: std::ffi::CString,
+    linkpath: std::ffi::CString,
+}
+
+impl SymlinkAt {
+    fn new(target: &Path, linkpath: &Path) -> io::Result<Self> {
+        Ok(Self {
+            target: path_to_cstring(target)?,
+            linkpath: path_to_cstring(linkpath)?,
+        })
+    }
+}
+
+impl Operation for SymlinkAt {
+    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+        let this = self.get_mut();
+        opcode::SymlinkAt::new(
+            types::Fd(libc::AT_FDCWD),
+            this.target.as_ptr(),
+            this.linkpath.as_ptr(),
+        )
+        .build()
+    }
+
+    fn cleanup(&mut self, _: crate::operation::CQEResult) {}
+}
+
+impl Singleshot for SymlinkAt {
+    type Output = io::Result<()>;
+
+    fn complete(self, result: crate::operation::CQEResult) -> Self::Output {
+        result.result.map(drop)
+    }
+}
+
+struct LinkAt {
+    oldpath: std::ffi::CString,
+    newpath: std::ffi::CString,
+    flags: i32,
+}
+
+impl LinkAt {
+    fn new(oldpath: &Path, newpath: &Path, flags: i32) -> io::Result<Self> {
+        Ok(Self {
+            oldpath: path_to_cstring(oldpath)?,
+            newpath: path_to_cstring(newpath)?,
+            flags,
+        })
+    }
+}
+
+impl Operation for LinkAt {
+    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+        let this = self.get_mut();
+        opcode::LinkAt::new(
+            types::Fd(libc::AT_FDCWD),
+            this.oldpath.as_ptr(),
+            types::Fd(libc::AT_FDCWD),
+            this.newpath.as_ptr(),
+        )
+        .flags(this.flags)
+        .build()
+    }
+
+    fn cleanup(&mut self, _: crate::operation::CQEResult) {}
+}
+
+impl Singleshot for LinkAt {
+    type Output = io::Result<()>;
+
+    fn complete(self, result: crate::operation::CQEResult) -> Self::Output {
+        result.result.map(drop)
+    }
+}
+
+struct Statx {
+    path: std::ffi::CString,
+    flags: i32,
+    mask: u32,
+    statx: std::mem::MaybeUninit<libc::statx>,
+}
+
+impl Statx {
+    fn new(path: &Path, flags: i32, mask: u32) -> io::Result<Self> {
+        Ok(Self {
+            path: path_to_cstring(path)?,
+            flags,
+            mask,
+            statx: std::mem::MaybeUninit::zeroed(),
+        })
+    }
+}
+
+impl Operation for Statx {
+    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+        let this = self.get_mut();
+        opcode::Statx::new(
+            types::Fd(libc::AT_FDCWD),
+            this.path.as_ptr(),
+            this.statx.as_mut_ptr().cast(),
+        )
+        .flags(this.flags)
+        .mask(this.mask)
+        .build()
+    }
+
+    fn cleanup(&mut self, _: crate::operation::CQEResult) {}
+}
+
+impl Singleshot for Statx {
+    type Output = io::Result<libc::statx>;
+
+    fn complete(self, result: crate::operation::CQEResult) -> Self::Output {
+        result.result?;
+        // Safety: the kernel initialized the statx struct on successful completion.
+        Ok(unsafe { self.statx.assume_init() })
+    }
+}
+
+fn path_to_cstring(path: &Path) -> io::Result<std::ffi::CString> {
+    let path = path
+        .to_str()
+        .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
+    Ok(std::ffi::CString::new(path)?)
 }

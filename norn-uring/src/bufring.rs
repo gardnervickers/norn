@@ -135,6 +135,15 @@ pub(crate) type Bgid = u16;
 /// [Bid] is used to identify a buffer within a buffer group.
 pub(crate) type Bid = u16;
 
+fn selected_bid_from_flags(flags: u32) -> io::Result<Bid> {
+    io_uring::cqueue::buffer_select(flags).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "completion did not include a selected buffer id",
+        )
+    })
+}
+
 /// [`Builder`] is used to create a new [`BufRing`].
 #[derive(Copy, Clone, Debug)]
 pub struct Builder {
@@ -373,7 +382,16 @@ impl InnerBufRing {
         // This fn does the odd thing of having self as the BufRing and taking an argument that is
         // the same BufRing but wrapped in Rc<_> so the wrapped buf_ring can be passed to the
         // outgoing GBuf.
-        let bid = io_uring::cqueue::buffer_select(flags).unwrap();
+        let bid = selected_bid_from_flags(flags)?;
+        if bid >= self.buf_cnt {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "completion selected buffer id {} outside ring bounds (buf_cnt={})",
+                    bid, self.buf_cnt
+                ),
+            ));
+        }
 
         let len = res as usize;
 
@@ -501,5 +519,17 @@ impl ops::Deref for BufRingBuf {
 
     fn deref(&self) -> &Self::Target {
         BufRingBuf::as_slice(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::selected_bid_from_flags;
+    use std::io;
+
+    #[test]
+    fn selected_bid_requires_buffer_select_flag() {
+        let err = selected_bid_from_flags(0).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }

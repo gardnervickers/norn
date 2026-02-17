@@ -29,6 +29,14 @@ impl UdpSocket {
         Ok(UdpSocket { inner })
     }
 
+    /// Connect this socket to a remote address.
+    ///
+    /// A connected UDP socket can use [`send`] and [`recv`] without passing
+    /// an address for each operation.
+    pub async fn connect(&self, addr: SocketAddr) -> io::Result<()> {
+        self.inner.connect(addr).await
+    }
+
     /// Returns the socket address that this socket was created from.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.inner.local_addr()
@@ -52,6 +60,40 @@ impl UdpSocket {
         self.inner.send_to(buf, addr).await
     }
 
+    /// Sends a single datagram message on the socket to the given address with the
+    /// provided send flags.
+    pub async fn send_to_with_flags<B>(
+        &self,
+        buf: B,
+        addr: SocketAddr,
+        flags: i32,
+    ) -> (io::Result<usize>, B)
+    where
+        B: StableBuf + 'static,
+    {
+        self.inner.send_to_with_flags(buf, addr, flags).await
+    }
+
+    /// Sends a single datagram message on a connected socket.
+    ///
+    /// This takes ownership of the buffer provided and will return it back
+    /// once the operation has completed.
+    pub async fn send<B>(&self, buf: B) -> (io::Result<usize>, B)
+    where
+        B: StableBuf + 'static,
+    {
+        self.inner.send(buf).await
+    }
+
+    /// Sends a single datagram message on a connected socket with the provided
+    /// send flags.
+    pub async fn send_with_flags<B>(&self, buf: B, flags: i32) -> (io::Result<usize>, B)
+    where
+        B: StableBuf + 'static,
+    {
+        self.inner.send_with_flags(buf, flags).await
+    }
+
     /// Receives a single datagram message on the socket. On success, returns the number
     /// of bytes read and the origin.
     ///
@@ -62,6 +104,65 @@ impl UdpSocket {
         B: StableBufMut + 'static,
     {
         self.inner.recv_from(buf).await
+    }
+
+    /// Receives a single datagram message on the socket with the provided recv flags.
+    pub async fn recv_from_with_flags<B>(
+        &self,
+        buf: B,
+        flags: i32,
+    ) -> (io::Result<(usize, SocketAddr)>, B)
+    where
+        B: StableBufMut + 'static,
+    {
+        self.inner.recv_from_with_flags(buf, flags).await
+    }
+
+    /// Receives a single datagram message on a connected socket.
+    ///
+    /// This must be called with a buffer of sufficient size to hold the message. If a message
+    /// is too long to fit in the supplied buffer, excess bytes may be discarded.
+    pub async fn recv<B>(&self, buf: B) -> (io::Result<usize>, B)
+    where
+        B: StableBufMut + 'static,
+    {
+        self.inner.recv(buf).await
+    }
+
+    /// Receives a single datagram message on a connected socket with the provided
+    /// recv flags.
+    pub async fn recv_with_flags<B>(&self, buf: B, flags: i32) -> (io::Result<usize>, B)
+    where
+        B: StableBufMut + 'static,
+    {
+        self.inner.recv_with_flags(buf, flags).await
+    }
+
+    /// Send a message on this socket using message-style flags.
+    ///
+    /// If `addr` is `Some`, the datagram is sent to that destination. If `None`, the socket
+    /// must already be connected.
+    pub async fn send_msg<B>(
+        &self,
+        buf: B,
+        addr: Option<SocketAddr>,
+        flags: i32,
+    ) -> (io::Result<usize>, B)
+    where
+        B: StableBuf + 'static,
+    {
+        match addr {
+            Some(addr) => self.send_to_with_flags(buf, addr, flags).await,
+            None => self.send_with_flags(buf, flags).await,
+        }
+    }
+
+    /// Receive a message from this socket using message-style flags.
+    pub async fn recv_msg<B>(&self, buf: B, flags: i32) -> (io::Result<(usize, SocketAddr)>, B)
+    where
+        B: StableBufMut + 'static,
+    {
+        self.recv_from_with_flags(buf, flags).await
     }
 
     /// Sends a single datagram message on the socket to the given address using a buffer
