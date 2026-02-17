@@ -2,10 +2,8 @@
 
 use std::borrow::Cow;
 use std::cmp;
-use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -14,7 +12,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use bencher::bench;
 use bencher::{run_tests_console, Bencher, TestDesc, TestDescAndFn, TestFn, TestOpts};
-use futures::future::join_all;
 use futures::stream::{FuturesUnordered, StreamExt};
 
 use norn_uring::fs;
@@ -72,8 +69,7 @@ async fn udp_request_response_worker(
     let lanes = cmp::max(1, sockets.len());
     let per_lane = total_requests / lanes;
     let extra = total_requests % lanes;
-    let mut pending: FuturesUnordered<Pin<Box<dyn Future<Output = io::Result<()>> + '_>>> =
-        FuturesUnordered::new();
+    let mut pending = FuturesUnordered::new();
 
     for (lane, socket) in sockets.iter().enumerate() {
         let lane_requests = per_lane + usize::from(lane < extra);
@@ -306,7 +302,7 @@ impl bencher::TDynBenchFn for FileWriteReadBench {
             let block_size = self.block_size;
             let slots_per_worker = self.slots_per_worker;
             ex.block_on(async {
-                let mut workers = Vec::with_capacity(files.len());
+                let mut workers = FuturesUnordered::new();
                 for (worker_index, file) in files.iter().enumerate() {
                     workers.push(file_write_read_worker(
                         file,
@@ -317,7 +313,7 @@ impl bencher::TDynBenchFn for FileWriteReadBench {
                     ));
                 }
 
-                for result in join_all(workers).await {
+                while let Some(result) = workers.next().await {
                     result.unwrap();
                 }
             });
