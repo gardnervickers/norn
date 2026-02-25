@@ -455,21 +455,28 @@ impl Shared {
     }
 
     fn submit_once(&self, mode: ParkMode) -> io::Result<usize> {
-        let ring = self.ring.borrow();
-        let submitter = ring.submitter();
+        let mut ring = self.ring.borrow_mut();
         Ok(match mode {
             ParkMode::Timeout(duration) => {
                 let ts = Timespec::new()
                     .sec(duration.as_secs())
                     .nsec(duration.subsec_nanos());
                 let args = SubmitArgs::new().timespec(&ts);
-                submitter.submit_with_args(1, &args)?
+                ring.submitter().submit_with_args(1, &args)?
             }
             ParkMode::NextCompletion => {
                 let args = SubmitArgs::new();
-                submitter.submit_with_args(1, &args)?
+                ring.submitter().submit_with_args(1, &args)?
             }
-            ParkMode::NoPark => submitter.submit()?,
+            ParkMode::NoPark => {
+                let sq = ring.submission();
+                if sq.is_empty() {
+                    0
+                } else {
+                    drop(sq);
+                    ring.submitter().submit()?
+                }
+            }
         })
     }
 
@@ -484,7 +491,9 @@ impl Shared {
         loop {
             match self.submit_once(mode) {
                 Ok(submitted) => {
-                    self.backpressure.notify(submitted);
+                    if submitted > 0 {
+                        self.backpressure.notify(submitted);
+                    }
                     return Ok(submitted);
                 }
                 Err(err) if err.raw_os_error() == Some(libc::EINTR) => {
