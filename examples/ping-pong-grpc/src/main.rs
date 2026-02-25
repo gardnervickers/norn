@@ -9,6 +9,7 @@ mod linux {
     use std::pin::{pin, Pin};
     use std::rc::Rc;
     use std::task::{ready, Context, Poll};
+    use std::time::Instant;
 
     use futures_util::StreamExt;
     use norn_executor::{spawn, LocalExecutor};
@@ -27,6 +28,7 @@ mod linux {
         // The inner state is !Send/!Sync (Rc<RefCell<_>>). PanicSyncSend provides
         // runtime thread-affinity checks while satisfying transport trait bounds.
         state: PanicSyncSend<Rc<RefCell<State>>>,
+        disk_io: bool,
     }
 
     #[derive(Default)]
@@ -34,10 +36,98 @@ mod linux {
         request_count: u64,
     }
 
+    #[derive(Debug, Clone, Copy)]
+    struct RunConfig {
+        requests: usize,
+        disk_io: bool,
+        bench: bool,
+    }
+
+    impl Default for RunConfig {
+        fn default() -> Self {
+            Self {
+                requests: 1,
+                disk_io: true,
+                bench: false,
+            }
+        }
+    }
+
+    fn print_usage() {
+        eprintln!(
+            "Usage: cargo run -p ping-pong-grpc -- [--bench] [--requests N] [--disk=on|off|true|false]"
+        );
+    }
+
+    fn parse_bool_arg(raw: &str) -> io::Result<bool> {
+        match raw {
+            "1" | "on" | "true" | "yes" => Ok(true),
+            "0" | "off" | "false" | "no" => Ok(false),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid bool value: {raw}"),
+            )),
+        }
+    }
+
+    fn parse_args() -> io::Result<RunConfig> {
+        let mut config = RunConfig::default();
+        let mut args = std::env::args().skip(1);
+        while let Some(arg) = args.next() {
+            if arg == "--help" || arg == "-h" {
+                print_usage();
+                std::process::exit(0);
+            } else if arg == "--bench" {
+                config.bench = true;
+            } else if arg == "--no-disk" {
+                config.disk_io = false;
+            } else if arg == "--requests" {
+                let raw = args.next().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "missing value for --requests")
+                })?;
+                config.requests = raw.parse::<usize>().map_err(|err| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("invalid --requests value '{raw}': {err}"),
+                    )
+                })?;
+            } else if let Some(raw) = arg.strip_prefix("--requests=") {
+                config.requests = raw.parse::<usize>().map_err(|err| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("invalid --requests value '{raw}': {err}"),
+                    )
+                })?;
+            } else if arg == "--disk" {
+                let raw = args.next().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "missing value for --disk")
+                })?;
+                config.disk_io = parse_bool_arg(&raw)?;
+            } else if let Some(raw) = arg.strip_prefix("--disk=") {
+                config.disk_io = parse_bool_arg(raw)?;
+            } else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("unknown argument: {arg}"),
+                ));
+            }
+        }
+
+        if config.requests == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "requests must be greater than zero",
+            ));
+        }
+
+        Ok(config)
+    }
+
     impl PingPongService {
-        fn new() -> Self {
+        fn new(disk_io: bool) -> Self {
             Self {
                 state: PanicSyncSend::new(Rc::new(RefCell::new(State::default()))),
+                disk_io,
             }
         }
     }
@@ -55,9 +145,13 @@ mod linux {
                 state.request_count
             };
 
-            let disk_echo = PanicSyncSend::new(ping_disk_roundtrip(request_count, &payload))
-                .await
-                .map_err(|err| Status::internal(format!("disk roundtrip failed: {err}")))?;
+            let disk_echo = if self.disk_io {
+                PanicSyncSend::new(ping_disk_roundtrip(request_count, &payload))
+                    .await
+                    .map_err(|err| Status::internal(format!("disk roundtrip failed: {err}")))?
+            } else {
+                payload.clone()
+            };
 
             Ok(Response::new(pingpong::PingReply {
                 message: format!("pong: {payload} (count={request_count}, disk_echo={disk_echo})"),
@@ -104,6 +198,7 @@ mod linux {
     }
 
     pub fn run() -> Result<(), BoxError> {
+        let config = parse_args()?;
         let builder = io_uring::IoUring::builder();
         let driver = norn_uring::Driver::new(builder, 256)?;
         let driver = norn_timer::Driver::new(driver, Clock::system());
@@ -113,13 +208,27 @@ mod linux {
             let listener = TcpListener::bind("127.0.0.1:0".parse()?, 32).await?;
             let addr = listener.local_addr()?;
 
-            let service = PingPongService::new();
+            let service = PingPongService::new(config.disk_io);
             let server = spawn(run_server(listener, service));
 
             let ping = "ping from norn".to_string();
-            let pong = run_client(addr, ping.clone()).await?;
-            println!("request: {ping}");
-            println!("response: {pong}");
+            let start = Instant::now();
+            let pong = run_client(addr, ping.clone(), config.requests).await?;
+            let elapsed = start.elapsed();
+            if config.bench || config.requests > 1 {
+                let elapsed_secs = elapsed.as_secs_f64().max(f64::EPSILON);
+                let elapsed_ms = elapsed_secs * 1_000.0;
+                let req_per_sec = config.requests as f64 / elapsed_secs;
+                println!(
+                    "benchmark mode={} requests={} elapsed_ms={elapsed_ms:.3} req_per_sec={req_per_sec:.3}",
+                    if config.disk_io { "disk" } else { "memory" },
+                    config.requests
+                );
+                println!("last_response: {pong}");
+            } else {
+                println!("request: {ping}");
+                println!("response: {pong}");
+            }
 
             match server.await {
                 Ok(Ok(())) => {}
@@ -153,7 +262,11 @@ mod linux {
         Ok(())
     }
 
-    async fn run_client(addr: SocketAddr, message: String) -> Result<String, BoxError> {
+    async fn run_client(
+        addr: SocketAddr,
+        message: String,
+        requests: usize,
+    ) -> Result<String, BoxError> {
         let socket = TcpSocket::connect(addr).await?;
         let stream = Box::pin(NornIo {
             inner: socket.into_stream(),
@@ -172,13 +285,18 @@ mod linux {
         let service = HyperGrpcService { sender };
         let origin: hyper::Uri = format!("http://{addr}").parse()?;
         let mut client = pingpong::ping_pong_client::PingPongClient::with_origin(service, origin);
+        let mut last_response = String::new();
+        for _ in 0..requests {
+            let response = client
+                .ping(Request::new(pingpong::PingRequest {
+                    message: message.clone(),
+                }))
+                .await?
+                .into_inner();
+            last_response = response.message;
+        }
 
-        let response = client
-            .ping(Request::new(pingpong::PingRequest { message }))
-            .await?
-            .into_inner();
-
-        Ok(response.message)
+        Ok(last_response)
     }
 
     struct HyperGrpcService {

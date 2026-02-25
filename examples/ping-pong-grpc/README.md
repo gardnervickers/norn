@@ -25,3 +25,18 @@ response: pong: ping from norn (count=1, disk_echo=ping from norn)
 
 On non-Linux platforms the binary prints a message and exits, because `norn-uring`
 is Linux-only.
+
+## Benchmark Mode
+
+The binary supports a simple throughput mode:
+
+```bash
+cargo run -p ping-pong-grpc --release -- --bench --requests 500 --disk=off
+cargo run -p ping-pong-grpc --release -- --bench --requests 500 --disk=on
+```
+
+Options:
+
+- `--bench`: print benchmark summary instead of single request/response output.
+- `--requests N`: number of unary RPCs over a single HTTP/2 connection.
+- `--disk=on|off`: enable/disable handler disk roundtrip.
