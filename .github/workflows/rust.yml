@@ -17,6 +17,9 @@ jobs:
     steps:
     - uses: actions/checkout@v3
     - uses: cachix/install-nix-action@v26
+    - uses: Swatinem/rust-cache@v2.7.0
+      with:
+        shared-key: nix-rust
     - name: Build
       run: nix develop -c cargo build
     - name: Run tests
@@ -35,5 +38,8 @@ jobs:
     steps:
     - uses: actions/checkout@v3
     - uses: cachix/install-nix-action@v26
+    - uses: Swatinem/rust-cache@v2.7.0
+      with:
+        shared-key: nix-miri-${{ matrix.package }}
     - name: Run Miri (${{ matrix.package }})
       run: nix develop -c cargo miri test -p ${{ matrix.package }}
