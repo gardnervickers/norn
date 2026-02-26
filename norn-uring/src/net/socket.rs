@@ -597,6 +597,7 @@ impl Singleshot for RecvFromRing {
 }
 
 /// A bufring-backed receive buffer that exposes only payload bytes for `RecvMsgMulti`.
+#[derive(Debug)]
 pub struct RecvMsgRingBuf {
     buf: BufRingBuf,
     payload_offset: usize,
@@ -631,6 +632,7 @@ impl RecvMsgRingBuf {
     }
 }
 
+#[derive(Debug)]
 pub struct RecvFromRingMulti {
     fd: NornFd,
     ring: BufRing,
@@ -714,6 +716,7 @@ impl Multishot for RecvFromRingMulti {
     }
 }
 
+#[derive(Debug)]
 pub struct RecvRingMulti {
     fd: NornFd,
     ring: BufRing,
