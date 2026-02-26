@@ -6,6 +6,7 @@ use std::pin::pin;
 
 use futures_util::StreamExt;
 use norn_executor::spawn;
+use norn_uring::bufring::BufRing;
 use norn_uring::net::{TcpListener, TcpSocket};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -77,6 +78,31 @@ fn echo() -> Result<(), Box<dyn std::error::Error>> {
             assert_eq!(buf, buf2);
         }
 
+        Ok(())
+    })
+}
+
+#[test]
+fn recv_ring_stream_socket_reports_peer() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let listener = TcpListener::bind("127.0.0.1:0".parse()?, 32).await?;
+        let addr = listener.local_addr()?;
+
+        let client_task = spawn(async move { TcpSocket::connect(addr).await });
+        let (server, peer_addr) = listener.accept().await?;
+        let client = client_task.await??;
+
+        let ring = BufRing::builder(7).buf_cnt(16).buf_len(1024).build()?;
+        let payload = b"hello".to_vec();
+        let (send_res, payload) = client.send(payload).await;
+        assert_eq!(send_res?, payload.len());
+
+        let (buf, recv_peer) = server.recv_ring(&ring).await?;
+        assert_eq!(&buf[..payload.len()], payload.as_slice());
+        assert_eq!(recv_peer, peer_addr);
+
+        server.close().await?;
+        client.close().await?;
         Ok(())
     })
 }
