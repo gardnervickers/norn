@@ -207,6 +207,27 @@ fn close_socket() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn poll_readiness_smoke() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let s1 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let s2 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+
+        let writable = s1.poll_readiness::<false>(libc::POLLOUT as u32).await?;
+        assert!(writable.is_writeable() || writable.is_error());
+
+        s1.send_to(Bytes::from_static(b"x"), s2.local_addr()?)
+            .await
+            .0?;
+        let readable = s2.poll_readiness::<false>(libc::POLLIN as u32).await?;
+        assert!(readable.is_readable());
+
+        let (res, _) = s2.recv_from(BytesMut::with_capacity(16)).await;
+        res?;
+        Ok(())
+    })
+}
+
+#[test]
 fn drop_bufring_outside_runtime() -> Result<(), Box<dyn std::error::Error>> {
     let ring = util::with_test_env(|| async {
         let ring = BufRing::builder(3).buf_cnt(8).buf_len(1024).build()?;

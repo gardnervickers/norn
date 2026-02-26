@@ -235,6 +235,14 @@ impl TcpSocket {
         self.socket.close().await
     }
 
+    /// Poll readiness on this socket.
+    ///
+    /// `events` uses `libc::POLL*` flags such as `POLLIN` and `POLLOUT`.
+    /// When `MULTI` is `true`, the returned operation yields a stream of events.
+    pub fn poll_readiness<const MULTI: bool>(&self, events: u32) -> Op<socket::Poll<MULTI>> {
+        self.socket.poll_readiness(events)
+    }
+
     /// Set value for the SO_RCVBUF option on this socket.
     pub fn set_recv_buffer_size(&self, size: usize) -> io::Result<()> {
         self.socket.as_socket()?.set_recv_buffer_size(size)
