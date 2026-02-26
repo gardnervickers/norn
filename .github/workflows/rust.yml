@@ -21,3 +21,17 @@ jobs:
       run: cargo build
     - name: Run tests
       run: cargo test
+
+  miri:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+    - uses: dtolnay/rust-toolchain@nightly
+      with:
+        components: miri,rust-src
+    - uses: Swatinem/rust-cache@v2.7.0
+      with:
+        shared-key: miri-nightly
+    - name: Run Miri (norn-nursery)
+      run: cargo +nightly miri test -p norn-nursery
