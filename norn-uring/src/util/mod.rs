@@ -8,6 +8,9 @@ pub(crate) mod notify;
 /// This will submit a no-op operation to the kernel,
 /// and wait for it to complete. This checks the round-trip
 /// functionality of the driver.
+///
+/// ### Panics
+/// Panics if called outside a running driver context, or if submission fails.
 pub async fn noop() {
     let handle = crate::Handle::current();
 

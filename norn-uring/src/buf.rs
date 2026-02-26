@@ -200,7 +200,7 @@ where
 
     /// Advance the cursor by `n` bytes.
     pub fn consume(&mut self, n: usize) {
-        self.pos += n;
+        self.pos = self.pos.saturating_add(n);
     }
 
     /// Return the inner [`StableBuf`].
@@ -221,7 +221,7 @@ where
     }
 
     fn bytes_init(&self) -> usize {
-        self.buf.bytes_init() - self.pos
+        self.buf.bytes_init().saturating_sub(self.pos)
     }
 }
 
@@ -253,5 +253,27 @@ where
 
     fn bytes_init(&self) -> usize {
         cmp::min(self.buf.bytes_init(), self.limit)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BufCursor, StableBuf};
+
+    #[test]
+    fn cursor_consume_saturates_remaining_len() {
+        let mut cursor = BufCursor::new(vec![1_u8, 2, 3]);
+        cursor.consume(5);
+        assert_eq!(cursor.bytes_init(), 0);
+        assert!(cursor.as_slice().is_empty());
+    }
+
+    #[test]
+    fn cursor_consume_saturates_position_addition() {
+        let mut cursor = BufCursor::new(vec![1_u8, 2, 3]);
+        cursor.consume(usize::MAX);
+        cursor.consume(usize::MAX);
+        assert_eq!(cursor.bytes_init(), 0);
+        assert!(cursor.as_slice().is_empty());
     }
 }

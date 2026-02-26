@@ -25,7 +25,7 @@ const LOG: &str = "norn_uring::driver";
 /// This will have a perf impact on each poll, but may ensure better overall performance.
 const NEEDS_PARK_CHECK_RINGS: bool = true;
 
-/// [`Driver`] provies a [`Park`] implementation which will drive
+/// [`Driver`] provides a [`Park`] implementation which will drive
 /// a [`IoUring`] instance, submitting new requests and waiting
 /// for completions.
 ///

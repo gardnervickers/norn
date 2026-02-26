@@ -6,9 +6,8 @@ use crate::fs::File;
 /// Options and flags which can be used to configure how a file is opened.
 ///
 /// This builder exposes the ability to configure how a [`File`] is opened and
-/// what operations are permitted on the open file. The [`File::open`] and
-/// [`File::create`] methods are aliases for commonly used options using this
-/// builder.
+/// what operations are permitted on the open file. [`File::open`] is a
+/// convenience wrapper for a common read-only configuration of this builder.
 ///
 /// Generally speaking, when using `OpenOptions`, you'll first call
 /// [`OpenOptions::new`], then chain calls to methods to set each option, then
@@ -102,7 +101,7 @@ impl OpenOptions {
     /// whether a file exists and creating a new one, the file may have been
     /// created by another process (a TOCTOU race condition / attack).
     ///
-    /// If `.create_new(true)` is set, [`.create()`] and [`.truncate()`] are
+    /// If `.create_new(true)` is set, [`OpenOptions::create`] and [`OpenOptions::truncate`] are
     /// ignored.
     ///
     /// The file must be opened with write or append access in order to create
