@@ -13,7 +13,7 @@ norn-timer = { path = "../norn-timer" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 norn-uring = { path = "../norn-uring" }
-io-uring = "0.7"
+io-uring = "0.7.11"
 hyper = { version = "1", features = ["client", "server", "http2"] }
 pin-project-lite = "0.2.13"
 tokio = { version = "1.35.0", features = ["io-util"] }

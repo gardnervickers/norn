@@ -126,8 +126,8 @@ impl EchoServer {
         while let Some(socket) = incoming.next().await {
             let socket = socket?;
             // Set small buffer size to test the blocking behavior.
-            socket.set_recv_buffer_size(64)?;
-            socket.set_send_buffer_size(64)?;
+            socket.set_recv_buffer_size(64).await?;
+            socket.set_send_buffer_size(64).await?;
             spawn(async move {
                 let (mut reader, mut writer) = socket.into_stream().owned_split();
                 let mut reader = pin!(reader);
