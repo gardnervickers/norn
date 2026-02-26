@@ -255,6 +255,18 @@ impl Schedule for Scheduler {
     }
 }
 
+struct ScopeClearGuard<'scope, 'env, R> {
+    scope: Rc<Scope<'scope, 'env, R>>,
+}
+
+impl<'scope, 'env, R> Drop for ScopeClearGuard<'scope, 'env, R> {
+    fn drop(&mut self) {
+        // Clear tasks before the scope body frame is dropped, so child futures
+        // cannot outlive borrows owned by the body future.
+        self.scope.clear();
+    }
+}
+
 pin_project! {
     /// The future returned by [`scope_fn`] and [`scope!`].
     #[must_use = "futures do nothing unless polled or awaited"]
@@ -262,6 +274,7 @@ pin_project! {
     where
         F: Future<Output = R>,
     {
+        clear_guard: ScopeClearGuard<'env, 'env, R>,
         #[pin]
         body_future: Option<F>,
         body_result: Option<R>,
@@ -275,6 +288,9 @@ where
 {
     fn new(body_future: F, scope: Rc<Scope<'env, 'env, R>>) -> Self {
         Self {
+            clear_guard: ScopeClearGuard {
+                scope: Rc::clone(&scope),
+            },
             body_future: Some(body_future),
             body_result: None,
             scope,
@@ -546,5 +562,37 @@ mod tests {
 
         drop(fut);
         assert!(dropped.get());
+    }
+
+    #[test]
+    fn drop_partially_polled_scope_cancels_children_before_body_frame_drop() {
+        struct ReadBodyLocalOnDrop<'a> {
+            local: &'a Cell<usize>,
+        }
+
+        impl Future for ReadBodyLocalOnDrop<'_> {
+            type Output = ();
+
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+                Poll::Pending
+            }
+        }
+
+        impl Drop for ReadBodyLocalOnDrop<'_> {
+            fn drop(&mut self) {
+                self.local.set(self.local.get() + 1);
+            }
+        }
+
+        let mut fut = Box::pin(crate::scope!(|scope| {
+            let local = Cell::new(0usize);
+            std::mem::drop(scope.spawn(ReadBodyLocalOnDrop { local: &local }));
+            pending::<()>().await
+        }));
+
+        let poll = poll_once(fut.as_mut());
+        assert!(matches!(poll, Poll::Pending));
+
+        drop(fut);
     }
 }
