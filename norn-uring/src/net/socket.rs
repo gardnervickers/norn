@@ -133,6 +133,16 @@ impl Socket {
         self.handle.submit(op)
     }
 
+    pub(crate) fn recv_from_ring_multi(&self, ring: &BufRing) -> Op<RecvFromRingMulti> {
+        let op = RecvFromRingMulti::new(self.fd.clone(), ring.clone());
+        self.handle.submit(op)
+    }
+
+    pub(crate) fn recv_ring_multi(&self, ring: &BufRing) -> Op<RecvRingMulti> {
+        let op = RecvRingMulti::new(self.fd.clone(), ring.clone(), 0);
+        self.handle.submit(op)
+    }
+
     pub(crate) async fn recv_from<B>(&self, buf: B) -> (io::Result<(usize, SocketAddr)>, B)
     where
         B: StableBufMut + 'static,
@@ -583,6 +593,202 @@ impl Singleshot for RecvFromRing {
         unsafe { this.addr.set_length(msg_namelen) };
         let addr = as_socket_addr_or_peer(&this.fd, &this.addr, msg_namelen)?;
         Ok((buf, addr))
+    }
+}
+
+/// A bufring-backed receive buffer that exposes only payload bytes for `RecvMsgMulti`.
+pub struct RecvMsgRingBuf {
+    buf: BufRingBuf,
+    payload_offset: usize,
+    payload_len: usize,
+}
+
+impl std::ops::Deref for RecvMsgRingBuf {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.payload()
+    }
+}
+
+impl RecvMsgRingBuf {
+    fn new(buf: BufRingBuf, payload_offset: usize, payload_len: usize) -> Self {
+        Self {
+            buf,
+            payload_offset,
+            payload_len,
+        }
+    }
+
+    /// Returns the payload bytes from the received message.
+    pub fn payload(&self) -> &[u8] {
+        &self.buf[self.payload_offset..self.payload_offset + self.payload_len]
+    }
+
+    /// Returns the underlying full buffer including recvmsg metadata prefix.
+    pub fn as_raw(&self) -> &[u8] {
+        &self.buf
+    }
+}
+
+pub struct RecvFromRingMulti {
+    fd: NornFd,
+    ring: BufRing,
+    addr: SockAddr,
+    msghdr: MaybeUninit<libc::msghdr>,
+}
+
+impl RecvFromRingMulti {
+    pub(crate) fn new(fd: NornFd, ring: BufRing) -> Self {
+        // Safety: We won't read from the socket addr until it's initialized by the kernel.
+        let addr = unsafe { SockAddr::try_init(|_, _| Ok(())) }.unwrap().1;
+        Self {
+            fd,
+            ring,
+            addr,
+            msghdr: MaybeUninit::zeroed(),
+        }
+    }
+
+    fn to_item(
+        &mut self,
+        result: crate::operation::CQEResult,
+    ) -> io::Result<(RecvMsgRingBuf, SocketAddr)> {
+        let n = result.result?;
+        let buf = self.ring.get_buf(n, result.flags)?;
+        let msghdr = unsafe { self.msghdr.assume_init_ref() };
+        let recvmsg = io_uring::types::RecvMsgOut::parse(&buf, msghdr).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid recvmsg multishot completion layout",
+            )
+        })?;
+        let addr = socket_addr_from_name(recvmsg.name_data())?;
+        let base_ptr = buf[..].as_ptr() as usize;
+        let payload = recvmsg.payload_data();
+        let payload_offset = payload.as_ptr() as usize - base_ptr;
+        let payload_len = payload.len();
+        Ok((RecvMsgRingBuf::new(buf, payload_offset, payload_len), addr))
+    }
+}
+
+impl Operation for RecvFromRingMulti {
+    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+        let this = unsafe { self.get_unchecked_mut() };
+        let msghdr = this.msghdr.as_mut_ptr();
+        unsafe {
+            (*msghdr).msg_name = this.addr.as_ptr() as *mut libc::c_void;
+            (*msghdr).msg_namelen = this.addr.len() as _;
+            (*msghdr).msg_control = std::ptr::null_mut();
+            (*msghdr).msg_controllen = 0;
+            (*msghdr).msg_iov = std::ptr::null_mut();
+            (*msghdr).msg_iovlen = 0;
+        }
+
+        match this.fd.kind() {
+            crate::fd::FdKind::Fd(fd) => {
+                opcode::RecvMsgMulti::new(types::Fd(fd.0), msghdr, this.ring.bgid()).build()
+            }
+            crate::fd::FdKind::Fixed(fd) => {
+                opcode::RecvMsgMulti::new(types::Fixed(fd.0), msghdr, this.ring.bgid()).build()
+            }
+        }
+    }
+
+    fn cleanup(&mut self, result: crate::operation::CQEResult) {
+        if let Ok(n) = result.result {
+            drop(self.ring.get_buf(n, result.flags));
+        }
+    }
+}
+
+impl Multishot for RecvFromRingMulti {
+    type Item = io::Result<(RecvMsgRingBuf, SocketAddr)>;
+
+    fn update(&mut self, result: crate::operation::CQEResult) -> Self::Item {
+        self.to_item(result)
+    }
+
+    fn complete(mut self, result: crate::operation::CQEResult) -> Option<Self::Item> {
+        Some(self.to_item(result))
+    }
+}
+
+pub struct RecvRingMulti {
+    fd: NornFd,
+    ring: BufRing,
+    flags: i32,
+}
+
+impl RecvRingMulti {
+    pub(crate) fn new(fd: NornFd, ring: BufRing, flags: i32) -> Self {
+        Self { fd, ring, flags }
+    }
+
+    fn to_item(&self, result: crate::operation::CQEResult) -> io::Result<BufRingBuf> {
+        let n = result.result?;
+        self.ring.get_buf(n, result.flags)
+    }
+}
+
+impl Operation for RecvRingMulti {
+    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+        let this = unsafe { self.get_unchecked_mut() };
+        match this.fd.kind() {
+            crate::fd::FdKind::Fd(fd) => opcode::RecvMulti::new(types::Fd(fd.0), this.ring.bgid())
+                .flags(this.flags)
+                .build(),
+            crate::fd::FdKind::Fixed(fd) => {
+                opcode::RecvMulti::new(types::Fixed(fd.0), this.ring.bgid())
+                    .flags(this.flags)
+                    .build()
+            }
+        }
+    }
+
+    fn cleanup(&mut self, result: crate::operation::CQEResult) {
+        if let Ok(n) = result.result {
+            drop(self.ring.get_buf(n, result.flags));
+        }
+    }
+}
+
+impl Multishot for RecvRingMulti {
+    type Item = io::Result<BufRingBuf>;
+
+    fn update(&mut self, result: crate::operation::CQEResult) -> Self::Item {
+        self.to_item(result)
+    }
+
+    fn complete(self, result: crate::operation::CQEResult) -> Option<Self::Item> {
+        Some(self.to_item(result))
+    }
+}
+
+fn socket_addr_from_name(name: &[u8]) -> io::Result<SocketAddr> {
+    if name.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "recvmsg completion did not include source address",
+        ));
+    }
+    if name.len() > std::mem::size_of::<libc::sockaddr_storage>() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "recvmsg completion source address exceeded storage size",
+        ));
+    }
+    let mut storage = std::mem::MaybeUninit::<libc::sockaddr_storage>::zeroed();
+    unsafe {
+        std::ptr::copy_nonoverlapping(name.as_ptr(), storage.as_mut_ptr() as *mut u8, name.len());
+        let storage = storage.assume_init();
+        let addr = SockAddr::new(storage, name.len() as libc::socklen_t);
+        addr.as_socket().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "recvmsg completion had unsupported address family",
+            )
+        })
     }
 }
 

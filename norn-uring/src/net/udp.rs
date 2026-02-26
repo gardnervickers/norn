@@ -183,6 +183,20 @@ impl UdpSocket {
         self.inner.poll_readiness(events)
     }
 
+    /// Receives datagrams from this socket using a multishot recvmsg operation backed by the
+    /// provided buffer ring.
+    ///
+    /// Each yielded item includes payload bytes and the sender address.
+    pub fn recv_from_ring_multi(&self, ring: &BufRing) -> Op<socket::RecvFromRingMulti> {
+        self.inner.recv_from_ring_multi(ring)
+    }
+
+    /// Receives datagrams from a connected socket using a multishot recv operation backed by the
+    /// provided buffer ring.
+    pub fn recv_ring_multi(&self, ring: &BufRing) -> Op<socket::RecvRingMulti> {
+        self.inner.recv_ring_multi(ring)
+    }
+
     /// Close the socket.
     ///
     /// This will wait for all pending operations to complete before closing the socket.

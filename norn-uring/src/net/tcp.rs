@@ -215,6 +215,11 @@ impl TcpSocket {
         self.socket.recv_from_ring(ring)
     }
 
+    /// Receive data using a multishot recv operation and a provided buffer ring.
+    pub fn recv_ring_multi(&self, ring: &BufRing) -> Op<socket::RecvRingMulti> {
+        self.socket.recv_ring_multi(ring)
+    }
+
     /// Convert this socket into a stream.
     ///
     /// [`TcpStream`] is a stateful wrapper around [`TcpSocket`] that implements

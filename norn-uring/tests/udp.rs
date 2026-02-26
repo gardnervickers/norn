@@ -1,6 +1,9 @@
 #![cfg(target_os = "linux")]
 
+use std::pin::pin;
+
 use bytes::{Bytes, BytesMut};
+use futures_util::StreamExt;
 use norn_uring::bufring::BufRing;
 use norn_uring::net::UdpSocket;
 
@@ -102,6 +105,49 @@ fn send_recv_ring() -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(s1.local_addr()?, addr);
         // Assert that the message is correct
         assert_eq!(b"hello", &buf[..5]);
+
+        Ok(())
+    })
+}
+
+#[test]
+fn send_recv_ring_multi_msg() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let ring = BufRing::builder(4).buf_cnt(32).buf_len(2048).build()?;
+        let s1 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let s2 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let sender = s1.local_addr()?;
+
+        let mut recv = pin!(s2.recv_from_ring_multi(&ring));
+        let messages: [&[u8]; 3] = [b"alpha", b"beta", b"gamma"];
+        for message in messages {
+            let payload = Bytes::copy_from_slice(message);
+            s1.send_to(payload, s2.local_addr()?).await.0?;
+            let (buf, addr) = recv.next().await.expect("multishot stream ended")??;
+            assert_eq!(addr, sender);
+            assert_eq!(&buf[..], message);
+        }
+
+        Ok(())
+    })
+}
+
+#[test]
+fn connected_send_recv_ring_multi() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let ring = BufRing::builder(5).buf_cnt(32).buf_len(2048).build()?;
+        let s1 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let s2 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        s1.connect(s2.local_addr()?).await?;
+        s2.connect(s1.local_addr()?).await?;
+
+        let mut recv = pin!(s2.recv_ring_multi(&ring));
+        let messages: [&[u8]; 3] = [b"one", b"two", b"three"];
+        for message in messages {
+            s1.send(Bytes::copy_from_slice(message)).await.0?;
+            let buf = recv.next().await.expect("multishot stream ended")??;
+            assert_eq!(&buf[..], message);
+        }
 
         Ok(())
     })
