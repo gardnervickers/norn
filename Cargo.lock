@@ -581,6 +581,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "norn-nursery"
+version = "0.1.0"
+dependencies = [
+ "norn-executor",
+ "norn-task",
+ "pin-project-lite",
+]
+
+[[package]]
 name = "norn-task"
 version = "0.1.0"
 dependencies = [
