@@ -30,6 +30,43 @@ type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 /// Child jobs may borrow from stack values that outlive the scope and they are
 /// all driven to completion before the scope completes, unless the scope is
 /// terminated early via [`Scope::terminate`].
+///
+/// # Examples
+///
+/// ```rust
+/// use norn_executor::park::SpinPark;
+/// use norn_executor::LocalExecutor;
+///
+/// let mut ex = LocalExecutor::new(SpinPark);
+/// let output = ex.block_on(async {
+///     let value = 21;
+///     norn_nursery::scope!(|scope| {
+///         let child = scope.spawn(async move { value * 2 });
+///         child.await.unwrap() + 1
+///     })
+///     .await
+/// });
+///
+/// assert_eq!(output, 43);
+/// ```
+///
+/// ```rust
+/// use norn_executor::park::SpinPark;
+/// use norn_executor::LocalExecutor;
+///
+/// let mut ex = LocalExecutor::new(SpinPark);
+/// let output = ex.block_on(async {
+///     norn_nursery::scope!(|scope| -> Result<(), &'static str> {
+///         std::mem::drop(scope.spawn(async move {
+///             let _: () = scope.terminate(Err("stop")).await;
+///         }));
+///         Ok(())
+///     })
+///     .await
+/// });
+///
+/// assert_eq!(output, Err("stop"));
+/// ```
 #[macro_export]
 macro_rules! scope {
     (|$scope:ident| -> $result:ty { $($body:tt)* }) => {{
@@ -95,6 +132,26 @@ impl<'scope, 'env, R> Scope<'scope, 'env, R> {
     ///
     /// The returned future never resolves; awaiting it is a convenient way to
     /// stop the current task immediately.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use norn_executor::park::SpinPark;
+    /// use norn_executor::LocalExecutor;
+    ///
+    /// let mut ex = LocalExecutor::new(SpinPark);
+    /// let output = ex.block_on(async {
+    ///     norn_nursery::scope!(|scope| -> Result<(), &'static str> {
+    ///         std::mem::drop(scope.spawn(async move {
+    ///             let _: () = scope.terminate(Err("cancelled")).await;
+    ///         }));
+    ///         Ok(())
+    ///     })
+    ///     .await
+    /// });
+    ///
+    /// assert_eq!(output, Err("cancelled"));
+    /// ```
     pub fn terminate<T>(&'scope self, value: R) -> impl Future<Output = T> + 'scope
     where
         T: 'scope,
