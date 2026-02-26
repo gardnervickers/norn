@@ -1,6 +1,14 @@
 [workspace]
 resolver = "2"
-members = [ "benches", "norn-executor", "norn-task" , "norn-timer", "norn-uring", "norn-util" ]
+members = [
+    "benches",
+    "examples/ping-pong-grpc",
+    "norn-executor",
+    "norn-task",
+    "norn-timer",
+    "norn-uring",
+    "norn-util",
+]
 default-members = ["norn-executor", "norn-task", "norn-timer", "norn-uring", "norn-util"]
 
 [workspace.dependencies]
