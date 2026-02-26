@@ -34,11 +34,6 @@ jobs:
 
     steps:
     - uses: actions/checkout@v3
-    - uses: dtolnay/rust-toolchain@nightly
-      with:
-        components: miri,rust-src
-    - uses: Swatinem/rust-cache@v2.7.0
-      with:
-        shared-key: miri-nightly
+    - uses: cachix/install-nix-action@v26
     - name: Run Miri (${{ matrix.package }})
-      run: cargo +nightly miri test -p ${{ matrix.package }}
+      run: nix develop -c cargo miri test -p ${{ matrix.package }}
