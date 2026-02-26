@@ -123,7 +123,7 @@ fn send_recv_ring_multi_msg() -> Result<(), Box<dyn std::error::Error>> {
         for message in messages {
             let payload = Bytes::copy_from_slice(message);
             s1.send_to(payload, s2.local_addr()?).await.0?;
-            let (buf, addr) = recv.next().await.expect("multishot stream ended")??;
+            let (buf, addr) = recv.next().await.expect("multishot stream ended")?;
             assert_eq!(addr, sender);
             assert_eq!(&buf[..], message);
         }
@@ -145,7 +145,7 @@ fn connected_send_recv_ring_multi() -> Result<(), Box<dyn std::error::Error>> {
         let messages: [&[u8]; 3] = [b"one", b"two", b"three"];
         for message in messages {
             s1.send(Bytes::copy_from_slice(message)).await.0?;
-            let buf = recv.next().await.expect("multishot stream ended")??;
+            let buf = recv.next().await.expect("multishot stream ended")?;
             assert_eq!(&buf[..], message);
         }
 
