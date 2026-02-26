@@ -39,15 +39,24 @@ type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 ///
 /// let mut ex = LocalExecutor::new(SpinPark);
 /// let output = ex.block_on(async {
-///     let value = 21;
+///     let values = vec![10, 11, 12];
+///     let suffix = String::from("!");
 ///     norn_nursery::scope!(|scope| {
-///         let child = scope.spawn(async move { value * 2 });
-///         child.await.unwrap() + 1
+///         // These child futures borrow from stack data outside the scope body:
+///         // `values` and `suffix` are not `'static`.
+///         let first = scope.spawn(async {
+///             values.iter().sum::<i32>()
+///         });
+///         let second = scope.spawn(async {
+///             suffix.len()
+///         });
+///
+///         first.await.unwrap() + second.await.unwrap() as i32
 ///     })
 ///     .await
 /// });
 ///
-/// assert_eq!(output, 43);
+/// assert_eq!(output, 34);
 /// ```
 ///
 /// ```rust
