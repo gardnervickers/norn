@@ -18,6 +18,49 @@ use crate::bufring::{BufRing, BufRingBuf};
 use crate::fd::NornFd;
 use crate::operation::{Multishot, Op, Operation, Singleshot};
 
+fn invalid_socket_addr_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "socket operation returned a non-inet socket address",
+    )
+}
+
+fn no_source_addr_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "recvmsg did not return a source socket address",
+    )
+}
+
+fn fixed_fd_unsupported_error(context: &'static str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!("fixed descriptors are not supported for {context}"),
+    )
+}
+
+fn as_socket_addr(addr: &SockAddr) -> io::Result<SocketAddr> {
+    addr.as_socket().ok_or_else(invalid_socket_addr_error)
+}
+
+fn as_socket_addr_or_peer(
+    fd: &NornFd,
+    addr: &SockAddr,
+    msg_namelen: libc::socklen_t,
+) -> io::Result<SocketAddr> {
+    if msg_namelen == 0 {
+        let sock = match fd.kind() {
+            crate::fd::FdKind::Fd(fd) => unsafe { socket2::Socket::from_raw_fd(fd.0) },
+            crate::fd::FdKind::Fixed(_) => {
+                return Err(fixed_fd_unsupported_error("peer address lookup"))
+            }
+        };
+        let sock = ManuallyDrop::new(sock);
+        return as_socket_addr(&sock.peer_addr()?);
+    }
+    as_socket_addr(addr)
+}
+
 #[derive(Clone)]
 pub(crate) struct Socket {
     fd: NornFd,
@@ -55,13 +98,13 @@ impl Socket {
     ) -> io::Result<Self> {
         let addr = SockAddr::from(addr);
         let socket = Self::open(domain, socket_type, None).await?;
-        let s = socket.as_socket();
+        let s = socket.as_socket()?;
         s.bind(&addr)?;
         Ok(socket)
     }
 
     pub(crate) fn listen(&self, backlog: u32) -> io::Result<()> {
-        let s = self.as_socket();
+        let s = self.as_socket()?;
         s.listen(backlog as _)?;
         Ok(())
     }
@@ -178,20 +221,20 @@ impl Socket {
     }
 
     pub(crate) fn local_addr(&self) -> io::Result<SocketAddr> {
-        Ok(self.as_socket().local_addr()?.as_socket().unwrap())
+        as_socket_addr(&self.as_socket()?.local_addr()?)
     }
 
     pub(crate) fn peer_addr(&self) -> io::Result<SocketAddr> {
-        Ok(self.as_socket().peer_addr()?.as_socket().unwrap())
+        as_socket_addr(&self.as_socket()?.peer_addr()?)
     }
 
-    pub(crate) fn as_socket(&self) -> ManuallyDrop<socket2::Socket> {
+    pub(crate) fn as_socket(&self) -> io::Result<ManuallyDrop<socket2::Socket>> {
         match self.fd.kind() {
             crate::fd::FdKind::Fd(fd) => {
                 let sock = unsafe { socket2::Socket::from_raw_fd(fd.0) };
-                ManuallyDrop::new(sock)
+                Ok(ManuallyDrop::new(sock))
             }
-            crate::fd::FdKind::Fixed(_) => unimplemented!(),
+            crate::fd::FdKind::Fixed(_) => Err(fixed_fd_unsupported_error("socket2 operations")),
         }
     }
 
@@ -407,14 +450,25 @@ where
     type Output = (io::Result<(usize, SocketAddr)>, B);
 
     fn complete(self, result: crate::operation::CQEResult) -> Self::Output {
+        let mut this = self;
         match result.result {
             Ok(bytes_read) => {
-                let addr = self.addr.as_socket().unwrap();
-                let mut buf = self.buf;
+                // Safety: the msghdr was initialized when the sqe was configured.
+                let msg_namelen = unsafe { this.msghdr.assume_init_ref().msg_namelen };
+                if msg_namelen == 0 {
+                    return (Err(no_source_addr_error()), this.buf);
+                }
+                // Safety: the kernel wrote at most `msg_namelen` bytes into `addr`.
+                unsafe { this.addr.set_length(msg_namelen) };
+                let addr = match as_socket_addr(&this.addr) {
+                    Ok(addr) => addr,
+                    Err(err) => return (Err(err), this.buf),
+                };
+                let mut buf = this.buf;
                 unsafe { buf.set_init(bytes_read as usize) };
                 (Ok((bytes_read as usize, addr)), buf)
             }
-            Err(err) => (Err(err), self.buf),
+            Err(err) => (Err(err), this.buf),
         }
     }
 }
@@ -474,9 +528,14 @@ impl Singleshot for RecvFromRing {
     type Output = io::Result<(BufRingBuf, SocketAddr)>;
 
     fn complete(self, result: crate::operation::CQEResult) -> Self::Output {
+        let mut this = self;
         let n = result.result?;
-        let buf = self.ring.get_buf(n, result.flags)?;
-        let addr = self.addr.as_socket().unwrap();
+        let buf = this.ring.get_buf(n, result.flags)?;
+        // Safety: the msghdr was initialized when the sqe was configured.
+        let msg_namelen = unsafe { this.msghdr.assume_init_ref().msg_namelen };
+        // Safety: the kernel wrote at most `msg_namelen` bytes into `addr`.
+        unsafe { this.addr.set_length(msg_namelen) };
+        let addr = as_socket_addr_or_peer(&this.fd, &this.addr, msg_namelen)?;
         Ok((buf, addr))
     }
 }
@@ -546,7 +605,7 @@ impl Singleshot for Accept<false> {
         let fd = result.result?;
         // Safety: the kernel wrote at most `addr_len` bytes into `addr`.
         unsafe { this.addr.set_length(this.addr_len) };
-        let addr = this.addr.as_socket().unwrap();
+        let addr = as_socket_addr(&this.addr)?;
         Ok((NornFd::from_fd(fd as i32), addr))
     }
 }
@@ -733,6 +792,7 @@ where
     }
 }
 
+#[derive(Debug)]
 pub struct Poll<const MULTI: bool> {
     fd: NornFd,
     events: u32,

@@ -7,6 +7,7 @@ use socket2::{Domain, Type};
 use crate::buf::{StableBuf, StableBufMut};
 use crate::bufring::{BufRing, BufRingBuf};
 use crate::net::socket;
+use crate::operation::Op;
 
 /// A UDP socket.
 ///
@@ -165,13 +166,21 @@ impl UdpSocket {
         self.recv_from_with_flags(buf, flags).await
     }
 
-    /// Sends a single datagram message on the socket to the given address using a buffer
+    /// Receives a single datagram message on the socket using a buffer
     /// from the given ring.
     ///
     /// The buffer ring used must contain buffers of sufficient size to hold the message. If
     /// a message is too long to fit in the supplied, buffer, excess bytes may be discarded.
     pub async fn recv_from_ring(&self, ring: &BufRing) -> io::Result<(BufRingBuf, SocketAddr)> {
         self.inner.recv_from_ring(ring).await
+    }
+
+    /// Poll readiness on this socket.
+    ///
+    /// `events` uses `libc::POLL*` flags such as `POLLIN` and `POLLOUT`.
+    /// When `MULTI` is `true`, the returned operation yields a stream of events.
+    pub fn poll_readiness<const MULTI: bool>(&self, events: u32) -> Op<socket::Poll<MULTI>> {
+        self.inner.poll_readiness(events)
     }
 
     /// Close the socket.
