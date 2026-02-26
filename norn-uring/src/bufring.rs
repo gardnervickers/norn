@@ -1,4 +1,4 @@
-//! Support for io_uring registered bufer ring.
+//! Support for io_uring registered buffer rings.
 //!
 //! Copied from the test code here
 //! https://github.com/tokio-rs/io-uring/blob/master/io-uring-test/src/tests/register_buf_ring.rs
@@ -69,7 +69,7 @@ impl BufRing {
 ///
 /// It is reference counted and will be returned to the buffer ring when dropped.
 /// Users should be careful to drop the buffer as soon as possible to avoid
-/// exausting the buffer ring.
+/// exhausting the buffer ring.
 pub struct BufRingBuf {
     bufgroup: BufRing,
     len: usize,
@@ -94,29 +94,25 @@ impl BufRingBuf {
         Self { bufgroup, len, bid }
     }
 
-    // Return the number of bytes initialized.
-    //
-    // This value initially came from the kernel, as reported in the cqe. This value may have been
-    // modified with a call to the IoBufMut::set_init method.
-    #[allow(dead_code)]
-    fn len(&self) -> usize {
+    /// Return the number of bytes initialized in this buffer.
+    ///
+    /// This is the length reported by the kernel for the completed operation.
+    pub fn len(&self) -> usize {
         self.len as _
     }
 
-    // Return true if this represents an empty buffer. The length reported by the kernel was 0.
-    #[allow(dead_code)]
-    fn is_empty(&self) -> bool {
+    /// Return `true` if this buffer contains no initialized bytes.
+    pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    // Return the capacity of this buffer.
-    #[allow(dead_code)]
-    fn cap(&self) -> usize {
+    /// Return the total capacity of this buffer.
+    pub fn capacity(&self) -> usize {
         self.bufgroup.rc.buf_capacity()
     }
 
-    // Return a byte slice reference.
-    fn as_slice(&self) -> &[u8] {
+    /// Return this buffer as a byte slice.
+    pub fn as_slice(&self) -> &[u8] {
         let p = self.bufgroup.rc.stable_ptr(self.bid);
         unsafe { std::slice::from_raw_parts(p, self.len) }
     }
@@ -129,11 +125,11 @@ impl Drop for BufRingBuf {
     }
 }
 
-/// [Bgid] is used to identify a buffer group.
-pub(crate) type Bgid = u16;
+/// Identifier for a registered buffer group.
+pub type Bgid = u16;
 
-/// [Bid] is used to identify a buffer within a buffer group.
-pub(crate) type Bid = u16;
+/// Identifier for a buffer within a registered buffer group.
+pub type Bid = u16;
 
 fn selected_bid_from_flags(flags: u32) -> io::Result<Bid> {
     io_uring::cqueue::buffer_select(flags).ok_or_else(|| {

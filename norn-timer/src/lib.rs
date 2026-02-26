@@ -6,6 +6,11 @@
 //! This implementation takes a different approach for
 //! storing timers and integrates with Norn's [`Park`] trait.
 //!
+//! # Components
+//! - [`Driver`]: [`Park`] wrapper that advances timer wheels.
+//! - [`Handle`]: creates [`Sleep`] futures.
+//! - [`Clock`]: system or simulated time source.
+//!
 //! [Tokio]:https://github.com/tokio-rs/tokio
 #![deny(
     missing_docs,
@@ -20,6 +25,7 @@ use std::task::Context;
 use std::time::Duration;
 
 pub use clock::Clock;
+pub use error::{Error, ErrorKind};
 use norn_executor::park::{Park, ParkMode};
 
 mod clock;
@@ -72,7 +78,7 @@ pin_project_lite::pin_project! {
     /// Future returned by [`Handle::sleep`].
     ///
     /// This future will resolve once the specified duration has elapsed,
-    /// or the time driver is shutdown.
+    /// or the time driver is shut down.
     #[must_use = "futures do nothing unless you `.await` or poll them"]
     pub struct Sleep {
         #[pin]
@@ -87,7 +93,7 @@ impl std::fmt::Debug for Sleep {
 }
 
 impl Future for Sleep {
-    type Output = Result<(), error::Error>;
+    type Output = Result<(), Error>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> std::task::Poll<Self::Output> {
         self.project().inner.poll(cx)

@@ -1,4 +1,7 @@
 //! Filesystem operations.
+//!
+//! Unless otherwise documented, functions and methods in this module require
+//! an active [`crate::Driver`] context.
 
 mod dir;
 mod file;

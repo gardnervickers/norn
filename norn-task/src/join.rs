@@ -34,7 +34,7 @@ impl<T> JoinHandle<T> {
 
     /// Detach the task from this [`JoinHandle`].
     ///
-    /// This is a convinience method that will drop the [`JoinHandle`] without
+    /// This is a convenience method that will drop the [`JoinHandle`] without
     /// cancelling the task. This signals intent to the reader that the task
     /// result is not needed.
     pub fn detach(self) {}

@@ -10,6 +10,10 @@ use norn_task::{JoinHandle, Runnable, Schedule, TaskSet};
 
 /// [`PollSet`] provides a way to spawn and run tasks within
 /// a scope.
+///
+/// Polling a `PollSet` drives all currently runnable tasks and then returns
+/// [`Poll::Pending`]. It is intended to be embedded in another future that
+/// controls lifecycle and shutdown.
 #[must_use = "futures do nothing unless awaited or polled"]
 pub struct PollSet {
     shared: Rc<Shared>,
@@ -26,6 +30,7 @@ struct Scheduler {
 }
 
 impl PollSet {
+    /// Create an empty [`PollSet`].
     pub fn new() -> Self {
         let shared = Shared {
             waker: RefCell::new(None),
@@ -37,6 +42,10 @@ impl PollSet {
         }
     }
 
+    /// Spawn a task into this poll set and return a [`JoinHandle`] for its output.
+    ///
+    /// The task is scheduled on this poll set's local queue and will be driven when
+    /// the [`PollSet`] future is polled.
     pub fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
     where
         F: Future + 'static,
