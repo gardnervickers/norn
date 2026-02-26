@@ -32,6 +32,13 @@ fn no_source_addr_error() -> io::Error {
     )
 }
 
+fn fixed_fd_unsupported_error(context: &'static str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!("fixed descriptors are not supported for {context}"),
+    )
+}
+
 fn as_socket_addr(addr: &SockAddr) -> io::Result<SocketAddr> {
     addr.as_socket().ok_or_else(invalid_socket_addr_error)
 }
@@ -44,7 +51,9 @@ fn as_socket_addr_or_peer(
     if msg_namelen == 0 {
         let sock = match fd.kind() {
             crate::fd::FdKind::Fd(fd) => unsafe { socket2::Socket::from_raw_fd(fd.0) },
-            crate::fd::FdKind::Fixed(_) => unimplemented!(),
+            crate::fd::FdKind::Fixed(_) => {
+                return Err(fixed_fd_unsupported_error("peer address lookup"))
+            }
         };
         let sock = ManuallyDrop::new(sock);
         return as_socket_addr(&sock.peer_addr()?);
@@ -89,13 +98,13 @@ impl Socket {
     ) -> io::Result<Self> {
         let addr = SockAddr::from(addr);
         let socket = Self::open(domain, socket_type, None).await?;
-        let s = socket.as_socket();
+        let s = socket.as_socket()?;
         s.bind(&addr)?;
         Ok(socket)
     }
 
     pub(crate) fn listen(&self, backlog: u32) -> io::Result<()> {
-        let s = self.as_socket();
+        let s = self.as_socket()?;
         s.listen(backlog as _)?;
         Ok(())
     }
@@ -212,20 +221,20 @@ impl Socket {
     }
 
     pub(crate) fn local_addr(&self) -> io::Result<SocketAddr> {
-        as_socket_addr(&self.as_socket().local_addr()?)
+        as_socket_addr(&self.as_socket()?.local_addr()?)
     }
 
     pub(crate) fn peer_addr(&self) -> io::Result<SocketAddr> {
-        as_socket_addr(&self.as_socket().peer_addr()?)
+        as_socket_addr(&self.as_socket()?.peer_addr()?)
     }
 
-    pub(crate) fn as_socket(&self) -> ManuallyDrop<socket2::Socket> {
+    pub(crate) fn as_socket(&self) -> io::Result<ManuallyDrop<socket2::Socket>> {
         match self.fd.kind() {
             crate::fd::FdKind::Fd(fd) => {
                 let sock = unsafe { socket2::Socket::from_raw_fd(fd.0) };
-                ManuallyDrop::new(sock)
+                Ok(ManuallyDrop::new(sock))
             }
-            crate::fd::FdKind::Fixed(_) => unimplemented!(),
+            crate::fd::FdKind::Fixed(_) => Err(fixed_fd_unsupported_error("socket2 operations")),
         }
     }
 
@@ -596,7 +605,7 @@ impl Singleshot for Accept<false> {
         let fd = result.result?;
         // Safety: the kernel wrote at most `addr_len` bytes into `addr`.
         unsafe { this.addr.set_length(this.addr_len) };
-        let addr = this.addr.as_socket().unwrap();
+        let addr = as_socket_addr(&this.addr)?;
         Ok((NornFd::from_fd(fd as i32), addr))
     }
 }

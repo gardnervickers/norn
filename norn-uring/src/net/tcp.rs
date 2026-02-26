@@ -76,7 +76,7 @@ impl TcpListener {
 
     /// Set value for the SO_REUSEADDR option on this socket.
     pub fn set_reuse_address(&self, reuse: bool) -> io::Result<()> {
-        self.socket.as_socket().set_reuse_address(reuse)
+        self.socket.as_socket()?.set_reuse_address(reuse)
     }
 
     /// Returns the local address that this listener is bound to.
@@ -245,25 +245,25 @@ impl TcpSocket {
 
     /// Set value for the SO_RCVBUF option on this socket.
     pub fn set_recv_buffer_size(&self, size: usize) -> io::Result<()> {
-        self.socket.as_socket().set_recv_buffer_size(size)
+        self.socket.as_socket()?.set_recv_buffer_size(size)
     }
     /// Set value for the SO_SNDBUF option on this socket.
     pub fn set_send_buffer_size(&self, size: usize) -> io::Result<()> {
-        self.socket.as_socket().set_send_buffer_size(size)
+        self.socket.as_socket()?.set_send_buffer_size(size)
     }
 
     /// Set value for the SO_REUSEADDR option on this socket.
     pub fn set_reuse_address(&self, reuse: bool) -> io::Result<()> {
-        self.socket.as_socket().set_reuse_address(reuse)
+        self.socket.as_socket()?.set_reuse_address(reuse)
     }
 
     /// Set value for the SO_KEEPALIVE option on this socket.
     pub fn set_keepalive(&self, keepalive: bool) -> io::Result<()> {
-        self.socket.as_socket().set_keepalive(keepalive)
+        self.socket.as_socket()?.set_keepalive(keepalive)
     }
     /// Set the value of the TCP_NODELAY option on this socket.
     pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
-        self.socket.as_socket().set_nodelay(nodelay)
+        self.socket.as_socket()?.set_nodelay(nodelay)
     }
 }
 
@@ -436,7 +436,7 @@ impl ReadyStream {
             ready!(self.as_mut().poll_ready(cx, flags))?;
             log::trace!(target: LOG, "poll_op.ready");
             let this = self.as_mut().project();
-            let sock = this.inner.as_socket();
+            let sock = this.inner.as_socket()?;
             match f(sock) {
                 Ok(res) => {
                     log::trace!(target: LOG, "poll_op.success");
