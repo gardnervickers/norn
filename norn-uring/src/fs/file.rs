@@ -156,8 +156,7 @@ impl File {
 
 struct Open {
     path: std::ffi::CString,
-    access_mode: i32,
-    creation_mode: i32,
+    how: types::OpenHow,
 }
 
 impl Open {
@@ -166,11 +165,9 @@ impl Open {
             .to_str()
             .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
         let path = std::ffi::CString::new(path)?;
-        Ok(Self {
-            path,
-            access_mode,
-            creation_mode,
-        })
+        let flags = access_mode | creation_mode | libc::O_CLOEXEC;
+        let how = types::OpenHow::new().flags(flags as u64);
+        Ok(Self { path, how })
     }
 }
 
@@ -178,9 +175,7 @@ impl Operation for Open {
     fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
         let this = self.get_mut();
         let ptr = this.path.as_ptr();
-        opcode::OpenAt::new(types::Fd(libc::AT_FDCWD), ptr)
-            .flags(this.access_mode | this.creation_mode | libc::O_CLOEXEC)
-            .build()
+        opcode::OpenAt2::new(types::Fd(libc::AT_FDCWD), ptr, &this.how).build()
     }
 
     fn cleanup(&mut self, result: CQEResult) {

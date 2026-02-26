@@ -96,17 +96,18 @@ impl Socket {
         domain: Domain,
         socket_type: Type,
     ) -> io::Result<Self> {
-        let addr = SockAddr::from(addr);
         let socket = Self::open(domain, socket_type, None).await?;
-        let s = socket.as_socket()?;
-        s.bind(&addr)?;
+        let op = BindSocket::new(socket.fd.clone(), addr);
+        socket.handle.submit(op).await?;
         Ok(socket)
     }
 
-    pub(crate) fn listen(&self, backlog: u32) -> io::Result<()> {
-        let s = self.as_socket()?;
-        s.listen(backlog as _)?;
-        Ok(())
+    pub(crate) async fn listen(&self, backlog: u32) -> io::Result<()> {
+        let backlog = i32::try_from(backlog).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "listen backlog exceeds i32")
+        })?;
+        let op = ListenSocket::new(self.fd.clone(), backlog);
+        self.handle.submit(op).await
     }
 
     pub(crate) async fn accept(&self) -> io::Result<(Self, SocketAddr)> {
@@ -240,6 +241,51 @@ impl Socket {
 
     pub(crate) async fn close(self) -> io::Result<()> {
         self.fd.close().await
+    }
+
+    pub(crate) async fn set_recv_buffer_size(&self, size: usize) -> io::Result<()> {
+        let size = i32::try_from(size).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "receive buffer size exceeds i32",
+            )
+        })?;
+        self.set_sock_opt(libc::SOL_SOCKET, libc::SO_RCVBUF, size)
+            .await
+    }
+
+    pub(crate) async fn set_send_buffer_size(&self, size: usize) -> io::Result<()> {
+        let size = i32::try_from(size).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "send buffer size exceeds i32")
+        })?;
+        self.set_sock_opt(libc::SOL_SOCKET, libc::SO_SNDBUF, size)
+            .await
+    }
+
+    pub(crate) async fn set_reuse_address(&self, reuse: bool) -> io::Result<()> {
+        let reuse = if reuse { 1 } else { 0 };
+        self.set_sock_opt(libc::SOL_SOCKET, libc::SO_REUSEADDR, reuse)
+            .await
+    }
+
+    pub(crate) async fn set_keepalive(&self, keepalive: bool) -> io::Result<()> {
+        let keepalive = if keepalive { 1 } else { 0 };
+        self.set_sock_opt(libc::SOL_SOCKET, libc::SO_KEEPALIVE, keepalive)
+            .await
+    }
+
+    pub(crate) async fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
+        let nodelay = if nodelay { 1 } else { 0 };
+        self.set_sock_opt(libc::IPPROTO_TCP, libc::TCP_NODELAY, nodelay)
+            .await
+    }
+
+    async fn set_sock_opt<T>(&self, level: i32, optname: i32, value: T) -> io::Result<()>
+    where
+        T: Copy + 'static,
+    {
+        let op = SetSockOpt::new(self.fd.clone(), level as u32, optname as u32, value);
+        self.handle.submit(op).await
     }
 }
 
@@ -620,6 +666,134 @@ impl Multishot for Accept<true> {
 
     fn complete(self, result: crate::operation::CQEResult) -> Option<Self::Item> {
         Some(result.result.map(|fd| NornFd::from_fd(fd as i32)))
+    }
+}
+
+struct BindSocket {
+    fd: NornFd,
+    addr: SockAddr,
+}
+
+impl BindSocket {
+    fn new(fd: NornFd, addr: SocketAddr) -> Self {
+        Self {
+            fd,
+            addr: SockAddr::from(addr),
+        }
+    }
+}
+
+impl Operation for BindSocket {
+    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+        let this = unsafe { self.get_unchecked_mut() };
+        match this.fd.kind() {
+            crate::fd::FdKind::Fd(fd) => {
+                opcode::Bind::new(*fd, this.addr.as_ptr() as *const _, this.addr.len() as _).build()
+            }
+            crate::fd::FdKind::Fixed(fd) => {
+                opcode::Bind::new(*fd, this.addr.as_ptr() as *const _, this.addr.len() as _).build()
+            }
+        }
+    }
+
+    fn cleanup(&mut self, _: crate::operation::CQEResult) {}
+}
+
+impl Singleshot for BindSocket {
+    type Output = io::Result<()>;
+
+    fn complete(self, result: crate::operation::CQEResult) -> Self::Output {
+        result.result.map(|_| ())
+    }
+}
+
+struct ListenSocket {
+    fd: NornFd,
+    backlog: i32,
+}
+
+impl ListenSocket {
+    fn new(fd: NornFd, backlog: i32) -> Self {
+        Self { fd, backlog }
+    }
+}
+
+impl Operation for ListenSocket {
+    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+        let this = unsafe { self.get_unchecked_mut() };
+        match this.fd.kind() {
+            crate::fd::FdKind::Fd(fd) => opcode::Listen::new(*fd, this.backlog).build(),
+            crate::fd::FdKind::Fixed(fd) => opcode::Listen::new(*fd, this.backlog).build(),
+        }
+    }
+
+    fn cleanup(&mut self, _: crate::operation::CQEResult) {}
+}
+
+impl Singleshot for ListenSocket {
+    type Output = io::Result<()>;
+
+    fn complete(self, result: crate::operation::CQEResult) -> Self::Output {
+        result.result.map(|_| ())
+    }
+}
+
+struct SetSockOpt<T> {
+    fd: NornFd,
+    level: u32,
+    optname: u32,
+    value: T,
+}
+
+impl<T> SetSockOpt<T>
+where
+    T: Copy,
+{
+    fn new(fd: NornFd, level: u32, optname: u32, value: T) -> Self {
+        Self {
+            fd,
+            level,
+            optname,
+            value,
+        }
+    }
+}
+
+impl<T> Operation for SetSockOpt<T>
+where
+    T: Copy,
+{
+    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+        let this = unsafe { self.get_unchecked_mut() };
+        let optlen = std::mem::size_of::<T>() as u32;
+        let optval = &this.value as *const T as *const libc::c_void;
+        match this.fd.kind() {
+            crate::fd::FdKind::Fd(fd) => {
+                opcode::SetSockOpt::new(types::Fd(fd.0), this.level, this.optname, optval, optlen)
+                    .build()
+            }
+            crate::fd::FdKind::Fixed(fd) => opcode::SetSockOpt::new(
+                types::Fixed(fd.0),
+                this.level,
+                this.optname,
+                optval,
+                optlen,
+            )
+            .build(),
+        }
+    }
+
+    fn cleanup(&mut self, _: crate::operation::CQEResult) {}
+}
+
+impl<T> Singleshot for SetSockOpt<T>
+where
+    T: Copy,
+{
+    type Output = io::Result<()>;
+
+    fn complete(self, result: crate::operation::CQEResult) -> Self::Output {
+        result.result.map(|_| ())
     }
 }
 

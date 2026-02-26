@@ -70,13 +70,13 @@ impl TcpListener {
     /// Creates a TCP listener bound to the specified address.
     pub async fn bind(addr: SocketAddr, backlog: u32) -> io::Result<TcpListener> {
         let inner = socket::Socket::bind(addr, Domain::for_address(addr), Type::STREAM).await?;
-        inner.listen(backlog)?;
+        inner.listen(backlog).await?;
         Ok(TcpListener { socket: inner })
     }
 
     /// Set value for the SO_REUSEADDR option on this socket.
-    pub fn set_reuse_address(&self, reuse: bool) -> io::Result<()> {
-        self.socket.as_socket()?.set_reuse_address(reuse)
+    pub async fn set_reuse_address(&self, reuse: bool) -> io::Result<()> {
+        self.socket.set_reuse_address(reuse).await
     }
 
     /// Returns the local address that this listener is bound to.
@@ -244,26 +244,26 @@ impl TcpSocket {
     }
 
     /// Set value for the SO_RCVBUF option on this socket.
-    pub fn set_recv_buffer_size(&self, size: usize) -> io::Result<()> {
-        self.socket.as_socket()?.set_recv_buffer_size(size)
+    pub async fn set_recv_buffer_size(&self, size: usize) -> io::Result<()> {
+        self.socket.set_recv_buffer_size(size).await
     }
     /// Set value for the SO_SNDBUF option on this socket.
-    pub fn set_send_buffer_size(&self, size: usize) -> io::Result<()> {
-        self.socket.as_socket()?.set_send_buffer_size(size)
+    pub async fn set_send_buffer_size(&self, size: usize) -> io::Result<()> {
+        self.socket.set_send_buffer_size(size).await
     }
 
     /// Set value for the SO_REUSEADDR option on this socket.
-    pub fn set_reuse_address(&self, reuse: bool) -> io::Result<()> {
-        self.socket.as_socket()?.set_reuse_address(reuse)
+    pub async fn set_reuse_address(&self, reuse: bool) -> io::Result<()> {
+        self.socket.set_reuse_address(reuse).await
     }
 
     /// Set value for the SO_KEEPALIVE option on this socket.
-    pub fn set_keepalive(&self, keepalive: bool) -> io::Result<()> {
-        self.socket.as_socket()?.set_keepalive(keepalive)
+    pub async fn set_keepalive(&self, keepalive: bool) -> io::Result<()> {
+        self.socket.set_keepalive(keepalive).await
     }
     /// Set the value of the TCP_NODELAY option on this socket.
-    pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
-        self.socket.as_socket()?.set_nodelay(nodelay)
+    pub async fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
+        self.socket.set_nodelay(nodelay).await
     }
 }
 
