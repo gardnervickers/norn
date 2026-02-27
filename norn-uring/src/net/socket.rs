@@ -32,6 +32,13 @@ fn no_source_addr_error() -> io::Error {
     )
 }
 
+fn invalid_zc_notification_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "zerocopy send notification completion missing primary send result",
+    )
+}
+
 fn fixed_fd_unsupported_error(context: &'static str) -> io::Error {
     io::Error::new(
         io::ErrorKind::Unsupported,
@@ -216,6 +223,30 @@ impl Socket {
         self.handle.submit(op)
     }
 
+    pub(crate) fn send_zc<B>(&self, buf: B) -> Op<SendZc<B>>
+    where
+        B: StableBuf + 'static,
+    {
+        let op = SendZc::new(self.fd.clone(), buf, 0);
+        self.handle.submit(op)
+    }
+
+    pub(crate) fn send_zc_with_flags<B>(&self, buf: B, flags: i32) -> Op<SendZc<B>>
+    where
+        B: StableBuf + 'static,
+    {
+        let op = SendZc::new(self.fd.clone(), buf, flags);
+        self.handle.submit(op)
+    }
+
+    pub(crate) fn send_msg_zc<B>(&self, buf: B, flags: i32) -> Op<SendMsgZc<B>>
+    where
+        B: StableBuf + 'static,
+    {
+        let op = SendMsgZc::new(self.fd.clone(), buf, flags);
+        self.handle.submit(op)
+    }
+
     pub(crate) async fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()> {
         let how = match how {
             std::net::Shutdown::Read => libc::SHUT_RD,
@@ -287,6 +318,12 @@ impl Socket {
     pub(crate) async fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
         let nodelay = if nodelay { 1 } else { 0 };
         self.set_sock_opt(libc::IPPROTO_TCP, libc::TCP_NODELAY, nodelay)
+            .await
+    }
+
+    pub(crate) async fn set_zerocopy(&self, enabled: bool) -> io::Result<()> {
+        let enabled = if enabled { 1 } else { 0 };
+        self.set_sock_opt(libc::SOL_SOCKET, libc::SO_ZEROCOPY, enabled)
             .await
     }
 
@@ -1175,6 +1212,173 @@ where
     }
 }
 
+fn update_send_zc_primary(
+    primary_result: &mut Option<io::Result<usize>>,
+    result: crate::operation::CQEResult,
+) {
+    if result.notif() {
+        return;
+    }
+    *primary_result = Some(result.result.map(|v| v as usize));
+}
+
+fn complete_send_zc_result(
+    primary_result: Option<io::Result<usize>>,
+    result: crate::operation::CQEResult,
+) -> io::Result<usize> {
+    if result.notif() {
+        primary_result.unwrap_or_else(|| Err(invalid_zc_notification_error()))
+    } else {
+        result.result.map(|v| v as usize)
+    }
+}
+
+#[derive(Debug)]
+pub struct SendZc<B> {
+    fd: NornFd,
+    buf: B,
+    flags: i32,
+    primary_result: Option<io::Result<usize>>,
+}
+
+impl<B> SendZc<B>
+where
+    B: StableBuf,
+{
+    pub(crate) fn new(fd: NornFd, buf: B, flags: i32) -> Self {
+        Self {
+            fd,
+            buf,
+            flags,
+            primary_result: None,
+        }
+    }
+}
+
+impl<B> Operation for SendZc<B>
+where
+    B: StableBuf,
+{
+    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+        let this = unsafe { self.get_unchecked_mut() };
+        let ptr = this.buf.stable_ptr();
+        let len = this.buf.bytes_init();
+
+        match this.fd.kind() {
+            crate::fd::FdKind::Fd(fd) => opcode::SendZc::new(*fd, ptr, len as _),
+            crate::fd::FdKind::Fixed(fd) => opcode::SendZc::new(*fd, ptr, len as _),
+        }
+        .flags(this.flags)
+        .build()
+    }
+
+    fn cleanup(&mut self, _: crate::operation::CQEResult) {}
+}
+
+impl<B> Singleshot for SendZc<B>
+where
+    B: StableBuf,
+{
+    type Output = (io::Result<usize>, B);
+
+    fn update(&mut self, result: crate::operation::CQEResult) {
+        update_send_zc_primary(&mut self.primary_result, result);
+    }
+
+    fn complete(self, result: crate::operation::CQEResult) -> Self::Output {
+        let this = self;
+        (
+            complete_send_zc_result(this.primary_result, result),
+            this.buf,
+        )
+    }
+}
+
+pub struct SendMsgZc<B> {
+    fd: NornFd,
+    buf: B,
+    flags: i32,
+    msghdr: MaybeUninit<libc::msghdr>,
+    slices: MaybeUninit<[io::IoSlice<'static>; 1]>,
+    primary_result: Option<io::Result<usize>>,
+}
+
+impl<B> std::fmt::Debug for SendMsgZc<B> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SendMsgZc").finish()
+    }
+}
+
+impl<B> SendMsgZc<B>
+where
+    B: StableBuf,
+{
+    pub(crate) fn new(fd: NornFd, buf: B, flags: i32) -> Self {
+        Self {
+            fd,
+            buf,
+            flags,
+            msghdr: MaybeUninit::zeroed(),
+            slices: MaybeUninit::zeroed(),
+            primary_result: None,
+        }
+    }
+}
+
+impl<B> Operation for SendMsgZc<B>
+where
+    B: StableBuf,
+{
+    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+        let this = unsafe { self.get_unchecked_mut() };
+
+        let slice = io::IoSlice::new(unsafe {
+            std::slice::from_raw_parts(this.buf.stable_ptr(), this.buf.bytes_init())
+        });
+        this.slices.write([slice]);
+
+        let msghdr = this.msghdr.as_mut_ptr();
+        let slices = unsafe { this.slices.assume_init_mut() };
+        unsafe {
+            (*msghdr).msg_iov = slices.as_mut_ptr() as *mut _;
+            (*msghdr).msg_iovlen = slices.len() as _;
+            (*msghdr).msg_name = std::ptr::null_mut();
+            (*msghdr).msg_namelen = 0;
+            (*msghdr).msg_control = std::ptr::null_mut();
+            (*msghdr).msg_controllen = 0;
+        }
+
+        let msghdr = this.msghdr.as_ptr();
+        match this.fd.kind() {
+            crate::fd::FdKind::Fd(fd) => opcode::SendMsgZc::new(types::Fd(fd.0), msghdr),
+            crate::fd::FdKind::Fixed(fd) => opcode::SendMsgZc::new(types::Fixed(fd.0), msghdr),
+        }
+        .flags(this.flags as u32)
+        .build()
+    }
+
+    fn cleanup(&mut self, _: crate::operation::CQEResult) {}
+}
+
+impl<B> Singleshot for SendMsgZc<B>
+where
+    B: StableBuf,
+{
+    type Output = (io::Result<usize>, B);
+
+    fn update(&mut self, result: crate::operation::CQEResult) {
+        update_send_zc_primary(&mut self.primary_result, result);
+    }
+
+    fn complete(self, result: crate::operation::CQEResult) -> Self::Output {
+        let this = self;
+        (
+            complete_send_zc_result(this.primary_result, result),
+            this.buf,
+        )
+    }
+}
+
 #[derive(Debug)]
 pub struct Poll<const MULTI: bool> {
     fd: NornFd,
@@ -1271,5 +1475,50 @@ impl Event {
     /// Returns true if there is a priority event.
     pub fn is_priority(&self) -> bool {
         (self.events & libc::POLLPRI) != 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn more_flag() -> u32 {
+        (0..=u32::MAX)
+            .find(|flags| io_uring::cqueue::more(*flags))
+            .expect("missing CQE more flag")
+    }
+
+    fn notif_flag() -> u32 {
+        (0..=u32::MAX)
+            .find(|flags| io_uring::cqueue::notif(*flags))
+            .expect("missing CQE notif flag")
+    }
+
+    #[test]
+    fn zc_completion_single_cqe_uses_final_result() {
+        let final_cqe = crate::operation::CQEResult::new(Ok(64), 0);
+        let result = complete_send_zc_result(None, final_cqe).unwrap();
+        assert_eq!(result, 64);
+    }
+
+    #[test]
+    fn zc_completion_final_notification_uses_primary_result() {
+        let mut primary = None;
+        let update = crate::operation::CQEResult::new(Ok(32), more_flag());
+        update_send_zc_primary(&mut primary, update);
+        let result = complete_send_zc_result(
+            primary,
+            crate::operation::CQEResult::new(Ok(0), notif_flag()),
+        )
+        .unwrap();
+        assert_eq!(result, 32);
+    }
+
+    #[test]
+    fn zc_completion_notification_without_primary_is_invalid() {
+        let err =
+            complete_send_zc_result(None, crate::operation::CQEResult::new(Ok(0), notif_flag()))
+                .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }
