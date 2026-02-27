@@ -244,6 +244,30 @@ impl TcpSocket {
         self.socket.recv_ring_multi(ring)
     }
 
+    /// Receive data using a single-shot recv bundle operation and a provided buffer ring.
+    pub fn recv_bundle(&self, ring: &BufRing) -> Op<socket::RecvRingBundle> {
+        self.socket.recv_ring_bundle(ring)
+    }
+
+    /// Receive data using a single-shot recv bundle operation and a provided buffer ring.
+    pub fn recv_bundle_with_flags(&self, ring: &BufRing, flags: i32) -> Op<socket::RecvRingBundle> {
+        self.socket.recv_ring_bundle_with_flags(ring, flags)
+    }
+
+    /// Receive data using a multishot recv bundle operation and a provided buffer ring.
+    pub fn recv_bundle_multi(&self, ring: &BufRing) -> Op<socket::RecvRingBundleMulti> {
+        self.socket.recv_ring_bundle_multi(ring)
+    }
+
+    /// Receive data using a multishot recv bundle operation and a provided buffer ring.
+    pub fn recv_bundle_multi_with_flags(
+        &self,
+        ring: &BufRing,
+        flags: i32,
+    ) -> Op<socket::RecvRingBundleMulti> {
+        self.socket.recv_ring_bundle_multi_with_flags(ring, flags)
+    }
+
     /// Convert this socket into a stream.
     ///
     /// [`TcpStream`] is a stateful wrapper around [`TcpSocket`] that implements
