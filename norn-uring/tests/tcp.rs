@@ -4,6 +4,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::pin::pin;
 
+use bytes::BytesMut;
 use futures_util::StreamExt;
 use norn_executor::spawn;
 use norn_uring::bufring::BufRing;
@@ -105,6 +106,92 @@ fn recv_ring_stream_socket_reports_peer() -> Result<(), Box<dyn std::error::Erro
         client.close().await?;
         Ok(())
     })
+}
+
+#[test]
+fn send_zc_smoke() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let (server, client) = connected_pair().await?;
+        if let Err(err) = client.set_zerocopy(true).await {
+            let _ = client.close().await;
+            if util::zerocopy_unsupported(&err) {
+                return Ok(());
+            }
+            return Err(err.into());
+        }
+
+        let payload = b"hello-zc".to_vec();
+        let expected_len = payload.len();
+        let recv_task =
+            spawn(async move { server.recv(BytesMut::with_capacity(expected_len)).await });
+        let (send_res, sent_buf) = client.send_zc(payload).await;
+        let sent = match send_res {
+            Ok(sent) => sent,
+            Err(err) => {
+                let _ = client.close().await;
+                if util::zerocopy_unsupported(&err) {
+                    return Ok(());
+                }
+                return Err(err.into());
+            }
+        };
+        assert_eq!(sent, sent_buf.len());
+
+        let (recv_res, recv_buf) = recv_task.await?;
+        let recv_n = recv_res?;
+        assert_eq!(&recv_buf[..recv_n], sent_buf.as_slice());
+
+        client.close().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn send_msg_zc_smoke() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let (server, client) = connected_pair().await?;
+        if let Err(err) = client.set_zerocopy(true).await {
+            let _ = client.close().await;
+            if util::zerocopy_unsupported(&err) {
+                return Ok(());
+            }
+            return Err(err.into());
+        }
+
+        let payload = b"hello-zc-msg".to_vec();
+        let expected_len = payload.len();
+        let recv_task =
+            spawn(async move { server.recv(BytesMut::with_capacity(expected_len)).await });
+        let (send_res, sent_buf) = client.send_msg_zc(payload, 0).await;
+        let sent = match send_res {
+            Ok(sent) => sent,
+            Err(err) => {
+                let _ = client.close().await;
+                if util::zerocopy_unsupported(&err) {
+                    return Ok(());
+                }
+                return Err(err.into());
+            }
+        };
+        assert_eq!(sent, sent_buf.len());
+
+        let (recv_res, recv_buf) = recv_task.await?;
+        let recv_n = recv_res?;
+        assert_eq!(&recv_buf[..recv_n], sent_buf.as_slice());
+
+        client.close().await?;
+        Ok(())
+    })
+}
+
+async fn connected_pair() -> Result<(TcpSocket, TcpSocket), Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap(), 32).await?;
+    let addr = listener.local_addr()?;
+
+    let client_task = spawn(async move { TcpSocket::connect(addr).await });
+    let (server, _) = listener.accept().await?;
+    let client = client_task.await??;
+    Ok((server, client))
 }
 
 struct EchoServer {

@@ -2,6 +2,7 @@
 
 use std::ops;
 use std::path::{Path, PathBuf};
+use std::{io, os::raw::c_int};
 
 use futures_core::Future;
 
@@ -76,4 +77,17 @@ impl Drop for ThreadNameTestDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);
     }
+}
+
+#[allow(dead_code)]
+pub fn zerocopy_unsupported(err: &io::Error) -> bool {
+    const ZC_UNSUPPORTED_ERRNOS: [c_int; 5] = [
+        libc::ENOSYS,
+        libc::EOPNOTSUPP,
+        libc::ENOTSUP,
+        libc::EINVAL,
+        libc::ENOPROTOOPT,
+    ];
+    err.kind() == io::ErrorKind::Unsupported
+        || ZC_UNSUPPORTED_ERRNOS.contains(&err.raw_os_error().unwrap_or_default())
 }

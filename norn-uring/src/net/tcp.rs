@@ -196,9 +196,33 @@ impl TcpSocket {
         self.socket.send_with_flags(buf, flags)
     }
 
+    /// Send data from the given buffer using io_uring zerocopy send.
+    ///
+    /// This method does not fall back to regular send if zerocopy is unsupported.
+    /// Callers should enable `SO_ZEROCOPY` with [`set_zerocopy`] first.
+    pub fn send_zc<B: StableBuf>(&self, buf: B) -> Op<socket::SendZc<B>> {
+        self.socket.send_zc(buf)
+    }
+
+    /// Send data from the given buffer using io_uring zerocopy send with send flags.
+    ///
+    /// This method does not fall back to regular send if zerocopy is unsupported.
+    /// Callers should enable `SO_ZEROCOPY` with [`set_zerocopy`] first.
+    pub fn send_zc_with_flags<B: StableBuf>(&self, buf: B, flags: i32) -> Op<socket::SendZc<B>> {
+        self.socket.send_zc_with_flags(buf, flags)
+    }
+
     /// Send a message from the given buffer with message-style flags.
     pub fn send_msg<B: StableBuf>(&self, buf: B, flags: i32) -> Op<socket::Send<B>> {
         self.send_with_flags(buf, flags)
+    }
+
+    /// Send a message from the given buffer using io_uring zerocopy sendmsg.
+    ///
+    /// This method does not fall back to regular sendmsg if zerocopy is unsupported.
+    /// Callers should enable `SO_ZEROCOPY` with [`set_zerocopy`] first.
+    pub fn send_msg_zc<B: StableBuf>(&self, buf: B, flags: i32) -> Op<socket::SendMsgZc<B>> {
+        self.socket.send_msg_zc(buf, flags)
     }
 
     /// Receive a message into the given buffer with message-style flags.
@@ -264,6 +288,11 @@ impl TcpSocket {
     /// Set the value of the TCP_NODELAY option on this socket.
     pub async fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
         self.socket.set_nodelay(nodelay).await
+    }
+
+    /// Enable or disable `SO_ZEROCOPY` on this socket.
+    pub async fn set_zerocopy(&self, enabled: bool) -> io::Result<()> {
+        self.socket.set_zerocopy(enabled).await
     }
 }
 

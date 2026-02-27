@@ -66,6 +66,92 @@ fn connected_send_recv() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn connected_send_recv_zc() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let s1 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let s2 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+
+        s1.connect(s2.local_addr()?).await?;
+        s2.connect(s1.local_addr()?).await?;
+
+        if let Err(err) = s1.set_zerocopy(true).await {
+            s1.close().await?;
+            s2.close().await?;
+            if util::zerocopy_unsupported(&err) {
+                return Ok(());
+            }
+            return Err(err.into());
+        }
+
+        let recv_task =
+            norn_executor::spawn(async move { s2.recv(BytesMut::with_capacity(64)).await });
+        let payload = Bytes::from_static(b"udp-zc");
+        let (res, sent) = s1.send_zc(payload).await;
+        let sent_n = match res {
+            Ok(n) => n,
+            Err(err) => {
+                s1.close().await?;
+                if util::zerocopy_unsupported(&err) {
+                    return Ok(());
+                }
+                return Err(err.into());
+            }
+        };
+        assert_eq!(sent_n, sent.len());
+
+        let (res, buf) = recv_task.await?;
+        let n = res?;
+        assert_eq!(&buf[..n], b"udp-zc");
+
+        s1.close().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn connected_send_recv_msg_zc() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let s1 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let s2 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+
+        s1.connect(s2.local_addr()?).await?;
+        s2.connect(s1.local_addr()?).await?;
+
+        if let Err(err) = s1.set_zerocopy(true).await {
+            s1.close().await?;
+            s2.close().await?;
+            if util::zerocopy_unsupported(&err) {
+                return Ok(());
+            }
+            return Err(err.into());
+        }
+
+        let recv_task =
+            norn_executor::spawn(async move { s2.recv(BytesMut::with_capacity(64)).await });
+        let payload = Bytes::from_static(b"udp-zc-msg");
+        let (res, sent) = s1.send_msg_zc(payload, 0).await;
+        let sent_n = match res {
+            Ok(n) => n,
+            Err(err) => {
+                s1.close().await?;
+                if util::zerocopy_unsupported(&err) {
+                    return Ok(());
+                }
+                return Err(err.into());
+            }
+        };
+        assert_eq!(sent_n, sent.len());
+
+        let (res, buf) = recv_task.await?;
+        let n = res?;
+        assert_eq!(&buf[..n], b"udp-zc-msg");
+
+        s1.close().await?;
+        Ok(())
+    })
+}
+
+#[test]
 fn send_recv_msg() -> Result<(), Box<dyn std::error::Error>> {
     util::with_test_env(|| async {
         let s1 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
