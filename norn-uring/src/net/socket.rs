@@ -730,7 +730,11 @@ impl RecvFromRingMulti {
                 "invalid recvmsg multishot completion layout",
             )
         })?;
-        let addr = socket_addr_from_name(recvmsg.name_data())?;
+        let addr = if recvmsg.name_data().is_empty() {
+            as_socket_addr_or_peer(&self.fd, &self.addr, 0)?
+        } else {
+            socket_addr_from_name(recvmsg.name_data())?
+        };
         let base_ptr = buf[..].as_ptr() as usize;
         let payload = recvmsg.payload_data();
         let payload_offset = payload.as_ptr() as usize - base_ptr;

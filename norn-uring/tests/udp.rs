@@ -247,6 +247,26 @@ fn connected_send_recv_ring_multi() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn connected_send_recv_from_ring_multi() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let ring = BufRing::builder(8).buf_cnt(32).buf_len(2048).build()?;
+        let s1 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let s2 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        s1.connect(s2.local_addr()?).await?;
+        s2.connect(s1.local_addr()?).await?;
+
+        let mut recv = pin!(s2.recv_from_ring_multi(&ring));
+        let payload = Bytes::from_static(b"peer-fallback");
+        s1.send(payload.clone()).await.0?;
+        let (buf, addr) = recv.next().await.expect("multishot stream ended")?;
+        assert_eq!(addr, s1.local_addr()?);
+        assert_eq!(&buf[..], payload.as_ref());
+
+        Ok(())
+    })
+}
+
+#[test]
 fn connected_send_recv_bundle() -> Result<(), Box<dyn std::error::Error>> {
     util::with_test_env(|| async {
         let ring = BufRing::builder(6).buf_cnt(64).buf_len(2048).build()?;
