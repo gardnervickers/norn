@@ -236,3 +236,69 @@ fn drop_file_outside_runtime() -> Result<(), Box<dyn std::error::Error>> {
     drop(file);
     Ok(())
 }
+
+#[test]
+fn splice_and_tee() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let dir = util::ThreadNameTestDir::new();
+        let src_path = dir.join("splice-src");
+        let dst_path = dir.join("splice-dst");
+        let tee_left_path = dir.join("tee-left");
+        let tee_right_path = dir.join("tee-right");
+        let payload = b"splice and tee payload";
+        let len = payload.len() as u32;
+
+        let mut opts = fs::OpenOptions::new();
+        opts.create(true).truncate(true).read(true).write(true);
+
+        let src = opts.open(&src_path).await?;
+        src.write_at(&payload[..], 0).await.0?;
+
+        let dst = opts.open(&dst_path).await?;
+        let tee_left = opts.open(&tee_left_path).await?;
+        let tee_right = opts.open(&tee_right_path).await?;
+
+        let (pipe_reader, pipe_writer) = fs::pipe()?;
+        assert_eq!(
+            src.splice_to_pipe(&pipe_writer, Some(0), len, 0).await?,
+            payload.len()
+        );
+        assert_eq!(
+            dst.splice_from_pipe(&pipe_reader, Some(0), len, 0).await?,
+            payload.len()
+        );
+
+        let (res, buf) = dst.read_at(vec![0; payload.len()], 0).await;
+        assert_eq!(res?, payload.len());
+        assert_eq!(&buf[..], payload);
+
+        let (source_reader, source_writer) = fs::pipe()?;
+        let (dup_reader, dup_writer) = fs::pipe()?;
+        assert_eq!(
+            source_writer.splice_from(&src, Some(0), len, 0).await?,
+            payload.len()
+        );
+        assert_eq!(
+            source_reader.tee_to(&dup_writer, len, 0).await?,
+            payload.len()
+        );
+        assert_eq!(
+            source_reader.splice_to(&tee_left, Some(0), len, 0).await?,
+            payload.len()
+        );
+        assert_eq!(
+            dup_reader.splice_to(&tee_right, Some(0), len, 0).await?,
+            payload.len()
+        );
+
+        let (res, buf) = tee_left.read_at(vec![0; payload.len()], 0).await;
+        assert_eq!(res?, payload.len());
+        assert_eq!(&buf[..], payload);
+
+        let (res, buf) = tee_right.read_at(vec![0; payload.len()], 0).await;
+        assert_eq!(res?, payload.len());
+        assert_eq!(&buf[..], payload);
+
+        Ok(())
+    })
+}
