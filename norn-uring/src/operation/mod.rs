@@ -10,10 +10,13 @@ mod raw;
 use io_uring::types::CancelBuilder;
 pub(crate) use raw::{CQEResult, RawOpRef};
 
-use futures_core::Stream;
+use io_uring::squeue::Flags;
+use smallvec::SmallVec;
 
 use crate::driver::PushFuture;
+use crate::error::SubmitError;
 
+/// Low-level request customization for advanced io_uring users.
 pub trait Operation {
     /// Configure a new [`io_uring::squeue::Entry`] for this operation.
     ///
@@ -27,7 +30,9 @@ pub trait Operation {
     fn cleanup(&mut self, result: CQEResult);
 }
 
+/// A singleshot request that resolves to one final output.
 pub trait Singleshot: Operation {
+    /// The value returned once the final completion is observed.
     type Output;
 
     /// Complete can be called multiple times in the case of a multi-shot operation.
@@ -39,9 +44,12 @@ pub trait Singleshot: Operation {
     }
 }
 
+/// A multishot request that can yield many items from one submission.
 pub trait Multishot: Operation {
+    /// The item yielded by each completion.
     type Item;
 
+    /// Handle a non-terminal completion.
     fn update(&mut self, result: CQEResult) -> Self::Item;
 
     /// Called when the final completion for this operation is received.
@@ -63,8 +71,10 @@ pub(crate) struct ConfiguredEntry {
 }
 
 impl ConfiguredEntry {
-    pub(crate) fn into_entry(self) -> io_uring::squeue::Entry {
-        self.entry.user_data(self.handle.into_raw_usize() as u64)
+    pub(crate) fn into_entry_with_flags(self, flags: Flags) -> io_uring::squeue::Entry {
+        self.entry
+            .flags(flags)
+            .user_data(self.handle.into_raw_usize() as u64)
     }
 
     pub(crate) fn new(handle: RawOpRef, entry: io_uring::squeue::Entry) -> Self {
@@ -73,35 +83,99 @@ impl ConfiguredEntry {
 }
 
 pin_project_lite::pin_project! {
+    /// A lazily-submitted io_uring operation.
     #[must_use = "future does nothing unless you `.await` or poll them"]
     pub struct Op<T>
     where
         T: 'static,
     {
         #[pin]
-        stage: Stage<T>,
+        submit: Option<PushFuture>,
+        state: State<T>,
         reactor: crate::Handle,
-        completed: bool
+        completed: bool,
     }
 
     impl<T> PinnedDrop for Op<T> where T: 'static {
         fn drop(me: Pin<&mut Self>) {
             let this = me.project();
-            // Safety: We are not moving out of the pinned `this.stage` field.
-            match unsafe {this.stage.get_unchecked_mut()} {
-                Stage::Unsubmitted { .. } => {
-                },
-                Stage::Submitted { inner } => {
+            match this.state {
+                State::Submitted { inner } => {
                     if !*this.completed {
-                        // Ignore the result, it is possible that the future
-                        // completed before or concurrently with the Op drop.
                         let user_data = inner.inner.inner.as_raw_usize();
                         let criteria = CancelBuilder::user_data(user_data as u64);
                         let _ = this.reactor.cancel(criteria, false);
                     }
-                },
+                }
+                State::Prepared { .. } | State::Waiting { .. } | State::Done => {}
             }
         }
+    }
+}
+
+enum State<T>
+where
+    T: 'static,
+{
+    Prepared {
+        handle: Option<TypedHandle<T>>,
+        entry: Option<ConfiguredEntry>,
+    },
+    Waiting {
+        handle: Option<TypedHandle<T>>,
+    },
+    Submitted {
+        inner: SubmittedOp<T>,
+    },
+    Done,
+}
+
+impl<T> State<T>
+where
+    T: Operation + 'static,
+{
+    fn prepare_batch(&mut self, batch: &mut SmallVec<[ConfiguredEntry; 4]>) {
+        let state = mem::replace(self, State::Done);
+        *self = match state {
+            State::Prepared {
+                mut handle,
+                mut entry,
+            } => {
+                batch.push(entry.take().expect("entry already prepared"));
+                State::Waiting {
+                    handle: Some(handle.take().expect("handle missing")),
+                }
+            }
+            state => state,
+        };
+    }
+
+    fn finish_submit(&mut self) {
+        let state = mem::replace(self, State::Done);
+        *self = match state {
+            State::Waiting { mut handle } => State::Submitted {
+                inner: SubmittedOp {
+                    inner: handle.take().expect("handle missing"),
+                },
+            },
+            state => state,
+        };
+    }
+
+    fn fail_submit(&mut self, err: &SubmitError) {
+        let state = mem::replace(self, State::Done);
+        *self = match state {
+            State::Waiting { mut handle } => {
+                let handle = handle.take().expect("handle missing");
+                handle
+                    .untyped()
+                    .complete(CQEResult::new(Err(err.to_io_error()), 0));
+                State::Submitted {
+                    inner: SubmittedOp { inner: handle },
+                }
+            }
+            state => state,
+        };
     }
 }
 
@@ -119,14 +193,72 @@ where
 
         let entry = T::configure(data);
         let entry = ConfiguredEntry::new(handle.untyped(), entry);
-        let submit_future = reactor.push(entry);
-        let inner = Stage::new(handle, submit_future);
 
         Self {
-            stage: inner,
+            submit: None,
+            state: State::Prepared {
+                handle: Some(handle),
+                entry: Some(entry),
+            },
             reactor,
             completed: false,
         }
+    }
+
+    pub(crate) fn handle(&self) -> &crate::Handle {
+        &self.reactor
+    }
+
+    pub(crate) fn prepare_batch(
+        mut self: Pin<&mut Self>,
+        batch: &mut SmallVec<[ConfiguredEntry; 4]>,
+    ) {
+        let this = self.as_mut().project();
+        this.state.prepare_batch(batch);
+    }
+
+    pub(crate) fn finish_submit(mut self: Pin<&mut Self>) {
+        let this = self.as_mut().project();
+        this.state.finish_submit();
+    }
+
+    pub(crate) fn fail_submit(mut self: Pin<&mut Self>, err: &SubmitError) {
+        let this = self.as_mut().project();
+        this.state.fail_submit(err);
+    }
+
+    pub(crate) fn cancel_unfinished(mut self: Pin<&mut Self>) {
+        let this = self.as_mut().project();
+        if let State::Submitted { inner } = this.state {
+            if !*this.completed {
+                let user_data = inner.inner.inner.as_raw_usize();
+                let criteria = CancelBuilder::user_data(user_data as u64);
+                let _ = self.reactor.cancel(criteria, false);
+            }
+        }
+    }
+
+    fn poll_submit(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        {
+            let mut this = self.as_mut().project();
+            if this.submit.is_none() && matches!(this.state, State::Prepared { .. }) {
+                let mut batch = SmallVec::new();
+                this.state.prepare_batch(&mut batch);
+                this.submit.set(Some(this.reactor.push_batch(batch)));
+            }
+        }
+
+        let mut this = self.as_mut().project();
+        let Some(fut) = this.submit.as_mut().as_pin_mut() else {
+            return Poll::Ready(());
+        };
+
+        match ready!(fut.poll(cx)) {
+            Ok(()) => this.state.finish_submit(),
+            Err(err) => this.state.fail_submit(&err),
+        }
+        this.submit.set(None);
+        Poll::Ready(())
     }
 }
 
@@ -136,11 +268,18 @@ where
 {
     type Output = T::Output;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        ready!(self.as_mut().poll_submit(cx));
         let this = self.project();
-        let res = ready!(this.stage.poll(cx));
-        *this.completed = true;
-        Poll::Ready(res)
+        let State::Submitted { inner } = this.state else {
+            unreachable!("operation not submitted");
+        };
+        if let Some(result) = inner.try_complete() {
+            *this.completed = true;
+            return Poll::Ready(result);
+        }
+        inner.inner.register_waker(cx.waker());
+        Poll::Pending
     }
 }
 
@@ -150,13 +289,21 @@ where
 {
     type Item = T::Item;
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        ready!(self.as_mut().poll_submit(cx));
         let this = self.project();
-        let res = ready!(this.stage.poll_next(cx));
-        if res.is_none() {
-            *this.completed = true;
+        let State::Submitted { inner } = this.state else {
+            unreachable!("operation not submitted");
+        };
+        if let Some(result) = inner.try_next() {
+            return Poll::Ready(Some(result));
         }
-        Poll::Ready(res)
+        if inner.inner.is_complete() {
+            *this.completed = true;
+            return Poll::Ready(None);
+        }
+        inner.inner.register_waker(cx.waker());
+        Poll::Pending
     }
 }
 
@@ -256,78 +403,8 @@ pub(crate) unsafe fn complete_operation(entry: &io_uring::cqueue::Entry) {
     handle.complete(result);
 }
 
-pin_project_lite::pin_project! {
-    #[project = StageProj]
-    enum Stage<T> where T: 'static {
-        Unsubmitted{#[pin] unsubmitted: UnsubmittedOp<T>},
-        Submitted{inner: SubmittedOp<T>},
-    }
-}
-
-impl<T> Stage<T>
-where
-    T: Operation + 'static,
-{
-    fn new(handle: TypedHandle<T>, future: PushFuture) -> Self {
-        Self::Unsubmitted {
-            unsubmitted: UnsubmittedOp {
-                handle: Some(handle),
-                future,
-            },
-        }
-    }
-
-    fn poll_submit(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        let this = self.as_mut().project();
-        match this {
-            StageProj::Unsubmitted { unsubmitted } => {
-                let handle = ready!(unsubmitted.poll(cx));
-                Pin::set(
-                    &mut self,
-                    Stage::Submitted {
-                        inner: SubmittedOp { inner: handle },
-                    },
-                );
-                Poll::Ready(())
-            }
-            StageProj::Submitted { .. } => Poll::Ready(()),
-        }
-    }
-}
-
-pin_project_lite::pin_project! {
-    #[must_use = "futures do nothing unless you `.await` or poll them"]
-    struct UnsubmittedOp<T> where T: 'static {
-        handle: Option<TypedHandle<T>>,
-        #[pin]
-        future: PushFuture,
-    }
-}
-
-impl<T> Future for UnsubmittedOp<T>
-where
-    T: Operation + 'static,
-{
-    type Output = TypedHandle<T>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.project();
-        if let Err(err) = ready!(this.future.poll(cx)) {
-            // Submission failed (typically during driver shutdown). Synthesize a completion
-            // error so the op follows normal completion/drop lifetimes instead of panicking.
-            let op = this
-                .handle
-                .as_ref()
-                .expect("operation handle must exist until submission completes")
-                .untyped();
-            op.complete(CQEResult::new(Err(err.into()), 0));
-        }
-        Poll::Ready(this.handle.take().unwrap())
-    }
-}
-
 #[must_use = "futures do nothing unless you `.await` or poll them"]
-struct SubmittedOp<T> {
+pub(crate) struct SubmittedOp<T> {
     inner: TypedHandle<T>,
 }
 
@@ -368,51 +445,6 @@ where
         }
         let data = unsafe { self.inner.try_take() }.expect("operation already completed");
         data.complete(completion)
-    }
-}
-
-impl<T> Future for Stage<T>
-where
-    T: Singleshot + 'static,
-{
-    type Output = T::Output;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        ready!(self.as_mut().poll_submit(cx));
-        let this = self.as_mut().project();
-        let inner = match this {
-            StageProj::Unsubmitted { .. } => unreachable!("unsubmitted"),
-            StageProj::Submitted { inner } => inner,
-        };
-        if let Some(result) = inner.try_complete() {
-            return Poll::Ready(result);
-        }
-        inner.inner.register_waker(cx.waker());
-        Poll::Pending
-    }
-}
-
-impl<T> Stream for Stage<T>
-where
-    T: Multishot + 'static,
-{
-    type Item = T::Item;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        ready!(self.as_mut().poll_submit(cx));
-        let this = self.as_mut().project();
-        let inner = match this {
-            StageProj::Unsubmitted { .. } => unreachable!("unsubmitted"),
-            StageProj::Submitted { inner } => inner,
-        };
-        if let Some(result) = inner.try_next() {
-            return Poll::Ready(Some(result));
-        }
-        if inner.inner.is_complete() {
-            return Poll::Ready(None);
-        }
-        inner.inner.register_waker(cx.waker());
-        Poll::Pending
     }
 }
 

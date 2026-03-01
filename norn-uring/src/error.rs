@@ -18,6 +18,17 @@ impl SubmitError {
             kind: SubmitErrorKind::Broken(err),
         }
     }
+
+    pub(crate) fn to_io_error(&self) -> io::Error {
+        match &self.kind {
+            SubmitErrorKind::ShuttingDown => {
+                io::Error::new(io::ErrorKind::Other, "reactor is shutting down")
+            }
+            SubmitErrorKind::Broken(err) => {
+                io::Error::new(err.kind(), format!("reactor submit path failed: {err}"))
+            }
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
