@@ -1,4 +1,5 @@
 use std::io;
+use std::os::fd::RawFd;
 use std::path::Path;
 use std::pin::Pin;
 
@@ -16,10 +17,54 @@ pub struct File {
     handle: crate::Handle,
 }
 
+/// The read end of a pipe.
+pub struct PipeReader {
+    fd: NornFd,
+    handle: crate::Handle,
+}
+
+/// The write end of a pipe.
+pub struct PipeWriter {
+    fd: NornFd,
+    handle: crate::Handle,
+}
+
 impl std::fmt::Debug for File {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("File").finish()
     }
+}
+
+impl std::fmt::Debug for PipeReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PipeReader").finish()
+    }
+}
+
+impl std::fmt::Debug for PipeWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PipeWriter").finish()
+    }
+}
+
+/// Create a nonblocking pipe.
+pub fn pipe() -> io::Result<(PipeReader, PipeWriter)> {
+    let handle = crate::Handle::current();
+    let mut fds: [RawFd; 2] = [0; 2];
+    let res = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) };
+    if res != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let read = PipeReader {
+        fd: NornFd::from_fd(fds[0]),
+        handle: handle.clone(),
+    };
+    let write = PipeWriter {
+        fd: NornFd::from_fd(fds[1]),
+        handle,
+    };
+    Ok((read, write))
 }
 
 impl File {
@@ -148,7 +193,103 @@ impl File {
         .await
     }
 
+    /// Splice bytes from this file into the provided pipe.
+    pub async fn splice_to_pipe(
+        &self,
+        dst: &PipeWriter,
+        src_offset: Option<u64>,
+        len: u32,
+        flags: u32,
+    ) -> io::Result<usize> {
+        let splice = SpliceOp::new(
+            self.fd.clone(),
+            option_offset_to_i64(src_offset)?,
+            dst.fd.clone(),
+            -1,
+            len,
+            flags,
+        );
+        self.handle.submit(splice).await
+    }
+
+    /// Splice bytes from the provided pipe into this file.
+    pub async fn splice_from_pipe(
+        &self,
+        src: &PipeReader,
+        dst_offset: Option<u64>,
+        len: u32,
+        flags: u32,
+    ) -> io::Result<usize> {
+        let splice = SpliceOp::new(
+            src.fd.clone(),
+            -1,
+            self.fd.clone(),
+            option_offset_to_i64(dst_offset)?,
+            len,
+            flags,
+        );
+        self.handle.submit(splice).await
+    }
+
     /// Close the file.
+    pub async fn close(self) -> io::Result<()> {
+        self.fd.close().await
+    }
+}
+
+impl PipeReader {
+    /// Splice bytes from this pipe into the provided file.
+    pub async fn splice_to(
+        &self,
+        dst: &File,
+        dst_offset: Option<u64>,
+        len: u32,
+        flags: u32,
+    ) -> io::Result<usize> {
+        let splice = SpliceOp::new(
+            self.fd.clone(),
+            -1,
+            dst.fd.clone(),
+            option_offset_to_i64(dst_offset)?,
+            len,
+            flags,
+        );
+        self.handle.submit(splice).await
+    }
+
+    /// Duplicate bytes from this pipe into another pipe without consuming them.
+    pub async fn tee_to(&self, dst: &PipeWriter, len: u32, flags: u32) -> io::Result<usize> {
+        let tee = TeeOp::new(self.fd.clone(), dst.fd.clone(), len, flags);
+        self.handle.submit(tee).await
+    }
+
+    /// Close the pipe read end.
+    pub async fn close(self) -> io::Result<()> {
+        self.fd.close().await
+    }
+}
+
+impl PipeWriter {
+    /// Splice bytes from the provided file into this pipe.
+    pub async fn splice_from(
+        &self,
+        src: &File,
+        src_offset: Option<u64>,
+        len: u32,
+        flags: u32,
+    ) -> io::Result<usize> {
+        let splice = SpliceOp::new(
+            src.fd.clone(),
+            option_offset_to_i64(src_offset)?,
+            self.fd.clone(),
+            -1,
+            len,
+            flags,
+        );
+        self.handle.submit(splice).await
+    }
+
+    /// Close the pipe write end.
     pub async fn close(self) -> io::Result<()> {
         self.fd.close().await
     }
@@ -564,5 +705,112 @@ impl Singleshot for Truncate {
 
     fn complete(self, result: CQEResult) -> Self::Output {
         result.result.map(|_| ())
+    }
+}
+
+struct SpliceOp {
+    fd_in: NornFd,
+    off_in: i64,
+    fd_out: NornFd,
+    off_out: i64,
+    len: u32,
+    flags: u32,
+}
+
+impl SpliceOp {
+    fn new(fd_in: NornFd, off_in: i64, fd_out: NornFd, off_out: i64, len: u32, flags: u32) -> Self {
+        Self {
+            fd_in,
+            off_in,
+            fd_out,
+            off_out,
+            len,
+            flags,
+        }
+    }
+}
+
+impl Operation for SpliceOp {
+    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+        let this = self.get_mut();
+        match (*this.fd_in.kind(), *this.fd_out.kind()) {
+            (FdKind::Fd(fd_in), FdKind::Fd(fd_out)) => {
+                opcode::Splice::new(fd_in, this.off_in, fd_out, this.off_out, this.len)
+            }
+            (FdKind::Fd(fd_in), FdKind::Fixed(fd_out)) => {
+                opcode::Splice::new(fd_in, this.off_in, fd_out, this.off_out, this.len)
+            }
+            (FdKind::Fixed(fd_in), FdKind::Fd(fd_out)) => {
+                opcode::Splice::new(fd_in, this.off_in, fd_out, this.off_out, this.len)
+            }
+            (FdKind::Fixed(fd_in), FdKind::Fixed(fd_out)) => {
+                opcode::Splice::new(fd_in, this.off_in, fd_out, this.off_out, this.len)
+            }
+        }
+        .flags(this.flags)
+        .build()
+    }
+
+    fn cleanup(&mut self, _: CQEResult) {}
+}
+
+impl Singleshot for SpliceOp {
+    type Output = io::Result<usize>;
+
+    fn complete(self, result: CQEResult) -> Self::Output {
+        result.result.map(|n| n as usize)
+    }
+}
+
+struct TeeOp {
+    fd_in: NornFd,
+    fd_out: NornFd,
+    len: u32,
+    flags: u32,
+}
+
+impl TeeOp {
+    fn new(fd_in: NornFd, fd_out: NornFd, len: u32, flags: u32) -> Self {
+        Self {
+            fd_in,
+            fd_out,
+            len,
+            flags,
+        }
+    }
+}
+
+impl Operation for TeeOp {
+    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+        let this = self.get_mut();
+        match (*this.fd_in.kind(), *this.fd_out.kind()) {
+            (FdKind::Fd(fd_in), FdKind::Fd(fd_out)) => opcode::Tee::new(fd_in, fd_out, this.len),
+            (FdKind::Fd(fd_in), FdKind::Fixed(fd_out)) => opcode::Tee::new(fd_in, fd_out, this.len),
+            (FdKind::Fixed(fd_in), FdKind::Fd(fd_out)) => opcode::Tee::new(fd_in, fd_out, this.len),
+            (FdKind::Fixed(fd_in), FdKind::Fixed(fd_out)) => {
+                opcode::Tee::new(fd_in, fd_out, this.len)
+            }
+        }
+        .flags(this.flags)
+        .build()
+    }
+
+    fn cleanup(&mut self, _: CQEResult) {}
+}
+
+impl Singleshot for TeeOp {
+    type Output = io::Result<usize>;
+
+    fn complete(self, result: CQEResult) -> Self::Output {
+        result.result.map(|n| n as usize)
+    }
+}
+
+fn option_offset_to_i64(offset: Option<u64>) -> io::Result<i64> {
+    match offset {
+        Some(offset) => {
+            i64::try_from(offset).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))
+        }
+        None => Ok(-1),
     }
 }
