@@ -14,7 +14,7 @@ use libc::O_NONBLOCK;
 use socket2::{Domain, Protocol, SockAddr, Type};
 
 use crate::buf::{StableBuf, StableBufMut};
-use crate::bufring::{BufRing, BufRingBuf};
+use crate::bufring::{BufRing, BufRingBuf, BufRingBufBundle};
 use crate::fd::NornFd;
 use crate::operation::{Multishot, Op, Operation, Singleshot};
 
@@ -147,6 +147,34 @@ impl Socket {
 
     pub(crate) fn recv_ring_multi(&self, ring: &BufRing) -> Op<RecvRingMulti> {
         let op = RecvRingMulti::new(self.fd.clone(), ring.clone(), 0);
+        self.handle.submit(op)
+    }
+
+    pub(crate) fn recv_ring_bundle(&self, ring: &BufRing) -> Op<RecvRingBundle> {
+        let op = RecvRingBundle::new(self.fd.clone(), ring.clone(), 0);
+        self.handle.submit(op)
+    }
+
+    pub(crate) fn recv_ring_bundle_with_flags(
+        &self,
+        ring: &BufRing,
+        flags: i32,
+    ) -> Op<RecvRingBundle> {
+        let op = RecvRingBundle::new(self.fd.clone(), ring.clone(), flags);
+        self.handle.submit(op)
+    }
+
+    pub(crate) fn recv_ring_bundle_multi(&self, ring: &BufRing) -> Op<RecvRingBundleMulti> {
+        let op = RecvRingBundleMulti::new(self.fd.clone(), ring.clone(), 0);
+        self.handle.submit(op)
+    }
+
+    pub(crate) fn recv_ring_bundle_multi_with_flags(
+        &self,
+        ring: &BufRing,
+        flags: i32,
+    ) -> Op<RecvRingBundleMulti> {
+        let op = RecvRingBundleMulti::new(self.fd.clone(), ring.clone(), flags);
         self.handle.submit(op)
     }
 
@@ -702,7 +730,11 @@ impl RecvFromRingMulti {
                 "invalid recvmsg multishot completion layout",
             )
         })?;
-        let addr = socket_addr_from_name(recvmsg.name_data())?;
+        let addr = if recvmsg.name_data().is_empty() {
+            as_socket_addr_or_peer(&self.fd, &self.addr, 0)?
+        } else {
+            socket_addr_from_name(recvmsg.name_data())?
+        };
         let base_ptr = buf[..].as_ptr() as usize;
         let payload = recvmsg.payload_data();
         let payload_offset = payload.as_ptr() as usize - base_ptr;
@@ -795,6 +827,104 @@ impl Operation for RecvRingMulti {
 
 impl Multishot for RecvRingMulti {
     type Item = io::Result<BufRingBuf>;
+
+    fn update(&mut self, result: crate::operation::CQEResult) -> Self::Item {
+        self.to_item(result)
+    }
+
+    fn complete(self, result: crate::operation::CQEResult) -> Option<Self::Item> {
+        Some(self.to_item(result))
+    }
+}
+
+#[derive(Debug)]
+pub struct RecvRingBundle {
+    fd: NornFd,
+    ring: BufRing,
+    flags: i32,
+}
+
+impl RecvRingBundle {
+    pub(crate) fn new(fd: NornFd, ring: BufRing, flags: i32) -> Self {
+        Self { fd, ring, flags }
+    }
+}
+
+impl Operation for RecvRingBundle {
+    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+        let this = unsafe { self.get_unchecked_mut() };
+        match this.fd.kind() {
+            crate::fd::FdKind::Fd(fd) => opcode::RecvBundle::new(types::Fd(fd.0), this.ring.bgid())
+                .flags(this.flags)
+                .build(),
+            crate::fd::FdKind::Fixed(fd) => {
+                opcode::RecvBundle::new(types::Fixed(fd.0), this.ring.bgid())
+                    .flags(this.flags)
+                    .build()
+            }
+        }
+    }
+
+    fn cleanup(&mut self, result: crate::operation::CQEResult) {
+        if let Ok(n) = result.result {
+            drop(self.ring.get_buf_bundle(n, result.flags));
+        }
+    }
+}
+
+impl Singleshot for RecvRingBundle {
+    type Output = io::Result<BufRingBufBundle>;
+
+    fn complete(self, result: crate::operation::CQEResult) -> Self::Output {
+        let n = result.result?;
+        self.ring.get_buf_bundle(n, result.flags)
+    }
+}
+
+#[derive(Debug)]
+pub struct RecvRingBundleMulti {
+    fd: NornFd,
+    ring: BufRing,
+    flags: i32,
+}
+
+impl RecvRingBundleMulti {
+    pub(crate) fn new(fd: NornFd, ring: BufRing, flags: i32) -> Self {
+        Self { fd, ring, flags }
+    }
+
+    fn to_item(&self, result: crate::operation::CQEResult) -> io::Result<BufRingBufBundle> {
+        let n = result.result?;
+        self.ring.get_buf_bundle(n, result.flags)
+    }
+}
+
+impl Operation for RecvRingBundleMulti {
+    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+        let this = unsafe { self.get_unchecked_mut() };
+        match this.fd.kind() {
+            crate::fd::FdKind::Fd(fd) => {
+                opcode::RecvMultiBundle::new(types::Fd(fd.0), this.ring.bgid())
+                    .flags(this.flags)
+                    .build()
+            }
+            crate::fd::FdKind::Fixed(fd) => {
+                opcode::RecvMultiBundle::new(types::Fixed(fd.0), this.ring.bgid())
+                    .flags(this.flags)
+                    .build()
+            }
+        }
+    }
+
+    fn cleanup(&mut self, result: crate::operation::CQEResult) {
+        if let Ok(n) = result.result {
+            drop(self.ring.get_buf_bundle(n, result.flags));
+        }
+    }
+}
+
+impl Multishot for RecvRingBundleMulti {
+    type Item = io::Result<BufRingBufBundle>;
 
     fn update(&mut self, result: crate::operation::CQEResult) -> Self::Item {
         self.to_item(result)

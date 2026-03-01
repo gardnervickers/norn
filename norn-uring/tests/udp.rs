@@ -4,10 +4,17 @@ use std::pin::pin;
 
 use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
-use norn_uring::bufring::BufRing;
+use norn_uring::bufring::{BufRing, BufRingBufBundle};
 use norn_uring::net::UdpSocket;
 
 mod util;
+
+fn flatten_bundle(bundle: &BufRingBufBundle) -> Vec<u8> {
+    bundle
+        .iter()
+        .flat_map(|chunk| chunk.iter().copied())
+        .collect()
+}
 
 #[test]
 fn send_recv() -> Result<(), Box<dyn std::error::Error>> {
@@ -233,6 +240,75 @@ fn connected_send_recv_ring_multi() -> Result<(), Box<dyn std::error::Error>> {
             s1.send(Bytes::copy_from_slice(message)).await.0?;
             let buf = recv.next().await.expect("multishot stream ended")?;
             assert_eq!(&buf[..], message);
+        }
+
+        Ok(())
+    })
+}
+
+#[test]
+fn connected_send_recv_from_ring_multi() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let ring = BufRing::builder(8).buf_cnt(32).buf_len(2048).build()?;
+        let s1 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let s2 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        s1.connect(s2.local_addr()?).await?;
+        s2.connect(s1.local_addr()?).await?;
+
+        let mut recv = pin!(s2.recv_from_ring_multi(&ring));
+        let payload = Bytes::from_static(b"peer-fallback");
+        s1.send(payload.clone()).await.0?;
+        let (buf, addr) = recv.next().await.expect("multishot stream ended")?;
+        assert_eq!(addr, s1.local_addr()?);
+        assert_eq!(&buf[..], payload.as_ref());
+
+        Ok(())
+    })
+}
+
+#[test]
+fn connected_send_recv_bundle() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let ring = BufRing::builder(6).buf_cnt(64).buf_len(2048).build()?;
+        let s1 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let s2 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        s1.connect(s2.local_addr()?).await?;
+        s2.connect(s1.local_addr()?).await?;
+
+        let payload = Bytes::from_static(b"bundle-single");
+        s1.send(payload.clone()).await.0?;
+
+        let bundle = match s2.recv_bundle(&ring).await {
+            Ok(bundle) => bundle,
+            Err(err) if util::recv_bundle_unsupported(&err) => return Ok(()),
+            Err(err) => return Err(err.into()),
+        };
+        assert_eq!(bundle.len(), payload.len());
+        assert_eq!(flatten_bundle(&bundle), payload.as_ref());
+
+        Ok(())
+    })
+}
+
+#[test]
+fn connected_send_recv_bundle_multi() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let ring = BufRing::builder(7).buf_cnt(64).buf_len(2048).build()?;
+        let s1 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let s2 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        s1.connect(s2.local_addr()?).await?;
+        s2.connect(s1.local_addr()?).await?;
+
+        let mut recv = pin!(s2.recv_bundle_multi(&ring));
+        let messages: [&[u8]; 3] = [b"bundle-a", b"bundle-b", b"bundle-c"];
+        for message in messages {
+            s1.send(Bytes::copy_from_slice(message)).await.0?;
+            let bundle = match recv.next().await.expect("multishot stream ended") {
+                Ok(bundle) => bundle,
+                Err(err) if util::recv_bundle_unsupported(&err) => return Ok(()),
+                Err(err) => return Err(err.into()),
+            };
+            assert_eq!(flatten_bundle(&bundle), message);
         }
 
         Ok(())

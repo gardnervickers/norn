@@ -230,6 +230,30 @@ impl UdpSocket {
         self.inner.recv_ring_multi(ring)
     }
 
+    /// Receives data from a connected socket using a single-shot recv bundle operation.
+    pub fn recv_bundle(&self, ring: &BufRing) -> Op<socket::RecvRingBundle> {
+        self.inner.recv_ring_bundle(ring)
+    }
+
+    /// Receives data from a connected socket using a single-shot recv bundle operation with flags.
+    pub fn recv_bundle_with_flags(&self, ring: &BufRing, flags: i32) -> Op<socket::RecvRingBundle> {
+        self.inner.recv_ring_bundle_with_flags(ring, flags)
+    }
+
+    /// Receives data from a connected socket using a multishot recv bundle operation.
+    pub fn recv_bundle_multi(&self, ring: &BufRing) -> Op<socket::RecvRingBundleMulti> {
+        self.inner.recv_ring_bundle_multi(ring)
+    }
+
+    /// Receives data from a connected socket using a multishot recv bundle operation with flags.
+    pub fn recv_bundle_multi_with_flags(
+        &self,
+        ring: &BufRing,
+        flags: i32,
+    ) -> Op<socket::RecvRingBundleMulti> {
+        self.inner.recv_ring_bundle_multi_with_flags(ring, flags)
+    }
+
     /// Close the socket.
     ///
     /// This will wait for all pending operations to complete before closing the socket.

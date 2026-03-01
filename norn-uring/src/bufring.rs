@@ -60,6 +60,10 @@ impl BufRing {
         self.rc.get_buf(self.clone(), res, flags)
     }
 
+    pub(crate) fn get_buf_bundle(&self, res: u32, flags: u32) -> io::Result<BufRingBufBundle> {
+        self.rc.get_buf_bundle(self.clone(), res, flags)
+    }
+
     pub(crate) fn bgid(&self) -> Bgid {
         self.rc.bgid
     }
@@ -74,6 +78,47 @@ pub struct BufRingBuf {
     bufgroup: BufRing,
     len: usize,
     bid: Bid,
+}
+
+/// [`BufRingBufBundle`] is a collection of one or more buffers selected from a buffer ring.
+///
+/// This is primarily used by recv bundle operations that may consume multiple provided buffers
+/// for a single completion.
+#[derive(Debug)]
+pub struct BufRingBufBundle {
+    bufs: Vec<BufRingBuf>,
+    len: usize,
+}
+
+impl BufRingBufBundle {
+    fn new(bufs: Vec<BufRingBuf>, len: usize) -> Self {
+        Self { bufs, len }
+    }
+
+    /// Returns the total number of initialized bytes across all buffers in this bundle.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns `true` if this bundle contains no initialized bytes.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Returns the number of ring buffers contained in this bundle.
+    pub fn buffer_count(&self) -> usize {
+        self.bufs.len()
+    }
+
+    /// Returns an iterator over payload slices for each buffer in this bundle.
+    pub fn iter(&self) -> impl Iterator<Item = &[u8]> + '_ {
+        self.bufs.iter().map(BufRingBuf::as_slice)
+    }
+
+    /// Consumes this bundle and returns the underlying ring buffers.
+    pub fn into_bufs(self) -> Vec<BufRingBuf> {
+        self.bufs
+    }
 }
 
 impl fmt::Debug for BufRingBuf {
@@ -248,6 +293,10 @@ struct InnerBufRing {
     // value from time to time. The address could be computed from ring_start when needed. This
     // might be here for no good reason any more.
     shared_tail: *const AtomicU16,
+
+    // Cached consume head used for recv bundle operations. This tracks the next ring slot expected
+    // to be consumed by bundle-aware receives.
+    bundle_head: Cell<u16>,
 }
 
 impl InnerBufRing {
@@ -304,6 +353,7 @@ impl InnerBufRing {
             buf_list,
             local_tail: Cell::new(0),
             shared_tail,
+            bundle_head: Cell::new(0),
         };
 
         Ok(buf_ring)
@@ -393,7 +443,93 @@ impl InnerBufRing {
 
         assert!(len <= self.buf_len);
 
+        // Best effort: keep bundle head in sync when single-buffer CQEs arrive in-order.
+        let expected = self.bid_at_ring_index(self.bundle_head.get());
+        if expected == bid {
+            self.bundle_head.set(self.bundle_head.get().wrapping_add(1));
+        }
+
         Ok(BufRingBuf::new(buf_ring, bid, len))
+    }
+
+    fn get_buf_bundle(
+        &self,
+        buf_ring: BufRing,
+        res: u32,
+        flags: u32,
+    ) -> io::Result<BufRingBufBundle> {
+        let total_len = res as usize;
+        let Some(first_bid) = io_uring::cqueue::buffer_select(flags) else {
+            if total_len == 0 {
+                return Ok(BufRingBufBundle::new(Vec::new(), 0));
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bundle completion did not include a selected buffer id",
+            ));
+        };
+        if first_bid >= self.buf_cnt {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "bundle completion selected buffer id {} outside ring bounds (buf_cnt={})",
+                    first_bid, self.buf_cnt
+                ),
+            ));
+        }
+
+        let needed = if total_len == 0 {
+            1
+        } else {
+            total_len.div_ceil(self.buf_len)
+        };
+        if needed > usize::from(self.buf_cnt) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "bundle completion requires {} buffers but ring only has {}",
+                    needed, self.buf_cnt
+                ),
+            ));
+        }
+
+        let head = self.bundle_head.get();
+        let head_bid = self.bid_at_ring_index(head);
+        if head_bid != first_bid {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "bundle completion selected bid {} but bundle head expected bid {}",
+                    first_bid, head_bid
+                ),
+            ));
+        }
+
+        let mut bufs = Vec::with_capacity(needed);
+        let mut remaining = total_len;
+        for i in 0..needed {
+            let ring_index = head.wrapping_add(i as u16);
+            let bid = self.bid_at_ring_index(ring_index);
+            if bid >= self.buf_cnt {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "bundle completion consumed invalid bid {} (buf_cnt={})",
+                        bid, self.buf_cnt
+                    ),
+                ));
+            }
+            let len = if i + 1 == needed {
+                remaining
+            } else {
+                self.buf_len
+            };
+            bufs.push(BufRingBuf::new(buf_ring.clone(), bid, len));
+            remaining = remaining.saturating_sub(len);
+        }
+
+        self.bundle_head.set(head.wrapping_add(needed as u16));
+        Ok(BufRingBufBundle::new(bufs, total_len))
     }
 
     fn buf_capacity(&self) -> usize {
@@ -402,6 +538,12 @@ impl InnerBufRing {
 
     fn stable_ptr(&self, bid: Bid) -> *const u8 {
         self.buf_list[bid as usize].as_ptr()
+    }
+
+    fn bid_at_ring_index(&self, index: u16) -> Bid {
+        let idx = index & self.mask();
+        let entries = self.ring_start.as_ptr() as *const BufRingEntry;
+        unsafe { (&*entries.add(idx as usize)).bid() }
     }
 
     fn ring_entries(&self) -> u16 {
