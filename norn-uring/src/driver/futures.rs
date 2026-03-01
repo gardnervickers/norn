@@ -63,6 +63,9 @@ impl Future for PushFutureInner<'_> {
                 }
                 return Poll::Ready(Err(SubmitError::shutting_down()));
             }
+            if let Err(err) = this.shared.validate_batch_len(this.entries.len()) {
+                return Poll::Ready(Err(err));
+            }
             if let Some(notify) = this.notify.as_mut().as_pin_mut() {
                 ready!(notify.poll(cx));
                 Pin::set(&mut this.notify, None);

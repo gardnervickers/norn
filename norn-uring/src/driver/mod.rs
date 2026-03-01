@@ -10,6 +10,7 @@ use log::{debug, error, trace, warn};
 use norn_executor::park::{Park, ParkMode};
 use smallvec::SmallVec;
 
+use crate::error::SubmitError;
 use crate::fd;
 use crate::operation::{complete_operation, ConfiguredEntry, Op, Operation};
 use crate::util::notify::Notify;
@@ -376,6 +377,16 @@ impl Park for Driver {
 }
 
 impl Shared {
+    fn validate_batch_len(&self, batch_len: usize) -> Result<(), SubmitError> {
+        let mut ring = self.ring.borrow_mut();
+        let sq = ring.submission();
+        let capacity = sq.capacity();
+        if batch_len > capacity {
+            return Err(SubmitError::batch_too_large(batch_len, capacity));
+        }
+        Ok(())
+    }
+
     fn should_record_submit_error(err: &io::Error) -> bool {
         !matches!(err.raw_os_error(), Some(libc::EBUSY | libc::EINTR))
     }
@@ -627,11 +638,13 @@ impl Drop for Driver {
 mod tests {
     use std::future::Future;
     use std::pin::Pin;
+    use std::task::Poll;
 
     use smallvec::SmallVec;
 
     use super::*;
     use crate::operation::{CQEResult, Operation, Singleshot};
+    use crate::Request;
 
     #[test]
     fn prepare_park_sq_full_clears_parked_state() {
@@ -788,6 +801,42 @@ mod tests {
         let mut ring = driver.shared.ring.borrow_mut();
         let sq = ring.submission();
         assert_eq!(sq.len(), 1, "failed batch enqueue must not partially push");
+    }
+
+    #[test]
+    fn oversized_batch_fails_instead_of_waiting_forever() {
+        #[derive(Debug)]
+        struct NopOp;
+
+        impl Operation for NopOp {
+            fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+                io_uring::opcode::Nop::new().build()
+            }
+
+            fn cleanup(&mut self, _: CQEResult) {}
+        }
+
+        impl Singleshot for NopOp {
+            type Output = io::Result<()>;
+
+            fn complete(self, result: CQEResult) -> Self::Output {
+                result.result.map(drop)
+            }
+        }
+
+        let driver = Driver::new(io_uring::IoUring::builder(), 1).unwrap();
+        let handle = driver.handle();
+        let mut chain = std::pin::pin!(handle.submit(NopOp).then(handle.submit(NopOp)));
+        let waker = futures_test::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+
+        match Future::poll(chain.as_mut(), &mut cx) {
+            Poll::Ready((Err(left), Err(right))) => {
+                assert_eq!(left.kind(), io::ErrorKind::InvalidInput);
+                assert_eq!(right.kind(), io::ErrorKind::InvalidInput);
+            }
+            other => panic!("expected immediate invalid-input errors, got {other:?}"),
+        }
     }
 
     #[test]
