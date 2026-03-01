@@ -101,7 +101,7 @@ pub struct Scope<'scope, 'env, R> {
     _marker: PhantomData<&'scope &'env ()>,
 }
 
-impl<'scope, 'env, R> Scope<'scope, 'env, R> {
+impl<'scope, R> Scope<'scope, '_, R> {
     fn new() -> Self {
         Self {
             shared: Rc::new(Shared::default()),
@@ -205,13 +205,13 @@ impl<'scope, 'env, R> Scope<'scope, 'env, R> {
     }
 }
 
-impl<'scope, 'env, R> std::fmt::Debug for Scope<'scope, 'env, R> {
+impl<R> std::fmt::Debug for Scope<'_, '_, R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Scope").finish()
     }
 }
 
-impl<'scope, 'env, R> Drop for Scope<'scope, 'env, R> {
+impl<R> Drop for Scope<'_, '_, R> {
     fn drop(&mut self) {
         self.clear();
     }
@@ -259,7 +259,7 @@ struct ScopeClearGuard<'scope, 'env, R> {
     scope: Rc<Scope<'scope, 'env, R>>,
 }
 
-impl<'scope, 'env, R> Drop for ScopeClearGuard<'scope, 'env, R> {
+impl<R> Drop for ScopeClearGuard<'_, '_, R> {
     fn drop(&mut self) {
         // Clear tasks before the scope body frame is dropped, so child futures
         // cannot outlive borrows owned by the body future.
@@ -298,7 +298,7 @@ where
     }
 }
 
-impl<'env, R, F> std::fmt::Debug for ScopeBody<'env, R, F>
+impl<R, F> std::fmt::Debug for ScopeBody<'_, R, F>
 where
     F: Future<Output = R>,
 {
@@ -307,7 +307,7 @@ where
     }
 }
 
-impl<'env, R, F> Future for ScopeBody<'env, R, F>
+impl<R, F> Future for ScopeBody<'_, R, F>
 where
     F: Future<Output = R>,
 {

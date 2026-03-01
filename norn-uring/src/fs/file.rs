@@ -51,23 +51,31 @@ impl File {
     /// Read bytes from the file into the specified buffer.
     ///
     /// The read will start at the provided offset.
-    pub async fn read_at<B>(&self, buf: B, offset: u64) -> (io::Result<usize>, B)
+    pub fn read_at<B>(
+        &self,
+        buf: B,
+        offset: u64,
+    ) -> impl crate::Request<Output = (io::Result<usize>, B)>
     where
         B: StableBufMut + 'static,
     {
         let read = ReadAt::new(self.fd.clone(), buf, offset);
-        self.handle.submit(read).await
+        self.handle.submit(read)
     }
 
     /// Write the specified buffer to the file.
     ///
     /// The write will start at the provided offset.
-    pub async fn write_at<B>(&self, buf: B, offset: u64) -> (io::Result<usize>, B)
+    pub fn write_at<B>(
+        &self,
+        buf: B,
+        offset: u64,
+    ) -> impl crate::Request<Output = (io::Result<usize>, B)>
     where
         B: StableBuf + 'static,
     {
         let write = WriteAt::new(self.fd.clone(), buf, offset);
-        self.handle.submit(write).await
+        self.handle.submit(write)
     }
 
     /// Read bytes from the file into a set of buffers.
@@ -93,29 +101,39 @@ impl File {
     }
 
     /// Sync the file and metadata to disk.
-    pub async fn sync(&self) -> io::Result<()> {
+    pub fn sync(&self) -> impl crate::Request<Output = io::Result<()>> {
         let flags = FsyncFlags::empty();
         let sync = Sync::new(self.fd.clone(), flags);
-        self.handle.submit(sync).await
+        self.handle.submit(sync)
     }
 
     /// Sync only the data in the file to disk.
-    pub async fn datasync(&self) -> io::Result<()> {
+    pub fn datasync(&self) -> impl crate::Request<Output = io::Result<()>> {
         let flags = FsyncFlags::DATASYNC;
         let sync = Sync::new(self.fd.clone(), flags);
-        self.handle.submit(sync).await
+        self.handle.submit(sync)
     }
 
     /// Sync a range of the file.
-    pub async fn sync_range(&self, offset: u64, len: u32, flags: u32) -> io::Result<()> {
+    pub fn sync_range(
+        &self,
+        offset: u64,
+        len: u32,
+        flags: u32,
+    ) -> impl crate::Request<Output = io::Result<()>> {
         let sync = SyncRange::new(self.fd.clone(), offset, len, flags);
-        self.handle.submit(sync).await
+        self.handle.submit(sync)
     }
 
     /// Call `fallocate` on the file.
-    pub async fn fallocate(&self, offset: u64, len: u64, mode: i32) -> io::Result<()> {
+    pub fn fallocate(
+        &self,
+        offset: u64,
+        len: u64,
+        mode: i32,
+    ) -> impl crate::Request<Output = io::Result<()>> {
         let fallocate = Fallocate::new(self.fd.clone(), offset, len, mode);
-        self.handle.submit(fallocate).await
+        self.handle.submit(fallocate)
     }
 
     /// Truncate or extend the underlying file, updating the file length.
@@ -127,25 +145,23 @@ impl File {
     /// Allocate additional space in the file without changing the file length metadata.
     ///
     /// This is akin to fallocate with `FALLOC_FL_ZERO_RANGE` and `FALLOC_FL_KEEP_SIZE` set.
-    pub async fn allocate(&self, offset: u64, len: u64) -> io::Result<()> {
+    pub fn allocate(&self, offset: u64, len: u64) -> impl crate::Request<Output = io::Result<()>> {
         self.fallocate(
             offset,
             len,
             libc::FALLOC_FL_ZERO_RANGE | libc::FALLOC_FL_KEEP_SIZE,
         )
-        .await
     }
     /// Punches a hole in the file at the specified offset range.
     ///
     /// This can be used to discard portions of a file to save space. The file size will not be
     /// changed.
-    pub async fn discard(&self, offset: u64, len: u64) -> io::Result<()> {
+    pub fn discard(&self, offset: u64, len: u64) -> impl crate::Request<Output = io::Result<()>> {
         self.fallocate(
             offset,
             len,
             libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
         )
-        .await
     }
 
     /// Close the file.

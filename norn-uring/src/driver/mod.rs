@@ -8,6 +8,7 @@ use io_uring::types::{self, CancelBuilder, SubmitArgs, Timespec};
 use io_uring::{cqueue, opcode, IoUring, Submitter};
 use log::{debug, error, trace, warn};
 use norn_executor::park::{Park, ParkMode};
+use smallvec::SmallVec;
 
 use crate::fd;
 use crate::operation::{complete_operation, ConfiguredEntry, Op, Operation};
@@ -88,7 +89,11 @@ impl Handle {
         Self::try_current().expect("not in driver context")
     }
 
-    pub(crate) fn submit<T>(&self, op: T) -> Op<T>
+    /// Prepare an operation for submission.
+    ///
+    /// The returned [`Op`] is lazy: it does not touch the submission queue until
+    /// it is first polled.
+    pub fn submit<T>(&self, op: T) -> Op<T>
     where
         T: Operation + 'static,
     {
@@ -109,8 +114,8 @@ impl Handle {
     ///
     /// If the submission queue is full, this will block until there
     /// is space or the driver has shutdown.
-    pub(crate) fn push(&self, entry: ConfiguredEntry) -> PushFuture {
-        PushFuture::new(Rc::clone(&self.shared), entry)
+    pub(crate) fn push_batch(&self, entries: SmallVec<[ConfiguredEntry; 4]>) -> PushFuture {
+        PushFuture::new(Rc::clone(&self.shared), entries)
     }
 
     pub(crate) fn close_fd(&self, kind: &fd::FdKind) -> io::Result<()> {
@@ -124,6 +129,10 @@ impl Handle {
     /// Returns the first recorded fatal driver submit error, if any.
     pub fn health_error(&self) -> Option<io::Error> {
         self.shared.health_error()
+    }
+
+    pub(crate) fn same_driver(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.shared, &other.shared)
     }
 }
 
@@ -404,19 +413,32 @@ impl Shared {
         self.status.set(status);
     }
 
-    /// Attempt to push a new entry into the submission queue.
+    /// Attempt to push a batch of entries into the submission queue.
     ///
-    /// If the submission queue is full, this will return the entry.
-    fn try_push(&self, entry: ConfiguredEntry) -> Result<(), ConfiguredEntry> {
+    /// If the submission queue does not have enough free capacity for the full
+    /// batch, the original entries are returned unchanged.
+    fn try_push_batch(
+        &self,
+        entries: SmallVec<[ConfiguredEntry; 4]>,
+    ) -> Result<(), SmallVec<[ConfiguredEntry; 4]>> {
         let mut ring = self.ring.borrow_mut();
         let mut sq = ring.submission();
-        if sq.is_full() {
-            Err(entry)
-        } else {
-            let entry = entry.into_entry();
-            unsafe { sq.push(&entry) }.unwrap();
-            Ok(())
+        if sq.capacity() - sq.len() < entries.len() {
+            return Err(entries);
         }
+
+        let len = entries.len();
+        let mut raw_entries = SmallVec::<[io_uring::squeue::Entry; 4]>::with_capacity(len);
+        for (idx, entry) in entries.into_iter().enumerate() {
+            let flags = if idx + 1 == len {
+                Flags::empty()
+            } else {
+                Flags::IO_LINK
+            };
+            raw_entries.push(entry.into_entry_with_flags(flags));
+        }
+        unsafe { sq.push_multiple(raw_entries.as_slice()) }.unwrap();
+        Ok(())
     }
 
     /// Attempt to push a new raw entry into the submission queue.
@@ -606,6 +628,8 @@ mod tests {
     use std::future::Future;
     use std::pin::Pin;
 
+    use smallvec::SmallVec;
+
     use super::*;
     use crate::operation::{CQEResult, Operation, Singleshot};
 
@@ -689,6 +713,81 @@ mod tests {
             "unexpected submit error: {}",
             err
         );
+    }
+
+    #[test]
+    fn submit_construction_is_lazy() {
+        #[derive(Debug)]
+        struct NopOp;
+
+        impl Operation for NopOp {
+            fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+                io_uring::opcode::Nop::new().build()
+            }
+
+            fn cleanup(&mut self, _: CQEResult) {}
+        }
+
+        impl Singleshot for NopOp {
+            type Output = io::Result<()>;
+
+            fn complete(self, result: CQEResult) -> Self::Output {
+                result.result.map(drop)
+            }
+        }
+
+        let driver = Driver::new(io_uring::IoUring::builder(), 2).unwrap();
+        let _op = driver.handle().submit(NopOp);
+
+        let mut ring = driver.shared.ring.borrow_mut();
+        let sq = ring.submission();
+        assert_eq!(sq.len(), 0, "request construction must not enqueue");
+    }
+
+    #[test]
+    fn try_push_batch_needs_full_capacity() {
+        #[derive(Debug)]
+        struct NopOp;
+
+        impl Operation for NopOp {
+            fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+                io_uring::opcode::Nop::new().build()
+            }
+
+            fn cleanup(&mut self, _: CQEResult) {}
+        }
+
+        impl Singleshot for NopOp {
+            type Output = io::Result<()>;
+
+            fn complete(self, result: CQEResult) -> Self::Output {
+                result.result.map(drop)
+            }
+        }
+
+        let driver = Driver::new(io_uring::IoUring::builder(), 2).unwrap();
+        let handle = driver.handle();
+
+        let mut first = std::pin::pin!(handle.submit(NopOp));
+        let mut first_batch = SmallVec::new();
+        first.as_mut().prepare_batch(&mut first_batch);
+        assert!(driver.shared.try_push_batch(first_batch).is_ok());
+
+        let mut second = std::pin::pin!(handle.submit(NopOp));
+        let mut third = std::pin::pin!(handle.submit(NopOp));
+        let mut batch = SmallVec::new();
+        second.as_mut().prepare_batch(&mut batch);
+        third.as_mut().prepare_batch(&mut batch);
+
+        let batch = driver
+            .shared
+            .try_push_batch(batch)
+            .expect_err("batch should wait for full capacity");
+        assert_eq!(batch.len(), 2);
+
+        let mut ring = driver.shared.ring.borrow_mut();
+        let sq = ring.submission();
+        assert_eq!(sq.len(), 1, "failed batch enqueue must not partially push");
     }
 
     #[test]

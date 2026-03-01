@@ -3,6 +3,8 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{ready, Context, Poll};
 
+use smallvec::SmallVec;
+
 use crate::driver::{Shared, Status};
 use crate::error::SubmitError;
 use crate::operation::ConfiguredEntry;
@@ -28,17 +30,17 @@ pin_project_lite::pin_project! {
         shared: &'a Shared,
         #[pin]
         notify: Option<Notified<'a>>,
-        entry: Option<ConfiguredEntry>,
+        entries: SmallVec<[ConfiguredEntry; 4]>,
     }
 }
 
 impl PushFuture {
-    pub(super) fn new(shared: Rc<Shared>, entry: ConfiguredEntry) -> Self {
+    pub(super) fn new(shared: Rc<Shared>, entries: SmallVec<[ConfiguredEntry; 4]>) -> Self {
         let shared = into_static_shared(shared);
         let inner = PushFutureInner {
             shared,
             notify: None,
-            entry: Some(entry),
+            entries,
         };
         PushFuture {
             shared: Some(shared),
@@ -66,12 +68,8 @@ impl Future for PushFutureInner<'_> {
                 Pin::set(&mut this.notify, None);
             }
 
-            if let Err(entry) = this
-                .shared
-                .try_push(this.entry.take().expect("entry already submitted"))
-            {
-                // Put the entry back
-                *this.entry = Some(entry);
+            if let Err(entries) = this.shared.try_push_batch(std::mem::take(this.entries)) {
+                *this.entries = entries;
                 // Wait for the submission queue to have space
                 log::trace!(target: LOG, "ring.push.full");
                 Pin::set(&mut this.notify, Some(this.shared.backpressure.wait()));

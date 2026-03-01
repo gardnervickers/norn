@@ -26,6 +26,7 @@ pub(crate) mod driver;
 pub(crate) mod error;
 pub(crate) mod fd;
 pub(crate) mod operation;
+mod request;
 pub(crate) mod util;
 
 /// Stable buffer traits and adapters for io_uring operations.
@@ -38,4 +39,6 @@ pub mod fs;
 pub mod net;
 
 pub use driver::{Driver, Handle};
+pub use operation::{Multishot, Op, Operation, Singleshot};
+pub use request::{Map, Request, Then, ThenAux};
 pub use util::noop;
