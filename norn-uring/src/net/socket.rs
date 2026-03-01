@@ -14,7 +14,7 @@ use libc::O_NONBLOCK;
 use socket2::{Domain, Protocol, SockAddr, Type};
 
 use crate::buf::{StableBuf, StableBufMut};
-use crate::bufring::{BufRing, BufRingBuf, BufRingBufBundle};
+use crate::bufring::{BufRing, BufRingBuf, BufRingBufBundle, SendBufRing};
 use crate::fd::NornFd;
 use crate::operation::{Multishot, Op, Operation, Singleshot};
 
@@ -216,6 +216,20 @@ impl Socket {
         B: StableBuf + 'static,
     {
         let op = SendTo::new(self.fd.clone(), buf, Some(addr), flags as u32);
+        self.handle.submit(op).await
+    }
+
+    pub(crate) async fn send_bundle_udp(&self, ring: &SendBufRing) -> io::Result<usize> {
+        self.send_bundle_udp_with_flags(ring, 0).await
+    }
+
+    pub(crate) async fn send_bundle_udp_with_flags(
+        &self,
+        ring: &SendBufRing,
+        flags: i32,
+    ) -> io::Result<usize> {
+        ring.begin_send()?;
+        let op = SendBundleUdp::new(self.fd.clone(), ring.clone(), flags);
         self.handle.submit(op).await
     }
 
@@ -1339,6 +1353,46 @@ where
 
     fn complete(self, result: crate::operation::CQEResult) -> Self::Output {
         (result.result.map(|v| v as usize), self.buf)
+    }
+}
+
+#[derive(Debug)]
+struct SendBundleUdp {
+    fd: NornFd,
+    ring: SendBufRing,
+    flags: i32,
+}
+
+impl SendBundleUdp {
+    fn new(fd: NornFd, ring: SendBufRing, flags: i32) -> Self {
+        Self { fd, ring, flags }
+    }
+}
+
+impl Operation for SendBundleUdp {
+    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+        let this = unsafe { self.get_unchecked_mut() };
+        match this.fd.kind() {
+            crate::fd::FdKind::Fd(fd) => opcode::SendBundle::new(types::Fd(fd.0), this.ring.bgid()),
+            crate::fd::FdKind::Fixed(fd) => {
+                opcode::SendBundle::new(types::Fixed(fd.0), this.ring.bgid())
+            }
+        }
+        .flags(this.flags)
+        .len(0)
+        .build()
+    }
+
+    fn cleanup(&mut self, result: crate::operation::CQEResult) {
+        let _ = self.ring.finish_send(result);
+    }
+}
+
+impl Singleshot for SendBundleUdp {
+    type Output = io::Result<usize>;
+
+    fn complete(self, result: crate::operation::CQEResult) -> Self::Output {
+        self.ring.finish_send(result)
     }
 }
 
