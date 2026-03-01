@@ -148,6 +148,43 @@ impl File {
         .await
     }
 
+    /// Provide access pattern advice for the file.
+    ///
+    /// This maps to `posix_fadvise(2)`.
+    pub async fn advise(&self, offset: u64, len: u64, advice: i32) -> io::Result<()> {
+        let len = u64_to_off_t(len, "fadvise length")?;
+        let op = Advise::new(self.fd.clone(), offset, len, advice);
+        self.handle.submit(op).await
+    }
+
+    /// Read an extended attribute from this file into the provided buffer.
+    ///
+    /// On success, returns the number of bytes written into `buf`.
+    pub async fn get_xattr<N, B>(&self, name: N, buf: B) -> (io::Result<usize>, B)
+    where
+        N: AsRef<[u8]>,
+        B: StableBufMut + 'static,
+    {
+        let op = match FileGetXattr::new(self.fd.clone(), name.as_ref(), buf) {
+            Ok(op) => op,
+            Err((err, buf)) => return (Err(err), buf),
+        };
+        self.handle.submit(op).await
+    }
+
+    /// Set an extended attribute on this file from the provided buffer.
+    pub async fn set_xattr<N, B>(&self, name: N, value: B, flags: i32) -> (io::Result<()>, B)
+    where
+        N: AsRef<[u8]>,
+        B: StableBuf + 'static,
+    {
+        let op = match FileSetXattr::new(self.fd.clone(), name.as_ref(), value, flags) {
+            Ok(op) => op,
+            Err((err, value)) => return (Err(err), value),
+        };
+        self.handle.submit(op).await
+    }
+
     /// Close the file.
     pub async fn close(self) -> io::Result<()> {
         self.fd.close().await
@@ -192,6 +229,33 @@ impl Singleshot for Open {
         let res = result.result?;
         Ok(NornFd::from_fd(res as _))
     }
+}
+
+fn bytes_to_cstring(bytes: &[u8], what: &'static str) -> io::Result<std::ffi::CString> {
+    std::ffi::CString::new(bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{what} contains an interior NUL byte"),
+        )
+    })
+}
+
+fn usize_to_u32(len: usize, what: &'static str) -> io::Result<u32> {
+    u32::try_from(len).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{what} exceeds u32::MAX"),
+        )
+    })
+}
+
+fn u64_to_off_t(len: u64, what: &'static str) -> io::Result<libc::off_t> {
+    libc::off_t::try_from(len).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{what} exceeds off_t::MAX"),
+        )
+    })
 }
 
 #[derive(Debug)]
@@ -422,6 +486,162 @@ where
             Ok(n) => (Ok(n as usize), self.bufs),
             Err(err) => (Err(err), self.bufs),
         }
+    }
+}
+
+struct Advise {
+    fd: NornFd,
+    offset: u64,
+    len: libc::off_t,
+    advice: i32,
+}
+
+impl Advise {
+    fn new(fd: NornFd, offset: u64, len: libc::off_t, advice: i32) -> Self {
+        Self {
+            fd,
+            offset,
+            len,
+            advice,
+        }
+    }
+}
+
+impl Operation for Advise {
+    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+        match self.fd.kind() {
+            FdKind::Fd(fd) => opcode::Fadvise::new(*fd, self.len, self.advice),
+            FdKind::Fixed(fd) => opcode::Fadvise::new(*fd, self.len, self.advice),
+        }
+        .offset(self.offset)
+        .build()
+    }
+
+    fn cleanup(&mut self, _: CQEResult) {}
+}
+
+impl Singleshot for Advise {
+    type Output = io::Result<()>;
+
+    fn complete(self, result: CQEResult) -> Self::Output {
+        result.result.map(|_| ())
+    }
+}
+
+struct FileGetXattr<B> {
+    fd: NornFd,
+    name: std::ffi::CString,
+    buf: B,
+    len: u32,
+}
+
+impl<B> FileGetXattr<B>
+where
+    B: StableBufMut,
+{
+    fn new(fd: NornFd, name: &[u8], buf: B) -> Result<Self, (io::Error, B)> {
+        let name = match bytes_to_cstring(name, "xattr name") {
+            Ok(name) => name,
+            Err(err) => return Err((err, buf)),
+        };
+        let len = match usize_to_u32(buf.bytes_remaining(), "xattr buffer length") {
+            Ok(len) => len,
+            Err(err) => return Err((err, buf)),
+        };
+        Ok(Self { fd, name, buf, len })
+    }
+}
+
+impl<B> Operation for FileGetXattr<B>
+where
+    B: StableBufMut,
+{
+    fn configure(mut self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+        let ptr = self.buf.stable_ptr_mut() as *mut libc::c_void;
+        match self.fd.kind() {
+            FdKind::Fd(fd) => opcode::FGetXattr::new(*fd, self.name.as_ptr(), ptr, self.len),
+            FdKind::Fixed(fd) => opcode::FGetXattr::new(*fd, self.name.as_ptr(), ptr, self.len),
+        }
+        .build()
+    }
+
+    fn cleanup(&mut self, _: CQEResult) {}
+}
+
+impl<B> Singleshot for FileGetXattr<B>
+where
+    B: StableBufMut,
+{
+    type Output = (io::Result<usize>, B);
+
+    fn complete(mut self, result: CQEResult) -> Self::Output {
+        match result.result {
+            Ok(n) => {
+                let n = n as usize;
+                unsafe { self.buf.set_init(n) };
+                (Ok(n), self.buf)
+            }
+            Err(err) => (Err(err), self.buf),
+        }
+    }
+}
+
+struct FileSetXattr<B> {
+    fd: NornFd,
+    name: std::ffi::CString,
+    value: B,
+    flags: i32,
+    len: u32,
+}
+
+impl<B> FileSetXattr<B>
+where
+    B: StableBuf,
+{
+    fn new(fd: NornFd, name: &[u8], value: B, flags: i32) -> Result<Self, (io::Error, B)> {
+        let name = match bytes_to_cstring(name, "xattr name") {
+            Ok(name) => name,
+            Err(err) => return Err((err, value)),
+        };
+        let len = match usize_to_u32(value.bytes_init(), "xattr value length") {
+            Ok(len) => len,
+            Err(err) => return Err((err, value)),
+        };
+        Ok(Self {
+            fd,
+            name,
+            value,
+            flags,
+            len,
+        })
+    }
+}
+
+impl<B> Operation for FileSetXattr<B>
+where
+    B: StableBuf,
+{
+    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+        let ptr = self.value.stable_ptr() as *const libc::c_void;
+        match self.fd.kind() {
+            FdKind::Fd(fd) => opcode::FSetXattr::new(*fd, self.name.as_ptr(), ptr, self.len),
+            FdKind::Fixed(fd) => opcode::FSetXattr::new(*fd, self.name.as_ptr(), ptr, self.len),
+        }
+        .flags(self.flags)
+        .build()
+    }
+
+    fn cleanup(&mut self, _: CQEResult) {}
+}
+
+impl<B> Singleshot for FileSetXattr<B>
+where
+    B: StableBuf,
+{
+    type Output = (io::Result<()>, B);
+
+    fn complete(self, result: CQEResult) -> Self::Output {
+        (result.result.map(|_| ()), self.value)
     }
 }
 

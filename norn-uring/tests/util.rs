@@ -91,3 +91,17 @@ pub fn zerocopy_unsupported(err: &io::Error) -> bool {
     err.kind() == io::ErrorKind::Unsupported
         || ZC_UNSUPPORTED_ERRNOS.contains(&err.raw_os_error().unwrap_or_default())
 }
+
+#[allow(dead_code)]
+pub fn xattr_unsupported(err: &io::Error) -> bool {
+    const XATTR_UNSUPPORTED_ERRNOS: [c_int; 6] = [
+        libc::ENOSYS,
+        libc::EOPNOTSUPP,
+        libc::ENOTSUP,
+        libc::EPERM,
+        libc::EACCES,
+        libc::EINVAL,
+    ];
+    err.kind() == io::ErrorKind::Unsupported
+        || XATTR_UNSUPPORTED_ERRNOS.contains(&err.raw_os_error().unwrap_or_default())
+}

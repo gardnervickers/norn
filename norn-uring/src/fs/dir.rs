@@ -91,6 +91,40 @@ pub async fn read_link<P: AsRef<Path>>(path: P) -> io::Result<PathBuf> {
     std::fs::read_link(path)
 }
 
+/// Read an extended attribute from a path into the provided buffer.
+///
+/// On success, returns the number of bytes written into `buf`.
+pub async fn get_xattr<P, N, B>(path: P, name: N, buf: B) -> (io::Result<usize>, B)
+where
+    P: AsRef<Path>,
+    N: AsRef<[u8]>,
+    B: crate::buf::StableBufMut + 'static,
+{
+    let path = path.as_ref().to_owned();
+    let handle = Handle::current();
+    let op = match PathGetXattr::new(&path, name.as_ref(), buf) {
+        Ok(op) => op,
+        Err((err, buf)) => return (Err(err), buf),
+    };
+    handle.submit(op).await
+}
+
+/// Set an extended attribute on a path from the provided buffer.
+pub async fn set_xattr<P, N, B>(path: P, name: N, value: B, flags: i32) -> (io::Result<()>, B)
+where
+    P: AsRef<Path>,
+    N: AsRef<[u8]>,
+    B: crate::buf::StableBuf + 'static,
+{
+    let path = path.as_ref().to_owned();
+    let handle = Handle::current();
+    let op = match PathSetXattr::new(&path, name.as_ref(), value, flags) {
+        Ok(op) => op,
+        Err((err, value)) => return (Err(err), value),
+    };
+    handle.submit(op).await
+}
+
 struct UnlinkAt {
     path: std::ffi::CString,
     flags: i32,
@@ -329,9 +363,150 @@ impl Singleshot for Statx {
     }
 }
 
+struct PathGetXattr<B> {
+    path: std::ffi::CString,
+    name: std::ffi::CString,
+    buf: B,
+    len: u32,
+}
+
+impl<B> PathGetXattr<B>
+where
+    B: crate::buf::StableBufMut,
+{
+    fn new(path: &Path, name: &[u8], buf: B) -> Result<Self, (io::Error, B)> {
+        let path = match path_to_cstring(path) {
+            Ok(path) => path,
+            Err(err) => return Err((err, buf)),
+        };
+        let name = match bytes_to_cstring(name, "xattr name") {
+            Ok(name) => name,
+            Err(err) => return Err((err, buf)),
+        };
+        let len = match usize_to_u32(buf.bytes_remaining(), "xattr buffer length") {
+            Ok(len) => len,
+            Err(err) => return Err((err, buf)),
+        };
+        Ok(Self {
+            path,
+            name,
+            buf,
+            len,
+        })
+    }
+}
+
+impl<B> Operation for PathGetXattr<B>
+where
+    B: crate::buf::StableBufMut,
+{
+    fn configure(mut self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+        let value = self.buf.stable_ptr_mut() as *mut libc::c_void;
+        opcode::GetXattr::new(self.name.as_ptr(), value, self.path.as_ptr(), self.len).build()
+    }
+
+    fn cleanup(&mut self, _: crate::operation::CQEResult) {}
+}
+
+impl<B> Singleshot for PathGetXattr<B>
+where
+    B: crate::buf::StableBufMut,
+{
+    type Output = (io::Result<usize>, B);
+
+    fn complete(mut self, result: crate::operation::CQEResult) -> Self::Output {
+        match result.result {
+            Ok(n) => {
+                let n = n as usize;
+                unsafe { self.buf.set_init(n) };
+                (Ok(n), self.buf)
+            }
+            Err(err) => (Err(err), self.buf),
+        }
+    }
+}
+
+struct PathSetXattr<B> {
+    path: std::ffi::CString,
+    name: std::ffi::CString,
+    value: B,
+    flags: i32,
+    len: u32,
+}
+
+impl<B> PathSetXattr<B>
+where
+    B: crate::buf::StableBuf,
+{
+    fn new(path: &Path, name: &[u8], value: B, flags: i32) -> Result<Self, (io::Error, B)> {
+        let path = match path_to_cstring(path) {
+            Ok(path) => path,
+            Err(err) => return Err((err, value)),
+        };
+        let name = match bytes_to_cstring(name, "xattr name") {
+            Ok(name) => name,
+            Err(err) => return Err((err, value)),
+        };
+        let len = match usize_to_u32(value.bytes_init(), "xattr value length") {
+            Ok(len) => len,
+            Err(err) => return Err((err, value)),
+        };
+        Ok(Self {
+            path,
+            name,
+            value,
+            flags,
+            len,
+        })
+    }
+}
+
+impl<B> Operation for PathSetXattr<B>
+where
+    B: crate::buf::StableBuf,
+{
+    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+        let value = self.value.stable_ptr() as *const libc::c_void;
+        opcode::SetXattr::new(self.name.as_ptr(), value, self.path.as_ptr(), self.len)
+            .flags(self.flags)
+            .build()
+    }
+
+    fn cleanup(&mut self, _: crate::operation::CQEResult) {}
+}
+
+impl<B> Singleshot for PathSetXattr<B>
+where
+    B: crate::buf::StableBuf,
+{
+    type Output = (io::Result<()>, B);
+
+    fn complete(self, result: crate::operation::CQEResult) -> Self::Output {
+        (result.result.map(|_| ()), self.value)
+    }
+}
+
 fn path_to_cstring(path: &Path) -> io::Result<std::ffi::CString> {
     let path = path
         .to_str()
         .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
     Ok(std::ffi::CString::new(path)?)
+}
+
+fn bytes_to_cstring(bytes: &[u8], what: &'static str) -> io::Result<std::ffi::CString> {
+    std::ffi::CString::new(bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{what} contains an interior NUL byte"),
+        )
+    })
+}
+
+fn usize_to_u32(len: usize, what: &'static str) -> io::Result<u32> {
+    u32::try_from(len).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{what} exceeds u32::MAX"),
+        )
+    })
 }
