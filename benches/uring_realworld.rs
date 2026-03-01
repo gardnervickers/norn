@@ -2,8 +2,10 @@
 
 use std::borrow::Cow;
 use std::cmp;
+use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::pin::{pin, Pin};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -14,6 +16,7 @@ use bencher::bench;
 use bencher::{run_tests_console, Bencher, TestDesc, TestDescAndFn, TestFn, TestOpts};
 use futures::stream::{FuturesUnordered, StreamExt};
 
+use norn_uring::bufring::BufRing;
 use norn_uring::fs;
 use norn_uring::net::UdpSocket;
 
@@ -62,24 +65,39 @@ impl Drop for BenchDir {
 
 async fn udp_request_response_worker(
     sockets: &[UdpSocket],
+    recv_mode: UdpRecvMode,
+    recv_rings: &[BufRing],
     server_addr: std::net::SocketAddr,
     payload_len: usize,
     total_requests: usize,
 ) -> io::Result<()> {
+    if recv_mode == UdpRecvMode::Multi {
+        assert_eq!(sockets.len(), recv_rings.len());
+    }
     let lanes = cmp::max(1, sockets.len());
     let per_lane = total_requests / lanes;
     let extra = total_requests % lanes;
-    let mut pending = FuturesUnordered::new();
+    let mut pending: FuturesUnordered<Pin<Box<dyn Future<Output = io::Result<()>> + '_>>> =
+        FuturesUnordered::new();
 
     for (lane, socket) in sockets.iter().enumerate() {
         let lane_requests = per_lane + usize::from(lane < extra);
         if lane_requests > 0 {
-            pending.push(Box::pin(udp_request_response_lane(
-                socket,
-                server_addr,
-                payload_len,
-                lane_requests,
-            )));
+            match recv_mode {
+                UdpRecvMode::Single => pending.push(Box::pin(udp_request_response_lane_single(
+                    socket,
+                    server_addr,
+                    payload_len,
+                    lane_requests,
+                ))),
+                UdpRecvMode::Multi => pending.push(Box::pin(udp_request_response_lane_multi(
+                    socket,
+                    &recv_rings[lane],
+                    server_addr,
+                    payload_len,
+                    lane_requests,
+                ))),
+            }
         }
     }
 
@@ -90,7 +108,7 @@ async fn udp_request_response_worker(
     Ok(())
 }
 
-async fn udp_request_response_lane(
+async fn udp_request_response_lane_single(
     socket: &UdpSocket,
     server_addr: std::net::SocketAddr,
     payload_len: usize,
@@ -106,8 +124,31 @@ async fn udp_request_response_lane(
 
         let (recv_res, recv) = socket.recv_from(recv_buf).await;
         recv_buf = recv;
-        let (n, _) = recv_res?;
+        let (n, addr) = recv_res?;
         assert_eq!(n, payload_len);
+        assert_eq!(addr, server_addr);
+    }
+    Ok(())
+}
+
+async fn udp_request_response_lane_multi(
+    socket: &UdpSocket,
+    recv_ring: &BufRing,
+    server_addr: std::net::SocketAddr,
+    payload_len: usize,
+    requests: usize,
+) -> io::Result<()> {
+    let mut send_buf = vec![0x5A; payload_len];
+    let mut recv = pin!(socket.recv_from_ring_multi(recv_ring));
+    for _ in 0..requests {
+        let (send_res, send) = socket.send_to(send_buf, server_addr).await;
+        send_buf = send;
+        let sent = send_res?;
+        assert_eq!(sent, payload_len);
+
+        let (buf, addr) = recv.next().await.expect("multishot stream ended")?;
+        assert_eq!(addr, server_addr);
+        assert_eq!(buf.len(), payload_len);
     }
     Ok(())
 }
@@ -164,14 +205,36 @@ struct UdpRequestResponseBench {
     total_requests: usize,
     payload_len: usize,
     window: usize,
+    recv_mode: UdpRecvMode,
 }
 
 impl UdpRequestResponseBench {
-    fn new(total_requests: usize, payload_len: usize, window: usize) -> Self {
+    fn new(
+        total_requests: usize,
+        payload_len: usize,
+        window: usize,
+        recv_mode: UdpRecvMode,
+    ) -> Self {
         Self {
             total_requests,
             payload_len,
             window,
+            recv_mode,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UdpRecvMode {
+    Single,
+    Multi,
+}
+
+impl UdpRecvMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Single => "single",
+            Self::Multi => "multi",
         }
     }
 }
@@ -182,7 +245,8 @@ impl bencher::TDynBenchFn for UdpRequestResponseBench {
         let server_addr = server.addr;
         let mut ex = new_executor();
         let lane_count = cmp::max(1, cmp::min(self.window, self.total_requests));
-        let mut client_sockets = ex.block_on(async {
+        let recv_mode = self.recv_mode;
+        let (mut client_sockets, mut recv_rings) = ex.block_on(async {
             let mut sockets = Vec::with_capacity(lane_count);
             for _ in 0..lane_count {
                 sockets.push(
@@ -191,7 +255,20 @@ impl bencher::TDynBenchFn for UdpRequestResponseBench {
                         .unwrap(),
                 );
             }
-            sockets
+            let mut rings = Vec::with_capacity(lane_count);
+            if recv_mode == UdpRecvMode::Multi {
+                let ring_buf_len = cmp::max(2048, self.payload_len * 2);
+                for lane in 0..lane_count {
+                    rings.push(
+                        BufRing::builder((100 + lane) as u16)
+                            .buf_cnt(32)
+                            .buf_len(ring_buf_len)
+                            .build()
+                            .unwrap(),
+                    );
+                }
+            }
+            (sockets, rings)
         });
 
         b.iter(|| {
@@ -200,6 +277,8 @@ impl bencher::TDynBenchFn for UdpRequestResponseBench {
             ex.block_on(async {
                 udp_request_response_worker(
                     &client_sockets,
+                    recv_mode,
+                    &recv_rings,
                     server_addr,
                     payload_len,
                     total_requests,
@@ -213,6 +292,7 @@ impl bencher::TDynBenchFn for UdpRequestResponseBench {
             for socket in client_sockets.drain(..) {
                 socket.close().await.unwrap();
             }
+            recv_rings.clear();
         });
     }
 }
@@ -333,19 +413,23 @@ fn benches() -> Vec<TestDescAndFn> {
     for total_requests in [4_096, 8_192] {
         for payload_len in [64, 1024] {
             for window in [1, 2, 4, 8, 16, 32, 64] {
-                benches.push(TestDescAndFn {
-                    desc: TestDesc {
-                        name: Cow::from(format!(
-                            "bench_udp_request_response/window={window}/total_requests={total_requests}/payload={payload_len}"
-                        )),
-                        ignore: false,
-                    },
-                    testfn: TestFn::DynBenchFn(Box::new(UdpRequestResponseBench::new(
-                        total_requests,
-                        payload_len,
-                        window,
-                    ))),
-                });
+                for recv_mode in [UdpRecvMode::Single, UdpRecvMode::Multi] {
+                    benches.push(TestDescAndFn {
+                        desc: TestDesc {
+                            name: Cow::from(format!(
+                                "bench_udp_request_response/recv={}/window={window}/total_requests={total_requests}/payload={payload_len}",
+                                recv_mode.as_str()
+                            )),
+                            ignore: false,
+                        },
+                        testfn: TestFn::DynBenchFn(Box::new(UdpRequestResponseBench::new(
+                            total_requests,
+                            payload_len,
+                            window,
+                            recv_mode,
+                        ))),
+                    });
+                }
             }
         }
     }

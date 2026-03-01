@@ -95,6 +95,28 @@ impl UdpSocket {
         self.inner.send_with_flags(buf, flags).await
     }
 
+    /// Sends a single datagram on a connected socket using io_uring zerocopy send.
+    ///
+    /// This method does not fall back to regular send if zerocopy is unsupported.
+    /// Callers should enable `SO_ZEROCOPY` with [`set_zerocopy`] first.
+    pub async fn send_zc<B>(&self, buf: B) -> (io::Result<usize>, B)
+    where
+        B: StableBuf + 'static,
+    {
+        self.inner.send_zc(buf).await
+    }
+
+    /// Sends a single datagram on a connected socket using io_uring zerocopy send with flags.
+    ///
+    /// This method does not fall back to regular send if zerocopy is unsupported.
+    /// Callers should enable `SO_ZEROCOPY` with [`set_zerocopy`] first.
+    pub async fn send_zc_with_flags<B>(&self, buf: B, flags: i32) -> (io::Result<usize>, B)
+    where
+        B: StableBuf + 'static,
+    {
+        self.inner.send_zc_with_flags(buf, flags).await
+    }
+
     /// Receives a single datagram message on the socket. On success, returns the number
     /// of bytes read and the origin.
     ///
@@ -158,6 +180,17 @@ impl UdpSocket {
         }
     }
 
+    /// Sends a message on a connected socket using io_uring zerocopy sendmsg.
+    ///
+    /// This method does not fall back to regular sendmsg if zerocopy is unsupported.
+    /// Callers should enable `SO_ZEROCOPY` with [`set_zerocopy`] first.
+    pub async fn send_msg_zc<B>(&self, buf: B, flags: i32) -> (io::Result<usize>, B)
+    where
+        B: StableBuf + 'static,
+    {
+        self.inner.send_msg_zc(buf, flags).await
+    }
+
     /// Receive a message from this socket using message-style flags.
     pub async fn recv_msg<B>(&self, buf: B, flags: i32) -> (io::Result<(usize, SocketAddr)>, B)
     where
@@ -183,10 +216,29 @@ impl UdpSocket {
         self.inner.poll_readiness(events)
     }
 
+    /// Receives datagrams from this socket using a multishot recvmsg operation backed by the
+    /// provided buffer ring.
+    ///
+    /// Each yielded item includes payload bytes and the sender address.
+    pub fn recv_from_ring_multi(&self, ring: &BufRing) -> Op<socket::RecvFromRingMulti> {
+        self.inner.recv_from_ring_multi(ring)
+    }
+
+    /// Receives datagrams from a connected socket using a multishot recv operation backed by the
+    /// provided buffer ring.
+    pub fn recv_ring_multi(&self, ring: &BufRing) -> Op<socket::RecvRingMulti> {
+        self.inner.recv_ring_multi(ring)
+    }
+
     /// Close the socket.
     ///
     /// This will wait for all pending operations to complete before closing the socket.
     pub async fn close(self) -> io::Result<()> {
         self.inner.close().await
+    }
+
+    /// Enable or disable `SO_ZEROCOPY` on this socket.
+    pub async fn set_zerocopy(&self, enabled: bool) -> io::Result<()> {
+        self.inner.set_zerocopy(enabled).await
     }
 }

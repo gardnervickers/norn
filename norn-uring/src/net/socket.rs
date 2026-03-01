@@ -32,6 +32,13 @@ fn no_source_addr_error() -> io::Error {
     )
 }
 
+fn invalid_zc_notification_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "zerocopy send notification completion missing primary send result",
+    )
+}
+
 fn fixed_fd_unsupported_error(context: &'static str) -> io::Error {
     io::Error::new(
         io::ErrorKind::Unsupported,
@@ -133,6 +140,16 @@ impl Socket {
         self.handle.submit(op)
     }
 
+    pub(crate) fn recv_from_ring_multi(&self, ring: &BufRing) -> Op<RecvFromRingMulti> {
+        let op = RecvFromRingMulti::new(self.fd.clone(), ring.clone());
+        self.handle.submit(op)
+    }
+
+    pub(crate) fn recv_ring_multi(&self, ring: &BufRing) -> Op<RecvRingMulti> {
+        let op = RecvRingMulti::new(self.fd.clone(), ring.clone(), 0);
+        self.handle.submit(op)
+    }
+
     pub(crate) async fn recv_from<B>(&self, buf: B) -> (io::Result<(usize, SocketAddr)>, B)
     where
         B: StableBufMut + 'static,
@@ -203,6 +220,30 @@ impl Socket {
         B: StableBuf + 'static,
     {
         let op = Send::new(self.fd.clone(), buf, flags);
+        self.handle.submit(op)
+    }
+
+    pub(crate) fn send_zc<B>(&self, buf: B) -> Op<SendZc<B>>
+    where
+        B: StableBuf + 'static,
+    {
+        let op = SendZc::new(self.fd.clone(), buf, 0);
+        self.handle.submit(op)
+    }
+
+    pub(crate) fn send_zc_with_flags<B>(&self, buf: B, flags: i32) -> Op<SendZc<B>>
+    where
+        B: StableBuf + 'static,
+    {
+        let op = SendZc::new(self.fd.clone(), buf, flags);
+        self.handle.submit(op)
+    }
+
+    pub(crate) fn send_msg_zc<B>(&self, buf: B, flags: i32) -> Op<SendMsgZc<B>>
+    where
+        B: StableBuf + 'static,
+    {
+        let op = SendMsgZc::new(self.fd.clone(), buf, flags);
         self.handle.submit(op)
     }
 
@@ -277,6 +318,12 @@ impl Socket {
     pub(crate) async fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
         let nodelay = if nodelay { 1 } else { 0 };
         self.set_sock_opt(libc::IPPROTO_TCP, libc::TCP_NODELAY, nodelay)
+            .await
+    }
+
+    pub(crate) async fn set_zerocopy(&self, enabled: bool) -> io::Result<()> {
+        let enabled = if enabled { 1 } else { 0 };
+        self.set_sock_opt(libc::SOL_SOCKET, libc::SO_ZEROCOPY, enabled)
             .await
     }
 
@@ -583,6 +630,205 @@ impl Singleshot for RecvFromRing {
         unsafe { this.addr.set_length(msg_namelen) };
         let addr = as_socket_addr_or_peer(&this.fd, &this.addr, msg_namelen)?;
         Ok((buf, addr))
+    }
+}
+
+/// A bufring-backed receive buffer that exposes only payload bytes for `RecvMsgMulti`.
+#[derive(Debug)]
+pub struct RecvMsgRingBuf {
+    buf: BufRingBuf,
+    payload_offset: usize,
+    payload_len: usize,
+}
+
+impl std::ops::Deref for RecvMsgRingBuf {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.payload()
+    }
+}
+
+impl RecvMsgRingBuf {
+    fn new(buf: BufRingBuf, payload_offset: usize, payload_len: usize) -> Self {
+        Self {
+            buf,
+            payload_offset,
+            payload_len,
+        }
+    }
+
+    /// Returns the payload bytes from the received message.
+    pub fn payload(&self) -> &[u8] {
+        &self.buf[self.payload_offset..self.payload_offset + self.payload_len]
+    }
+
+    /// Returns the underlying full buffer including recvmsg metadata prefix.
+    pub fn as_raw(&self) -> &[u8] {
+        &self.buf
+    }
+}
+
+#[derive(Debug)]
+pub struct RecvFromRingMulti {
+    fd: NornFd,
+    ring: BufRing,
+    addr: SockAddr,
+    msghdr: MaybeUninit<libc::msghdr>,
+}
+
+impl RecvFromRingMulti {
+    pub(crate) fn new(fd: NornFd, ring: BufRing) -> Self {
+        // Safety: We won't read from the socket addr until it's initialized by the kernel.
+        let addr = unsafe { SockAddr::try_init(|_, _| Ok(())) }.unwrap().1;
+        Self {
+            fd,
+            ring,
+            addr,
+            msghdr: MaybeUninit::zeroed(),
+        }
+    }
+
+    fn to_item(
+        &mut self,
+        result: crate::operation::CQEResult,
+    ) -> io::Result<(RecvMsgRingBuf, SocketAddr)> {
+        let n = result.result?;
+        let buf = self.ring.get_buf(n, result.flags)?;
+        let msghdr = unsafe { self.msghdr.assume_init_ref() };
+        let recvmsg = io_uring::types::RecvMsgOut::parse(&buf, msghdr).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid recvmsg multishot completion layout",
+            )
+        })?;
+        let addr = socket_addr_from_name(recvmsg.name_data())?;
+        let base_ptr = buf[..].as_ptr() as usize;
+        let payload = recvmsg.payload_data();
+        let payload_offset = payload.as_ptr() as usize - base_ptr;
+        let payload_len = payload.len();
+        Ok((RecvMsgRingBuf::new(buf, payload_offset, payload_len), addr))
+    }
+}
+
+impl Operation for RecvFromRingMulti {
+    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+        let this = unsafe { self.get_unchecked_mut() };
+        let msghdr = this.msghdr.as_mut_ptr();
+        unsafe {
+            (*msghdr).msg_name = this.addr.as_ptr() as *mut libc::c_void;
+            (*msghdr).msg_namelen = this.addr.len() as _;
+            (*msghdr).msg_control = std::ptr::null_mut();
+            (*msghdr).msg_controllen = 0;
+            (*msghdr).msg_iov = std::ptr::null_mut();
+            (*msghdr).msg_iovlen = 0;
+        }
+
+        match this.fd.kind() {
+            crate::fd::FdKind::Fd(fd) => {
+                opcode::RecvMsgMulti::new(types::Fd(fd.0), msghdr, this.ring.bgid()).build()
+            }
+            crate::fd::FdKind::Fixed(fd) => {
+                opcode::RecvMsgMulti::new(types::Fixed(fd.0), msghdr, this.ring.bgid()).build()
+            }
+        }
+    }
+
+    fn cleanup(&mut self, result: crate::operation::CQEResult) {
+        if let Ok(n) = result.result {
+            drop(self.ring.get_buf(n, result.flags));
+        }
+    }
+}
+
+impl Multishot for RecvFromRingMulti {
+    type Item = io::Result<(RecvMsgRingBuf, SocketAddr)>;
+
+    fn update(&mut self, result: crate::operation::CQEResult) -> Self::Item {
+        self.to_item(result)
+    }
+
+    fn complete(mut self, result: crate::operation::CQEResult) -> Option<Self::Item> {
+        Some(self.to_item(result))
+    }
+}
+
+#[derive(Debug)]
+pub struct RecvRingMulti {
+    fd: NornFd,
+    ring: BufRing,
+    flags: i32,
+}
+
+impl RecvRingMulti {
+    pub(crate) fn new(fd: NornFd, ring: BufRing, flags: i32) -> Self {
+        Self { fd, ring, flags }
+    }
+
+    fn to_item(&self, result: crate::operation::CQEResult) -> io::Result<BufRingBuf> {
+        let n = result.result?;
+        self.ring.get_buf(n, result.flags)
+    }
+}
+
+impl Operation for RecvRingMulti {
+    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+        let this = unsafe { self.get_unchecked_mut() };
+        match this.fd.kind() {
+            crate::fd::FdKind::Fd(fd) => opcode::RecvMulti::new(types::Fd(fd.0), this.ring.bgid())
+                .flags(this.flags)
+                .build(),
+            crate::fd::FdKind::Fixed(fd) => {
+                opcode::RecvMulti::new(types::Fixed(fd.0), this.ring.bgid())
+                    .flags(this.flags)
+                    .build()
+            }
+        }
+    }
+
+    fn cleanup(&mut self, result: crate::operation::CQEResult) {
+        if let Ok(n) = result.result {
+            drop(self.ring.get_buf(n, result.flags));
+        }
+    }
+}
+
+impl Multishot for RecvRingMulti {
+    type Item = io::Result<BufRingBuf>;
+
+    fn update(&mut self, result: crate::operation::CQEResult) -> Self::Item {
+        self.to_item(result)
+    }
+
+    fn complete(self, result: crate::operation::CQEResult) -> Option<Self::Item> {
+        Some(self.to_item(result))
+    }
+}
+
+fn socket_addr_from_name(name: &[u8]) -> io::Result<SocketAddr> {
+    if name.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "recvmsg completion did not include source address",
+        ));
+    }
+    if name.len() > std::mem::size_of::<libc::sockaddr_storage>() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "recvmsg completion source address exceeded storage size",
+        ));
+    }
+    let mut storage = std::mem::MaybeUninit::<libc::sockaddr_storage>::zeroed();
+    unsafe {
+        std::ptr::copy_nonoverlapping(name.as_ptr(), storage.as_mut_ptr() as *mut u8, name.len());
+        let storage = storage.assume_init();
+        let addr = SockAddr::new(storage, name.len() as libc::socklen_t);
+        addr.as_socket().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "recvmsg completion had unsupported address family",
+            )
+        })
     }
 }
 
@@ -966,6 +1212,173 @@ where
     }
 }
 
+fn update_send_zc_primary(
+    primary_result: &mut Option<io::Result<usize>>,
+    result: crate::operation::CQEResult,
+) {
+    if result.notif() {
+        return;
+    }
+    *primary_result = Some(result.result.map(|v| v as usize));
+}
+
+fn complete_send_zc_result(
+    primary_result: Option<io::Result<usize>>,
+    result: crate::operation::CQEResult,
+) -> io::Result<usize> {
+    if result.notif() {
+        primary_result.unwrap_or_else(|| Err(invalid_zc_notification_error()))
+    } else {
+        result.result.map(|v| v as usize)
+    }
+}
+
+#[derive(Debug)]
+pub struct SendZc<B> {
+    fd: NornFd,
+    buf: B,
+    flags: i32,
+    primary_result: Option<io::Result<usize>>,
+}
+
+impl<B> SendZc<B>
+where
+    B: StableBuf,
+{
+    pub(crate) fn new(fd: NornFd, buf: B, flags: i32) -> Self {
+        Self {
+            fd,
+            buf,
+            flags,
+            primary_result: None,
+        }
+    }
+}
+
+impl<B> Operation for SendZc<B>
+where
+    B: StableBuf,
+{
+    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+        let this = unsafe { self.get_unchecked_mut() };
+        let ptr = this.buf.stable_ptr();
+        let len = this.buf.bytes_init();
+
+        match this.fd.kind() {
+            crate::fd::FdKind::Fd(fd) => opcode::SendZc::new(*fd, ptr, len as _),
+            crate::fd::FdKind::Fixed(fd) => opcode::SendZc::new(*fd, ptr, len as _),
+        }
+        .flags(this.flags)
+        .build()
+    }
+
+    fn cleanup(&mut self, _: crate::operation::CQEResult) {}
+}
+
+impl<B> Singleshot for SendZc<B>
+where
+    B: StableBuf,
+{
+    type Output = (io::Result<usize>, B);
+
+    fn update(&mut self, result: crate::operation::CQEResult) {
+        update_send_zc_primary(&mut self.primary_result, result);
+    }
+
+    fn complete(self, result: crate::operation::CQEResult) -> Self::Output {
+        let this = self;
+        (
+            complete_send_zc_result(this.primary_result, result),
+            this.buf,
+        )
+    }
+}
+
+pub struct SendMsgZc<B> {
+    fd: NornFd,
+    buf: B,
+    flags: i32,
+    msghdr: MaybeUninit<libc::msghdr>,
+    slices: MaybeUninit<[io::IoSlice<'static>; 1]>,
+    primary_result: Option<io::Result<usize>>,
+}
+
+impl<B> std::fmt::Debug for SendMsgZc<B> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SendMsgZc").finish()
+    }
+}
+
+impl<B> SendMsgZc<B>
+where
+    B: StableBuf,
+{
+    pub(crate) fn new(fd: NornFd, buf: B, flags: i32) -> Self {
+        Self {
+            fd,
+            buf,
+            flags,
+            msghdr: MaybeUninit::zeroed(),
+            slices: MaybeUninit::zeroed(),
+            primary_result: None,
+        }
+    }
+}
+
+impl<B> Operation for SendMsgZc<B>
+where
+    B: StableBuf,
+{
+    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+        let this = unsafe { self.get_unchecked_mut() };
+
+        let slice = io::IoSlice::new(unsafe {
+            std::slice::from_raw_parts(this.buf.stable_ptr(), this.buf.bytes_init())
+        });
+        this.slices.write([slice]);
+
+        let msghdr = this.msghdr.as_mut_ptr();
+        let slices = unsafe { this.slices.assume_init_mut() };
+        unsafe {
+            (*msghdr).msg_iov = slices.as_mut_ptr() as *mut _;
+            (*msghdr).msg_iovlen = slices.len() as _;
+            (*msghdr).msg_name = std::ptr::null_mut();
+            (*msghdr).msg_namelen = 0;
+            (*msghdr).msg_control = std::ptr::null_mut();
+            (*msghdr).msg_controllen = 0;
+        }
+
+        let msghdr = this.msghdr.as_ptr();
+        match this.fd.kind() {
+            crate::fd::FdKind::Fd(fd) => opcode::SendMsgZc::new(types::Fd(fd.0), msghdr),
+            crate::fd::FdKind::Fixed(fd) => opcode::SendMsgZc::new(types::Fixed(fd.0), msghdr),
+        }
+        .flags(this.flags as u32)
+        .build()
+    }
+
+    fn cleanup(&mut self, _: crate::operation::CQEResult) {}
+}
+
+impl<B> Singleshot for SendMsgZc<B>
+where
+    B: StableBuf,
+{
+    type Output = (io::Result<usize>, B);
+
+    fn update(&mut self, result: crate::operation::CQEResult) {
+        update_send_zc_primary(&mut self.primary_result, result);
+    }
+
+    fn complete(self, result: crate::operation::CQEResult) -> Self::Output {
+        let this = self;
+        (
+            complete_send_zc_result(this.primary_result, result),
+            this.buf,
+        )
+    }
+}
+
 #[derive(Debug)]
 pub struct Poll<const MULTI: bool> {
     fd: NornFd,
@@ -1062,5 +1475,50 @@ impl Event {
     /// Returns true if there is a priority event.
     pub fn is_priority(&self) -> bool {
         (self.events & libc::POLLPRI) != 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn more_flag() -> u32 {
+        (0..=u32::MAX)
+            .find(|flags| io_uring::cqueue::more(*flags))
+            .expect("missing CQE more flag")
+    }
+
+    fn notif_flag() -> u32 {
+        (0..=u32::MAX)
+            .find(|flags| io_uring::cqueue::notif(*flags))
+            .expect("missing CQE notif flag")
+    }
+
+    #[test]
+    fn zc_completion_single_cqe_uses_final_result() {
+        let final_cqe = crate::operation::CQEResult::new(Ok(64), 0);
+        let result = complete_send_zc_result(None, final_cqe).unwrap();
+        assert_eq!(result, 64);
+    }
+
+    #[test]
+    fn zc_completion_final_notification_uses_primary_result() {
+        let mut primary = None;
+        let update = crate::operation::CQEResult::new(Ok(32), more_flag());
+        update_send_zc_primary(&mut primary, update);
+        let result = complete_send_zc_result(
+            primary,
+            crate::operation::CQEResult::new(Ok(0), notif_flag()),
+        )
+        .unwrap();
+        assert_eq!(result, 32);
+    }
+
+    #[test]
+    fn zc_completion_notification_without_primary_is_invalid() {
+        let err =
+            complete_send_zc_result(None, crate::operation::CQEResult::new(Ok(0), notif_flag()))
+                .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }
