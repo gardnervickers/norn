@@ -134,20 +134,30 @@ impl<T> State<T>
 where
     T: Operation + 'static,
 {
-    fn prepare_batch(&mut self, batch: &mut SmallVec<[ConfiguredEntry; 4]>) {
+    fn start_submit(&mut self) -> Option<ConfiguredEntry> {
         let state = mem::replace(self, State::Done);
-        *self = match state {
+        match state {
             State::Prepared {
                 mut handle,
                 mut entry,
             } => {
-                batch.push(entry.take().expect("entry already prepared"));
-                State::Waiting {
+                let entry = entry.take().expect("entry already prepared");
+                *self = State::Waiting {
                     handle: Some(handle.take().expect("handle missing")),
-                }
+                };
+                Some(entry)
             }
-            state => state,
-        };
+            state => {
+                *self = state;
+                None
+            }
+        }
+    }
+
+    fn prepare_batch(&mut self, batch: &mut SmallVec<[ConfiguredEntry; 4]>) {
+        if let Some(entry) = self.start_submit() {
+            batch.push(entry);
+        }
     }
 
     fn finish_submit(&mut self) {
@@ -242,9 +252,11 @@ where
         {
             let mut this = self.as_mut().project();
             if this.submit.is_none() && matches!(this.state, State::Prepared { .. }) {
-                let mut batch = SmallVec::new();
-                this.state.prepare_batch(&mut batch);
-                this.submit.set(Some(this.reactor.push_batch(batch)));
+                let entry = this
+                    .state
+                    .start_submit()
+                    .expect("prepared operation missing entry");
+                this.submit.set(Some(this.reactor.push(entry)));
             }
         }
 

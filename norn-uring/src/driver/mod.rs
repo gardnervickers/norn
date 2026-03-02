@@ -115,8 +115,16 @@ impl Handle {
     ///
     /// If the submission queue is full, this will block until there
     /// is space or the driver has shutdown.
+    pub(crate) fn push(&self, entry: ConfiguredEntry) -> PushFuture {
+        PushFuture::new(Rc::clone(&self.shared), entry)
+    }
+
+    /// Attempt to push a new batch of entries into the submission queue.
+    ///
+    /// If the submission queue is full, this will block until there
+    /// is space or the driver has shutdown.
     pub(crate) fn push_batch(&self, entries: SmallVec<[ConfiguredEntry; 4]>) -> PushFuture {
-        PushFuture::new(Rc::clone(&self.shared), entries)
+        PushFuture::new_batch(Rc::clone(&self.shared), entries)
     }
 
     pub(crate) fn close_fd(&self, kind: &fd::FdKind) -> io::Result<()> {
@@ -378,6 +386,9 @@ impl Park for Driver {
 
 impl Shared {
     fn validate_batch_len(&self, batch_len: usize) -> Result<(), SubmitError> {
+        if batch_len <= 1 {
+            return Ok(());
+        }
         let mut ring = self.ring.borrow_mut();
         let sq = ring.submission();
         let capacity = sq.capacity();
@@ -424,18 +435,40 @@ impl Shared {
         self.status.set(status);
     }
 
+    /// Attempt to push a single entry into the submission queue.
+    ///
+    /// If the submission queue is full, this returns the original entry.
+    fn try_push(&self, entry: ConfiguredEntry) -> Result<(), ConfiguredEntry> {
+        let mut ring = self.ring.borrow_mut();
+        let mut sq = ring.submission();
+        if sq.is_full() {
+            Err(entry)
+        } else {
+            let entry = entry.into_entry_with_flags(Flags::empty());
+            unsafe { sq.push(&entry) }.unwrap();
+            Ok(())
+        }
+    }
+
     /// Attempt to push a batch of entries into the submission queue.
     ///
     /// If the submission queue does not have enough free capacity for the full
     /// batch, the original entries are returned unchanged.
     fn try_push_batch(
         &self,
-        entries: SmallVec<[ConfiguredEntry; 4]>,
+        mut entries: SmallVec<[ConfiguredEntry; 4]>,
     ) -> Result<(), SmallVec<[ConfiguredEntry; 4]>> {
         let mut ring = self.ring.borrow_mut();
         let mut sq = ring.submission();
         if sq.capacity() - sq.len() < entries.len() {
             return Err(entries);
+        }
+
+        if entries.len() == 1 {
+            let entry = entries.pop().expect("singleton batch missing entry");
+            let entry = entry.into_entry_with_flags(Flags::empty());
+            unsafe { sq.push(&entry) }.unwrap();
+            return Ok(());
         }
 
         let len = entries.len();
