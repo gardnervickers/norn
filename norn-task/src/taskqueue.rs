@@ -53,6 +53,9 @@ impl TaskQueue {
     ///
     /// The future will immediately be queued for execution. Returns a [`JoinHandle`]
     /// which can be used to await the result of the future.
+    ///
+    /// If the queue has already been shut down, the returned [`JoinHandle`]
+    /// resolves immediately with cancellation.
     pub fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
     where
         F: Future + 'static,

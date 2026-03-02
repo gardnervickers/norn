@@ -70,13 +70,13 @@ impl TcpListener {
     /// Creates a TCP listener bound to the specified address.
     pub async fn bind(addr: SocketAddr, backlog: u32) -> io::Result<TcpListener> {
         let inner = socket::Socket::bind(addr, Domain::for_address(addr), Type::STREAM).await?;
-        inner.listen(backlog)?;
+        inner.listen(backlog).await?;
         Ok(TcpListener { socket: inner })
     }
 
     /// Set value for the SO_REUSEADDR option on this socket.
-    pub fn set_reuse_address(&self, reuse: bool) -> io::Result<()> {
-        self.socket.as_socket().set_reuse_address(reuse)
+    pub async fn set_reuse_address(&self, reuse: bool) -> io::Result<()> {
+        self.socket.set_reuse_address(reuse).await
     }
 
     /// Returns the local address that this listener is bound to.
@@ -196,9 +196,33 @@ impl TcpSocket {
         self.socket.send_with_flags(buf, flags)
     }
 
+    /// Send data from the given buffer using io_uring zerocopy send.
+    ///
+    /// This method does not fall back to regular send if zerocopy is unsupported.
+    /// Callers should enable `SO_ZEROCOPY` with [`set_zerocopy`] first.
+    pub fn send_zc<B: StableBuf>(&self, buf: B) -> Op<socket::SendZc<B>> {
+        self.socket.send_zc(buf)
+    }
+
+    /// Send data from the given buffer using io_uring zerocopy send with send flags.
+    ///
+    /// This method does not fall back to regular send if zerocopy is unsupported.
+    /// Callers should enable `SO_ZEROCOPY` with [`set_zerocopy`] first.
+    pub fn send_zc_with_flags<B: StableBuf>(&self, buf: B, flags: i32) -> Op<socket::SendZc<B>> {
+        self.socket.send_zc_with_flags(buf, flags)
+    }
+
     /// Send a message from the given buffer with message-style flags.
     pub fn send_msg<B: StableBuf>(&self, buf: B, flags: i32) -> Op<socket::Send<B>> {
         self.send_with_flags(buf, flags)
+    }
+
+    /// Send a message from the given buffer using io_uring zerocopy sendmsg.
+    ///
+    /// This method does not fall back to regular sendmsg if zerocopy is unsupported.
+    /// Callers should enable `SO_ZEROCOPY` with [`set_zerocopy`] first.
+    pub fn send_msg_zc<B: StableBuf>(&self, buf: B, flags: i32) -> Op<socket::SendMsgZc<B>> {
+        self.socket.send_msg_zc(buf, flags)
     }
 
     /// Receive a message into the given buffer with message-style flags.
@@ -213,6 +237,35 @@ impl TcpSocket {
     /// fail.
     pub fn recv_ring(&self, ring: &BufRing) -> Op<socket::RecvFromRing> {
         self.socket.recv_from_ring(ring)
+    }
+
+    /// Receive data using a multishot recv operation and a provided buffer ring.
+    pub fn recv_ring_multi(&self, ring: &BufRing) -> Op<socket::RecvRingMulti> {
+        self.socket.recv_ring_multi(ring)
+    }
+
+    /// Receive data using a single-shot recv bundle operation and a provided buffer ring.
+    pub fn recv_bundle(&self, ring: &BufRing) -> Op<socket::RecvRingBundle> {
+        self.socket.recv_ring_bundle(ring)
+    }
+
+    /// Receive data using a single-shot recv bundle operation and a provided buffer ring.
+    pub fn recv_bundle_with_flags(&self, ring: &BufRing, flags: i32) -> Op<socket::RecvRingBundle> {
+        self.socket.recv_ring_bundle_with_flags(ring, flags)
+    }
+
+    /// Receive data using a multishot recv bundle operation and a provided buffer ring.
+    pub fn recv_bundle_multi(&self, ring: &BufRing) -> Op<socket::RecvRingBundleMulti> {
+        self.socket.recv_ring_bundle_multi(ring)
+    }
+
+    /// Receive data using a multishot recv bundle operation and a provided buffer ring.
+    pub fn recv_bundle_multi_with_flags(
+        &self,
+        ring: &BufRing,
+        flags: i32,
+    ) -> Op<socket::RecvRingBundleMulti> {
+        self.socket.recv_ring_bundle_multi_with_flags(ring, flags)
     }
 
     /// Convert this socket into a stream.
@@ -235,27 +288,40 @@ impl TcpSocket {
         self.socket.close().await
     }
 
+    /// Poll readiness on this socket.
+    ///
+    /// `events` uses `libc::POLL*` flags such as `POLLIN` and `POLLOUT`.
+    /// When `MULTI` is `true`, the returned operation yields a stream of events.
+    pub fn poll_readiness<const MULTI: bool>(&self, events: u32) -> Op<socket::Poll<MULTI>> {
+        self.socket.poll_readiness(events)
+    }
+
     /// Set value for the SO_RCVBUF option on this socket.
-    pub fn set_recv_buffer_size(&self, size: usize) -> io::Result<()> {
-        self.socket.as_socket().set_recv_buffer_size(size)
+    pub async fn set_recv_buffer_size(&self, size: usize) -> io::Result<()> {
+        self.socket.set_recv_buffer_size(size).await
     }
     /// Set value for the SO_SNDBUF option on this socket.
-    pub fn set_send_buffer_size(&self, size: usize) -> io::Result<()> {
-        self.socket.as_socket().set_send_buffer_size(size)
+    pub async fn set_send_buffer_size(&self, size: usize) -> io::Result<()> {
+        self.socket.set_send_buffer_size(size).await
     }
 
     /// Set value for the SO_REUSEADDR option on this socket.
-    pub fn set_reuse_address(&self, reuse: bool) -> io::Result<()> {
-        self.socket.as_socket().set_reuse_address(reuse)
+    pub async fn set_reuse_address(&self, reuse: bool) -> io::Result<()> {
+        self.socket.set_reuse_address(reuse).await
     }
 
     /// Set value for the SO_KEEPALIVE option on this socket.
-    pub fn set_keepalive(&self, keepalive: bool) -> io::Result<()> {
-        self.socket.as_socket().set_keepalive(keepalive)
+    pub async fn set_keepalive(&self, keepalive: bool) -> io::Result<()> {
+        self.socket.set_keepalive(keepalive).await
     }
     /// Set the value of the TCP_NODELAY option on this socket.
-    pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
-        self.socket.as_socket().set_nodelay(nodelay)
+    pub async fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
+        self.socket.set_nodelay(nodelay).await
+    }
+
+    /// Enable or disable `SO_ZEROCOPY` on this socket.
+    pub async fn set_zerocopy(&self, enabled: bool) -> io::Result<()> {
+        self.socket.set_zerocopy(enabled).await
     }
 }
 
@@ -428,7 +494,7 @@ impl ReadyStream {
             ready!(self.as_mut().poll_ready(cx, flags))?;
             log::trace!(target: LOG, "poll_op.ready");
             let this = self.as_mut().project();
-            let sock = this.inner.as_socket();
+            let sock = this.inner.as_socket()?;
             match f(sock) {
                 Ok(res) => {
                     log::trace!(target: LOG, "poll_op.success");

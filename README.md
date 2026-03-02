@@ -24,6 +24,8 @@ and in most cases non-existant.
   any substantial changes to the API.
 - [`norn-executor`] is the single-threaded executor. It is not complete. The
   API is likely to change.
+- [`norn-nursery`] provides scoped async concurrency on top of `norn-task`.
+  It is inspired by [moro].
 - [`norn-uring`] is a uring-based backend for the executor. It is not complete
   and hardly useful. The API is very likely to change.
 
@@ -33,3 +35,5 @@ Much of the design of the task system and async submission handling was inspired
 by Tokio and tokio-uring. The general approach to handling tasks is very similar
 in that we use a single allocation per task, and track tasks in a linked list
 for easy shutdown.
+
+[moro]: https://github.com/nikomatsakis/moro

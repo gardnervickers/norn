@@ -10,6 +10,10 @@ use norn_task::{JoinHandle, Runnable, Schedule, TaskSet};
 
 /// [`PollSet`] provides a way to spawn and run tasks within
 /// a scope.
+///
+/// Polling a `PollSet` drives all currently runnable tasks and then returns
+/// [`Poll::Pending`]. It is intended to be embedded in another future that
+/// controls lifecycle and shutdown.
 #[must_use = "futures do nothing unless awaited or polled"]
 pub struct PollSet {
     shared: Rc<Shared>,
@@ -26,6 +30,7 @@ struct Scheduler {
 }
 
 impl PollSet {
+    /// Create an empty [`PollSet`].
     pub fn new() -> Self {
         let shared = Shared {
             waker: RefCell::new(None),
@@ -37,6 +42,10 @@ impl PollSet {
         }
     }
 
+    /// Spawn a task into this poll set and return a [`JoinHandle`] for its output.
+    ///
+    /// The task is scheduled on this poll set's local queue and will be driven when
+    /// the [`PollSet`] future is polled.
     pub fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
     where
         F: Future + 'static,
@@ -60,6 +69,7 @@ impl PollSet {
     }
 
     pub(crate) fn clear(&self) {
+        self.shared.taskset.shutdown();
         self.shared.runqueue.borrow_mut().clear();
         drop(self.shared.runqueue.take());
     }
@@ -116,5 +126,47 @@ impl Schedule for Scheduler {
 impl Drop for PollSet {
     fn drop(&mut self) {
         self.clear()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::{pending, Future};
+    use std::pin::pin;
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
+
+    use super::PollSet;
+
+    struct NoopWaker;
+
+    impl Wake for NoopWaker {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    #[test]
+    fn dropping_pollset_cancels_pending_tasks() {
+        let handle = {
+            let mut set = pin!(PollSet::new());
+            let handle = set.as_ref().spawn(async {
+                pending::<()>().await;
+                1usize
+            });
+
+            let waker = Waker::from(Arc::new(NoopWaker));
+            let mut cx = Context::from_waker(&waker);
+            let _ = set.as_mut().poll(&mut cx);
+            handle
+        };
+
+        let mut handle = pin!(handle);
+        let waker = Waker::from(Arc::new(NoopWaker));
+        let mut cx = Context::from_waker(&waker);
+        let poll = Future::poll(handle.as_mut(), &mut cx);
+        let Poll::Ready(res) = poll else {
+            panic!("expected dropped pollset to cancel pending tasks");
+        };
+        let err = res.expect_err("task should be cancelled");
+        assert!(err.is_cancelled());
     }
 }

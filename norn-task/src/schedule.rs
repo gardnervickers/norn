@@ -16,7 +16,7 @@ pub trait Schedule: Sized + 'static {
 
     /// Unbind a [`RegisteredTask`] from this [`Schedule`].
     ///
-    /// This should delegate to [`crate::TaskSet::unbind`], unregistering
+    /// This should delegate to [`crate::TaskSet::remove`], unregistering
     /// the task from the [`crate::TaskSet`].
     fn unbind(&self, registered: &RegisteredTask);
 }

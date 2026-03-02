@@ -4,12 +4,20 @@ members = [
     "benches",
     "examples/ping-pong-grpc",
     "norn-executor",
+    "norn-nursery",
     "norn-task",
     "norn-timer",
     "norn-uring",
     "norn-util",
 ]
-default-members = ["norn-executor", "norn-task", "norn-timer", "norn-uring", "norn-util"]
+default-members = [
+    "norn-executor",
+    "norn-nursery",
+    "norn-task",
+    "norn-timer",
+    "norn-uring",
+    "norn-util",
+]
 
 [workspace.dependencies]
 cordyceps = { version = "0.3" }

@@ -42,13 +42,13 @@ impl TaskSet {
     /// Bind a future to this [`TaskSet`], returning a [`Runnable`] and a [`JoinHandle`].
     ///
     /// If the [`TaskSet`] is closed, the [`Runnable`] will be `None` and the [`JoinHandle`]
-    /// will immediately return `Err(())`.
+    /// will immediately resolve to `Err(crate::TaskError)`.
     ///
     /// # Safety
-    /// Callers must ensure that the provided [`Future`] outlives it's captures. The future cannot
+    /// Callers must ensure that the provided [`Future`] outlives its captures. The future cannot
     /// reference **anything** which may drop before the future itself.
     ///
-    /// An easy way to guarantee this is to require that the future is `'static` along with it's output,
+    /// An easy way to guarantee this is to require that the future is `'static` along with its output,
     /// however shorter lifetimes are also valid. For example, if you can prove that the [`TaskSet`]
     /// outlives all captures of a future, then you can safely bind that future to the [`TaskSet`].
     ///

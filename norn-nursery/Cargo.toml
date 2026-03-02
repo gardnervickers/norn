@@ -1,0 +1,11 @@
+[package]
+name = "norn-nursery"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+norn-task = { path = "../norn-task" }
+pin-project-lite.workspace = true
+
+[dev-dependencies]
+norn-executor = { path = "../norn-executor" }

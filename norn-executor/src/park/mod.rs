@@ -43,7 +43,7 @@ pub enum ParkMode {
 /// The [`Park`] trait provides a way to share control flow
 /// between different layers in a runtime.
 ///
-/// As each layer exausts the work it can perform, it calls
+/// As each layer exhausts the work it can perform, it calls
 /// [`Park::park`] to pass control to the next layer.
 ///
 /// A [`ParkMode`] is passed to [`Park::park`] to indicate
@@ -54,10 +54,10 @@ pub enum ParkMode {
 /// The [`Park::unparker`] method returns a [`Unpark`] that
 /// can be used to force a wakeup from another thread.
 pub trait Park {
-    /// The [`Unparker`] associated with this [`Park`] instance.
+    /// The [`Park::Unparker`] associated with this [`Park`] instance.
     type Unparker: Unpark + Clone + Send + Sync + 'static;
 
-    /// The [`Guard`] associated with this [`Park`] instance.
+    /// The [`Park::Guard`] associated with this [`Park`] instance.
     ///
     /// Guard objects will be dropped once all tasks have stopped.
     /// This is a good place to put cleanup logic for things like
@@ -69,7 +69,7 @@ pub trait Park {
     /// Layers must respect the [`ParkMode`] passed to this method.
     fn park(&mut self, mode: ParkMode) -> Result<(), io::Error>;
 
-    /// Get a [`Guard`] for this [`Park`] instance.
+    /// Get a [`Park::Guard`] for this [`Park`] instance.
     ///
     /// This will be called before any calls to [`Park::park`],
     /// and can be used to setup any thread-local state needed

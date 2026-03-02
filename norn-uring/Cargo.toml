@@ -19,11 +19,10 @@ cordyceps.workspace = true
 tokio = { version = "1.35.0", features = ["io-util"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-io-uring = { version = "0.7.2", features = ["io_safety"] }
+io-uring = { version = "0.7.11", features = ["io_safety"] }
 libc = "0.2.149"
 
 [dev-dependencies]
 env_logger = "0.11.5"
 futures-test.workspace = true
 futures-util = "0.3.29"
-

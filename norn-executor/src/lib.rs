@@ -1,5 +1,8 @@
 //! Provides a single-threaded executor for driving [`Future`]s
 //! to completion.
+//!
+//! # Modules
+//! - [`park`]: parking and unparking abstractions plus built-in implementations.
 #![deny(
     missing_docs,
     missing_debug_implementations,
@@ -12,6 +15,7 @@ use std::pin::pin;
 use norn_task::JoinHandle;
 
 mod context;
+/// Parking abstractions and built-in park implementations.
 pub mod park;
 mod wakerfn;
 
@@ -57,6 +61,9 @@ impl<P: park::Park> LocalExecutor<P> {
     ///
     /// This will run all tasks which have been spawned onto the [`LocalExecutor`]
     /// and drive the [`park::Park`] instance.
+    ///
+    /// ### Panics
+    /// Panics if [`park::Park::park`] returns an error.
     pub fn block_on<F>(&mut self, fut: F) -> F::Output
     where
         F: Future,

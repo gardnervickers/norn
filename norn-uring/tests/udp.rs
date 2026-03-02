@@ -1,10 +1,20 @@
 #![cfg(target_os = "linux")]
 
+use std::pin::pin;
+
 use bytes::{Bytes, BytesMut};
-use norn_uring::bufring::BufRing;
+use futures_util::StreamExt;
+use norn_uring::bufring::{BufRing, BufRingBufBundle};
 use norn_uring::net::UdpSocket;
 
 mod util;
+
+fn flatten_bundle(bundle: &BufRingBufBundle) -> Vec<u8> {
+    bundle
+        .iter()
+        .flat_map(|chunk| chunk.iter().copied())
+        .collect()
+}
 
 #[test]
 fn send_recv() -> Result<(), Box<dyn std::error::Error>> {
@@ -66,6 +76,92 @@ fn connected_send_recv() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn connected_send_recv_zc() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let s1 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let s2 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+
+        s1.connect(s2.local_addr()?).await?;
+        s2.connect(s1.local_addr()?).await?;
+
+        if let Err(err) = s1.set_zerocopy(true).await {
+            s1.close().await?;
+            s2.close().await?;
+            if util::zerocopy_unsupported(&err) {
+                return Ok(());
+            }
+            return Err(err.into());
+        }
+
+        let recv_task =
+            norn_executor::spawn(async move { s2.recv(BytesMut::with_capacity(64)).await });
+        let payload = Bytes::from_static(b"udp-zc");
+        let (res, sent) = s1.send_zc(payload).await;
+        let sent_n = match res {
+            Ok(n) => n,
+            Err(err) => {
+                s1.close().await?;
+                if util::zerocopy_unsupported(&err) {
+                    return Ok(());
+                }
+                return Err(err.into());
+            }
+        };
+        assert_eq!(sent_n, sent.len());
+
+        let (res, buf) = recv_task.await?;
+        let n = res?;
+        assert_eq!(&buf[..n], b"udp-zc");
+
+        s1.close().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn connected_send_recv_msg_zc() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let s1 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let s2 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+
+        s1.connect(s2.local_addr()?).await?;
+        s2.connect(s1.local_addr()?).await?;
+
+        if let Err(err) = s1.set_zerocopy(true).await {
+            s1.close().await?;
+            s2.close().await?;
+            if util::zerocopy_unsupported(&err) {
+                return Ok(());
+            }
+            return Err(err.into());
+        }
+
+        let recv_task =
+            norn_executor::spawn(async move { s2.recv(BytesMut::with_capacity(64)).await });
+        let payload = Bytes::from_static(b"udp-zc-msg");
+        let (res, sent) = s1.send_msg_zc(payload, 0).await;
+        let sent_n = match res {
+            Ok(n) => n,
+            Err(err) => {
+                s1.close().await?;
+                if util::zerocopy_unsupported(&err) {
+                    return Ok(());
+                }
+                return Err(err.into());
+            }
+        };
+        assert_eq!(sent_n, sent.len());
+
+        let (res, buf) = recv_task.await?;
+        let n = res?;
+        assert_eq!(&buf[..n], b"udp-zc-msg");
+
+        s1.close().await?;
+        Ok(())
+    })
+}
+
+#[test]
 fn send_recv_msg() -> Result<(), Box<dyn std::error::Error>> {
     util::with_test_env(|| async {
         let s1 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
@@ -102,6 +198,118 @@ fn send_recv_ring() -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(s1.local_addr()?, addr);
         // Assert that the message is correct
         assert_eq!(b"hello", &buf[..5]);
+
+        Ok(())
+    })
+}
+
+#[test]
+fn send_recv_ring_multi_msg() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let ring = BufRing::builder(4).buf_cnt(32).buf_len(2048).build()?;
+        let s1 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let s2 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let sender = s1.local_addr()?;
+
+        let mut recv = pin!(s2.recv_from_ring_multi(&ring));
+        let messages: [&[u8]; 3] = [b"alpha", b"beta", b"gamma"];
+        for message in messages {
+            let payload = Bytes::copy_from_slice(message);
+            s1.send_to(payload, s2.local_addr()?).await.0?;
+            let (buf, addr) = recv.next().await.expect("multishot stream ended")?;
+            assert_eq!(addr, sender);
+            assert_eq!(&buf[..], message);
+        }
+
+        Ok(())
+    })
+}
+
+#[test]
+fn connected_send_recv_ring_multi() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let ring = BufRing::builder(5).buf_cnt(32).buf_len(2048).build()?;
+        let s1 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let s2 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        s1.connect(s2.local_addr()?).await?;
+        s2.connect(s1.local_addr()?).await?;
+
+        let mut recv = pin!(s2.recv_ring_multi(&ring));
+        let messages: [&[u8]; 3] = [b"one", b"two", b"three"];
+        for message in messages {
+            s1.send(Bytes::copy_from_slice(message)).await.0?;
+            let buf = recv.next().await.expect("multishot stream ended")?;
+            assert_eq!(&buf[..], message);
+        }
+
+        Ok(())
+    })
+}
+
+#[test]
+fn connected_send_recv_from_ring_multi() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let ring = BufRing::builder(8).buf_cnt(32).buf_len(2048).build()?;
+        let s1 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let s2 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        s1.connect(s2.local_addr()?).await?;
+        s2.connect(s1.local_addr()?).await?;
+
+        let mut recv = pin!(s2.recv_from_ring_multi(&ring));
+        let payload = Bytes::from_static(b"peer-fallback");
+        s1.send(payload.clone()).await.0?;
+        let (buf, addr) = recv.next().await.expect("multishot stream ended")?;
+        assert_eq!(addr, s1.local_addr()?);
+        assert_eq!(&buf[..], payload.as_ref());
+
+        Ok(())
+    })
+}
+
+#[test]
+fn connected_send_recv_bundle() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let ring = BufRing::builder(6).buf_cnt(64).buf_len(2048).build()?;
+        let s1 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let s2 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        s1.connect(s2.local_addr()?).await?;
+        s2.connect(s1.local_addr()?).await?;
+
+        let payload = Bytes::from_static(b"bundle-single");
+        s1.send(payload.clone()).await.0?;
+
+        let bundle = match s2.recv_bundle(&ring).await {
+            Ok(bundle) => bundle,
+            Err(err) if util::recv_bundle_unsupported(&err) => return Ok(()),
+            Err(err) => return Err(err.into()),
+        };
+        assert_eq!(bundle.len(), payload.len());
+        assert_eq!(flatten_bundle(&bundle), payload.as_ref());
+
+        Ok(())
+    })
+}
+
+#[test]
+fn connected_send_recv_bundle_multi() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let ring = BufRing::builder(7).buf_cnt(64).buf_len(2048).build()?;
+        let s1 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let s2 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        s1.connect(s2.local_addr()?).await?;
+        s2.connect(s1.local_addr()?).await?;
+
+        let mut recv = pin!(s2.recv_bundle_multi(&ring));
+        let messages: [&[u8]; 3] = [b"bundle-a", b"bundle-b", b"bundle-c"];
+        for message in messages {
+            s1.send(Bytes::copy_from_slice(message)).await.0?;
+            let bundle = match recv.next().await.expect("multishot stream ended") {
+                Ok(bundle) => bundle,
+                Err(err) if util::recv_bundle_unsupported(&err) => return Ok(()),
+                Err(err) => return Err(err.into()),
+            };
+            assert_eq!(flatten_bundle(&bundle), message);
+        }
 
         Ok(())
     })
@@ -202,6 +410,27 @@ fn close_socket() -> Result<(), Box<dyn std::error::Error>> {
     util::with_test_env(|| async {
         let s1 = UdpSocket::bind("0.0.0.0:0".parse()?).await?;
         s1.close().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn poll_readiness_smoke() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let s1 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let s2 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+
+        let writable = s1.poll_readiness::<false>(libc::POLLOUT as u32).await?;
+        assert!(writable.is_writeable() || writable.is_error());
+
+        s1.send_to(Bytes::from_static(b"x"), s2.local_addr()?)
+            .await
+            .0?;
+        let readable = s2.poll_readiness::<false>(libc::POLLIN as u32).await?;
+        assert!(readable.is_readable());
+
+        let (res, _) = s2.recv_from(BytesMut::with_capacity(16)).await;
+        res?;
         Ok(())
     })
 }

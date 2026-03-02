@@ -68,7 +68,10 @@ impl Clock {
             }
         }
     }
-    /// Advances simulated time.
+    /// Advance simulated time.
+    ///
+    /// ### Panics
+    /// Panics if called on a system clock created with [`Clock::system`].
     pub fn advance(&self, duration: Duration) {
         match &self.time {
             TimeSource::System => panic!("Cannot advance system clock"),

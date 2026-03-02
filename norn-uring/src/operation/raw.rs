@@ -114,6 +114,10 @@ impl CQEResult {
     pub(crate) fn more(&self) -> bool {
         io_uring::cqueue::more(self.flags)
     }
+
+    pub(crate) fn notif(&self) -> bool {
+        io_uring::cqueue::notif(self.flags)
+    }
 }
 
 /// [`RawOpHandle`] is a reference to an operation that is in
