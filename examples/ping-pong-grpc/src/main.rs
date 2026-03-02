@@ -349,7 +349,7 @@ mod linux {
         ) -> std::pin::Pin<Box<dyn hyper::rt::Sleep>> {
             let handle = norn_timer::Handle::current();
             let now = handle.clock().now();
-            let duration = deadline - now;
+            let duration = deadline.saturating_duration_since(now);
             self.sleep(duration)
         }
     }
@@ -498,8 +498,9 @@ mod linux {
     impl<T> Drop for PanicSyncSend<T> {
         fn drop(&mut self) {
             self.assert_accessible();
-            if let Some(mut v) = self.value.take() {
-                unsafe { ManuallyDrop::drop(&mut v) }
+            if let Some(v) = self.value.as_mut() {
+                // Drop in place so we do not move a potentially pinned inner value.
+                unsafe { ManuallyDrop::drop(v) }
             }
         }
     }
