@@ -14,7 +14,7 @@ use libc::O_NONBLOCK;
 use socket2::{Domain, Protocol, SockAddr, Type};
 
 use crate::buf::{StableBuf, StableBufMut};
-use crate::bufring::{BufRing, BufRingBuf, BufRingBufBundle};
+use crate::bufring::{BufRing, BufRingBuf, BufRingBufBundle, SendBundleBatch};
 use crate::fd::NornFd;
 use crate::operation::{Multishot, Op, Operation, Singleshot};
 
@@ -216,6 +216,20 @@ impl Socket {
         B: StableBuf + 'static,
     {
         let op = SendTo::new(self.fd.clone(), buf, Some(addr), flags as u32);
+        self.handle.submit(op).await
+    }
+
+    pub(crate) async fn send_bundle_udp(&self, batch: SendBundleBatch) -> io::Result<usize> {
+        self.send_bundle_udp_with_flags(batch, 0).await
+    }
+
+    pub(crate) async fn send_bundle_udp_with_flags(
+        &self,
+        batch: SendBundleBatch,
+        flags: i32,
+    ) -> io::Result<usize> {
+        batch.validate_send()?;
+        let op = SendBundleUdp::new(self.fd.clone(), batch, flags);
         self.handle.submit(op).await
     }
 
@@ -1339,6 +1353,52 @@ where
 
     fn complete(self, result: crate::operation::CQEResult) -> Self::Output {
         (result.result.map(|v| v as usize), self.buf)
+    }
+}
+
+#[derive(Debug)]
+struct SendBundleUdp {
+    fd: NornFd,
+    batch: SendBundleBatch,
+    flags: i32,
+}
+
+impl SendBundleUdp {
+    fn new(fd: NornFd, batch: SendBundleBatch, flags: i32) -> Self {
+        Self { fd, batch, flags }
+    }
+}
+
+impl Operation for SendBundleUdp {
+    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+        let this = unsafe { self.get_unchecked_mut() };
+        match this.fd.kind() {
+            crate::fd::FdKind::Fd(fd) => {
+                opcode::SendBundle::new(types::Fd(fd.0), this.batch.bgid())
+            }
+            crate::fd::FdKind::Fixed(fd) => {
+                opcode::SendBundle::new(types::Fixed(fd.0), this.batch.bgid())
+            }
+        }
+        .flags(this.flags)
+        .len(0)
+        .build()
+    }
+
+    fn on_submit(&mut self) {
+        self.batch.on_submit();
+    }
+
+    fn cleanup(&mut self, result: crate::operation::CQEResult) {
+        let _ = self.batch.finish_send(result);
+    }
+}
+
+impl Singleshot for SendBundleUdp {
+    type Output = io::Result<usize>;
+
+    fn complete(self, result: crate::operation::CQEResult) -> Self::Output {
+        self.batch.finish_send(result)
     }
 }
 

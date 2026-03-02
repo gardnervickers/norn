@@ -1,10 +1,11 @@
 #![cfg(target_os = "linux")]
 
+use std::io;
 use std::pin::pin;
 
 use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
-use norn_uring::bufring::{BufRing, BufRingBufBundle};
+use norn_uring::bufring::{BufRing, BufRingBufBundle, SendBundleBatch};
 use norn_uring::net::UdpSocket;
 
 mod util;
@@ -14,6 +15,13 @@ fn flatten_bundle(bundle: &BufRingBufBundle) -> Vec<u8> {
         .iter()
         .flat_map(|chunk| chunk.iter().copied())
         .collect()
+}
+
+fn stage_bundle_segment(batch: &SendBundleBatch, payload: &[u8]) -> io::Result<()> {
+    let mut buf = batch.checkout()?;
+    buf.as_mut_slice()[..payload.len()].copy_from_slice(payload);
+    buf.set_len(payload.len())?;
+    buf.commit()
 }
 
 #[test]
@@ -310,6 +318,106 @@ fn connected_send_recv_bundle_multi() -> Result<(), Box<dyn std::error::Error>> 
             };
             assert_eq!(flatten_bundle(&bundle), message);
         }
+
+        Ok(())
+    })
+}
+
+#[test]
+fn connected_send_bundle_segments() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let ring = BufRing::builder(9).buf_cnt(8).buf_len(256).build_send()?;
+        let s1 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let s2 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        s1.connect(s2.local_addr()?).await?;
+        s2.connect(s1.local_addr()?).await?;
+        let batch = ring.batch()?;
+
+        let messages: [&[u8]; 3] = [b"send-bundle-a", b"send-bundle-b", b"send-bundle-c"];
+        let total: usize = messages.iter().map(|msg| msg.len()).sum();
+        for message in messages {
+            stage_bundle_segment(&batch, message)?;
+        }
+        assert_eq!(batch.queued_buffers(), 3);
+        assert_eq!(batch.queued_len(), total);
+
+        let sent = match s1.send_bundle(batch).await {
+            Ok(sent) => sent,
+            Err(err) if util::send_bundle_unsupported(&err) => return Ok(()),
+            Err(err) => return Err(err.into()),
+        };
+        assert_eq!(sent, total);
+        assert_eq!(ring.available_buffers(), 8);
+
+        let (res, buf) = s2.recv(BytesMut::with_capacity(64)).await;
+        let n = res?;
+        let expected: Vec<u8> = messages
+            .iter()
+            .flat_map(|msg| msg.iter().copied())
+            .collect();
+        assert_eq!(&buf[..n], expected.as_slice());
+
+        Ok(())
+    })
+}
+
+#[test]
+fn connected_send_bundle_with_flags_smoke() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let ring = BufRing::builder(10).buf_cnt(4).buf_len(256).build_send()?;
+        let s1 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let s2 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        s1.connect(s2.local_addr()?).await?;
+        s2.connect(s1.local_addr()?).await?;
+        let batch = ring.batch()?;
+
+        stage_bundle_segment(&batch, b"send-bundle-flags")?;
+
+        let sent = match s1.send_bundle_with_flags(batch, libc::MSG_DONTWAIT).await {
+            Ok(sent) => sent,
+            Err(err) if util::send_bundle_unsupported(&err) => return Ok(()),
+            Err(err) => return Err(err.into()),
+        };
+        assert_eq!(sent, b"send-bundle-flags".len());
+
+        let (res, buf) = s2.recv(BytesMut::with_capacity(64)).await;
+        let n = res?;
+        assert_eq!(&buf[..n], b"send-bundle-flags");
+
+        Ok(())
+    })
+}
+
+#[test]
+fn connected_send_bundle_reuses_ring_after_send() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let ring = BufRing::builder(11).buf_cnt(4).buf_len(256).build_send()?;
+        let s1 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let s2 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        s1.connect(s2.local_addr()?).await?;
+        s2.connect(s1.local_addr()?).await?;
+
+        let batch = ring.batch()?;
+        stage_bundle_segment(&batch, b"reuse-1")?;
+        stage_bundle_segment(&batch, b"reuse-2")?;
+        match s1.send_bundle(batch).await {
+            Ok(sent) => assert_eq!(sent, b"reuse-1".len() + b"reuse-2".len()),
+            Err(err) if util::send_bundle_unsupported(&err) => return Ok(()),
+            Err(err) => return Err(err.into()),
+        }
+        let (res, buf) = s2.recv(BytesMut::with_capacity(64)).await;
+        let n = res?;
+        assert_eq!(&buf[..n], b"reuse-1reuse-2");
+        assert_eq!(ring.available_buffers(), 4);
+
+        let batch = ring.batch()?;
+        stage_bundle_segment(&batch, b"reuse-3")?;
+        let sent = s1.send_bundle(batch).await?;
+        assert_eq!(sent, b"reuse-3".len());
+        let (res, buf) = s2.recv(BytesMut::with_capacity(64)).await;
+        let n = res?;
+        assert_eq!(&buf[..n], b"reuse-3");
+        assert_eq!(ring.available_buffers(), 4);
 
         Ok(())
     })

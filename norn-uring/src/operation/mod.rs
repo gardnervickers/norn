@@ -20,6 +20,12 @@ pub trait Operation {
     /// Self will be pinned for the duration of the operation.
     fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry;
 
+    /// Called after the SQE has been queued for submission.
+    ///
+    /// This is the point where operations may safely publish any userspace state that must only
+    /// become visible once the SQE exists in the submission queue.
+    fn on_submit(&mut self) {}
+
     /// Called (potentially multiple) times when the operation is dropped by the application.
     ///
     /// This should be used to cleanup resources created by the kernel, such as buffers and
@@ -312,7 +318,8 @@ where
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
-        if let Err(err) = ready!(this.future.poll(cx)) {
+        let pushed = ready!(this.future.poll(cx));
+        if let Err(err) = pushed {
             // Submission failed (typically during driver shutdown). Synthesize a completion
             // error so the op follows normal completion/drop lifetimes instead of panicking.
             let op = this
@@ -321,6 +328,15 @@ where
                 .expect("operation handle must exist until submission completes")
                 .untyped();
             op.complete(CQEResult::new(Err(err.into()), 0));
+        } else {
+            let data = unsafe {
+                this.handle
+                    .as_mut()
+                    .expect("operation handle must exist until submission completes")
+                    .data_mut()
+                    .expect("operation data must exist until submission completes")
+            };
+            data.on_submit();
         }
         Poll::Ready(this.handle.take().unwrap())
     }
