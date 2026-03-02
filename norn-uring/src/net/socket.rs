@@ -1386,6 +1386,10 @@ impl Operation for SendBundleUdp {
     fn cleanup(&mut self, result: crate::operation::CQEResult) {
         let _ = self.ring.finish_send(result);
     }
+
+    fn cleanup_unsubmitted(&mut self) {
+        self.ring.cancel_send();
+    }
 }
 
 impl Singleshot for SendBundleUdp {

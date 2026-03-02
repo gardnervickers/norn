@@ -14,6 +14,10 @@ use futures_core::Stream;
 
 use crate::driver::PushFuture;
 
+trait OpData: Operation + 'static {}
+
+impl<T> OpData for T where T: Operation + 'static {}
+
 pub trait Operation {
     /// Configure a new [`io_uring::squeue::Entry`] for this operation.
     ///
@@ -25,6 +29,11 @@ pub trait Operation {
     /// This should be used to cleanup resources created by the kernel, such as buffers and
     /// file descriptors.
     fn cleanup(&mut self, result: CQEResult);
+
+    /// Called when an operation is dropped before it has been submitted.
+    ///
+    /// This is for userspace-only reservations taken before the SQE reaches the ring.
+    fn cleanup_unsubmitted(&mut self) {}
 }
 
 pub trait Singleshot: Operation {
@@ -76,7 +85,7 @@ pin_project_lite::pin_project! {
     #[must_use = "future does nothing unless you `.await` or poll them"]
     pub struct Op<T>
     where
-        T: 'static,
+        T: OpData,
     {
         #[pin]
         stage: Stage<T>,
@@ -84,12 +93,20 @@ pin_project_lite::pin_project! {
         completed: bool
     }
 
-    impl<T> PinnedDrop for Op<T> where T: 'static {
+    impl<T: OpData> PinnedDrop for Op<T> {
         fn drop(me: Pin<&mut Self>) {
             let this = me.project();
             // Safety: We are not moving out of the pinned `this.stage` field.
             match unsafe {this.stage.get_unchecked_mut()} {
-                Stage::Unsubmitted { .. } => {
+                Stage::Unsubmitted { unsubmitted } => {
+                    if let Some(handle) = unsubmitted.handle.as_mut() {
+                        let data = unsafe {
+                            handle
+                                .data_mut()
+                                .expect("operation handle must exist until submission completes")
+                        };
+                        data.cleanup_unsubmitted();
+                    }
                 },
                 Stage::Submitted { inner } => {
                     if !*this.completed {

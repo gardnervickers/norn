@@ -124,6 +124,10 @@ impl SendBufRing {
         self.rc.begin_send()
     }
 
+    pub(crate) fn cancel_send(&self) {
+        self.rc.cancel_send();
+    }
+
     pub(crate) fn finish_send(&self, result: crate::operation::CQEResult) -> io::Result<usize> {
         self.rc.finish_send(result)
     }
@@ -859,6 +863,10 @@ impl SendQueueState {
         out
     }
 
+    fn cancel_send(&mut self) {
+        self.inflight = false;
+    }
+
     fn complete_udp_send(&mut self, bytes: usize, flags: u32) -> io::Result<usize> {
         let start_bid = selected_bid_from_flags(flags)?;
         let Some(front) = self.queued.front() else {
@@ -1028,6 +1036,10 @@ impl InnerSendBufRing {
 
     fn begin_send(&self) -> io::Result<()> {
         self.state.borrow_mut().begin_send()
+    }
+
+    fn cancel_send(&self) {
+        self.state.borrow_mut().cancel_send();
     }
 
     fn finish_send(&self, result: crate::operation::CQEResult) -> io::Result<usize> {
@@ -1245,5 +1257,18 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(state.poisoned);
+    }
+
+    #[test]
+    fn cancel_send_clears_inflight() {
+        let mut state = SendQueueState::new(2);
+        let bid = state.checkout_bid().unwrap();
+        state.commit_datagram(bid, 4).unwrap();
+        state.begin_send().unwrap();
+
+        state.cancel_send();
+
+        assert!(!state.inflight);
+        state.begin_send().unwrap();
     }
 }
