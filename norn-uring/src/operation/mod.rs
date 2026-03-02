@@ -14,26 +14,23 @@ use futures_core::Stream;
 
 use crate::driver::PushFuture;
 
-trait OpData: Operation + 'static {}
-
-impl<T> OpData for T where T: Operation + 'static {}
-
 pub trait Operation {
     /// Configure a new [`io_uring::squeue::Entry`] for this operation.
     ///
     /// Self will be pinned for the duration of the operation.
     fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry;
 
+    /// Called after the SQE has been queued for submission.
+    ///
+    /// This is the point where operations may safely publish any userspace state that must only
+    /// become visible once the SQE exists in the submission queue.
+    fn on_submit(&mut self) {}
+
     /// Called (potentially multiple) times when the operation is dropped by the application.
     ///
     /// This should be used to cleanup resources created by the kernel, such as buffers and
     /// file descriptors.
     fn cleanup(&mut self, result: CQEResult);
-
-    /// Called when an operation is dropped before it has been submitted.
-    ///
-    /// This is for userspace-only reservations taken before the SQE reaches the ring.
-    fn cleanup_unsubmitted(&mut self) {}
 }
 
 pub trait Singleshot: Operation {
@@ -85,7 +82,7 @@ pin_project_lite::pin_project! {
     #[must_use = "future does nothing unless you `.await` or poll them"]
     pub struct Op<T>
     where
-        T: OpData,
+        T: 'static,
     {
         #[pin]
         stage: Stage<T>,
@@ -93,20 +90,12 @@ pin_project_lite::pin_project! {
         completed: bool
     }
 
-    impl<T: OpData> PinnedDrop for Op<T> {
+    impl<T> PinnedDrop for Op<T> where T: 'static {
         fn drop(me: Pin<&mut Self>) {
             let this = me.project();
             // Safety: We are not moving out of the pinned `this.stage` field.
             match unsafe {this.stage.get_unchecked_mut()} {
-                Stage::Unsubmitted { unsubmitted } => {
-                    if let Some(handle) = unsubmitted.handle.as_mut() {
-                        let data = unsafe {
-                            handle
-                                .data_mut()
-                                .expect("operation handle must exist until submission completes")
-                        };
-                        data.cleanup_unsubmitted();
-                    }
+                Stage::Unsubmitted { .. } => {
                 },
                 Stage::Submitted { inner } => {
                     if !*this.completed {
@@ -329,7 +318,8 @@ where
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
-        if let Err(err) = ready!(this.future.poll(cx)) {
+        let pushed = ready!(this.future.poll(cx));
+        if let Err(err) = pushed {
             // Submission failed (typically during driver shutdown). Synthesize a completion
             // error so the op follows normal completion/drop lifetimes instead of panicking.
             let op = this
@@ -338,6 +328,15 @@ where
                 .expect("operation handle must exist until submission completes")
                 .untyped();
             op.complete(CQEResult::new(Err(err.into()), 0));
+        } else {
+            let data = unsafe {
+                this.handle
+                    .as_mut()
+                    .expect("operation handle must exist until submission completes")
+                    .data_mut()
+                    .expect("operation data must exist until submission completes")
+            };
+            data.on_submit();
         }
         Poll::Ready(this.handle.take().unwrap())
     }

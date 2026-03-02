@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use socket2::{Domain, Type};
 
 use crate::buf::{StableBuf, StableBufMut};
-use crate::bufring::{BufRing, BufRingBuf, SendBufRing};
+use crate::bufring::{BufRing, BufRingBuf, SendBundleBatch};
 use crate::net::socket;
 use crate::operation::Op;
 
@@ -95,22 +95,22 @@ impl UdpSocket {
         self.inner.send_with_flags(buf, flags).await
     }
 
-    /// Sends one datagram assembled from one or more committed buffers in a send buffer ring on a
+    /// Sends one datagram assembled from one or more committed buffers in a send bundle batch on a
     /// connected socket.
     ///
-    /// The ring must have at least one committed buffer queued.
-    pub async fn send_bundle(&self, ring: &SendBufRing) -> io::Result<usize> {
-        self.inner.send_bundle_udp(ring).await
+    /// The batch must have at least one committed buffer queued.
+    pub async fn send_bundle(&self, batch: SendBundleBatch) -> io::Result<usize> {
+        self.inner.send_bundle_udp(batch).await
     }
 
-    /// Sends one datagram assembled from one or more committed buffers in a send buffer ring on a
+    /// Sends one datagram assembled from one or more committed buffers in a send bundle batch on a
     /// connected socket with the provided send flags.
     pub async fn send_bundle_with_flags(
         &self,
-        ring: &SendBufRing,
+        batch: SendBundleBatch,
         flags: i32,
     ) -> io::Result<usize> {
-        self.inner.send_bundle_udp_with_flags(ring, flags).await
+        self.inner.send_bundle_udp_with_flags(batch, flags).await
     }
 
     /// Sends a single datagram on a connected socket using io_uring zerocopy send.
