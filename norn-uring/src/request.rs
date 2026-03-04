@@ -3,12 +3,13 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
+use std::time::Duration;
 
 use smallvec::SmallVec;
 
 use crate::driver::PushFuture;
 use crate::error::SubmitError;
-use crate::operation::{ConfiguredEntry, Op, Singleshot};
+use crate::operation::{CQEResult, ConfiguredEntry, Op, Operation, Singleshot};
 
 mod private {
     use super::*;
@@ -47,9 +48,93 @@ pub trait Request: Future + Sized + private::Chainable {
     {
         Map::new(self, f)
     }
+
+    /// Append a terminal linked timeout to this request chain.
+    ///
+    /// The returned future resolves to this request's output. If the timeout
+    /// expires first, the linked request is canceled and its output reflects
+    /// that cancellation.
+    fn timeout(self, duration: Duration) -> WithTimeout<Self> {
+        WithTimeout::new(self, duration)
+    }
 }
 
 impl<T> Request for T where T: Future + Sized + private::Chainable {}
+
+pin_project_lite::pin_project! {
+    /// A request future with a terminal linked timeout.
+    #[must_use = "futures do nothing unless you `.await` or poll them"]
+    pub struct WithTimeout<R>
+    where
+        R: Request,
+    {
+        #[pin]
+        inner: ThenAux<R, Op<LinkTimeoutOp>>,
+    }
+}
+
+impl<R> std::fmt::Debug for WithTimeout<R>
+where
+    R: Request,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WithTimeout").finish()
+    }
+}
+
+impl<R> WithTimeout<R>
+where
+    R: Request,
+{
+    fn new(inner: R, duration: Duration) -> Self {
+        let reactor = inner.reactor().clone();
+        let timeout = Op::new(LinkTimeoutOp::new(duration), reactor);
+        Self {
+            inner: ThenAux::new(inner, timeout),
+        }
+    }
+}
+
+impl<R> Future for WithTimeout<R>
+where
+    R: Request,
+{
+    type Output = R::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.project().inner.poll(cx)
+    }
+}
+
+#[derive(Debug)]
+struct LinkTimeoutOp {
+    timespec: io_uring::types::Timespec,
+}
+
+impl LinkTimeoutOp {
+    fn new(duration: Duration) -> Self {
+        Self {
+            timespec: duration.into(),
+        }
+    }
+}
+
+impl Operation for LinkTimeoutOp {
+    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+        let this = self.as_ref().get_ref();
+        io_uring::opcode::LinkTimeout::new(&this.timespec).build()
+    }
+
+    fn cleanup(&mut self, _: CQEResult) {}
+}
+
+impl Singleshot for LinkTimeoutOp {
+    type Output = std::io::Result<()>;
+
+    fn complete(self, result: CQEResult) -> Self::Output {
+        result.result.map(|_| ())
+    }
+}
 
 pin_project_lite::pin_project! {
     /// A linked request that yields both inner results.
@@ -586,11 +671,11 @@ mod tests {
     use std::cell::Cell;
     use std::pin::Pin;
     use std::rc::Rc;
+    use std::time::Duration;
 
     use norn_executor::LocalExecutor;
 
     use super::*;
-    use crate::operation::{CQEResult, Operation, Singleshot};
 
     #[derive(Debug)]
     struct TaggedNop(u8);
@@ -675,6 +760,22 @@ mod tests {
         });
 
         assert_eq!(output, 12);
+    }
+
+    #[test]
+    fn timeout_returns_primary_output_when_request_completes_first() {
+        let driver = crate::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let handle = driver.handle();
+        let mut ex = LocalExecutor::new(driver);
+
+        let output = ex.block_on(async {
+            handle
+                .submit(TaggedNop(11))
+                .timeout(Duration::from_secs(1))
+                .await
+        });
+
+        assert_eq!(output.unwrap(), 11);
     }
 
     #[test]
