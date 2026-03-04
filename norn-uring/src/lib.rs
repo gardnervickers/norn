@@ -40,5 +40,5 @@ pub mod net;
 
 pub use driver::{Driver, Handle};
 pub use operation::{Multishot, Op, Operation, Singleshot};
-pub use request::{Map, Request, Then, ThenAux};
+pub use request::{Map, Request, Then, ThenAux, WithTimeout};
 pub use util::noop;

@@ -2,6 +2,7 @@
 
 use std::cell::Cell;
 use std::rc::Rc;
+use std::time::Duration;
 
 use norn_uring::fs;
 use norn_uring::net::{TcpListener, TcpSocket};
@@ -127,6 +128,33 @@ fn linked_tcp_send_then_recv_round_trip() -> Result<(), Box<dyn std::error::Erro
 
         client.close().await?;
         server_task.await??;
+        Ok(())
+    })
+}
+
+#[test]
+fn linked_timeout_cancels_blocked_recv() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let listener = TcpListener::bind("127.0.0.1:0".parse()?, 32).await?;
+        let addr = listener.local_addr()?;
+
+        let server_task = norn_executor::spawn(async move {
+            let (server, _) = listener.accept().await?;
+            Ok::<_, Box<dyn std::error::Error>>(server)
+        });
+
+        let client = TcpSocket::connect(addr).await?;
+        let (recv_res, buf) = client
+            .recv(vec![0; 1])
+            .timeout(Duration::from_millis(10))
+            .await;
+
+        assert_eq!(recv_res.unwrap_err().raw_os_error(), Some(libc::ECANCELED));
+        assert_eq!(buf.len(), 1);
+
+        client.close().await?;
+        let server = server_task.await??;
+        server.close().await?;
         Ok(())
     })
 }
