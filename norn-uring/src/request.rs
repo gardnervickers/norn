@@ -580,3 +580,112 @@ where
         self.project().inner.cancel_unfinished();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::pin::Pin;
+    use std::rc::Rc;
+
+    use norn_executor::LocalExecutor;
+
+    use super::*;
+    use crate::operation::{CQEResult, Operation, Singleshot};
+
+    #[derive(Debug)]
+    struct TaggedNop(u8);
+
+    impl Operation for TaggedNop {
+        fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+            io_uring::opcode::Nop::new().build()
+        }
+
+        fn cleanup(&mut self, _: CQEResult) {}
+    }
+
+    impl Singleshot for TaggedNop {
+        type Output = std::io::Result<u8>;
+
+        fn complete(self, result: CQEResult) -> Self::Output {
+            result.result.map(|_| self.0)
+        }
+    }
+
+    #[test]
+    fn nested_then_composes_outputs() {
+        let driver = crate::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let handle = driver.handle();
+        let mut ex = LocalExecutor::new(driver);
+
+        let output = ex.block_on(async {
+            handle
+                .submit(TaggedNop(1))
+                .then(
+                    handle
+                        .submit(TaggedNop(2))
+                        .then(handle.submit(TaggedNop(3))),
+                )
+                .await
+        });
+
+        let (left, (middle, right)) = output;
+        assert_eq!(left.unwrap(), 1);
+        assert_eq!(middle.unwrap(), 2);
+        assert_eq!(right.unwrap(), 3);
+    }
+
+    #[test]
+    fn then_aux_waits_for_auxiliary_request_and_map_transforms_output() {
+        let driver = crate::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let handle = driver.handle();
+        let mut ex = LocalExecutor::new(driver);
+        let aux_ran = Rc::new(Cell::new(false));
+        let aux_seen = Rc::clone(&aux_ran);
+
+        let output = ex.block_on(async move {
+            handle
+                .submit(TaggedNop(4))
+                .map(|result| result.map(|value| value + 1))
+                .then_aux(handle.submit(TaggedNop(9)).map(move |result| {
+                    assert_eq!(result.unwrap(), 9);
+                    aux_seen.set(true);
+                }))
+                .await
+        });
+
+        assert_eq!(output.unwrap(), 5);
+        assert!(
+            aux_ran.get(),
+            "auxiliary request should be polled to completion"
+        );
+    }
+
+    #[test]
+    fn chained_maps_run_in_order() {
+        let driver = crate::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let handle = driver.handle();
+        let mut ex = LocalExecutor::new(driver);
+
+        let output = ex.block_on(async {
+            handle
+                .submit(TaggedNop(7))
+                .map(|result| result.expect("request should succeed"))
+                .map(|value| value as u16 + 5)
+                .await
+        });
+
+        assert_eq!(output, 12);
+    }
+
+    #[test]
+    #[should_panic(expected = "linked requests must target the same driver")]
+    fn linking_requests_from_different_drivers_panics() {
+        let left_driver = crate::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let right_driver = crate::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+
+        let _ = left_driver
+            .handle()
+            .submit(TaggedNop(1))
+            .then(right_driver.handle().submit(TaggedNop(2)));
+    }
+}
