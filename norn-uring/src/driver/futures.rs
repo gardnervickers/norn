@@ -3,6 +3,8 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{ready, Context, Poll};
 
+use smallvec::SmallVec;
+
 use crate::driver::{Shared, Status};
 use crate::error::SubmitError;
 use crate::operation::ConfiguredEntry;
@@ -28,8 +30,13 @@ pin_project_lite::pin_project! {
         shared: &'a Shared,
         #[pin]
         notify: Option<Notified<'a>>,
-        entry: Option<ConfiguredEntry>,
+        pending: PendingSubmission,
     }
+}
+
+enum PendingSubmission {
+    Single(Option<ConfiguredEntry>),
+    Batch(SmallVec<[ConfiguredEntry; 4]>),
 }
 
 impl PushFuture {
@@ -38,7 +45,20 @@ impl PushFuture {
         let inner = PushFutureInner {
             shared,
             notify: None,
-            entry: Some(entry),
+            pending: PendingSubmission::Single(Some(entry)),
+        };
+        PushFuture {
+            shared: Some(shared),
+            fut: Some(inner),
+        }
+    }
+
+    pub(super) fn new_batch(shared: Rc<Shared>, entries: SmallVec<[ConfiguredEntry; 4]>) -> Self {
+        let shared = into_static_shared(shared);
+        let inner = PushFutureInner {
+            shared,
+            notify: None,
+            pending: PendingSubmission::Batch(entries),
         };
         PushFuture {
             shared: Some(shared),
@@ -66,16 +86,31 @@ impl Future for PushFutureInner<'_> {
                 Pin::set(&mut this.notify, None);
             }
 
-            if let Err(entry) = this
-                .shared
-                .try_push(this.entry.take().expect("entry already submitted"))
-            {
-                // Put the entry back
-                *this.entry = Some(entry);
-                // Wait for the submission queue to have space
-                log::trace!(target: LOG, "ring.push.full");
-                Pin::set(&mut this.notify, Some(this.shared.backpressure.wait()));
-                continue;
+            match &mut *this.pending {
+                PendingSubmission::Single(entry) => {
+                    if let Err(returned_entry) = this
+                        .shared
+                        .try_push(entry.take().expect("entry already submitted"))
+                    {
+                        *entry = Some(returned_entry);
+                        log::trace!(target: LOG, "ring.push.full");
+                        Pin::set(&mut this.notify, Some(this.shared.backpressure.wait()));
+                        continue;
+                    }
+                }
+                PendingSubmission::Batch(entries) => {
+                    if let Err(err) = this.shared.validate_batch_len(entries.len()) {
+                        return Poll::Ready(Err(err));
+                    }
+                    if let Err(returned_entries) =
+                        this.shared.try_push_batch(std::mem::take(entries))
+                    {
+                        *entries = returned_entries;
+                        log::trace!(target: LOG, "ring.push.full");
+                        Pin::set(&mut this.notify, Some(this.shared.backpressure.wait()));
+                        continue;
+                    }
+                }
             }
             log::trace!(target: LOG, "ring.push.ok");
             return Poll::Ready(Ok(()));

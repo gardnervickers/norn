@@ -363,7 +363,12 @@ impl InnerBufRing {
         let bgid = self.bgid;
 
         let res = unsafe {
-            submitter.register_buf_ring(self.ring_start.as_ptr() as _, self.ring_entries(), bgid)
+            submitter.register_buf_ring_with_flags(
+                self.ring_start.as_ptr() as _,
+                self.ring_entries(),
+                bgid,
+                0,
+            )
         };
 
         if let Err(e) = res {
@@ -543,7 +548,7 @@ impl InnerBufRing {
     fn bid_at_ring_index(&self, index: u16) -> Bid {
         let idx = index & self.mask();
         let entries = self.ring_start.as_ptr() as *const BufRingEntry;
-        unsafe { (&*entries.add(idx as usize)).bid() }
+        unsafe { (*entries.add(idx as usize)).bid() }
     }
 
     fn ring_entries(&self) -> u16 {

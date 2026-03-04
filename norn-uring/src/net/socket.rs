@@ -717,7 +717,7 @@ impl RecvFromRingMulti {
         }
     }
 
-    fn to_item(
+    fn recv_item(
         &mut self,
         result: crate::operation::CQEResult,
     ) -> io::Result<(RecvMsgRingBuf, SocketAddr)> {
@@ -777,11 +777,11 @@ impl Multishot for RecvFromRingMulti {
     type Item = io::Result<(RecvMsgRingBuf, SocketAddr)>;
 
     fn update(&mut self, result: crate::operation::CQEResult) -> Self::Item {
-        self.to_item(result)
+        self.recv_item(result)
     }
 
     fn complete(mut self, result: crate::operation::CQEResult) -> Option<Self::Item> {
-        Some(self.to_item(result))
+        Some(self.recv_item(result))
     }
 }
 
