@@ -223,6 +223,57 @@ fn create_remove_dir() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn advise_and_xattr_ops() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let dir = util::ThreadNameTestDir::new();
+        let path = dir.join("xattr-file");
+        let mut opts = fs::OpenOptions::new();
+        opts.create(true).write(true).read(true);
+
+        let file = opts.open(&path).await?;
+        file.write_at(&b"payload"[..], 0).await.0?;
+        file.advise(0, 0, libc::POSIX_FADV_SEQUENTIAL).await?;
+
+        let fd_name = b"user.norn.fd";
+        let fd_value = Bytes::from_static(b"fd-value");
+        let (res, _) = file.set_xattr(fd_name, fd_value, 0).await;
+        match res {
+            Ok(()) => {}
+            Err(err) if util::xattr_unsupported(&err) => return Ok(()),
+            Err(err) => return Err(err.into()),
+        }
+
+        let (res, buf) = file.get_xattr(fd_name, vec![0u8; 32]).await;
+        let n = match res {
+            Ok(n) => n,
+            Err(err) if util::xattr_unsupported(&err) => return Ok(()),
+            Err(err) => return Err(err.into()),
+        };
+        assert_eq!(&buf[..n], b"fd-value");
+
+        let path_name = b"user.norn.path";
+        let path_value = Bytes::from_static(b"path-value");
+        let (res, _) = fs::set_xattr(&path, path_name, path_value, 0).await;
+        match res {
+            Ok(()) => {}
+            Err(err) if util::xattr_unsupported(&err) => return Ok(()),
+            Err(err) => return Err(err.into()),
+        }
+
+        let (res, buf) = fs::get_xattr(&path, path_name, vec![0u8; 32]).await;
+        let n = match res {
+            Ok(n) => n,
+            Err(err) if util::xattr_unsupported(&err) => return Ok(()),
+            Err(err) => return Err(err.into()),
+        };
+        assert_eq!(&buf[..n], b"path-value");
+
+        file.close().await?;
+        Ok(())
+    })
+}
+
+#[test]
 fn drop_file_outside_runtime() -> Result<(), Box<dyn std::error::Error>> {
     let file = util::with_test_env(|| async {
         let dir = util::ThreadNameTestDir::new();
