@@ -113,6 +113,8 @@ pin_project_lite::pin_project! {
         waker: RefCell<Option<Waker>>,
         complete: Cell<Result<(), error::Error>>,
         deadline: Cell<u64>,
+        wheel: Cell<u8>,
+        slot: Cell<u8>,
         #[pin]
         pointers: UnsafeCell<list::Links<Entry>>,
         _p: PhantomPinned,
@@ -129,6 +131,8 @@ impl Entry {
             pointers: UnsafeCell::new(list::Links::new()),
             _p: PhantomPinned,
             deadline: Cell::new(0),
+            wheel: Cell::new(0),
+            slot: Cell::new(0),
         }
     }
 
@@ -150,6 +154,19 @@ impl Entry {
         debug_assert!(!self.is_registered());
         self.state.set(State::Registered);
         self.deadline.set(tick);
+    }
+
+    pub(crate) fn set_location(&self, wheel: usize, slot: usize) {
+        debug_assert!(self.is_registered());
+        self.wheel
+            .set(u8::try_from(wheel).expect("wheel index out of range"));
+        self.slot
+            .set(u8::try_from(slot).expect("slot index out of range"));
+    }
+
+    pub(crate) fn location(&self) -> (usize, usize) {
+        debug_assert!(self.is_registered());
+        (usize::from(self.wheel.get()), usize::from(self.slot.get()))
     }
 
     pub(crate) fn fire(&self, completion: Result<(), error::Error>) {

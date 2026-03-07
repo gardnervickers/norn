@@ -105,7 +105,7 @@ impl Wheels {
             unsafe { entry.as_ref().fire(Ok(())) };
         } else {
             let wheel = wheel_for(self.elapsed(), expiration);
-            let slot = self.wheels.borrow_mut()[wheel].add_entry(entry);
+            let candidate = self.wheels.borrow_mut()[wheel].add_entry(entry);
             if !self.next_expiration_dirty.get() {
                 if let Some(current) = self.next_expiration_hint.get() {
                     // A newly inserted timer may only invalidate the hint if
@@ -114,7 +114,6 @@ impl Wheels {
                         self.next_expiration_dirty.set(true);
                     }
                 } else {
-                    let candidate = level::expiration_for_slot(wheel, slot, self.elapsed());
                     self.next_expiration_hint.set(Some(candidate));
                 }
             }
@@ -122,9 +121,7 @@ impl Wheels {
     }
 
     fn remove(&self, entry: ptr::NonNull<entry::Entry>) -> Option<ptr::NonNull<entry::Entry>> {
-        let expiration = unsafe { entry.as_ref().expiration() };
-        let wheel = wheel_for(self.elapsed(), expiration);
-        let slot = level::slot_for(expiration, wheel);
+        let (wheel, slot) = unsafe { entry.as_ref().location() };
         let removed = unsafe { self.wheels.borrow_mut()[wheel].remove_entry(entry) };
         if removed.is_some() {
             if let Some(next) = self.next_expiration_hint.get() {
@@ -298,5 +295,58 @@ mod tests {
         assert_eq!(expired, 1);
         assert!(next.is_none());
         assert!(sleep.as_mut().poll(&mut cx).is_ready());
+    }
+
+    #[test]
+    fn higher_level_timer_reports_exact_deadline() {
+        let mut cx = futures_test::task::noop_context();
+        let timer = Driver::new((), Clock::system());
+        let handle = timer.handle();
+        let mut sleep = pin!(handle.sleep(Duration::from_millis(1000)));
+        assert!(sleep.as_mut().poll(&mut cx).is_pending());
+
+        let (expired, next) = timer.wheels.advance(0);
+        assert_eq!(expired, 0);
+        assert_eq!(next.unwrap().deadline(), 1000);
+
+        let (expired, next) = timer.wheels.advance(999);
+        assert_eq!(expired, 0);
+        assert_eq!(next.unwrap().deadline(), 1000);
+
+        let (expired, next) = timer.wheels.advance(1000);
+        assert_eq!(expired, 1);
+        assert!(next.is_none());
+        assert!(sleep.as_mut().poll(&mut cx).is_ready());
+    }
+
+    #[test]
+    fn removing_earliest_timer_updates_slot_deadline() {
+        let mut cx = futures_test::task::noop_context();
+        let timer = Driver::new((), Clock::system());
+        let handle = timer.handle();
+        let mut second = pin!(handle.sleep(Duration::from_millis(1020)));
+
+        {
+            let mut first = pin!(handle.sleep(Duration::from_millis(1000)));
+            assert!(first.as_mut().poll(&mut cx).is_pending());
+            assert!(second.as_mut().poll(&mut cx).is_pending());
+
+            let (expired, next) = timer.wheels.advance(0);
+            assert_eq!(expired, 0);
+            assert_eq!(next.unwrap().deadline(), 1000);
+        }
+
+        let (expired, next) = timer.wheels.advance(0);
+        assert_eq!(expired, 0);
+        assert_eq!(next.unwrap().deadline(), 1020);
+
+        let (expired, next) = timer.wheels.advance(1019);
+        assert_eq!(expired, 0);
+        assert_eq!(next.unwrap().deadline(), 1020);
+
+        let (expired, next) = timer.wheels.advance(1020);
+        assert_eq!(expired, 1);
+        assert!(next.is_none());
+        assert!(second.as_mut().poll(&mut cx).is_ready());
     }
 }
