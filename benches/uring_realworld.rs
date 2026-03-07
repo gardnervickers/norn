@@ -16,7 +16,9 @@ use bencher::bench;
 use bencher::{run_tests_console, Bencher, TestDesc, TestDescAndFn, TestFn, TestOpts};
 use futures::stream::{FuturesUnordered, StreamExt};
 
+use norn_uring::buf::{StableBuf, StableBufMut};
 use norn_uring::bufring::BufRing;
+use norn_uring::fixedbuf::{FixedBufRegistry, RegisteredBufSlice};
 use norn_uring::fs;
 use norn_uring::net::UdpSocket;
 
@@ -327,6 +329,431 @@ async fn file_write_read_worker(
     Ok(())
 }
 
+#[derive(Debug)]
+struct AlignedIoBuf {
+    storage: Vec<u8>,
+    start: usize,
+    len: usize,
+    init_len: usize,
+}
+
+impl AlignedIoBuf {
+    fn new(len: usize, alignment: usize, init_len: usize) -> Self {
+        assert!(alignment.is_power_of_two());
+        assert!(init_len <= len);
+        let storage = vec![0u8; len + alignment];
+        let addr = storage.as_ptr() as usize;
+        let misalignment = addr & (alignment - 1);
+        let start = if misalignment == 0 {
+            0
+        } else {
+            alignment - misalignment
+        };
+        Self {
+            storage,
+            start,
+            len,
+            init_len,
+        }
+    }
+
+    fn as_full_mut(&mut self) -> &mut [u8] {
+        &mut self.storage[self.start..self.start + self.len]
+    }
+
+    fn clear_init(&mut self) {
+        self.init_len = 0;
+    }
+
+    fn set_full_init(&mut self) {
+        self.init_len = self.len;
+    }
+}
+
+unsafe impl StableBuf for AlignedIoBuf {
+    fn stable_ptr(&self) -> *const u8 {
+        unsafe { self.storage.as_ptr().add(self.start) }
+    }
+
+    fn bytes_init(&self) -> usize {
+        self.init_len
+    }
+}
+
+unsafe impl StableBufMut for AlignedIoBuf {
+    fn stable_ptr_mut(&mut self) -> *mut u8 {
+        unsafe { self.storage.as_mut_ptr().add(self.start) }
+    }
+
+    fn bytes_remaining(&self) -> usize {
+        self.len
+    }
+
+    unsafe fn set_init(&mut self, init_len: usize) {
+        self.init_len = cmp::min(init_len, self.len);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DirectIoMode {
+    Buffered,
+    Direct,
+    DirectFixed,
+}
+
+impl DirectIoMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Buffered => "buffered",
+            Self::Direct => "direct",
+            Self::DirectFixed => "direct_fixed",
+        }
+    }
+
+    fn uses_direct(self) -> bool {
+        !matches!(self, Self::Buffered)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DirectIoOp {
+    Write,
+    Read,
+}
+
+impl DirectIoOp {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Write => "write",
+            Self::Read => "read",
+        }
+    }
+}
+
+fn fixed_slice_range(buf: &[u8], alignment: usize, len: usize) -> std::ops::Range<usize> {
+    assert!(alignment.is_power_of_two());
+    assert!(len <= buf.len());
+    let addr = buf.as_ptr() as usize;
+    let misalignment = addr & (alignment - 1);
+    let start = if misalignment == 0 {
+        0
+    } else {
+        alignment - misalignment
+    };
+    assert!(start + len <= buf.len());
+    start..(start + len)
+}
+
+fn direct_path_unsupported(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::Unsupported | io::ErrorKind::InvalidInput
+    )
+}
+
+async fn file_io_worker_standard(
+    file: &fs::File,
+    mut write_buf: AlignedIoBuf,
+    mut read_buf: AlignedIoBuf,
+    op: DirectIoOp,
+    block_size: usize,
+    rounds: usize,
+    slots: usize,
+) -> io::Result<(AlignedIoBuf, AlignedIoBuf)> {
+    for round in 0..rounds {
+        let slot = round % slots;
+        let offset = (slot * block_size) as u64;
+        match op {
+            DirectIoOp::Write => {
+                write_buf.as_full_mut()[0] = (round as u8).wrapping_add(1);
+                write_buf.set_full_init();
+                let (write_res, write) = file.write_at(write_buf, offset).await;
+                write_buf = write;
+                let written = write_res?;
+                assert_eq!(written, block_size);
+            }
+            DirectIoOp::Read => {
+                read_buf.clear_init();
+                let (read_res, read) = file.read_at(read_buf, offset).await;
+                read_buf = read;
+                let n = read_res?;
+                assert_eq!(n, block_size);
+            }
+        }
+    }
+    Ok((write_buf, read_buf))
+}
+
+async fn file_io_worker_fixed(
+    file: &fs::File,
+    mut slice: RegisteredBufSlice,
+    op: DirectIoOp,
+    block_size: usize,
+    rounds: usize,
+    slots: usize,
+) -> io::Result<RegisteredBufSlice> {
+    for round in 0..rounds {
+        let slot = round % slots;
+        let offset = (slot * block_size) as u64;
+        match op {
+            DirectIoOp::Write => {
+                slice.as_mut_slice()[0] = (round as u8).wrapping_add(1);
+                slice.set_init(block_size)?;
+                let (write_res, returned) = file.write_fixed_at(slice, offset).await;
+                slice = returned;
+                let written = write_res?;
+                assert_eq!(written, block_size);
+            }
+            DirectIoOp::Read => {
+                let (read_res, returned) = file.read_fixed_at(slice, offset).await;
+                slice = returned;
+                let n = read_res?;
+                assert_eq!(n, block_size);
+                assert_eq!(slice.bytes_init(), block_size);
+            }
+        }
+    }
+    Ok(slice)
+}
+
+struct FileDirectComparisonBench {
+    mode: DirectIoMode,
+    op: DirectIoOp,
+    block_size: usize,
+    rounds: usize,
+    slots: usize,
+}
+
+impl FileDirectComparisonBench {
+    fn new(mode: DirectIoMode, op: DirectIoOp, block_size: usize, rounds: usize) -> Self {
+        // Keep working set larger than active request window.
+        let slots = cmp::max(rounds / 2, 512);
+        Self {
+            mode,
+            op,
+            block_size,
+            rounds,
+            slots,
+        }
+    }
+}
+
+impl bencher::TDynBenchFn for FileDirectComparisonBench {
+    fn run(&self, b: &mut Bencher) {
+        const ALIGNMENT: usize = 4096;
+
+        let dir = BenchDir::new("uring-direct-io");
+        let path = dir.join("bench-direct.dat");
+        let file_len = (self.slots * self.block_size) as u64;
+        {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)
+                .unwrap();
+            file.set_len(file_len).unwrap();
+        }
+
+        let mut ex = new_executor();
+        let file = ex.block_on(async {
+            let mut opts = fs::OpenOptions::new();
+            opts.read(true).write(true);
+            if self.mode.uses_direct() {
+                opts.direct(true);
+            }
+            opts.open(&path).await
+        });
+        let file = match file {
+            Ok(file) => file,
+            Err(err) if self.mode.uses_direct() && direct_path_unsupported(&err) => {
+                eprintln!(
+                    "skip direct-io benchmark mode={} op={} block_size={} because open failed: {err}",
+                    self.mode.as_str(),
+                    self.op.as_str(),
+                    self.block_size
+                );
+                return;
+            }
+            Err(err) => panic!("failed to open benchmark file: {err}"),
+        };
+
+        let mut standard_write = Some(AlignedIoBuf::new(
+            self.block_size,
+            ALIGNMENT,
+            self.block_size,
+        ));
+        let mut standard_read = Some(AlignedIoBuf::new(self.block_size, ALIGNMENT, 0));
+
+        let mut fixed_slice = if self.mode == DirectIoMode::DirectFixed {
+            let backing = vec![0u8; self.block_size + ALIGNMENT];
+            let range = fixed_slice_range(&backing, ALIGNMENT, self.block_size);
+            match ex.block_on(async {
+                let registry = FixedBufRegistry::register(vec![backing])?;
+                registry.slice(0, range)
+            }) {
+                Ok(slice) => Some(slice),
+                Err(err) if direct_path_unsupported(&err) => {
+                    eprintln!(
+                        "skip direct-fixed benchmark op={} block_size={} because registration failed: {err}",
+                        self.op.as_str(),
+                        self.block_size
+                    );
+                    ex.block_on(async {
+                        let _ = file.close().await;
+                    });
+                    return;
+                }
+                Err(err) => panic!("failed to setup fixed buffer benchmark state: {err}"),
+            }
+        } else {
+            None
+        };
+
+        if self.op == DirectIoOp::Read {
+            let prefill = match self.mode {
+                DirectIoMode::Buffered | DirectIoMode::Direct => ex
+                    .block_on(async {
+                        file_io_worker_standard(
+                            &file,
+                            standard_write.take().expect("write buffer missing"),
+                            standard_read.take().expect("read buffer missing"),
+                            DirectIoOp::Write,
+                            self.block_size,
+                            self.slots,
+                            self.slots,
+                        )
+                        .await
+                    })
+                    .map(|(write, read)| {
+                        standard_write = Some(write);
+                        standard_read = Some(read);
+                    }),
+                DirectIoMode::DirectFixed => ex
+                    .block_on(async {
+                        let slice = fixed_slice.take().expect("fixed slice missing");
+                        file_io_worker_fixed(
+                            &file,
+                            slice,
+                            DirectIoOp::Write,
+                            self.block_size,
+                            self.slots,
+                            self.slots,
+                        )
+                        .await
+                    })
+                    .map(|slice| {
+                        fixed_slice = Some(slice);
+                    }),
+            };
+
+            if let Err(err) = prefill {
+                if self.mode.uses_direct() && direct_path_unsupported(&err) {
+                    eprintln!(
+                        "skip benchmark mode={} op={} block_size={} because prefill failed: {err}",
+                        self.mode.as_str(),
+                        self.op.as_str(),
+                        self.block_size
+                    );
+                    ex.block_on(async {
+                        let _ = file.close().await;
+                    });
+                    return;
+                }
+                panic!("prefill failed: {err}");
+            }
+        }
+
+        // Warmup once so unsupported operation paths fail before timed iterations.
+        let warmup = match self.mode {
+            DirectIoMode::Buffered | DirectIoMode::Direct => ex
+                .block_on(async {
+                    file_io_worker_standard(
+                        &file,
+                        standard_write.take().expect("write buffer missing"),
+                        standard_read.take().expect("read buffer missing"),
+                        self.op,
+                        self.block_size,
+                        1,
+                        self.slots,
+                    )
+                    .await
+                })
+                .map(|(write, read)| {
+                    standard_write = Some(write);
+                    standard_read = Some(read);
+                }),
+            DirectIoMode::DirectFixed => ex
+                .block_on(async {
+                    let slice = fixed_slice.take().expect("fixed slice missing");
+                    file_io_worker_fixed(&file, slice, self.op, self.block_size, 1, self.slots)
+                        .await
+                })
+                .map(|slice| {
+                    fixed_slice = Some(slice);
+                }),
+        };
+        if let Err(err) = warmup {
+            if self.mode.uses_direct() && direct_path_unsupported(&err) {
+                eprintln!(
+                    "skip benchmark mode={} op={} block_size={} because warmup failed: {err}",
+                    self.mode.as_str(),
+                    self.op.as_str(),
+                    self.block_size
+                );
+                ex.block_on(async {
+                    let _ = file.close().await;
+                });
+                return;
+            }
+            panic!("warmup failed: {err}");
+        }
+
+        b.iter(|| match self.mode {
+            DirectIoMode::Buffered | DirectIoMode::Direct => {
+                let (write, read) = ex
+                    .block_on(async {
+                        file_io_worker_standard(
+                            &file,
+                            standard_write.take().expect("write buffer missing"),
+                            standard_read.take().expect("read buffer missing"),
+                            self.op,
+                            self.block_size,
+                            self.rounds,
+                            self.slots,
+                        )
+                        .await
+                    })
+                    .unwrap();
+                standard_write = Some(write);
+                standard_read = Some(read);
+            }
+            DirectIoMode::DirectFixed => {
+                let slice = fixed_slice.take().expect("fixed slice missing");
+                fixed_slice = Some(
+                    ex.block_on(async {
+                        file_io_worker_fixed(
+                            &file,
+                            slice,
+                            self.op,
+                            self.block_size,
+                            self.rounds,
+                            self.slots,
+                        )
+                        .await
+                    })
+                    .unwrap(),
+                );
+            }
+        });
+
+        ex.block_on(async {
+            let _ = file.close().await;
+        });
+    }
+}
+
 struct FileWriteReadBench {
     workers: usize,
     rounds_per_worker: usize,
@@ -454,6 +881,32 @@ fn benches() -> Vec<TestDescAndFn> {
                         slots_per_worker,
                     ))),
                 });
+            }
+        }
+    }
+
+    for block_size in [4 * 1024, 16 * 1024] {
+        for rounds in [2_048, 16_384] {
+            for mode in [
+                DirectIoMode::Buffered,
+                DirectIoMode::Direct,
+                DirectIoMode::DirectFixed,
+            ] {
+                for op in [DirectIoOp::Write, DirectIoOp::Read] {
+                    benches.push(TestDescAndFn {
+                        desc: TestDesc {
+                            name: Cow::from(format!(
+                                "bench_file_direct_compare/mode={}/op={}/rounds={rounds}/block_size={block_size}",
+                                mode.as_str(),
+                                op.as_str()
+                            )),
+                            ignore: false,
+                        },
+                        testfn: TestFn::DynBenchFn(Box::new(FileDirectComparisonBench::new(
+                            mode, op, block_size, rounds,
+                        ))),
+                    });
+                }
             }
         }
     }

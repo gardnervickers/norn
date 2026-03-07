@@ -9,6 +9,7 @@
 //! # Modules
 //! - `buf`: stable buffer traits and adapters used by I/O operations.
 //! - `bufring`: registered io_uring buffer-ring support.
+//! - `fixedbuf`: registered io_uring fixed-buffer support for file I/O.
 //! - `fs`: asynchronous filesystem operations.
 //! - `net`: asynchronous TCP and UDP networking.
 //!
@@ -33,6 +34,8 @@ pub(crate) mod util;
 pub mod buf;
 /// Registered io_uring buffer-ring support.
 pub mod bufring;
+/// Registered io_uring fixed-buffer support.
+pub mod fixedbuf;
 /// Asynchronous filesystem operations.
 pub mod fs;
 /// Asynchronous TCP and UDP networking.
