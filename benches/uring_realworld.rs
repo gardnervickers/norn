@@ -13,12 +13,14 @@ use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bencher::bench;
-use bencher::{run_tests_console, Bencher, TestDesc, TestDescAndFn, TestFn, TestOpts};
+use bencher::{Bencher, TestDesc, TestDescAndFn, TestFn};
 use futures::stream::{FuturesUnordered, StreamExt};
 
 use norn_uring::bufring::BufRing;
 use norn_uring::fs;
 use norn_uring::net::UdpSocket;
+
+mod support;
 
 const RING_DEPTH: u32 = 256;
 
@@ -501,9 +503,5 @@ fn main() {
         return;
     }
 
-    let mut test_opts = TestOpts::default();
-    if let Some(arg) = std::env::args().skip(1).find(|arg| *arg != "--bench") {
-        test_opts.filter = Some(arg);
-    }
-    run_tests_console(&test_opts, benches()).unwrap();
+    support::run(benches());
 }

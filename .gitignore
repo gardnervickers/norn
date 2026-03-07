@@ -1,4 +1,5 @@
 /target
+/bench-output
 lcov.info
 control
 variable

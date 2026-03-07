@@ -1,10 +1,12 @@
+mod support;
+
 #[cfg(target_os = "linux")]
 mod linux {
     use std::borrow::Cow;
     use std::cmp;
     use std::net::SocketAddr;
 
-    use bencher::{run_tests_console, Bencher, TestDesc, TestDescAndFn, TestFn, TestOpts};
+    use bencher::{Bencher, TestDesc, TestDescAndFn, TestFn};
     use futures::StreamExt;
     use norn_executor::spawn;
     use norn_uring::net::{TcpListener, TcpSocket};
@@ -136,13 +138,7 @@ mod linux {
     }
 
     pub fn run_main() {
-        let mut test_opts = TestOpts::default();
-        if let Some(arg) = std::env::args().skip(1).find(|arg| *arg != "--bench") {
-            test_opts.filter = Some(arg);
-        }
-        let mut all = Vec::new();
-        all.extend(benches());
-        run_tests_console(&test_opts, all).unwrap();
+        crate::support::run(benches());
     }
 }
 
