@@ -3,10 +3,12 @@
 use std::borrow::Cow;
 use std::cmp;
 
-use bencher::{run_tests_console, Bencher, TestDesc, TestDescAndFn, TestFn, TestOpts};
+use bencher::{Bencher, TestDesc, TestDescAndFn, TestFn};
 use futures::future;
 use norn_executor::spawn;
 use norn_uring::noop;
+
+mod support;
 
 struct NoopBench(usize, usize);
 
@@ -120,11 +122,5 @@ pub fn benches() -> ::std::vec::Vec<TestDescAndFn> {
 }
 
 fn main() {
-    let mut test_opts = TestOpts::default();
-    if let Some(arg) = ::std::env::args().skip(1).find(|arg| *arg != "--bench") {
-        test_opts.filter = Some(arg);
-    }
-    let mut all = Vec::new();
-    all.extend(benches());
-    run_tests_console(&test_opts, all).unwrap();
+    support::run(benches());
 }

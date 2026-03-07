@@ -8,7 +8,7 @@ use std::pin::{pin, Pin};
 
 use std::task::{ready, Context, Poll};
 
-use bencher::{run_tests_console, TestDesc, TestDescAndFn, TestFn, TestOpts};
+use bencher::{TestDesc, TestDescAndFn, TestFn};
 use futures::StreamExt;
 use http_body_util::BodyExt;
 use hyper::body::{Bytes, Frame};
@@ -18,6 +18,8 @@ use hyper::{Error, Request, Response, Uri};
 use norn_executor::spawn;
 use norn_timer::Clock;
 use norn_uring::net::{TcpListener, TcpSocket};
+
+mod support;
 
 struct HyperBench {
     clients: usize,
@@ -85,13 +87,7 @@ pub fn benches() -> ::std::vec::Vec<TestDescAndFn> {
 }
 
 fn main() {
-    let mut test_opts = TestOpts::default();
-    if let Some(arg) = ::std::env::args().skip(1).find(|arg| *arg != "--bench") {
-        test_opts.filter = Some(arg);
-    }
-    let mut all = Vec::new();
-    all.extend(benches());
-    run_tests_console(&test_opts, all).unwrap();
+    support::run(benches());
 }
 
 async fn http2_client(url: hyper::Uri, n_req: usize) -> Result<(), Box<dyn std::error::Error>> {
