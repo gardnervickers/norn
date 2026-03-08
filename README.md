@@ -36,4 +36,37 @@ by Tokio and tokio-uring. The general approach to handling tasks is very similar
 in that we use a single allocation per task, and track tasks in a linked list
 for easy shutdown.
 
+## Benchmarks
+
+Benchmarks can be run locally through the same scripts CI uses.
+
+Compare the current checkout against `master`:
+
+```bash
+nix develop -c python3 hack/bench_compare.py \
+  --repo-root . \
+  --base-ref master \
+  --head-ref HEAD \
+  --cargo-command cargo \
+  --output-dir ./target/bench-compare \
+  --cpu 0
+```
+
+Run the current checkout and emit pprof + flamegraph artifacts:
+
+```bash
+nix develop -c python3 hack/bench_run.py \
+  --repo-root . \
+  --cargo-command cargo \
+  --output-json ./target/bench-profile/results.json \
+  --output-markdown ./target/bench-profile/report.md \
+  --profile-output ./target/bench-profile/profiles \
+  --cpu 0
+```
+
+In GitHub Actions:
+
+- Apply the `benchmarks` label to a PR to run the compare workflow against `master`.
+- Use the `Benchmarks` workflow dispatch to run either a compare job or a profiling job with flamegraph artifacts.
+
 [moro]: https://github.com/nikomatsakis/moro
