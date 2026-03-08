@@ -1,5 +1,9 @@
 name: Benchmarks
 
+permissions:
+  contents: read
+  pull-requests: write
+
 on:
   pull_request:
     branches: ["master"]
@@ -82,6 +86,51 @@ jobs:
         with:
           name: benchmark-compare-${{ github.run_id }}
           path: ${{ runner.temp }}/benchmarks
+
+      - name: Comment benchmark diff
+        uses: actions/github-script@v7
+        env:
+          REPORT_PATH: ${{ runner.temp }}/benchmarks/report.md
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- codex-benchmark-diff -->';
+            const report = fs.readFileSync(process.env.REPORT_PATH, 'utf8').trim();
+            const body = [
+              marker,
+              '## Benchmark Diff',
+              '',
+              `Workflow run: ${process.env.RUN_URL}`,
+              '',
+              report,
+            ].join('\n');
+
+            const issue_number = context.payload.pull_request.number;
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number,
+              per_page: 100,
+            });
+
+            const existing = comments.find((comment) => comment.body && comment.body.includes(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number,
+                body,
+              });
+            }
 
   compare_dispatch:
     if: github.event_name == 'workflow_dispatch' && inputs.mode == 'compare'
