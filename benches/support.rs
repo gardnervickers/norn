@@ -3,7 +3,7 @@ use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use bencher::{bench, run_tests_console, TestDescAndFn, TestFn, TestOpts};
+use bencher::{bench, fmt_bench_samples, run_tests_console, TestDescAndFn, TestFn, TestOpts};
 use pprof::protos::Message;
 
 const PPROF_OUT_ENV: &str = "NORN_BENCH_PPROF";
@@ -52,10 +52,18 @@ fn profile_benches(opts: &TestOpts, benches: Vec<TestDescAndFn>, output: Profile
 
         match bench.testfn {
             TestFn::DynBenchFn(benchfn) => {
-                let _ = bench::benchmark(|harness| benchfn.run(harness));
+                let samples = bench::benchmark(|harness| benchfn.run(harness));
+                println!(
+                    "test {bench_name} ... bench: {}",
+                    fmt_bench_samples(&samples)
+                );
             }
             TestFn::StaticBenchFn(benchfn) => {
-                let _ = bench::benchmark(benchfn);
+                let samples = bench::benchmark(benchfn);
+                println!(
+                    "test {bench_name} ... bench: {}",
+                    fmt_bench_samples(&samples)
+                );
             }
         }
 

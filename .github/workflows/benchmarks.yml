@@ -1,0 +1,250 @@
+name: Benchmarks
+
+permissions:
+  contents: read
+  pull-requests: write
+
+on:
+  pull_request:
+    branches: ["master"]
+    types: [opened, reopened, synchronize, labeled]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "compare runs base vs head; profile runs the current ref and uploads flamegraphs"
+        type: choice
+        options:
+          - compare
+          - profile
+        default: compare
+      base_ref:
+        description: "baseline ref for compare runs"
+        type: string
+        default: master
+      benchmarks:
+        description: "comma-separated bench binaries; empty runs the default selection"
+        type: string
+        default: ""
+      filter:
+        description: "optional benchmark filter passed after --"
+        type: string
+        default: ""
+      collect_flamegraphs:
+        description: "collect flamegraphs during compare runs"
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  compare_pr:
+    if: github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'benchmarks')
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    concurrency:
+      group: benchmarks-pr-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - uses: cachix/install-nix-action@v26
+
+      - uses: Swatinem/rust-cache@v2.7.0
+        with:
+          shared-key: bench-compare
+
+      - name: Compare benchmarks
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          PR_BENCHMARKS: schedule_task,task_state,timers
+        run: |
+          set -euo pipefail
+          out_dir="$RUNNER_TEMP/benchmarks"
+          mkdir -p "$out_dir"
+          args=(
+            --repo-root "$GITHUB_WORKSPACE"
+            --base-ref "$BASE_REF"
+            --head-ref HEAD
+            --cargo-command cargo
+            --output-dir "$out_dir"
+            --bench "$PR_BENCHMARKS"
+            --cpu 0
+          )
+
+          nix develop -c python3 -u hack/bench_compare.py "${args[@]}" | tee "$out_dir/console.txt"
+
+      - name: Publish summary
+        run: cat "$RUNNER_TEMP/benchmarks/report.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-compare-${{ github.run_id }}
+          path: ${{ runner.temp }}/benchmarks
+
+      - name: Comment benchmark diff
+        uses: actions/github-script@v7
+        env:
+          REPORT_PATH: ${{ runner.temp }}/benchmarks/report.md
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- codex-benchmark-diff -->';
+            const report = fs.readFileSync(process.env.REPORT_PATH, 'utf8').trim();
+            const body = [
+              marker,
+              '## Benchmark Diff',
+              '',
+              `Workflow run: ${process.env.RUN_URL}`,
+              '',
+              report,
+            ].join('\n');
+
+            const issue_number = context.payload.pull_request.number;
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number,
+              per_page: 100,
+            });
+
+            const existing = comments.find((comment) => comment.body && comment.body.includes(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number,
+                body,
+              });
+            }
+
+  compare_dispatch:
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'compare'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    concurrency:
+      group: benchmarks-dispatch-compare-${{ github.ref }}
+      cancel-in-progress: true
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: cachix/install-nix-action@v26
+
+      - uses: Swatinem/rust-cache@v2.7.0
+        with:
+          shared-key: bench-compare
+
+      - name: Compare benchmarks
+        env:
+          BASE_REF: ${{ inputs.base_ref }}
+          BENCHMARKS: ${{ inputs.benchmarks }}
+          FILTER: ${{ inputs.filter }}
+          COLLECT_FLAMEGRAPHS: ${{ inputs.collect_flamegraphs }}
+        run: |
+          set -euo pipefail
+          out_dir="$RUNNER_TEMP/benchmarks"
+          mkdir -p "$out_dir"
+          args=(
+            --repo-root "$GITHUB_WORKSPACE"
+            --base-ref "$BASE_REF"
+            --head-ref HEAD
+            --cargo-command cargo
+            --output-dir "$out_dir"
+            --cpu 0
+          )
+
+          if [ -n "$BENCHMARKS" ]; then
+            args+=(--bench "$BENCHMARKS")
+          fi
+
+          if [ -n "$FILTER" ]; then
+            args+=(--filter "$FILTER")
+          fi
+
+          if [ "$COLLECT_FLAMEGRAPHS" = "true" ]; then
+            args+=(--collect-flamegraphs)
+          fi
+
+          nix develop -c python3 -u hack/bench_compare.py "${args[@]}" | tee "$out_dir/console.txt"
+
+      - name: Publish summary
+        run: cat "$RUNNER_TEMP/benchmarks/report.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-compare-${{ github.run_id }}
+          path: ${{ runner.temp }}/benchmarks
+
+  profile:
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'profile'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    concurrency:
+      group: benchmarks-dispatch-profile-${{ github.ref }}
+      cancel-in-progress: true
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: cachix/install-nix-action@v26
+
+      - uses: Swatinem/rust-cache@v2.7.0
+        with:
+          shared-key: bench-profile
+
+      - name: Run benchmark profile
+        env:
+          BENCHMARKS: ${{ inputs.benchmarks }}
+          FILTER: ${{ inputs.filter }}
+          CARGO_PROFILE_BENCH_DEBUG: "true"
+        run: |
+          set -euo pipefail
+          out_dir="$RUNNER_TEMP/bench-profile"
+          args=(
+            --repo-root "$GITHUB_WORKSPACE"
+            --cargo-command cargo
+            --output-json "$out_dir/results.json"
+            --output-markdown "$out_dir/report.md"
+            --log-dir "$out_dir/logs"
+            --profile-output "$out_dir/profiles"
+            --cpu 0
+          )
+
+          if [ -n "$BENCHMARKS" ]; then
+            args+=(--bench "$BENCHMARKS")
+          fi
+
+          if [ -n "$FILTER" ]; then
+            args+=(--filter "$FILTER")
+          fi
+
+          nix develop -c python3 -u hack/bench_run.py "${args[@]}"
+
+      - name: Publish summary
+        run: cat "$RUNNER_TEMP/bench-profile/report.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-profile-${{ github.run_id }}
+          path: ${{ runner.temp }}/bench-profile

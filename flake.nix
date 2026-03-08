@@ -64,6 +64,8 @@
           nativeBuildInputs = [
             pkgs.cargo-udeps
             pkgs.cargo-outdated
+            pkgs.git
+            pkgs.python3
             rust-toolchain-nightly
           ];
         };
