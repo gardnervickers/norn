@@ -32,31 +32,65 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  BENCHMARK_LABEL: benchmarks
-
-concurrency:
-  group: benchmarks-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'compare' }}
-  cancel-in-progress: true
 
 jobs:
-  compare:
-    if: |
-      github.event_name == 'workflow_dispatch' && inputs.mode == 'compare' ||
-      github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, env.BENCHMARK_LABEL)
+  compare_pr:
+    if: github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'benchmarks')
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    concurrency:
+      group: benchmarks-pr-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
 
     steps:
-      - name: Checkout PR head
-        if: github.event_name == 'pull_request'
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha }}
 
-      - name: Checkout selected ref
-        if: github.event_name == 'workflow_dispatch'
-        uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v26
+
+      - uses: Swatinem/rust-cache@v2.7.0
+        with:
+          shared-key: bench-compare
+
+      - name: Compare benchmarks
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          out_dir="$RUNNER_TEMP/benchmarks"
+          mkdir -p "$out_dir"
+          args=(
+            --repo-root "$GITHUB_WORKSPACE"
+            --base-ref "$BASE_REF"
+            --head-ref HEAD
+            --cargo-command cargo
+            --output-dir "$out_dir"
+            --cpu 0
+          )
+
+          nix develop -c python3 hack/bench_compare.py "${args[@]}" | tee "$out_dir/console.txt"
+
+      - name: Publish summary
+        run: cat "$RUNNER_TEMP/benchmarks/report.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-compare-${{ github.run_id }}
+          path: ${{ runner.temp }}/benchmarks
+
+  compare_dispatch:
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'compare'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    concurrency:
+      group: benchmarks-dispatch-compare-${{ github.ref }}
+      cancel-in-progress: true
+
+    steps:
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
@@ -68,10 +102,10 @@ jobs:
 
       - name: Compare benchmarks
         env:
-          BASE_REF: ${{ github.event_name == 'pull_request' && github.base_ref || inputs.base_ref }}
-          BENCHMARKS: ${{ github.event_name == 'workflow_dispatch' && inputs.benchmarks || '' }}
-          FILTER: ${{ github.event_name == 'workflow_dispatch' && inputs.filter || '' }}
-          COLLECT_FLAMEGRAPHS: ${{ github.event_name == 'workflow_dispatch' && inputs.collect_flamegraphs || 'false' }}
+          BASE_REF: ${{ inputs.base_ref }}
+          BENCHMARKS: ${{ inputs.benchmarks }}
+          FILTER: ${{ inputs.filter }}
+          COLLECT_FLAMEGRAPHS: ${{ inputs.collect_flamegraphs }}
         run: |
           set -euo pipefail
           out_dir="$RUNNER_TEMP/benchmarks"
@@ -112,6 +146,9 @@ jobs:
     if: github.event_name == 'workflow_dispatch' && inputs.mode == 'profile'
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    concurrency:
+      group: benchmarks-dispatch-profile-${{ github.ref }}
+      cancel-in-progress: true
 
     steps:
       - uses: actions/checkout@v4
