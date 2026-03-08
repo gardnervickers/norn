@@ -57,6 +57,7 @@ jobs:
       - name: Compare benchmarks
         env:
           BASE_REF: ${{ github.base_ref }}
+          PR_BENCHMARKS: schedule_task,task_state,timers
         run: |
           set -euo pipefail
           out_dir="$RUNNER_TEMP/benchmarks"
@@ -67,10 +68,11 @@ jobs:
             --head-ref HEAD
             --cargo-command cargo
             --output-dir "$out_dir"
+            --bench "$PR_BENCHMARKS"
             --cpu 0
           )
 
-          nix develop -c python3 hack/bench_compare.py "${args[@]}" | tee "$out_dir/console.txt"
+          nix develop -c python3 -u hack/bench_compare.py "${args[@]}" | tee "$out_dir/console.txt"
 
       - name: Publish summary
         run: cat "$RUNNER_TEMP/benchmarks/report.md" >> "$GITHUB_STEP_SUMMARY"
@@ -131,7 +133,7 @@ jobs:
             args+=(--collect-flamegraphs)
           fi
 
-          nix develop -c python3 hack/bench_compare.py "${args[@]}" | tee "$out_dir/console.txt"
+          nix develop -c python3 -u hack/bench_compare.py "${args[@]}" | tee "$out_dir/console.txt"
 
       - name: Publish summary
         run: cat "$RUNNER_TEMP/benchmarks/report.md" >> "$GITHUB_STEP_SUMMARY"
@@ -187,7 +189,7 @@ jobs:
             args+=(--filter "$FILTER")
           fi
 
-          nix develop -c python3 hack/bench_run.py "${args[@]}"
+          nix develop -c python3 -u hack/bench_run.py "${args[@]}"
 
       - name: Publish summary
         run: cat "$RUNNER_TEMP/bench-profile/report.md" >> "$GITHUB_STEP_SUMMARY"

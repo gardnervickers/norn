@@ -66,7 +66,7 @@ nix develop -c python3 hack/bench_run.py \
 
 In GitHub Actions:
 
-- Apply the `benchmarks` label to a PR to run the compare workflow against `master`.
+- Apply the `benchmarks` label to a PR to run the compare workflow against `master` using the default quick subset (`schedule_task`, `task_state`, `timers`).
 - Use the `Benchmarks` workflow dispatch to run either a compare job or a profiling job with flamegraph artifacts.
 
 [moro]: https://github.com/nikomatsakis/moro

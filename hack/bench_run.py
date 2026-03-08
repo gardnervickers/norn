@@ -198,13 +198,29 @@ def run_command(
     cwd: Path,
     env: dict[str, str],
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
+    process = subprocess.Popen(
         command,
         cwd=cwd,
         env=env,
         text=True,
-        capture_output=True,
-        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=1,
+    )
+    assert process.stdout is not None
+
+    stdout_parts: list[str] = []
+    for line in process.stdout:
+        sys.stdout.write(line)
+        sys.stdout.flush()
+        stdout_parts.append(line)
+
+    returncode = process.wait()
+    return subprocess.CompletedProcess(
+        command,
+        returncode,
+        "".join(stdout_parts),
+        "",
     )
 
 
@@ -239,7 +255,13 @@ def run_benchmarks(
     if profile_output is not None:
         env["NORN_BENCH_PPROF"] = str(profile_output.resolve())
 
-    for bench_name in benches:
+    total = len(benches)
+    for index, bench_name in enumerate(benches, start=1):
+        print(
+            f"[bench] ({index}/{total}) {repo_root.name}: running `{bench_name}`"
+            + (f" with filter `{filter_text}`" if filter_text else ""),
+            flush=True,
+        )
         command = bench_command(cargo_command, bench_name, filter_text, cpu)
         completed = run_command(command, cwd=repo_root, env=env)
 
@@ -267,6 +289,12 @@ def run_benchmarks(
                 f"no benchmark measurements were parsed for {bench_name}\n"
                 f"{render_failed_command(command, completed)}"
             )
+
+        print(
+            f"[bench] ({index}/{total}) {repo_root.name}: completed `{bench_name}`"
+            f" with {len(measurements)} measurements",
+            flush=True,
+        )
 
     return results
 

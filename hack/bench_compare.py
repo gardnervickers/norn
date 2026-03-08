@@ -239,9 +239,23 @@ def main() -> int:
             if not selected_benches:
                 raise SystemExit("no overlapping benchmark binaries were found for comparison")
 
+            print(
+                "[compare] selected benches: " + ", ".join(selected_benches),
+                flush=True,
+            )
+            print(
+                f"[compare] baseline {args.base_ref} at {base_commit[:12]}",
+                flush=True,
+            )
+            print(
+                f"[compare] head {args.head_ref} at {head_commit[:12]}",
+                flush=True,
+            )
+
             base_profiles = output_dir / "profiles" / "base" if args.collect_flamegraphs else None
             head_profiles = output_dir / "profiles" / "head" if args.collect_flamegraphs else None
 
+            print("[compare] running baseline benchmarks", flush=True)
             base_payload = {
                 "generated_at": datetime.now(timezone.utc).isoformat(),
                 "repo_root": str(base_root),
@@ -257,6 +271,7 @@ def main() -> int:
                 ),
             }
 
+            print("[compare] running head benchmarks", flush=True)
             head_payload = {
                 "generated_at": datetime.now(timezone.utc).isoformat(),
                 "repo_root": str(repo_root),
