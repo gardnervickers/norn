@@ -1,6 +1,7 @@
 #![cfg(target_os = "linux")]
 
 use bytes::Bytes;
+use norn_uring::fixedbuf::FixedBufRegistry;
 use norn_uring::fs;
 
 mod util;
@@ -37,6 +38,83 @@ fn read_write() -> Result<(), Box<dyn std::error::Error>> {
         let n = res?;
         assert_eq!(n, buf.len());
         assert_eq!(buf, b"hello world");
+        Ok(())
+    })
+}
+
+#[test]
+fn fixed_write_then_normal_read() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let dir = util::ThreadNameTestDir::new();
+        let path = dir.join("fixed-write");
+        let mut opts = fs::OpenOptions::new();
+        opts.create(true).truncate(true).write(true).read(true);
+
+        let file = opts.open(path).await?;
+        let registry = FixedBufRegistry::register(vec![vec![0u8; 128]])?;
+
+        let payload = b"fixed-write-payload";
+        let mut fixed = registry.slice(0, 0..payload.len())?;
+        fixed.as_mut_slice().copy_from_slice(payload);
+        let (res, _fixed) = file.write_fixed_at(fixed, 0).await;
+        assert_eq!(res?, payload.len());
+
+        let (res, buf) = file.read_at(vec![0u8; payload.len()], 0).await;
+        assert_eq!(res?, payload.len());
+        assert_eq!(&buf[..], payload);
+        Ok(())
+    })
+}
+
+#[test]
+fn normal_write_then_fixed_read() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let dir = util::ThreadNameTestDir::new();
+        let path = dir.join("fixed-read");
+        let mut opts = fs::OpenOptions::new();
+        opts.create(true).truncate(true).write(true).read(true);
+
+        let file = opts.open(path).await?;
+        let payload = b"fixed-read-payload";
+        file.write_at(&payload[..], 0).await.0?;
+
+        let registry = FixedBufRegistry::register(vec![vec![0u8; 128]])?;
+        let fixed = registry.slice(0, 0..payload.len())?;
+        let (res, fixed) = file.read_fixed_at(fixed, 0).await;
+        assert_eq!(res?, payload.len());
+        assert_eq!(fixed.bytes_init(), payload.len());
+        assert_eq!(fixed.as_slice(), payload);
+        Ok(())
+    })
+}
+
+#[test]
+fn fixed_buffer_slot_lease_exclusive() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let registry = FixedBufRegistry::register(vec![vec![0u8; 32]])?;
+        let fixed = registry.slice(0, 0..8)?;
+
+        let err = registry.slice(0, 0..8).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+
+        drop(fixed);
+
+        let _fixed = registry.slice(0, 0..8)?;
+        Ok(())
+    })
+}
+
+#[test]
+fn fixed_buffer_invalid_index_and_range() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let registry = FixedBufRegistry::register(vec![vec![0u8; 32]])?;
+
+        let err = registry.slice(1, 0..1).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+        let err = registry.slice(0, 16..40).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
         Ok(())
     })
 }
@@ -285,6 +363,17 @@ fn drop_file_outside_runtime() -> Result<(), Box<dyn std::error::Error>> {
     })?;
 
     drop(file);
+    Ok(())
+}
+
+#[test]
+fn drop_fixed_buf_registry_outside_runtime() -> Result<(), Box<dyn std::error::Error>> {
+    let registry = util::with_test_env(|| async {
+        let registry = FixedBufRegistry::register(vec![vec![0u8; 128]])?;
+        Ok(registry)
+    })?;
+
+    drop(registry);
     Ok(())
 }
 

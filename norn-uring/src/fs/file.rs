@@ -8,6 +8,7 @@ use io_uring::{opcode, types};
 
 use crate::buf::{StableBuf, StableBufMut};
 use crate::fd::{FdKind, NornFd};
+use crate::fixedbuf::RegisteredBufSlice;
 use crate::fs::opts;
 use crate::operation::{CQEResult, Operation, Singleshot};
 
@@ -120,6 +121,43 @@ impl File {
         B: StableBuf + 'static,
     {
         let write = WriteAt::new(self.fd.clone(), buf, offset);
+        self.handle.submit(write)
+    }
+
+    /// Read bytes into a registered fixed buffer slice.
+    ///
+    /// The read starts at `offset` and writes into the selected fixed-buffer
+    /// range owned by `buf`.
+    ///
+    /// This method does not fall back to regular `read_at` behavior if fixed
+    /// buffers are unavailable.
+    pub fn read_fixed_at(
+        &self,
+        buf: RegisteredBufSlice,
+        offset: u64,
+    ) -> impl crate::Request<Output = (io::Result<usize>, RegisteredBufSlice)> {
+        let read = ReadFixedAt::new(self.fd.clone(), buf, offset);
+        self.handle.submit(read)
+    }
+
+    /// Write bytes from a registered fixed buffer slice.
+    ///
+    /// The write starts at `offset` and uses the selected fixed-buffer range
+    /// owned by `buf`.
+    ///
+    /// Fixed buffers are commonly paired with `O_DIRECT`, which has filesystem-
+    /// and kernel-dependent alignment constraints. Callers are responsible for
+    /// any direct-I/O alignment requirements and for avoiding mixed
+    /// buffered/direct I/O on overlapping regions.
+    ///
+    /// This method does not fall back to regular `write_at` behavior if fixed
+    /// buffers are unavailable.
+    pub fn write_fixed_at(
+        &self,
+        buf: RegisteredBufSlice,
+        offset: u64,
+    ) -> impl crate::Request<Output = (io::Result<usize>, RegisteredBufSlice)> {
+        let write = WriteFixedAt::new(self.fd.clone(), buf, offset);
         self.handle.submit(write)
     }
 
@@ -469,6 +507,50 @@ where
     }
 }
 
+#[derive(Debug)]
+struct ReadFixedAt {
+    fd: NornFd,
+    buf: RegisteredBufSlice,
+    offset: u64,
+}
+
+impl ReadFixedAt {
+    fn new(fd: NornFd, buf: RegisteredBufSlice, offset: u64) -> Self {
+        Self { fd, buf, offset }
+    }
+}
+
+impl Operation for ReadFixedAt {
+    fn configure(mut self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+        self.buf.clear_init();
+        let buf = self.buf.ptr_mut();
+        let len = self.buf.len_u32();
+        match self.fd.kind() {
+            FdKind::Fd(fd) => opcode::ReadFixed::new(*fd, buf, len, self.buf.buf_index()),
+            FdKind::Fixed(fd) => opcode::ReadFixed::new(*fd, buf, len, self.buf.buf_index()),
+        }
+        .offset(self.offset)
+        .build()
+    }
+
+    fn cleanup(&mut self, _: CQEResult) {}
+}
+
+impl Singleshot for ReadFixedAt {
+    type Output = (io::Result<usize>, RegisteredBufSlice);
+
+    fn complete(mut self, result: CQEResult) -> Self::Output {
+        match result.result {
+            Ok(n) => {
+                let n = n as usize;
+                self.buf.set_init_after_read(n);
+                (Ok(n), self.buf)
+            }
+            Err(err) => (Err(err), self.buf),
+        }
+    }
+}
+
 struct WriteAt<B> {
     fd: NornFd,
     buf: B,
@@ -504,6 +586,45 @@ where
     B: StableBuf,
 {
     type Output = (io::Result<usize>, B);
+
+    fn complete(self, result: CQEResult) -> Self::Output {
+        match result.result {
+            Ok(n) => (Ok(n as usize), self.buf),
+            Err(err) => (Err(err), self.buf),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct WriteFixedAt {
+    fd: NornFd,
+    buf: RegisteredBufSlice,
+    offset: u64,
+}
+
+impl WriteFixedAt {
+    fn new(fd: NornFd, buf: RegisteredBufSlice, offset: u64) -> Self {
+        Self { fd, buf, offset }
+    }
+}
+
+impl Operation for WriteFixedAt {
+    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+        let buf = self.buf.ptr();
+        let len = self.buf.len_u32();
+        match self.fd.kind() {
+            FdKind::Fd(fd) => opcode::WriteFixed::new(*fd, buf, len, self.buf.buf_index()),
+            FdKind::Fixed(fd) => opcode::WriteFixed::new(*fd, buf, len, self.buf.buf_index()),
+        }
+        .offset(self.offset)
+        .build()
+    }
+
+    fn cleanup(&mut self, _: CQEResult) {}
+}
+
+impl Singleshot for WriteFixedAt {
+    type Output = (io::Result<usize>, RegisteredBufSlice);
 
     fn complete(self, result: CQEResult) -> Self::Output {
         match result.result {
