@@ -132,3 +132,65 @@ Linux runs were executed through the Lima `norn-uring` VM.
   normal stream path uses readiness plus direct socket sends. A future benchmark
   shape may need a split writer/socket API or a dedicated connected-socket send
   fast path to compare only receive-buffer strategy.
+
+## 2026-05-12: `uring_realworld` TCP Multishot Bufring
+
+Target benchmark added in commit `4fe518d`:
+
+```text
+cargo bench -p benches --bench uring_realworld -- \
+  bench_tcp_request_response/runtime=norn/recv=bufring_multi/connections=8/requests_per_connection=64/payload=64
+```
+
+Linux runs were executed through the Lima `norn-uring` VM.
+
+### Baseline
+
+- Focused median, Norn `recv=bufring_multi`: `1.055 ms`.
+- Same focused case, Norn `recv=normal`: `1.370 ms`.
+- Same focused case, Norn `recv=bufring`: `1.473 ms`.
+- Longer-lived connection check:
+  - `recv=bufring_multi/connections=8/requests_per_connection=512/payload=64`:
+    `7.420 ms`.
+  - `recv=normal/connections=8/requests_per_connection=512/payload=64`:
+    `10.453 ms`.
+  - `recv=bufring/connections=8/requests_per_connection=512/payload=64`:
+    `10.992 ms`.
+
+### Benchmark Bug Found and Fixed
+
+- Initial `recv=bufring_multi` shape hung during cleanup.
+  - Cause: the multishot receive op owns an `NornFd` reference, and the
+    benchmark awaited `socket.close()` while the multishot op was still in
+    scope.
+  - Fix: scope the multishot op so it is dropped before closing the socket.
+
+### Tried and Rejected
+
+- Public `TcpSocket::send_all` using direct nonblocking socket sends.
+  - Change: added an owned-buffer `send_all` API that tried direct socket sends
+    and fell back to the existing io_uring send path for unsupported
+    descriptors.
+  - Result: focused `recv=bufring_multi` median regressed from `1.055 ms` to
+    about `1.221 ms`; single-shot bufring also regressed.
+  - Reason rejected: the existing io_uring send path is better for this
+    workload.
+
+- Increase inline completion storage from one CQE to four CQEs.
+  - Change: changed `CompletionQueue` from `SmallVec<[CQEResult; 1]>` to
+    `SmallVec<[CQEResult; 4]>`.
+  - Result: focused `recv=bufring_multi` median regressed from `1.055 ms` to
+    about `1.079 ms`; the 512-request case regressed from `7.420 ms` to about
+    `7.568 ms`.
+  - Reason rejected: larger inline storage did not help this multishot path and
+    slightly slowed it down.
+
+### Ideas That Need a Different Benchmark Shape
+
+- Add a Norn-only `recv=bufring_bundle_multi` shape using `recv_bundle_multi`.
+  Bundle receive may reduce per-completion overhead when frames span multiple
+  buffers, but it is a distinct kernel/API path from `recv_ring_multi`.
+
+- Use longer-lived connections as the primary target when optimizing persistent
+  server behavior. The `requests_per_connection=512` case has lower setup and
+  cancellation weight than the focused 64-request case.
