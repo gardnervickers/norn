@@ -185,6 +185,31 @@ Linux runs were executed through the Lima `norn-uring` VM.
   - Reason rejected: larger inline storage did not help this multishot path and
     slightly slowed it down.
 
+- Non-full submission queue fast-submit path.
+  - Change: added a checked `Handle::try_push` path so `Op::poll_submit` could
+    push immediately when the driver was running and the SQ had space, avoiding
+    `PushFuture` construction in the common path.
+  - Result: initially looked like about `2%` on the 512-request multishot case,
+    but repeat/cross-checks did not hold: focused 64-request target was about
+    baseline or slower, 512-request target was noise, and the UDP target
+    regressed to about `7.904 ms`.
+  - Reason rejected: not a repeatable material win, and it was already noisy on
+    the earlier UDP work.
+
+- Return the multishot `more` bit from the raw completion vtable.
+  - Change: avoided a duplicate `CQEResult::more()` call by having
+    `RawOp<T>::complete` return the `more` flag to `RawOpRef::complete`.
+  - Result: focused 64-request target regressed to about `1.062 ms`; the
+    512-request target stayed around baseline.
+  - Reason rejected: no measurable improvement.
+
+- Fast-path `pop()` for single queued multishot completions.
+  - Change: used `SmallVec::pop()` instead of `remove(0)` when the completion
+    queue length was exactly one.
+  - Result: combined with SQ fast-submit it did not improve the focused target
+    and only moved the 512-request case by about `1%`.
+  - Reason rejected: sub-threshold and not reliable.
+
 ### Ideas That Need a Different Benchmark Shape
 
 - Add a Norn-only `recv=bufring_bundle_multi` shape using `recv_bundle_multi`.
