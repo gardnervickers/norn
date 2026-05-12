@@ -361,3 +361,44 @@ Repeated key cases:
 - This supports using `requests_per_connection=512` as the persistent-server
   optimization target and keeping a separate lifecycle target for setup,
   teardown, and multishot cancellation/drop sensitivity.
+
+## 2026-05-12: `uring_realworld` TCP Linked Requests
+
+Target benchmark added in commit `b9e768a`:
+
+```text
+cargo bench -p benches --bench uring_realworld -- \
+  bench_tcp_request_response_linked/runtime=norn/recv=bufring_linked/connections=8/requests_per_connection=512/payload=1
+```
+
+Linux runs were executed through the Lima `norn-uring` VM.
+
+### Baseline
+
+One-pass linked matrix:
+
+- `recv=bufring/requests_per_connection=64/payload=1`: `1.443 ms`.
+- `recv=bufring_linked/requests_per_connection=64/payload=1`: `1.489 ms`.
+- `recv=bufring/requests_per_connection=512/payload=1`: `10.237 ms`.
+- `recv=bufring_linked/requests_per_connection=512/payload=1`: `10.890 ms`.
+
+Repeated key cases:
+
+- `recv=bufring/requests_per_connection=64` median:
+  `1.457 ms` (`1.440772`, `1.456641`, `1.476816` ms).
+- `recv=bufring_linked/requests_per_connection=64` median:
+  `1.509 ms` (`1.504386`, `1.509079`, `1.527765` ms).
+- `recv=bufring/requests_per_connection=512` median:
+  `10.699 ms` (`10.584496`, `10.730947`, `10.699473` ms).
+- `recv=bufring_linked/requests_per_connection=512` median:
+  `10.968 ms` (`10.967942`, `10.954609`, `11.048699` ms).
+
+### Result
+
+- Linked send/receive submission was not a win for this loopback
+  request/response shape.
+- The linked path was about `3.6%` slower at 64 requests and about `2.5%`
+  slower at 512 requests.
+- Do not revisit request linking as a generic send/completion optimization
+  without a benchmark shape that can benefit from deeper independent batches or
+  from avoiding multiple explicit round trips.
