@@ -70,3 +70,65 @@ Linux runs were executed through the Lima `norn-uring` VM.
 - Spin/retry receive after send on loopback. This might help the current
   loopback request/response workload, but it is likely too benchmark-shaped
   without a broader runtime policy.
+
+## 2026-05-12: `uring_realworld` TCP Request/Response
+
+Target benchmark added in commit `abb6eeb`:
+
+```text
+cargo bench -p benches --bench uring_realworld -- \
+  bench_tcp_request_response/runtime=norn/recv=normal/connections=8/requests_per_connection=64/payload=64
+```
+
+Linux runs were executed through the Lima `norn-uring` VM.
+
+### Baseline
+
+- Focused apples-to-apples median, Norn normal: `1.335 ms`.
+- Focused apples-to-apples median, comparison runtime normal: `1.393 ms`.
+- Focused Norn bufring median: `1.457 ms`.
+- Broader one-off checks:
+  - `connections=1/requests_per_connection=512/payload=64`: Norn `1.542 ms`,
+    comparison runtime `1.748 ms`.
+  - `connections=64/requests_per_connection=64/payload=64`: Norn `11.468 ms`,
+    comparison runtime `11.811 ms`.
+  - `connections=8/requests_per_connection=64/payload=1024`: Norn `1.739 ms`,
+    comparison runtime `1.796 ms`.
+
+### Tried and Rejected
+
+- Raw direct TCP stream `recv`/`send` helpers.
+  - Change: bypassed per-call `socket2::Socket` wrapper creation in
+    `TcpStreamReader`/`TcpStreamWriter` by calling `libc::recv`/`libc::send`
+    directly after readiness.
+  - Result: focused Norn normal median regressed from `1.335 ms` to about
+    `1.368 ms`; focused bufring also regressed.
+  - Reason rejected: slower and added unsafe raw socket code.
+
+- Immediate no-op `TcpStreamWriter::poll_flush`.
+  - Change: returned `Poll::Ready(Ok(()))` for TCP stream flush instead of
+    polling write readiness and calling socket `flush`.
+  - Result: focused Norn normal median regressed to about `1.405 ms`.
+  - Reason rejected: plausible API cleanup, but not a performance win in this
+    benchmark and below the bar.
+
+- Direct nonblocking `accept4` fast path before io_uring accept.
+  - Change: tried queued accepts directly before falling back to the existing
+    io_uring accept operation.
+  - Result: `connections=64/requests_per_connection=64/payload=64` moved only
+    from a prior `11.468 ms` one-off baseline to an `11.345 ms` median, roughly
+    `1%`; the focused 8-connection case was noisy/slower.
+  - Reason rejected: real idea, but not material enough for this workload.
+
+### Ideas That Need a Different Benchmark Shape
+
+- Add a Norn-only TCP `recv=bufring_multi` shape using `recv_ring_multi`.
+  The current `recv=bufring` variant intentionally uses single-shot bufring
+  receives, which makes it a useful baseline but not the best-case registered
+  buffer-ring path.
+
+- Isolate bufring receive from send-path overhead. The current bufring variant
+  uses `TcpSocket::send`, which submits io_uring send operations, while the
+  normal stream path uses readiness plus direct socket sends. A future benchmark
+  shape may need a split writer/socket API or a dedicated connected-socket send
+  fast path to compare only receive-buffer strategy.
