@@ -351,6 +351,20 @@ Result:
 - After removing `FuturesUnordered`, the remaining profile points at send,
   multishot receive, driver park/drain, and raw completion overhead.
 
+Tried and rejected after this profile:
+
+- Skip replacing an operation waker when `Waker::will_wake` says the current
+  registered waker is equivalent.
+  - Change: `Header::set_waker` checked the existing waker before cloning and
+    storing the new one.
+  - Result: improved the scan-shaped 512-request target from the noisy
+    `7.380 ms` median to about `6.911 ms`, but did not carry over to the stable
+    unordered/default shape: unordered 512 stayed about `7.46 ms`, and
+    unordered 64 moved from about `1.059 ms` to about `1.084 ms`.
+  - Reason rejected: the win appears tied to scan polling repeatedly with the
+    same root waker, while the benchmark's default orchestration did not benefit
+    and the short target regressed.
+
 ## 2026-05-12: `uring_realworld` TCP Lifecycle
 
 Target benchmark added in commit `bca7814`:
