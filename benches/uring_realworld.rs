@@ -6,10 +6,12 @@ use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::{pin, Pin};
+use std::task::Poll;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bencher::bench;
 use bencher::{Bencher, TestDesc, TestDescAndFn, TestFn};
+use futures::future::poll_fn;
 use futures::stream::{FuturesUnordered, Stream, StreamExt};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -317,6 +319,21 @@ impl TcpRecvMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TcpCoordMode {
+    Unordered,
+    Scan,
+}
+
+impl TcpCoordMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Unordered => "unordered",
+            Self::Scan => "scan",
+        }
+    }
+}
+
 impl bencher::TDynBenchFn for UdpRequestResponseBench {
     fn run(&self, b: &mut Bencher) {
         match self.runtime {
@@ -422,6 +439,42 @@ impl UdpRequestResponseBench {
             });
         });
     }
+}
+
+type PendingIo<'a> = Pin<Box<dyn Future<Output = io::Result<()>> + 'a>>;
+
+async fn drain_pending_unordered(pending: FuturesUnordered<PendingIo<'_>>) -> io::Result<()> {
+    let mut pending = pending;
+    while let Some(result) = pending.next().await {
+        result?;
+    }
+    Ok(())
+}
+
+async fn drain_pending_scan(mut pending: Vec<PendingIo<'_>>) -> io::Result<()> {
+    let mut complete = vec![false; pending.len()];
+    let mut remaining = pending.len();
+    poll_fn(move |cx| {
+        for (idx, future) in pending.iter_mut().enumerate() {
+            if complete[idx] {
+                continue;
+            }
+            match future.as_mut().poll(cx) {
+                Poll::Ready(Ok(())) => {
+                    complete[idx] = true;
+                    remaining -= 1;
+                }
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => {}
+            }
+        }
+        if remaining == 0 {
+            Poll::Ready(Ok(()))
+        } else {
+            Poll::Pending
+        }
+    })
+    .await
 }
 
 async fn tcp_read_exact<S>(mut stream: Pin<&mut S>, buf: &mut [u8]) -> io::Result<()>
@@ -569,58 +622,57 @@ async fn norn_tcp_echo_server(
     requests_per_connection: usize,
     payload_len: usize,
     recv_mode: TcpRecvMode,
+    coord_mode: TcpCoordMode,
 ) -> io::Result<()> {
-    let mut handlers: FuturesUnordered<Pin<Box<dyn Future<Output = io::Result<()>> + '_>>> =
-        FuturesUnordered::new();
+    let unordered: FuturesUnordered<PendingIo<'_>> = FuturesUnordered::new();
+    let mut scan: Vec<PendingIo<'_>> = Vec::with_capacity(connections);
 
     for connection in 0..connections {
         let (socket, _) = listener.accept().await?;
         socket.set_nodelay(true).await?;
-        match recv_mode {
-            TcpRecvMode::Normal => {
-                handlers.push(Box::pin(norn_tcp_echo_connection_normal(
-                    socket,
-                    requests_per_connection,
-                    payload_len,
-                )));
-            }
+        let handler: PendingIo<'_> = match recv_mode {
+            TcpRecvMode::Normal => Box::pin(norn_tcp_echo_connection_normal(
+                socket,
+                requests_per_connection,
+                payload_len,
+            )),
             TcpRecvMode::BufRing | TcpRecvMode::BufRingMulti | TcpRecvMode::BufRingBundleMulti => {
                 let ring = tcp_bufring(2_000, connection, payload_len)?;
                 match recv_mode {
-                    TcpRecvMode::BufRing => {
-                        handlers.push(Box::pin(norn_tcp_echo_connection_bufring(
-                            socket,
-                            ring,
-                            requests_per_connection,
-                            payload_len,
-                        )));
-                    }
-                    TcpRecvMode::BufRingMulti => {
-                        handlers.push(Box::pin(norn_tcp_echo_connection_bufring_multi(
-                            socket,
-                            ring,
-                            requests_per_connection,
-                            payload_len,
-                        )));
-                    }
+                    TcpRecvMode::BufRing => Box::pin(norn_tcp_echo_connection_bufring(
+                        socket,
+                        ring,
+                        requests_per_connection,
+                        payload_len,
+                    )),
+                    TcpRecvMode::BufRingMulti => Box::pin(norn_tcp_echo_connection_bufring_multi(
+                        socket,
+                        ring,
+                        requests_per_connection,
+                        payload_len,
+                    )),
                     TcpRecvMode::BufRingBundleMulti => {
-                        handlers.push(Box::pin(norn_tcp_echo_connection_bufring_bundle_multi(
+                        Box::pin(norn_tcp_echo_connection_bufring_bundle_multi(
                             socket,
                             ring,
                             requests_per_connection,
                             payload_len,
-                        )));
+                        ))
                     }
                     TcpRecvMode::Normal => unreachable!(),
                 }
             }
+        };
+        match coord_mode {
+            TcpCoordMode::Unordered => unordered.push(handler),
+            TcpCoordMode::Scan => scan.push(handler),
         }
     }
 
-    while let Some(result) = handlers.next().await {
-        result?;
+    match coord_mode {
+        TcpCoordMode::Unordered => drain_pending_unordered(unordered).await,
+        TcpCoordMode::Scan => drain_pending_scan(scan).await,
     }
-    Ok(())
 }
 
 async fn norn_tcp_echo_connection_normal(
@@ -694,35 +746,38 @@ async fn norn_tcp_request_response_clients(
     requests_per_connection: usize,
     payload_len: usize,
     recv_mode: TcpRecvMode,
+    coord_mode: TcpCoordMode,
 ) -> io::Result<()> {
-    let mut clients: FuturesUnordered<Pin<Box<dyn Future<Output = io::Result<()>> + '_>>> =
-        FuturesUnordered::new();
+    let unordered: FuturesUnordered<PendingIo<'_>> = FuturesUnordered::new();
+    let mut scan: Vec<PendingIo<'_>> = Vec::with_capacity(connections);
 
     for connection in 0..connections {
-        match recv_mode {
-            TcpRecvMode::Normal => {
-                clients.push(Box::pin(norn_tcp_request_response_client_normal(
-                    server_addr,
-                    requests_per_connection,
-                    payload_len,
-                )));
-            }
+        let client: PendingIo<'_> = match recv_mode {
+            TcpRecvMode::Normal => Box::pin(norn_tcp_request_response_client_normal(
+                server_addr,
+                requests_per_connection,
+                payload_len,
+            )),
             TcpRecvMode::BufRing | TcpRecvMode::BufRingMulti | TcpRecvMode::BufRingBundleMulti => {
-                clients.push(Box::pin(norn_tcp_request_response_client_bufring(
+                Box::pin(norn_tcp_request_response_client_bufring(
                     server_addr,
                     connection,
                     requests_per_connection,
                     payload_len,
                     recv_mode,
-                )));
+                ))
             }
+        };
+        match coord_mode {
+            TcpCoordMode::Unordered => unordered.push(client),
+            TcpCoordMode::Scan => scan.push(client),
         }
     }
 
-    while let Some(result) = clients.next().await {
-        result?;
+    match coord_mode {
+        TcpCoordMode::Unordered => drain_pending_unordered(unordered).await,
+        TcpCoordMode::Scan => drain_pending_scan(scan).await,
     }
-    Ok(())
 }
 
 async fn norn_tcp_request_response_client_normal(
@@ -880,6 +935,7 @@ struct TcpRequestResponseBench {
     requests_per_connection: usize,
     payload_len: usize,
     recv_mode: TcpRecvMode,
+    coord_mode: TcpCoordMode,
 }
 
 impl TcpRequestResponseBench {
@@ -889,6 +945,7 @@ impl TcpRequestResponseBench {
         requests_per_connection: usize,
         payload_len: usize,
         recv_mode: TcpRecvMode,
+        coord_mode: TcpCoordMode,
     ) -> Self {
         Self {
             runtime,
@@ -896,6 +953,7 @@ impl TcpRequestResponseBench {
             requests_per_connection,
             payload_len,
             recv_mode,
+            coord_mode,
         }
     }
 }
@@ -925,6 +983,7 @@ impl TcpRequestResponseBench {
             let requests_per_connection = self.requests_per_connection;
             let payload_len = self.payload_len;
             let recv_mode = self.recv_mode;
+            let coord_mode = self.coord_mode;
             ex.block_on(async {
                 futures::try_join!(
                     norn_tcp_echo_server(
@@ -933,6 +992,7 @@ impl TcpRequestResponseBench {
                         requests_per_connection,
                         payload_len,
                         recv_mode,
+                        coord_mode,
                     ),
                     norn_tcp_request_response_clients(
                         server_addr,
@@ -940,6 +1000,7 @@ impl TcpRequestResponseBench {
                         requests_per_connection,
                         payload_len,
                         recv_mode,
+                        coord_mode,
                     )
                 )
                 .unwrap();
@@ -953,6 +1014,7 @@ impl TcpRequestResponseBench {
 
     fn run_tokio(&self, b: &mut Bencher) {
         assert_eq!(self.recv_mode, TcpRecvMode::Normal);
+        assert_eq!(self.coord_mode, TcpCoordMode::Unordered);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_io()
             .build()
@@ -1162,11 +1224,34 @@ fn benches() -> Vec<TestDescAndFn> {
                                 requests_per_connection,
                                 payload_len,
                                 *recv_mode,
+                                TcpCoordMode::Unordered,
                             ))),
                         });
                     }
                 }
             }
+        }
+    }
+
+    for requests_per_connection in [64, 512] {
+        for coord_mode in [TcpCoordMode::Unordered, TcpCoordMode::Scan] {
+            benches.push(TestDescAndFn {
+                desc: TestDesc {
+                    name: Cow::from(format!(
+                        "bench_tcp_request_response_coord/runtime=norn/coord={}/recv=bufring_multi/connections=8/requests_per_connection={requests_per_connection}/payload=64",
+                        coord_mode.as_str(),
+                    )),
+                    ignore: false,
+                },
+                testfn: TestFn::DynBenchFn(Box::new(TcpRequestResponseBench::new(
+                    RuntimeKind::Norn,
+                    8,
+                    requests_per_connection,
+                    64,
+                    TcpRecvMode::BufRingMulti,
+                    coord_mode,
+                ))),
+            });
         }
     }
 
