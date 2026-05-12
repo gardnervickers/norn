@@ -20,6 +20,7 @@ use norn_uring::bufring::{BufRing, BufRingBuf, BufRingBufBundle};
 use norn_uring::fs;
 use norn_uring::net::UdpSocket as NornUdpSocket;
 use norn_uring::net::{TcpListener as NornTcpListener, TcpSocket as NornTcpSocket};
+use norn_uring::Request;
 
 mod support;
 
@@ -304,6 +305,7 @@ impl UdpRecvMode {
 enum TcpRecvMode {
     Normal,
     BufRing,
+    BufRingLinked,
     BufRingMulti,
     BufRingBundleMulti,
 }
@@ -313,6 +315,7 @@ impl TcpRecvMode {
         match self {
             Self::Normal => "normal",
             Self::BufRing => "bufring",
+            Self::BufRingLinked => "bufring_linked",
             Self::BufRingMulti => "bufring_multi",
             Self::BufRingBundleMulti => "bufring_bundle_multi",
         }
@@ -549,6 +552,21 @@ async fn norn_tcp_recv_exact_ring(
     Ok(())
 }
 
+fn norn_tcp_validate_exact_ring_buf(
+    buf: BufRingBuf,
+    expected_byte: u8,
+    payload_len: usize,
+) -> io::Result<()> {
+    if buf.len() != payload_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "tcp linked bufring receive did not match frame size",
+        ));
+    }
+    assert!(buf.as_slice().iter().all(|byte| *byte == expected_byte));
+    Ok(())
+}
+
 async fn norn_tcp_recv_exact_ring_multi<S>(
     mut recv: Pin<&mut S>,
     expected_byte: u8,
@@ -636,7 +654,10 @@ async fn norn_tcp_echo_server(
                 requests_per_connection,
                 payload_len,
             )),
-            TcpRecvMode::BufRing | TcpRecvMode::BufRingMulti | TcpRecvMode::BufRingBundleMulti => {
+            TcpRecvMode::BufRing
+            | TcpRecvMode::BufRingLinked
+            | TcpRecvMode::BufRingMulti
+            | TcpRecvMode::BufRingBundleMulti => {
                 let ring = tcp_bufring(2_000, connection, payload_len)?;
                 match recv_mode {
                     TcpRecvMode::BufRing => Box::pin(norn_tcp_echo_connection_bufring(
@@ -645,6 +666,14 @@ async fn norn_tcp_echo_server(
                         requests_per_connection,
                         payload_len,
                     )),
+                    TcpRecvMode::BufRingLinked => {
+                        Box::pin(norn_tcp_echo_connection_bufring_linked(
+                            socket,
+                            ring,
+                            requests_per_connection,
+                            payload_len,
+                        ))
+                    }
                     TcpRecvMode::BufRingMulti => Box::pin(norn_tcp_echo_connection_bufring_multi(
                         socket,
                         ring,
@@ -704,6 +733,25 @@ async fn norn_tcp_echo_connection_bufring(
     socket.close().await
 }
 
+async fn norn_tcp_echo_connection_bufring_linked(
+    socket: NornTcpSocket,
+    ring: BufRing,
+    requests: usize,
+    payload_len: usize,
+) -> io::Result<()> {
+    let mut send_buf = vec![0x5A; payload_len];
+    for _ in 0..requests {
+        let (recv_res, (send_res, next_send_buf)) =
+            socket.recv_ring(&ring).then(socket.send(send_buf)).await;
+        let (buf, _) = recv_res?;
+        norn_tcp_validate_exact_ring_buf(buf, 0x5A, payload_len)?;
+        send_buf = next_send_buf;
+        let sent = send_res?;
+        assert_eq!(sent, payload_len);
+    }
+    socket.close().await
+}
+
 async fn norn_tcp_echo_connection_bufring_multi(
     socket: NornTcpSocket,
     ring: BufRing,
@@ -758,7 +806,10 @@ async fn norn_tcp_request_response_clients(
                 requests_per_connection,
                 payload_len,
             )),
-            TcpRecvMode::BufRing | TcpRecvMode::BufRingMulti | TcpRecvMode::BufRingBundleMulti => {
+            TcpRecvMode::BufRing
+            | TcpRecvMode::BufRingLinked
+            | TcpRecvMode::BufRingMulti
+            | TcpRecvMode::BufRingBundleMulti => {
                 Box::pin(norn_tcp_request_response_client_bufring(
                     server_addr,
                     connection,
@@ -814,6 +865,17 @@ async fn norn_tcp_request_response_client_bufring(
             for _ in 0..requests {
                 send_buf = norn_tcp_send_all(&socket, send_buf).await?;
                 norn_tcp_recv_exact_ring(&socket, &ring, 0x5A, payload_len).await?;
+            }
+        }
+        TcpRecvMode::BufRingLinked => {
+            for _ in 0..requests {
+                let ((send_res, next_send_buf), recv_res) =
+                    socket.send(send_buf).then(socket.recv_ring(&ring)).await;
+                send_buf = next_send_buf;
+                let sent = send_res?;
+                assert_eq!(sent, payload_len);
+                let (buf, _) = recv_res?;
+                norn_tcp_validate_exact_ring_buf(buf, 0x5A, payload_len)?;
             }
         }
         TcpRecvMode::BufRingMulti => {
@@ -1230,6 +1292,28 @@ fn benches() -> Vec<TestDescAndFn> {
                     }
                 }
             }
+        }
+    }
+
+    for requests_per_connection in [64, 512] {
+        for recv_mode in [TcpRecvMode::BufRing, TcpRecvMode::BufRingLinked] {
+            benches.push(TestDescAndFn {
+                desc: TestDesc {
+                    name: Cow::from(format!(
+                        "bench_tcp_request_response_linked/runtime=norn/recv={}/connections=8/requests_per_connection={requests_per_connection}/payload=1",
+                        recv_mode.as_str(),
+                    )),
+                    ignore: false,
+                },
+                testfn: TestFn::DynBenchFn(Box::new(TcpRequestResponseBench::new(
+                    RuntimeKind::Norn,
+                    8,
+                    requests_per_connection,
+                    1,
+                    recv_mode,
+                    TcpCoordMode::Unordered,
+                ))),
+            });
         }
     }
 
