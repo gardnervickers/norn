@@ -302,6 +302,55 @@ Top samples from the generated flamegraph data:
 - Next coordination target: compare against `norn-util::PollSet` or a small
   reusable poll-set abstraction before changing runtime internals.
 
+### PollSet Follow-up
+
+`coord=pollset` was added in commit `7341409`.
+
+Repeated three-way comparison after adding `coord=pollset`:
+
+- Focused 64-request unordered median:
+  `1.059 ms` (`1.059631`, `1.046450`, `1.058910` ms).
+- Focused 64-request scan median:
+  `1.012 ms` (`1.009356`, `1.020000`, `1.012157` ms).
+- Focused 64-request PollSet median:
+  `1.068 ms` (`1.065084`, `1.084633`, `1.067776` ms).
+- Longer-lived 512-request unordered median:
+  `7.444 ms` (`7.364495`, `7.443810`, `7.467562` ms).
+- Longer-lived 512-request scan median:
+  `7.380 ms` (`7.085961`, `7.394979`, `7.379787` ms).
+- Longer-lived 512-request PollSet median:
+  `7.403 ms` (`7.390006`, `7.402693`, `7.403087` ms).
+
+Profiled target after the scan change:
+
+```text
+NORN_BENCH_PPROF=/tmp/norn-tcp-scan-pprof cargo bench -p benches \
+  --bench uring_realworld -- \
+  bench_tcp_request_response_coord/runtime=norn/coord=scan/recv=bufring_multi/connections=8/requests_per_connection=512/payload=64
+```
+
+Top inclusive samples from the generated flamegraph data:
+
+- Scan coordination closure: `78.03%`.
+- TCP client body: `41.26%`.
+- TCP echo connection body: `35.43%`.
+- Send helper: `19.28%`.
+- Multishot receive helper: `17.94%`.
+- Driver park path: `17.04%`.
+- Driver CQ drain: `14.35%`.
+- `RawOp<T>::complete`: `4.93%`.
+
+Result:
+
+- `PollSet` is not a win for this fixed eight-connection benchmark. It was
+  slower than scan at 64 requests and roughly tied with the noisy 512-request
+  results.
+- The direct scan helper remains the best coordination shape measured so far,
+  but the 512-request coordination delta is small enough that future runtime
+  optimization work should use repeated runs.
+- After removing `FuturesUnordered`, the remaining profile points at send,
+  multishot receive, driver park/drain, and raw completion overhead.
+
 ## 2026-05-12: `uring_realworld` TCP Lifecycle
 
 Target benchmark added in commit `bca7814`:
