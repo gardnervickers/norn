@@ -219,3 +219,30 @@ Linux runs were executed through the Lima `norn-uring` VM.
 - Use longer-lived connections as the primary target when optimizing persistent
   server behavior. The `requests_per_connection=512` case has lower setup and
   cancellation weight than the focused 64-request case.
+
+## 2026-05-12: `uring_realworld` TCP Bundle Multishot Bufring
+
+Target benchmark added in commit `204844d`:
+
+```text
+cargo bench -p benches --bench uring_realworld -- \
+  bench_tcp_request_response/runtime=norn/recv=bufring_bundle_multi/connections=8/requests_per_connection=64/payload=64
+```
+
+Linux runs were executed through the Lima `norn-uring` VM.
+
+### Baseline
+
+- Focused 64-request median, Norn `recv=bufring_bundle_multi`: `1.056 ms`.
+- Same focused case, Norn `recv=bufring_multi`: `1.050 ms`.
+- Longer-lived 512-request median, Norn `recv=bufring_bundle_multi`: `7.492 ms`.
+- Same longer-lived case, Norn `recv=bufring_multi`: `7.395 ms`.
+
+### Result
+
+- Bundle multishot is a useful benchmark shape, but it was not a win for 64-byte
+  fixed-frame loopback TCP.
+- It was roughly tied with `recv=bufring_multi` on the short target and slower
+  on the longer-lived target.
+- Revisit with larger payloads or frames that naturally span multiple buffers;
+  that is where bundle receive is more likely to matter.
