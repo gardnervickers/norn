@@ -301,3 +301,63 @@ Top samples from the generated flamegraph data:
   fan-in overhead.
 - Next coordination target: compare against `norn-util::PollSet` or a small
   reusable poll-set abstraction before changing runtime internals.
+
+## 2026-05-12: `uring_realworld` TCP Lifecycle
+
+Target benchmark added in commit `bca7814`:
+
+```text
+cargo bench -p benches --bench uring_realworld -- \
+  bench_tcp_request_response_lifecycle/runtime=norn/recv=bufring_multi/connections=8/requests_per_connection=1/payload=64
+```
+
+Linux runs were executed through the Lima `norn-uring` VM.
+
+### Matrix
+
+One-pass lifecycle matrix:
+
+- `requests_per_connection=1`
+  - `recv=normal`: `96.579 us`.
+  - `recv=bufring`: `158.908 us`.
+  - `recv=bufring_multi`: `171.653 us`.
+  - `recv=bufring_bundle_multi`: `170.325 us`.
+- `requests_per_connection=4`
+  - `recv=normal`: `164.027 us`.
+  - `recv=bufring`: `225.079 us`.
+  - `recv=bufring_multi`: `218.880 us`.
+  - `recv=bufring_bundle_multi`: `218.359 us`.
+- `requests_per_connection=16`
+  - `recv=normal`: `417.931 us`.
+  - `recv=bufring`: `466.575 us`.
+  - `recv=bufring_multi`: `395.470 us`.
+  - `recv=bufring_bundle_multi`: `390.741 us`.
+- `requests_per_connection=64`
+  - `recv=normal`: `1.431 ms`.
+  - `recv=bufring`: `1.444 ms`.
+  - `recv=bufring_multi`: `1.196 ms`, high variance in this matrix run.
+  - `recv=bufring_bundle_multi`: `1.112 ms`.
+
+Repeated key cases:
+
+- `recv=normal/requests_per_connection=1` median:
+  `93.716 us` (`93.929`, `92.625`, `93.716` us).
+- `recv=bufring_multi/requests_per_connection=1` median:
+  `170.426 us` (`169.805`, `170.426`, `171.153` us).
+- `recv=bufring_bundle_multi/requests_per_connection=1` median:
+  `171.368 us` (`171.368`, `170.877`, `172.373` us).
+- `recv=normal/requests_per_connection=16` median:
+  `417.367 us` (`417.367`, `417.515`, `417.153` us).
+- `recv=bufring_multi/requests_per_connection=16` median:
+  `395.709 us` (`395.709`, `394.715`, `398.830` us).
+
+### Result
+
+- Multishot receive is the wrong path for one-request connections in this
+  benchmark: `recv=bufring_multi` was about `82%` slower than `recv=normal`.
+- The multishot path crosses over by about 16 requests per connection:
+  `recv=bufring_multi` was about `5.2%` faster than `recv=normal` in repeated
+  16-request runs.
+- This supports using `requests_per_connection=512` as the persistent-server
+  optimization target and keeping a separate lifecycle target for setup,
+  teardown, and multishot cancellation/drop sensitivity.
