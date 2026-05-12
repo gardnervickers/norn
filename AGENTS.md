@@ -127,6 +127,8 @@ The project is intentionally not general-purpose today; APIs are still in flux i
   - Build debuginfo bench binaries for readable symbols: `CARGO_PROFILE_BENCH_DEBUG=true cargo bench -p benches --bench <name> --no-run`
   - Use the `Sort by top of stack` section to identify dominant functions.
   - Linux (when available): use `perf record`/`perf report` for equivalent sampling.
+- Check `benches/perf-notes.md` before revisiting benchmark-driven optimizations;
+  it records attempts that were noisy, regressed, or need a different benchmark shape.
 - Only checkpoint a perf commit when the gain is material and repeatable; include exact before/after numbers and commands in the commit body.
 
 ## Test Coverage Map
