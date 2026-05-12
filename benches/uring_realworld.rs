@@ -1255,6 +1255,33 @@ fn benches() -> Vec<TestDescAndFn> {
         }
     }
 
+    for requests_per_connection in [1, 4, 16, 64] {
+        for recv_mode in [
+            TcpRecvMode::Normal,
+            TcpRecvMode::BufRing,
+            TcpRecvMode::BufRingMulti,
+            TcpRecvMode::BufRingBundleMulti,
+        ] {
+            benches.push(TestDescAndFn {
+                desc: TestDesc {
+                    name: Cow::from(format!(
+                        "bench_tcp_request_response_lifecycle/runtime=norn/recv={}/connections=8/requests_per_connection={requests_per_connection}/payload=64",
+                        recv_mode.as_str(),
+                    )),
+                    ignore: false,
+                },
+                testfn: TestFn::DynBenchFn(Box::new(TcpRequestResponseBench::new(
+                    RuntimeKind::Norn,
+                    8,
+                    requests_per_connection,
+                    64,
+                    recv_mode,
+                    TcpCoordMode::Unordered,
+                ))),
+            });
+        }
+    }
+
     for workers in [1, 8] {
         for total_round_trips in [2_048, 16_384] {
             for block_size in [4 * 1024, 16 * 1024] {
