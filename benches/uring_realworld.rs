@@ -14,7 +14,7 @@ use futures::stream::{FuturesUnordered, Stream, StreamExt};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use norn_uring::buf::{BufCursor, StableBuf};
-use norn_uring::bufring::{BufRing, BufRingBuf};
+use norn_uring::bufring::{BufRing, BufRingBuf, BufRingBufBundle};
 use norn_uring::fs;
 use norn_uring::net::UdpSocket as NornUdpSocket;
 use norn_uring::net::{TcpListener as NornTcpListener, TcpSocket as NornTcpSocket};
@@ -303,6 +303,7 @@ enum TcpRecvMode {
     Normal,
     BufRing,
     BufRingMulti,
+    BufRingBundleMulti,
 }
 
 impl TcpRecvMode {
@@ -311,6 +312,7 @@ impl TcpRecvMode {
             Self::Normal => "normal",
             Self::BufRing => "bufring",
             Self::BufRingMulti => "bufring_multi",
+            Self::BufRingBundleMulti => "bufring_bundle_multi",
         }
     }
 }
@@ -525,6 +527,42 @@ where
     Ok(())
 }
 
+async fn norn_tcp_recv_exact_bundle_multi<S>(
+    mut recv: Pin<&mut S>,
+    expected_byte: u8,
+    payload_len: usize,
+) -> io::Result<()>
+where
+    S: Stream<Item = io::Result<BufRingBufBundle>>,
+{
+    let mut read = 0;
+    while read < payload_len {
+        let bundle = recv.as_mut().next().await.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "tcp multishot bundle receive ended",
+            )
+        })??;
+        if bundle.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "tcp stream closed before full multishot bundle frame",
+            ));
+        }
+        if read + bundle.len() > payload_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "tcp multishot bundle receive crossed frame boundary",
+            ));
+        }
+        for chunk in bundle.iter() {
+            assert!(chunk.iter().all(|byte| *byte == expected_byte));
+        }
+        read += bundle.len();
+    }
+    Ok(())
+}
+
 async fn norn_tcp_echo_server(
     listener: &NornTcpListener,
     connections: usize,
@@ -546,7 +584,7 @@ async fn norn_tcp_echo_server(
                     payload_len,
                 )));
             }
-            TcpRecvMode::BufRing | TcpRecvMode::BufRingMulti => {
+            TcpRecvMode::BufRing | TcpRecvMode::BufRingMulti | TcpRecvMode::BufRingBundleMulti => {
                 let ring = tcp_bufring(2_000, connection, payload_len)?;
                 match recv_mode {
                     TcpRecvMode::BufRing => {
@@ -559,6 +597,14 @@ async fn norn_tcp_echo_server(
                     }
                     TcpRecvMode::BufRingMulti => {
                         handlers.push(Box::pin(norn_tcp_echo_connection_bufring_multi(
+                            socket,
+                            ring,
+                            requests_per_connection,
+                            payload_len,
+                        )));
+                    }
+                    TcpRecvMode::BufRingBundleMulti => {
+                        handlers.push(Box::pin(norn_tcp_echo_connection_bufring_bundle_multi(
                             socket,
                             ring,
                             requests_per_connection,
@@ -624,6 +670,24 @@ async fn norn_tcp_echo_connection_bufring_multi(
     socket.close().await
 }
 
+async fn norn_tcp_echo_connection_bufring_bundle_multi(
+    socket: NornTcpSocket,
+    ring: BufRing,
+    requests: usize,
+    payload_len: usize,
+) -> io::Result<()> {
+    let mut send_buf = vec![0x5A; payload_len];
+    // Drop the multishot op before closing; it owns an fd reference.
+    {
+        let mut recv = pin!(socket.recv_bundle_multi(&ring));
+        for _ in 0..requests {
+            norn_tcp_recv_exact_bundle_multi(recv.as_mut(), 0x5A, payload_len).await?;
+            send_buf = norn_tcp_send_all(&socket, send_buf).await?;
+        }
+    }
+    socket.close().await
+}
+
 async fn norn_tcp_request_response_clients(
     server_addr: std::net::SocketAddr,
     connections: usize,
@@ -643,7 +707,7 @@ async fn norn_tcp_request_response_clients(
                     payload_len,
                 )));
             }
-            TcpRecvMode::BufRing | TcpRecvMode::BufRingMulti => {
+            TcpRecvMode::BufRing | TcpRecvMode::BufRingMulti | TcpRecvMode::BufRingBundleMulti => {
                 clients.push(Box::pin(norn_tcp_request_response_client_bufring(
                     server_addr,
                     connection,
@@ -704,6 +768,16 @@ async fn norn_tcp_request_response_client_bufring(
                 for _ in 0..requests {
                     send_buf = norn_tcp_send_all(&socket, send_buf).await?;
                     norn_tcp_recv_exact_ring_multi(recv.as_mut(), 0x5A, payload_len).await?;
+                }
+            }
+        }
+        TcpRecvMode::BufRingBundleMulti => {
+            // Drop the multishot op before closing; it owns an fd reference.
+            {
+                let mut recv = pin!(socket.recv_bundle_multi(&ring));
+                for _ in 0..requests {
+                    send_buf = norn_tcp_send_all(&socket, send_buf).await?;
+                    norn_tcp_recv_exact_bundle_multi(recv.as_mut(), 0x5A, payload_len).await?;
                 }
             }
         }
@@ -1068,6 +1142,7 @@ fn benches() -> Vec<TestDescAndFn> {
                             TcpRecvMode::Normal,
                             TcpRecvMode::BufRing,
                             TcpRecvMode::BufRingMulti,
+                            TcpRecvMode::BufRingBundleMulti,
                         ],
                         RuntimeKind::Tokio => &[TcpRecvMode::Normal],
                     };
