@@ -246,3 +246,58 @@ Linux runs were executed through the Lima `norn-uring` VM.
   on the longer-lived target.
 - Revisit with larger payloads or frames that naturally span multiple buffers;
   that is where bundle receive is more likely to matter.
+
+## 2026-05-12: `uring_realworld` TCP Coordination
+
+Target benchmark added in commit `9c56541`:
+
+```text
+cargo bench -p benches --bench uring_realworld -- \
+  bench_tcp_request_response_coord/runtime=norn/coord=scan/recv=bufring_multi/connections=8/requests_per_connection=512/payload=64
+```
+
+Linux runs were executed through the Lima `norn-uring` VM.
+
+### Profile Signal
+
+Profiled target:
+
+```text
+cargo bench -p benches --bench uring_realworld -- \
+  bench_tcp_request_response/runtime=norn/recv=bufring_multi/connections=8/requests_per_connection=512/payload=64
+```
+
+Top samples from the generated flamegraph data:
+
+- `FuturesUnordered::next` poll path: `75.86%`.
+- TCP client body: `34.14%`.
+- TCP echo connection body: `31.03%`.
+- Driver park path: `21.38%`.
+- Send helper: `19.66%`.
+- Driver CQ drain: `17.59%`.
+- Multishot receive helper: `15.52%`.
+- `RawOp<T>::complete`: `11.38%`.
+- `FuturesUnordered` wake path: `7.59%`.
+
+### Baseline
+
+- Focused 64-request unordered median:
+  `1.054 ms` (`1.064515`, `1.049078`, `1.053556` ms).
+- Focused 64-request scan median:
+  `1.015 ms` (`1.063173`, `1.013193`, `1.015427` ms).
+- Longer-lived 512-request unordered median:
+  `7.409 ms` (`7.408739`, `7.407505`, `7.470373` ms).
+- Longer-lived 512-request scan median:
+  `7.079 ms` (`7.052264`, `7.120222`, `7.078803` ms).
+
+### Result
+
+- Scan coordination was faster than `FuturesUnordered` fan-in for this fixed
+  eight-connection benchmark: about `3.7%` on the 64-request target and `4.5%`
+  on the 512-request target.
+- This is useful benchmark evidence, but it is benchmark orchestration rather
+  than a runtime fast path. Keep using the original unordered benchmark for
+  apples-to-apples comparisons, and use the coordination benchmark to isolate
+  fan-in overhead.
+- Next coordination target: compare against `norn-util::PollSet` or a small
+  reusable poll-set abstraction before changing runtime internals.
