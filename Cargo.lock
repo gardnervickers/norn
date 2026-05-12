@@ -216,6 +216,7 @@ dependencies = [
  "norn-task",
  "norn-timer",
  "norn-uring",
+ "norn-util",
  "pin-project-lite",
  "pprof",
  "tokio",

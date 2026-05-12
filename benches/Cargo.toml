@@ -10,6 +10,7 @@ edition = "2021"
 norn-task = { path = "../norn-task" }
 norn-executor = { path = "../norn-executor" }
 norn-timer = { path = "../norn-timer" }
+norn-util = { path = "../norn-util" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 norn-uring = { path = "../norn-uring" }

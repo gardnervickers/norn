@@ -21,6 +21,7 @@ use norn_uring::fs;
 use norn_uring::net::UdpSocket as NornUdpSocket;
 use norn_uring::net::{TcpListener as NornTcpListener, TcpSocket as NornTcpSocket};
 use norn_uring::Request;
+use norn_util::PollSet;
 
 mod support;
 
@@ -326,6 +327,7 @@ impl TcpRecvMode {
 enum TcpCoordMode {
     Unordered,
     Scan,
+    PollSet,
 }
 
 impl TcpCoordMode {
@@ -333,6 +335,7 @@ impl TcpCoordMode {
         match self {
             Self::Unordered => "unordered",
             Self::Scan => "scan",
+            Self::PollSet => "pollset",
         }
     }
 }
@@ -445,6 +448,7 @@ impl UdpRequestResponseBench {
 }
 
 type PendingIo<'a> = Pin<Box<dyn Future<Output = io::Result<()>> + 'a>>;
+type OwnedPendingIo = PendingIo<'static>;
 
 async fn drain_pending_unordered(pending: FuturesUnordered<PendingIo<'_>>) -> io::Result<()> {
     let mut pending = pending;
@@ -475,6 +479,65 @@ async fn drain_pending_scan(mut pending: Vec<PendingIo<'_>>) -> io::Result<()> {
             Poll::Ready(Ok(()))
         } else {
             Poll::Pending
+        }
+    })
+    .await
+}
+
+async fn drain_pending_pollset(pending: Vec<OwnedPendingIo>) -> io::Result<()> {
+    let mut set = Box::pin(PollSet::new());
+    let mut handles: Vec<_> = pending
+        .into_iter()
+        .map(|future| Box::pin(set.as_ref().spawn(future)))
+        .collect();
+    let mut complete = vec![false; handles.len()];
+    let mut remaining = handles.len();
+
+    poll_fn(move |cx| loop {
+        let before = remaining;
+        for (idx, handle) in handles.iter_mut().enumerate() {
+            if complete[idx] {
+                continue;
+            }
+            match handle.as_mut().poll(cx) {
+                Poll::Ready(Ok(Ok(()))) => {
+                    complete[idx] = true;
+                    remaining -= 1;
+                }
+                Poll::Ready(Ok(Err(err))) => return Poll::Ready(Err(err)),
+                Poll::Ready(Err(err)) => {
+                    return Poll::Ready(Err(io::Error::other(err.to_string())));
+                }
+                Poll::Pending => {}
+            }
+        }
+        if remaining == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
+        let _ = set.as_mut().poll(cx);
+
+        for (idx, handle) in handles.iter_mut().enumerate() {
+            if complete[idx] {
+                continue;
+            }
+            match handle.as_mut().poll(cx) {
+                Poll::Ready(Ok(Ok(()))) => {
+                    complete[idx] = true;
+                    remaining -= 1;
+                }
+                Poll::Ready(Ok(Err(err))) => return Poll::Ready(Err(err)),
+                Poll::Ready(Err(err)) => {
+                    return Poll::Ready(Err(io::Error::other(err.to_string())));
+                }
+                Poll::Pending => {}
+            }
+        }
+        if remaining == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        if remaining == before {
+            return Poll::Pending;
         }
     })
     .await
@@ -642,13 +705,14 @@ async fn norn_tcp_echo_server(
     recv_mode: TcpRecvMode,
     coord_mode: TcpCoordMode,
 ) -> io::Result<()> {
-    let unordered: FuturesUnordered<PendingIo<'_>> = FuturesUnordered::new();
-    let mut scan: Vec<PendingIo<'_>> = Vec::with_capacity(connections);
+    let unordered: FuturesUnordered<OwnedPendingIo> = FuturesUnordered::new();
+    let mut scan: Vec<OwnedPendingIo> = Vec::with_capacity(connections);
+    let mut pollset: Vec<OwnedPendingIo> = Vec::with_capacity(connections);
 
     for connection in 0..connections {
         let (socket, _) = listener.accept().await?;
         socket.set_nodelay(true).await?;
-        let handler: PendingIo<'_> = match recv_mode {
+        let handler: OwnedPendingIo = match recv_mode {
             TcpRecvMode::Normal => Box::pin(norn_tcp_echo_connection_normal(
                 socket,
                 requests_per_connection,
@@ -695,12 +759,14 @@ async fn norn_tcp_echo_server(
         match coord_mode {
             TcpCoordMode::Unordered => unordered.push(handler),
             TcpCoordMode::Scan => scan.push(handler),
+            TcpCoordMode::PollSet => pollset.push(handler),
         }
     }
 
     match coord_mode {
         TcpCoordMode::Unordered => drain_pending_unordered(unordered).await,
         TcpCoordMode::Scan => drain_pending_scan(scan).await,
+        TcpCoordMode::PollSet => drain_pending_pollset(pollset).await,
     }
 }
 
@@ -796,11 +862,12 @@ async fn norn_tcp_request_response_clients(
     recv_mode: TcpRecvMode,
     coord_mode: TcpCoordMode,
 ) -> io::Result<()> {
-    let unordered: FuturesUnordered<PendingIo<'_>> = FuturesUnordered::new();
-    let mut scan: Vec<PendingIo<'_>> = Vec::with_capacity(connections);
+    let unordered: FuturesUnordered<OwnedPendingIo> = FuturesUnordered::new();
+    let mut scan: Vec<OwnedPendingIo> = Vec::with_capacity(connections);
+    let mut pollset: Vec<OwnedPendingIo> = Vec::with_capacity(connections);
 
     for connection in 0..connections {
-        let client: PendingIo<'_> = match recv_mode {
+        let client: OwnedPendingIo = match recv_mode {
             TcpRecvMode::Normal => Box::pin(norn_tcp_request_response_client_normal(
                 server_addr,
                 requests_per_connection,
@@ -822,12 +889,14 @@ async fn norn_tcp_request_response_clients(
         match coord_mode {
             TcpCoordMode::Unordered => unordered.push(client),
             TcpCoordMode::Scan => scan.push(client),
+            TcpCoordMode::PollSet => pollset.push(client),
         }
     }
 
     match coord_mode {
         TcpCoordMode::Unordered => drain_pending_unordered(unordered).await,
         TcpCoordMode::Scan => drain_pending_scan(scan).await,
+        TcpCoordMode::PollSet => drain_pending_pollset(pollset).await,
     }
 }
 
@@ -1318,7 +1387,11 @@ fn benches() -> Vec<TestDescAndFn> {
     }
 
     for requests_per_connection in [64, 512] {
-        for coord_mode in [TcpCoordMode::Unordered, TcpCoordMode::Scan] {
+        for coord_mode in [
+            TcpCoordMode::Unordered,
+            TcpCoordMode::Scan,
+            TcpCoordMode::PollSet,
+        ] {
             benches.push(TestDescAndFn {
                 desc: TestDesc {
                     name: Cow::from(format!(
