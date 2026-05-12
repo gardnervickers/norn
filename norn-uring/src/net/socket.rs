@@ -182,6 +182,10 @@ impl Socket {
     where
         B: StableBufMut + 'static,
     {
+        let mut buf = buf;
+        if let Some(result) = self.try_recv_from(&mut buf, 0) {
+            return (result, buf);
+        }
         let op = RecvFrom::new(self.fd.clone(), buf, 0);
         self.handle.submit(op).await
     }
@@ -190,6 +194,9 @@ impl Socket {
     where
         B: StableBuf + 'static,
     {
+        if let Some(result) = self.try_send_to(&buf, Some(addr), 0) {
+            return (result, buf);
+        }
         let op = SendTo::new(self.fd.clone(), buf, Some(addr), 0);
         self.handle.submit(op).await
     }
@@ -202,6 +209,10 @@ impl Socket {
     where
         B: StableBufMut + 'static,
     {
+        let mut buf = buf;
+        if let Some(result) = self.try_recv_from(&mut buf, flags) {
+            return (result, buf);
+        }
         let op = RecvFrom::new(self.fd.clone(), buf, flags as u32);
         self.handle.submit(op).await
     }
@@ -215,6 +226,9 @@ impl Socket {
     where
         B: StableBuf + 'static,
     {
+        if let Some(result) = self.try_send_to(&buf, Some(addr), flags) {
+            return (result, buf);
+        }
         let op = SendTo::new(self.fd.clone(), buf, Some(addr), flags as u32);
         self.handle.submit(op).await
     }
@@ -361,6 +375,99 @@ impl Socket {
     {
         let op = SetSockOpt::new(self.fd.clone(), level as u32, optname as u32, value);
         self.handle.submit(op).await
+    }
+
+    fn try_send_to<B>(
+        &self,
+        buf: &B,
+        addr: Option<SocketAddr>,
+        flags: i32,
+    ) -> Option<io::Result<usize>>
+    where
+        B: StableBuf,
+    {
+        let fd = match self.fd.kind() {
+            crate::fd::FdKind::Fd(fd) => fd.0,
+            crate::fd::FdKind::Fixed(_) => return None,
+        };
+        let (name, namelen) = match addr {
+            Some(addr) => {
+                let addr = SockAddr::from(addr);
+                let rc = unsafe {
+                    libc::sendto(
+                        fd,
+                        buf.stable_ptr().cast(),
+                        buf.bytes_init(),
+                        flags,
+                        addr.as_ptr(),
+                        addr.len(),
+                    )
+                };
+                return direct_io_result(rc).map(|res| res.map(|n| n as usize));
+            }
+            None => (std::ptr::null(), 0),
+        };
+        let rc = unsafe {
+            libc::sendto(
+                fd,
+                buf.stable_ptr().cast(),
+                buf.bytes_init(),
+                flags,
+                name,
+                namelen,
+            )
+        };
+        direct_io_result(rc).map(|res| res.map(|n| n as usize))
+    }
+
+    fn try_recv_from<B>(&self, buf: &mut B, flags: i32) -> Option<io::Result<(usize, SocketAddr)>>
+    where
+        B: StableBufMut,
+    {
+        let fd = match self.fd.kind() {
+            crate::fd::FdKind::Fd(fd) => fd.0,
+            crate::fd::FdKind::Fixed(_) => return None,
+        };
+        let addr = unsafe {
+            SockAddr::try_init(|storage, len| {
+                let n = libc::recvfrom(
+                    fd,
+                    buf.stable_ptr_mut().cast(),
+                    buf.bytes_remaining(),
+                    flags,
+                    storage.cast(),
+                    len,
+                );
+                if n >= 0 {
+                    Ok(n)
+                } else {
+                    Err(io::Error::last_os_error())
+                }
+            })
+        };
+        match addr {
+            Ok((n, addr)) => {
+                if n == 0 && addr.len() == 0 {
+                    return Some(Err(no_source_addr_error()));
+                }
+                unsafe { buf.set_init(n as usize) };
+                Some(as_socket_addr(&addr).map(|addr| (n as usize, addr)))
+            }
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => None,
+            Err(err) => Some(Err(err)),
+        }
+    }
+}
+
+fn direct_io_result(rc: libc::ssize_t) -> Option<io::Result<libc::ssize_t>> {
+    if rc >= 0 {
+        return Some(Ok(rc));
+    }
+    let err = io::Error::last_os_error();
+    if err.kind() == io::ErrorKind::WouldBlock {
+        None
+    } else {
+        Some(Err(err))
     }
 }
 

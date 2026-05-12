@@ -84,7 +84,7 @@ where
         let header = &this.as_ref().header;
         assert!(!header.is_complete());
         let mut completions = header.completions().borrow_mut();
-        completions.push_back(result);
+        completions.push(result);
         if !more {
             header.set_complete();
         }

@@ -1,9 +1,12 @@
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
 use std::ptr::NonNull;
 use std::task::Waker;
 
+use smallvec::SmallVec;
+
 use super::CQEResult;
+
+pub(crate) type CompletionQueue = SmallVec<[CQEResult; 1]>;
 
 /// Header is the first field in every operation. It is the handle
 /// through which the reactor completes operations.
@@ -14,7 +17,7 @@ use super::CQEResult;
 pub(crate) struct Header {
     refcount: Cell<usize>,
     waker: RefCell<Option<Waker>>,
-    completions: RefCell<VecDeque<CQEResult>>,
+    completions: RefCell<CompletionQueue>,
     complete: Cell<bool>,
     pub(crate) vtable: &'static VTable,
 }
@@ -63,7 +66,7 @@ impl Header {
         Self {
             refcount: Cell::new(1),
             waker: Default::default(),
-            completions: RefCell::new(VecDeque::new()),
+            completions: RefCell::new(SmallVec::new()),
             complete: Cell::new(false),
             vtable,
         }
@@ -90,12 +93,12 @@ impl Header {
     }
 
     /// Returns a reference to the completion list.
-    pub(crate) fn completions(&self) -> &RefCell<VecDeque<CQEResult>> {
+    pub(crate) fn completions(&self) -> &RefCell<CompletionQueue> {
         &self.completions
     }
 
     /// Returns a mutable reference to the completion list.
-    pub(crate) fn completions_mut(&mut self) -> &mut RefCell<VecDeque<CQEResult>> {
+    pub(crate) fn completions_mut(&mut self) -> &mut RefCell<CompletionQueue> {
         &mut self.completions
     }
 

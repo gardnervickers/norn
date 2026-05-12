@@ -6,10 +6,6 @@ use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::{pin, Pin};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::thread::JoinHandle;
-use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bencher::bench;
@@ -18,7 +14,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 
 use norn_uring::bufring::BufRing;
 use norn_uring::fs;
-use norn_uring::net::UdpSocket;
+use norn_uring::net::UdpSocket as NornUdpSocket;
 
 mod support;
 
@@ -65,8 +61,28 @@ impl Drop for BenchDir {
     }
 }
 
-async fn udp_request_response_worker(
-    sockets: &[UdpSocket],
+async fn norn_udp_echo_server(
+    socket: &NornUdpSocket,
+    payload_len: usize,
+    total_requests: usize,
+) -> io::Result<()> {
+    let mut buf = vec![0u8; payload_len];
+    for _ in 0..total_requests {
+        let (recv_res, recv) = socket.recv_from(buf).await;
+        buf = recv;
+        let (n, peer) = recv_res?;
+        assert_eq!(n, payload_len);
+
+        let (send_res, send) = socket.send_to(buf, peer).await;
+        buf = send;
+        let sent = send_res?;
+        assert_eq!(sent, payload_len);
+    }
+    Ok(())
+}
+
+async fn norn_udp_request_response_worker(
+    sockets: &[NornUdpSocket],
     recv_mode: UdpRecvMode,
     recv_rings: &[BufRing],
     server_addr: std::net::SocketAddr,
@@ -86,13 +102,15 @@ async fn udp_request_response_worker(
         let lane_requests = per_lane + usize::from(lane < extra);
         if lane_requests > 0 {
             match recv_mode {
-                UdpRecvMode::Single => pending.push(Box::pin(udp_request_response_lane_single(
-                    socket,
-                    server_addr,
-                    payload_len,
-                    lane_requests,
-                ))),
-                UdpRecvMode::Multi => pending.push(Box::pin(udp_request_response_lane_multi(
+                UdpRecvMode::Single => {
+                    pending.push(Box::pin(norn_udp_request_response_lane_single(
+                        socket,
+                        server_addr,
+                        payload_len,
+                        lane_requests,
+                    )))
+                }
+                UdpRecvMode::Multi => pending.push(Box::pin(norn_udp_request_response_lane_multi(
                     socket,
                     &recv_rings[lane],
                     server_addr,
@@ -110,8 +128,8 @@ async fn udp_request_response_worker(
     Ok(())
 }
 
-async fn udp_request_response_lane_single(
-    socket: &UdpSocket,
+async fn norn_udp_request_response_lane_single(
+    socket: &NornUdpSocket,
     server_addr: std::net::SocketAddr,
     payload_len: usize,
     requests: usize,
@@ -133,8 +151,8 @@ async fn udp_request_response_lane_single(
     Ok(())
 }
 
-async fn udp_request_response_lane_multi(
-    socket: &UdpSocket,
+async fn norn_udp_request_response_lane_multi(
+    socket: &NornUdpSocket,
     recv_ring: &BufRing,
     server_addr: std::net::SocketAddr,
     payload_len: usize,
@@ -155,55 +173,74 @@ async fn udp_request_response_lane_multi(
     Ok(())
 }
 
-struct ThreadUdpEchoServer {
-    addr: std::net::SocketAddr,
-    stop: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
-}
+async fn tokio_udp_echo_server(
+    socket: &tokio::net::UdpSocket,
+    payload_len: usize,
+    total_requests: usize,
+) -> io::Result<()> {
+    let mut buf = vec![0u8; payload_len];
+    for _ in 0..total_requests {
+        let (n, peer) = socket.recv_from(&mut buf).await?;
+        assert_eq!(n, payload_len);
 
-impl ThreadUdpEchoServer {
-    fn new(payload_len: usize) -> io::Result<Self> {
-        let socket = std::net::UdpSocket::bind("127.0.0.1:0")?;
-        socket.set_read_timeout(Some(Duration::from_millis(50)))?;
-        let addr = socket.local_addr()?;
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_clone = Arc::clone(&stop);
-
-        let thread = std::thread::spawn(move || {
-            let mut buf = vec![0u8; payload_len];
-            while !stop_clone.load(Ordering::Relaxed) {
-                match socket.recv_from(&mut buf) {
-                    Ok((n, peer)) => {
-                        let sent = socket.send_to(&buf[..n], peer).unwrap();
-                        assert_eq!(sent, n);
-                    }
-                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
-                    Err(err) if err.kind() == io::ErrorKind::TimedOut => {}
-                    Err(err) => panic!("udp echo server recv failed: {err}"),
-                }
-            }
-        });
-
-        Ok(Self {
-            addr,
-            stop,
-            thread: Some(thread),
-        })
+        let sent = socket.send_to(&buf[..n], peer).await?;
+        assert_eq!(sent, payload_len);
     }
+    Ok(())
 }
 
-impl Drop for ThreadUdpEchoServer {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        let _ = std::net::UdpSocket::bind("127.0.0.1:0")
-            .and_then(|waker| waker.send_to(&[0u8], self.addr).map(|_| ()));
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+async fn tokio_udp_request_response_worker(
+    sockets: &[tokio::net::UdpSocket],
+    server_addr: std::net::SocketAddr,
+    payload_len: usize,
+    total_requests: usize,
+) -> io::Result<()> {
+    let lanes = cmp::max(1, sockets.len());
+    let per_lane = total_requests / lanes;
+    let extra = total_requests % lanes;
+    let mut pending: FuturesUnordered<Pin<Box<dyn Future<Output = io::Result<()>> + '_>>> =
+        FuturesUnordered::new();
+
+    for (lane, socket) in sockets.iter().enumerate() {
+        let lane_requests = per_lane + usize::from(lane < extra);
+        if lane_requests > 0 {
+            pending.push(Box::pin(tokio_udp_request_response_lane(
+                socket,
+                server_addr,
+                payload_len,
+                lane_requests,
+            )));
         }
     }
+
+    while let Some(result) = pending.next().await {
+        result?;
+    }
+
+    Ok(())
+}
+
+async fn tokio_udp_request_response_lane(
+    socket: &tokio::net::UdpSocket,
+    server_addr: std::net::SocketAddr,
+    payload_len: usize,
+    requests: usize,
+) -> io::Result<()> {
+    let send_buf = vec![0x5A; payload_len];
+    let mut recv_buf = vec![0u8; payload_len];
+    for _ in 0..requests {
+        let sent = socket.send_to(&send_buf, server_addr).await?;
+        assert_eq!(sent, payload_len);
+
+        let (n, addr) = socket.recv_from(&mut recv_buf).await?;
+        assert_eq!(n, payload_len);
+        assert_eq!(addr, server_addr);
+    }
+    Ok(())
 }
 
 struct UdpRequestResponseBench {
+    runtime: RuntimeKind,
     total_requests: usize,
     payload_len: usize,
     window: usize,
@@ -212,16 +249,33 @@ struct UdpRequestResponseBench {
 
 impl UdpRequestResponseBench {
     fn new(
+        runtime: RuntimeKind,
         total_requests: usize,
         payload_len: usize,
         window: usize,
         recv_mode: UdpRecvMode,
     ) -> Self {
         Self {
+            runtime,
             total_requests,
             payload_len,
             window,
             recv_mode,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeKind {
+    Norn,
+    Tokio,
+}
+
+impl RuntimeKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Norn => "norn",
+            Self::Tokio => "tokio",
         }
     }
 }
@@ -243,16 +297,27 @@ impl UdpRecvMode {
 
 impl bencher::TDynBenchFn for UdpRequestResponseBench {
     fn run(&self, b: &mut Bencher) {
-        let server = ThreadUdpEchoServer::new(self.payload_len).unwrap();
-        let server_addr = server.addr;
+        match self.runtime {
+            RuntimeKind::Norn => self.run_norn(b),
+            RuntimeKind::Tokio => self.run_tokio(b),
+        }
+    }
+}
+
+impl UdpRequestResponseBench {
+    fn run_norn(&self, b: &mut Bencher) {
         let mut ex = new_executor();
         let lane_count = cmp::max(1, cmp::min(self.window, self.total_requests));
         let recv_mode = self.recv_mode;
-        let (mut client_sockets, mut recv_rings) = ex.block_on(async {
+        let (server_socket, server_addr, mut client_sockets, mut recv_rings) = ex.block_on(async {
+            let server_socket = NornUdpSocket::bind("127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap();
+            let server_addr = server_socket.local_addr().unwrap();
             let mut sockets = Vec::with_capacity(lane_count);
             for _ in 0..lane_count {
                 sockets.push(
-                    UdpSocket::bind("127.0.0.1:0".parse().unwrap())
+                    NornUdpSocket::bind("127.0.0.1:0".parse().unwrap())
                         .await
                         .unwrap(),
                 );
@@ -270,22 +335,24 @@ impl bencher::TDynBenchFn for UdpRequestResponseBench {
                     );
                 }
             }
-            (sockets, rings)
+            (server_socket, server_addr, sockets, rings)
         });
 
         b.iter(|| {
             let total_requests = self.total_requests;
             let payload_len = self.payload_len;
             ex.block_on(async {
-                udp_request_response_worker(
-                    &client_sockets,
-                    recv_mode,
-                    &recv_rings,
-                    server_addr,
-                    payload_len,
-                    total_requests,
+                futures::try_join!(
+                    norn_udp_echo_server(&server_socket, payload_len, total_requests),
+                    norn_udp_request_response_worker(
+                        &client_sockets,
+                        recv_mode,
+                        &recv_rings,
+                        server_addr,
+                        payload_len,
+                        total_requests,
+                    )
                 )
-                .await
                 .unwrap();
             });
         });
@@ -295,6 +362,42 @@ impl bencher::TDynBenchFn for UdpRequestResponseBench {
                 socket.close().await.unwrap();
             }
             recv_rings.clear();
+            server_socket.close().await.unwrap();
+        });
+    }
+
+    fn run_tokio(&self, b: &mut Bencher) {
+        assert_eq!(self.recv_mode, UdpRecvMode::Single);
+        let lane_count = cmp::max(1, cmp::min(self.window, self.total_requests));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .unwrap();
+        let (server_socket, server_addr, client_sockets) = rt.block_on(async {
+            let server_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let server_addr = server_socket.local_addr().unwrap();
+            let mut sockets = Vec::with_capacity(lane_count);
+            for _ in 0..lane_count {
+                sockets.push(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            }
+            (server_socket, server_addr, sockets)
+        });
+
+        b.iter(|| {
+            let total_requests = self.total_requests;
+            let payload_len = self.payload_len;
+            rt.block_on(async {
+                futures::try_join!(
+                    tokio_udp_echo_server(&server_socket, payload_len, total_requests),
+                    tokio_udp_request_response_worker(
+                        &client_sockets,
+                        server_addr,
+                        payload_len,
+                        total_requests,
+                    )
+                )
+                .unwrap();
+            });
         });
     }
 }
@@ -415,22 +518,30 @@ fn benches() -> Vec<TestDescAndFn> {
     for total_requests in [4_096, 8_192] {
         for payload_len in [64, 1024] {
             for window in [1, 2, 4, 8, 16, 32, 64] {
-                for recv_mode in [UdpRecvMode::Single, UdpRecvMode::Multi] {
-                    benches.push(TestDescAndFn {
-                        desc: TestDesc {
-                            name: Cow::from(format!(
-                                "bench_udp_request_response/recv={}/window={window}/total_requests={total_requests}/payload={payload_len}",
-                                recv_mode.as_str()
-                            )),
-                            ignore: false,
-                        },
-                        testfn: TestFn::DynBenchFn(Box::new(UdpRequestResponseBench::new(
-                            total_requests,
-                            payload_len,
-                            window,
-                            recv_mode,
-                        ))),
-                    });
+                for runtime in [RuntimeKind::Norn, RuntimeKind::Tokio] {
+                    let recv_modes: &[UdpRecvMode] = match runtime {
+                        RuntimeKind::Norn => &[UdpRecvMode::Single, UdpRecvMode::Multi],
+                        RuntimeKind::Tokio => &[UdpRecvMode::Single],
+                    };
+                    for recv_mode in recv_modes {
+                        benches.push(TestDescAndFn {
+                            desc: TestDesc {
+                                name: Cow::from(format!(
+                                    "bench_udp_request_response/runtime={}/recv={}/window={window}/total_requests={total_requests}/payload={payload_len}",
+                                    runtime.as_str(),
+                                    recv_mode.as_str()
+                                )),
+                                ignore: false,
+                            },
+                            testfn: TestFn::DynBenchFn(Box::new(UdpRequestResponseBench::new(
+                                runtime,
+                                total_requests,
+                                payload_len,
+                                window,
+                                *recv_mode,
+                            ))),
+                        });
+                    }
                 }
             }
         }

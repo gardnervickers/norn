@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{ready, Context, Poll, Waker};
@@ -15,6 +14,7 @@ use smallvec::SmallVec;
 
 use crate::driver::PushFuture;
 use crate::error::SubmitError;
+use header::CompletionQueue;
 
 /// Low-level request customization for advanced io_uring users.
 pub trait Operation {
@@ -346,16 +346,18 @@ where
         self.inner.clone()
     }
 
-    fn take_completions(&self) -> VecDeque<CQEResult> {
-        let handle = self.untyped();
-        let mut completions = handle.header().completions().borrow_mut();
+    fn take_completions(&self) -> CompletionQueue {
+        let mut completions = self.inner.header().completions().borrow_mut();
         mem::take(&mut *completions)
     }
 
     fn pop_completion(&self) -> Option<CQEResult> {
-        let handle = self.untyped();
-        let mut completions = handle.header().completions().borrow_mut();
-        completions.pop_front()
+        let mut completions = self.inner.header().completions().borrow_mut();
+        if completions.is_empty() {
+            None
+        } else {
+            Some(completions.remove(0))
+        }
     }
 
     /// Returns true if this operation is complete.
