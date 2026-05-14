@@ -25,6 +25,7 @@ pub struct OpenOptions {
     pub(crate) direct: bool,
     pub(crate) sync: bool,
     pub(crate) dsync: bool,
+    pub(crate) mode: u32,
 }
 
 impl OpenOptions {
@@ -33,6 +34,7 @@ impl OpenOptions {
     /// All options are initially set to `false`.
     pub fn new() -> Self {
         Self {
+            mode: 0o666,
             ..Default::default()
         }
     }
@@ -129,6 +131,16 @@ impl OpenOptions {
     /// Sets the option to open this file in O_DSYNC mode.
     pub fn dsync(&mut self, dsync: bool) -> &mut Self {
         self.dsync = dsync;
+        self
+    }
+
+    /// Sets the mode used when creating a file.
+    ///
+    /// This is only used when [`OpenOptions::create`] or
+    /// [`OpenOptions::create_new`] creates a file. The process umask is still
+    /// applied by the kernel.
+    pub fn mode(&mut self, mode: u32) -> &mut Self {
+        self.mode = mode;
         self
     }
 

@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "benches",
+    "examples/norn-kv",
     "examples/ping-pong-grpc",
     "norn-executor",
     "norn-nursery",

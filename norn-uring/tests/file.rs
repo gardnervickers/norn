@@ -20,6 +20,26 @@ fn open_close() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn create_uses_readable_default_mode() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let dir = util::ThreadNameTestDir::new();
+        let path = dir.join("created-mode");
+        let mut opts = fs::OpenOptions::new();
+        opts.create(true).write(true).read(true);
+
+        let file = opts.open(&path).await?;
+        file.close().await?;
+
+        let mut opts = fs::OpenOptions::new();
+        opts.read(true).write(true);
+        let file = opts.open(&path).await?;
+        file.close().await?;
+
+        Ok(())
+    })
+}
+
+#[test]
 fn read_write() -> Result<(), Box<dyn std::error::Error>> {
     util::with_test_env(|| async {
         let dir = util::ThreadNameTestDir::new();

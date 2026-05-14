@@ -11,10 +11,12 @@ norn-task = { path = "../norn-task" }
 norn-executor = { path = "../norn-executor" }
 norn-timer = { path = "../norn-timer" }
 norn-util = { path = "../norn-util" }
+norn-kv = { path = "../examples/norn-kv" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 norn-uring = { path = "../norn-uring" }
 io-uring = "0.7.11"
+libc = "0.2.149"
 hyper = { version = "1", features = ["client", "server", "http2"] }
 pin-project-lite = "0.2.13"
 tokio = { version = "1.35.0", features = ["io-util", "net", "rt"] }
@@ -58,4 +60,9 @@ harness = false
 [[bench]]
 name = "io_uring_accept_recv"
 path = "io_uring_accept_recv.rs"
+harness = false
+
+[[bench]]
+name = "norn_kv"
+path = "norn_kv.rs"
 harness = false

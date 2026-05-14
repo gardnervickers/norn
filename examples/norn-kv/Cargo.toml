@@ -1,0 +1,15 @@
+[package]
+name = "norn-kv"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+crc-fast = { version = "=1.9.0", default-features = false, features = ["std"] }
+thiserror.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7"
+libc = "0.2.149"
+norn-executor = { path = "../../norn-executor" }
+norn-uring = { path = "../../norn-uring" }

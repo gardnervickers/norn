@@ -76,7 +76,7 @@ impl File {
     ) -> io::Result<Self> {
         let access_mode = opts.get_access_mode()?;
         let creation_mode = opts.get_creation_mode()?;
-        let open = Open::new(path.as_ref(), access_mode, creation_mode)?;
+        let open = Open::new(path.as_ref(), access_mode, creation_mode, opts.mode)?;
         let handle = crate::Handle::current();
         let fd = handle.submit(open).await?;
         Ok(Self { fd, handle })
@@ -354,13 +354,16 @@ struct Open {
 }
 
 impl Open {
-    fn new(path: &Path, access_mode: i32, creation_mode: i32) -> io::Result<Self> {
+    fn new(path: &Path, access_mode: i32, creation_mode: i32, mode: u32) -> io::Result<Self> {
         let path = path
             .to_str()
             .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
         let path = std::ffi::CString::new(path)?;
         let flags = access_mode | creation_mode | libc::O_CLOEXEC;
-        let how = types::OpenHow::new().flags(flags as u64);
+        let mut how = types::OpenHow::new().flags(flags as u64);
+        if creation_mode & libc::O_CREAT != 0 {
+            how = how.mode(mode as u64);
+        }
         Ok(Self { path, how })
     }
 }
