@@ -5,6 +5,12 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Poll, RawWaker, RawWakerVTable, Waker};
 
+pub(super) type RootNotifier = Rc<Cell<bool>>;
+
+pub(super) fn root_notifier() -> RootNotifier {
+    Rc::new(Cell::new(true))
+}
+
 /// [`FutureHarness`] wraps a pinned future
 /// with a waker and provides a way to poll it.
 pub(super) struct FutureHarness<'a, F> {
@@ -18,10 +24,9 @@ where
     F: Future,
 {
     /// Construct a new [`FutureHarness`] from a pinned future.
-    pub(crate) fn new(future: Pin<&'a mut F>) -> Self {
-        let poll_root = Rc::new(Cell::new(true));
-        let pf = Rc::clone(&poll_root);
-        let waker = waker_fn(pf);
+    pub(crate) fn new(future: Pin<&'a mut F>, poll_root: RootNotifier) -> Self {
+        poll_root.set(true);
+        let waker = waker_fn(Rc::clone(&poll_root));
         Self {
             task: future,
             poll_root,
@@ -48,6 +53,19 @@ where
     /// Returns true if the future is ready to be polled.
     pub(crate) fn is_notified(&self) -> bool {
         self.poll_root.get()
+    }
+
+    /// Reclaim the root notifier when no clone of this root future's waker
+    /// escaped. An escaped waker retains its own notifier generation so waking
+    /// it cannot spuriously notify a later `block_on` call.
+    pub(crate) fn into_reusable_notifier(self) -> Option<RootNotifier> {
+        let Self {
+            task: _,
+            poll_root,
+            waker,
+        } = self;
+        drop(waker);
+        (Rc::strong_count(&poll_root) == 1).then_some(poll_root)
     }
 }
 

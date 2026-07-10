@@ -53,6 +53,11 @@ path = "task_state.rs"
 harness = false
 
 [[bench]]
+name = "executor"
+path = "executor.rs"
+harness = false
+
+[[bench]]
 name = "uring_realworld"
 path = "uring_realworld.rs"
 harness = false

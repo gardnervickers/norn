@@ -26,6 +26,7 @@ pub struct LocalExecutor<P: park::Park> {
     /// Task queue contains tasks which are ready to be executed.
     taskqueue: norn_task::TaskQueue,
     park: P,
+    root_notifier: Option<wakerfn::RootNotifier>,
 }
 
 impl<P: park::Park> std::fmt::Debug for LocalExecutor<P> {
@@ -45,6 +46,7 @@ impl<P: park::Park> LocalExecutor<P> {
         Self {
             taskqueue: norn_task::TaskQueue::new(),
             park,
+            root_notifier: Some(wakerfn::root_notifier()),
         }
     }
 
@@ -70,10 +72,15 @@ impl<P: park::Park> LocalExecutor<P> {
     {
         let _g = self.enter();
         let fut = pin!(fut);
-        let mut root = wakerfn::FutureHarness::new(fut);
+        let notifier = self
+            .root_notifier
+            .take()
+            .unwrap_or_else(wakerfn::root_notifier);
+        let mut root = wakerfn::FutureHarness::new(fut, notifier);
 
         loop {
             if let Some(result) = root.try_poll() {
+                self.root_notifier = root.into_reusable_notifier();
                 return result;
             }
             let mut has_remaining_tasks = false;
@@ -146,9 +153,12 @@ impl<P: park::Park> Drop for LocalExecutor<P> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::future;
     use std::io;
+    use std::rc::Rc;
     use std::task::Poll;
+    use std::task::Waker;
 
     use crate::park::SpinPark;
 
@@ -160,6 +170,25 @@ mod tests {
 
         let res = executor.block_on(async { 1 + 1 });
         assert_eq!(res, 2);
+        assert!(executor.root_notifier.is_some());
+    }
+
+    #[test]
+    fn escaped_root_waker_is_not_reused() {
+        let mut executor = LocalExecutor::new(SpinPark);
+        let escaped = Rc::new(RefCell::new(None::<Waker>));
+        let escaped_by_future = Rc::clone(&escaped);
+
+        executor.block_on(future::poll_fn(move |cx| {
+            *escaped_by_future.borrow_mut() = Some(cx.waker().clone());
+            Poll::Ready(())
+        }));
+
+        assert!(executor.root_notifier.is_none());
+        drop(escaped.borrow_mut().take());
+
+        executor.block_on(async {});
+        assert!(executor.root_notifier.is_some());
     }
 
     #[test]
