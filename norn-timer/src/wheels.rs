@@ -1,4 +1,4 @@
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, UnsafeCell};
 use std::pin::Pin;
 use std::ptr;
 use std::rc::Rc;
@@ -11,7 +11,7 @@ use crate::{entry, error, level, MAX_DURATION, NUM_LEVELS};
 pub(crate) struct Wheels {
     elapsed: Cell<u64>,
     shutdown: Cell<bool>,
-    wheels: RefCell<Vec<level::Level>>,
+    levels: UnsafeCell<[level::Level; NUM_LEVELS]>,
     next_expiration_hint: Cell<Option<level::Expiration>>,
     next_expiration_dirty: Cell<bool>,
 }
@@ -35,11 +35,10 @@ impl entry::TimerList for Rc<Wheels> {
 
 impl Wheels {
     pub(crate) fn new() -> Self {
-        let levels = (0..NUM_LEVELS).map(level::Level::new).collect();
         Self {
             elapsed: Cell::new(0),
             shutdown: Cell::new(false),
-            wheels: RefCell::new(levels),
+            levels: UnsafeCell::new(std::array::from_fn(level::Level::new)),
             next_expiration_hint: Cell::new(None),
             next_expiration_dirty: Cell::new(false),
         }
@@ -50,8 +49,9 @@ impl Wheels {
     /// This should only be used for debugging or tests.
     #[cfg(test)]
     fn num_registered(&self) -> usize {
-        self.wheels
-            .borrow()
+        // Safety: The timer wheel is local-only and this immutable access does
+        // not overlap any mutable level access.
+        unsafe { &*self.levels.get() }
             .iter()
             .map(|w| w.num_registered())
             .sum()
@@ -105,7 +105,9 @@ impl Wheels {
             unsafe { entry.as_ref().fire(Ok(())) };
         } else {
             let wheel = wheel_for(self.elapsed(), expiration);
-            let candidate = self.wheels.borrow_mut()[wheel].add_entry(entry);
+            // Safety: The timer wheel is driven on one thread and level
+            // mutations never span callbacks into user code.
+            let candidate = unsafe { (&mut *self.levels.get())[wheel].add_entry(entry) };
             if !self.next_expiration_dirty.get() {
                 if let Some(current) = self.next_expiration_hint.get() {
                     // A newly inserted timer may only invalidate the hint if
@@ -122,7 +124,8 @@ impl Wheels {
 
     fn remove(&self, entry: ptr::NonNull<entry::Entry>) -> Option<ptr::NonNull<entry::Entry>> {
         let (wheel, slot) = unsafe { entry.as_ref().location() };
-        let removed = unsafe { self.wheels.borrow_mut()[wheel].remove_entry(entry) };
+        // Safety: See `insert`; removal performs no user callbacks.
+        let removed = unsafe { (&mut *self.levels.get())[wheel].remove_entry(entry) };
         if removed.is_some() {
             if let Some(next) = self.next_expiration_hint.get() {
                 if next.level() == wheel && next.slot() == slot {
@@ -145,9 +148,10 @@ impl Wheels {
 
     fn scan_next_expiration(&self) -> Option<level::Expiration> {
         let now = self.elapsed.get();
-        let mut wheels = self.wheels.borrow_mut();
-        for level in 0..NUM_LEVELS {
-            if let Some(expiration) = wheels[level].next_expiration(now) {
+        // Safety: Scanning is local-only and does not call user code.
+        let levels = unsafe { &mut *self.levels.get() };
+        for level in levels.iter_mut() {
+            if let Some(expiration) = level.next_expiration(now) {
                 return Some(expiration);
             }
         }
@@ -180,7 +184,8 @@ impl Wheels {
 
     fn take_entries(&self, expiration: &level::Expiration) -> cordyceps::List<entry::Entry> {
         self.next_expiration_dirty.set(true);
-        self.wheels.borrow_mut()[expiration.level()].take_slot(expiration.slot())
+        // Safety: Taking a slot finishes before its entries wake user tasks.
+        unsafe { (&mut *self.levels.get())[expiration.level()].take_slot(expiration.slot()) }
     }
 
     pub(crate) fn shutdown(&self) {
