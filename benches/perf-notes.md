@@ -465,3 +465,60 @@ Repeated key cases:
 - Do not revisit request linking as a generic send/completion optimization
   without a benchmark shape that can benefit from deeper independent batches or
   from avoiding multiple explicit round trips.
+
+## 2026-07-10: Timer and `io_uring` Follow-up
+
+Portable profiling found three repeatable timer-wheel wins:
+
+- Lazy minimum-expiration recomputation after timer cancellation reduced the
+  4,096-timer cancellation benchmark from `11.818 ms` to `107.618 us` and also
+  improved the 64- and 512-timer cases by about `38%` and `88%`.
+- Storing the six wheel levels inline reduced the 256-timer benchmark by about
+  `6.1%` to `6.4%` across the 1-, 32-, and 64-task cases.
+- Removing `RefCell` borrow checks from the scoped timer-entry waker reduced
+  those same cases by another `5.7%` to `9.3%`.
+
+The latter two changes were checked with fresh-target Miri wheel tests and
+reduced the cancellation target by a further `5.6%` in combination.
+
+Tried and rejected after the retained timer changes:
+
+- Rewrite `Sleep::poll` to collapse its initial-registration and reset paths.
+  - Result: the 256-timer 1-, 32-, and 64-task cases regressed from about
+    `8.373`, `6.104`, and `7.238 us` to about `13.5`, `8.9`, and `9.8 us`.
+  - Reason rejected: large, consistent regressions in the primary timer target.
+- Remove the raw-operation lifecycle vtable, retesting commit `e13cf44` against
+  the current tree on Linux.
+  - Result: file round trips moved from a `113.239 ms` median to `113.113 ms`
+    (about `0.1%` faster), while noop submission moved from `28.107 ms` to
+    `28.240 ms` (about `0.5%` slower).
+  - Reason rejected: no material gain and a small regression in the focused
+    submission target.
+- Replace operation-header completion and waker `RefCell`s with scoped
+  `UnsafeCell` access.
+  - Result: file round trips improved from `113.239 ms` to `109.138 ms`
+    (`3.6%`) and noop submission from `28.107 ms` to `27.683 ms` (`1.5%`).
+  - Reason rejected: both results were below the `5%` materiality threshold and
+    did not justify adding unsafe lifecycle code.
+- Port fixed-buffer file I/O from commit `a3a72d6`.
+  - Result at 16,384 4-KiB operations: fixed-buffer direct writes took
+    `368.722 ms` versus `366.894 ms` for ordinary direct I/O; fixed-buffer
+    direct reads took `368.425 ms` versus a noisy `383.217 ms` direct-I/O run
+    and `368.008 ms` buffered run.
+  - Reason rejected: no write gain, no gain over buffered reads, and at most a
+    noisy `3.9%` gain over direct reads for roughly 1,000 lines of API and test
+    surface.
+- Port the batched UDP send-bundle branch (`0252622`/`8175bcf`).
+  - Result for 2,048 4-KiB datagrams (16 x 256-byte segments): copy/coalesce
+    median `4.136 ms`; bundle median `5.129 ms` (`24%` slower).
+  - Result for 2,048 32-KiB datagrams (64 x 512-byte segments): copy/coalesce
+    median `11.012 ms`; bundle median `12.437 ms` (`13%` slower).
+  - Reason rejected: the bundle path lost even in the copy-heavy case where it
+    had the best chance to win, while adding substantial buffer lifecycle and
+    operation API complexity.
+
+The unmerged ZCRX branch (`582d451`) was not treated as an optimization of the
+existing Norn receive path. It adds a separate kernel/NIC facility, and its
+microbenchmark measures only its own completion parsing and refill helper with
+no existing-path comparator. Evaluate it as a feature on supported hardware,
+not as evidence for a portable runtime fast-path change.
