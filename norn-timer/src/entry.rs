@@ -1,4 +1,4 @@
-use std::cell::{Cell, RefCell, UnsafeCell};
+use std::cell::{Cell, UnsafeCell};
 use std::future::Future;
 use std::marker::PhantomPinned;
 use std::pin::Pin;
@@ -59,7 +59,9 @@ where
                 }
                 State::Registered => {
                     debug_assert!(me.entry.is_registered());
-                    let mut w = me.entry.waker.borrow_mut();
+                    // Safety: Timer entries are local-only. This mutable access
+                    // is short-lived and performs no callbacks.
+                    let w = unsafe { &mut *me.entry.waker.get() };
                     if !w
                         .as_ref()
                         .is_some_and(|existing| existing.will_wake(cx.waker()))
@@ -103,14 +105,15 @@ where
         debug_assert!(!self.entry.is_registered());
         self.entry.complete.set(Ok(()));
         self.entry.deadline.set(0);
-        self.entry.waker.borrow_mut().take();
+        // Safety: Reset has exclusive access to the sleep and entry.
+        unsafe { (&mut *self.entry.waker.get()).take() };
     }
 }
 
 pin_project_lite::pin_project! {
     pub(crate) struct Entry {
         state: Cell<State>,
-        waker: RefCell<Option<Waker>>,
+        waker: UnsafeCell<Option<Waker>>,
         complete: Cell<Result<(), error::Error>>,
         deadline: Cell<u64>,
         wheel: Cell<u8>,
@@ -126,7 +129,7 @@ impl Entry {
     fn new() -> Self {
         Self {
             state: Cell::new(State::Unregistered),
-            waker: RefCell::new(None),
+            waker: UnsafeCell::new(None),
             complete: Cell::new(Ok(())),
             pointers: UnsafeCell::new(list::Links::new()),
             _p: PhantomPinned,
@@ -172,7 +175,10 @@ impl Entry {
     pub(crate) fn fire(&self, completion: Result<(), error::Error>) {
         self.state.set(State::Fired);
         self.complete.set(completion);
-        if let Some(waker) = self.waker.borrow_mut().take() {
+        // Take the waker before invoking it so no mutable entry access spans
+        // the callback.
+        let waker = unsafe { (&mut *self.waker.get()).take() };
+        if let Some(waker) = waker {
             waker.wake();
         }
     }
