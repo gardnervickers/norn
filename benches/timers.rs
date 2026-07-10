@@ -1,5 +1,7 @@
 use std::borrow::Cow;
 use std::cmp;
+use std::future::Future;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bencher::{Bencher, TestDesc, TestDescAndFn, TestFn};
@@ -12,6 +14,73 @@ mod support;
 struct TimerBench {
     tasks: usize,
     timers: usize,
+}
+
+struct CancelBench {
+    timers: usize,
+}
+
+struct TokioCancelBench {
+    timers: usize,
+}
+
+impl bencher::TDynBenchFn for CancelBench {
+    fn run(&self, b: &mut Bencher) {
+        let clock = Clock::simulated();
+        let driver = Driver::new((), clock);
+        let handle = driver.handle();
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let timers = self.timers;
+
+        b.iter(|| {
+            let mut sleeps = (0..timers)
+                .map(|offset| Box::pin(handle.sleep(Duration::from_millis(4096 + offset as u64))))
+                .collect::<Vec<_>>();
+
+            for sleep in &mut sleeps {
+                assert!(matches!(sleep.as_mut().poll(&mut cx), Poll::Pending));
+            }
+
+            // All deadlines occupy the same higher-level wheel slot. Cancelling
+            // in ascending deadline order stresses minimum-deadline maintenance.
+            for sleep in sleeps {
+                drop(sleep);
+            }
+        });
+    }
+}
+
+impl bencher::TDynBenchFn for TokioCancelBench {
+    fn run(&self, b: &mut Bencher) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let timers = self.timers;
+
+        b.iter(|| {
+            let start = tokio::time::Instant::now();
+            let mut sleeps = (0..timers)
+                .map(|offset| {
+                    Box::pin(tokio::time::sleep_until(
+                        start + Duration::from_millis(4096 + offset as u64),
+                    ))
+                })
+                .collect::<Vec<_>>();
+
+            for sleep in &mut sleeps {
+                assert!(matches!(sleep.as_mut().poll(&mut cx), Poll::Pending));
+            }
+
+            for sleep in sleeps {
+                drop(sleep);
+            }
+        });
+    }
 }
 
 impl bencher::TDynBenchFn for TimerBench {
@@ -99,6 +168,26 @@ pub fn benches() -> ::std::vec::Vec<TestDescAndFn> {
                 })),
             })
         }
+    }
+    for timers in [64, 512, 4096] {
+        benches.push(TestDescAndFn {
+            desc: TestDesc {
+                name: Cow::from(format!(
+                    "bench_cancel_same_slot/runtime=norn/timers={timers}"
+                )),
+                ignore: false,
+            },
+            testfn: TestFn::DynBenchFn(Box::new(CancelBench { timers })),
+        });
+        benches.push(TestDescAndFn {
+            desc: TestDesc {
+                name: Cow::from(format!(
+                    "bench_cancel_same_slot/runtime=tokio/timers={timers}"
+                )),
+                ignore: false,
+            },
+            testfn: TestFn::DynBenchFn(Box::new(TokioCancelBench { timers })),
+        });
     }
     benches
 }

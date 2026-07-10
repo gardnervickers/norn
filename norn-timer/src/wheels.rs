@@ -145,7 +145,7 @@ impl Wheels {
 
     fn scan_next_expiration(&self) -> Option<level::Expiration> {
         let now = self.elapsed.get();
-        let wheels = self.wheels.borrow();
+        let mut wheels = self.wheels.borrow_mut();
         for level in 0..NUM_LEVELS {
             if let Some(expiration) = wheels[level].next_expiration(now) {
                 return Some(expiration);
@@ -348,5 +348,32 @@ mod tests {
         assert_eq!(expired, 1);
         assert!(next.is_none());
         assert!(second.as_mut().poll(&mut cx).is_ready());
+    }
+
+    #[test]
+    fn removing_multiple_earliest_timers_preserves_exact_deadline() {
+        let mut cx = futures_test::task::noop_context();
+        let timer = Driver::new((), Clock::system());
+        let handle = timer.handle();
+        let mut first = Box::pin(handle.sleep(Duration::from_millis(4096)));
+        let mut second = Box::pin(handle.sleep(Duration::from_millis(4097)));
+        let mut third = Box::pin(handle.sleep(Duration::from_millis(4098)));
+
+        assert!(first.as_mut().poll(&mut cx).is_pending());
+        assert!(second.as_mut().poll(&mut cx).is_pending());
+        assert!(third.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(timer.wheels.advance(0).1.unwrap().deadline(), 4096);
+
+        drop(first);
+        drop(second);
+
+        let (expired, next) = timer.wheels.advance(0);
+        assert_eq!(expired, 0);
+        assert_eq!(next.unwrap().deadline(), 4098);
+
+        let (expired, next) = timer.wheels.advance(4098);
+        assert_eq!(expired, 1);
+        assert!(next.is_none());
+        assert!(third.as_mut().poll(&mut cx).is_ready());
     }
 }

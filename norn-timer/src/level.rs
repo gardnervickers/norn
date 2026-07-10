@@ -47,6 +47,7 @@ impl Expiration {
 pub(crate) struct Level {
     level: usize,
     bitfield: u64,
+    dirty_slots: u64,
     slots: [cordyceps::List<Entry>; Self::LEVEL_MULT],
     slot_deadlines: [Option<u64>; Self::LEVEL_MULT],
 }
@@ -58,6 +59,7 @@ impl Level {
         Self {
             level,
             bitfield: 0,
+            dirty_slots: 0,
             slots: std::array::from_fn(|_| cordyceps::List::new()),
             slot_deadlines: std::array::from_fn(|_| None),
         }
@@ -68,8 +70,13 @@ impl Level {
         self.slots.iter().map(|s| s.len()).sum()
     }
 
-    pub(crate) fn next_expiration(&self, now: u64) -> Option<Expiration> {
+    pub(crate) fn next_expiration(&mut self, now: u64) -> Option<Expiration> {
         let slot = self.next_occupied_slot(now)?;
+        let slot_bit = occupied_bit(slot);
+        if self.dirty_slots & slot_bit != 0 {
+            self.slot_deadlines[slot] = self.slots[slot].iter().map(Entry::expiration).min();
+            self.dirty_slots &= !slot_bit;
+        }
         let deadline =
             self.slot_deadlines[slot].expect("occupied slot must have a tracked minimum deadline");
         let expiration = Expiration::new(self.level, slot, deadline);
@@ -106,10 +113,18 @@ impl Level {
         let slot = slot_for(expiration, self.level);
         unsafe { item.as_ref().set_location(self.level, slot) };
         self.slots[slot].push_front(item);
-        self.bitfield |= occupied_bit(slot);
-        let deadline =
-            self.slot_deadlines[slot].map_or(expiration, |current| current.min(expiration));
-        self.slot_deadlines[slot] = Some(deadline);
+        let slot_bit = occupied_bit(slot);
+        self.bitfield |= slot_bit;
+        let deadline = if self.dirty_slots & slot_bit == 0 {
+            let deadline =
+                self.slot_deadlines[slot].map_or(expiration, |current| current.min(expiration));
+            self.slot_deadlines[slot] = Some(deadline);
+            deadline
+        } else {
+            // The cached minimum may name an entry that was removed. Keep the
+            // slot dirty and recompute once when the wheel next consults it.
+            self.slot_deadlines[slot].unwrap_or(expiration)
+        };
         Expiration::new(self.level, slot, deadline)
     }
 
@@ -119,23 +134,27 @@ impl Level {
     ) -> Option<ptr::NonNull<Entry>> {
         let expiration = unsafe { item.as_ref().expiration() };
         let (_, slot) = unsafe { item.as_ref().location() };
+        let slot_bit = occupied_bit(slot);
         let removed = unsafe { self.slots[slot].remove(item) };
         if self.slots[slot].is_empty() {
             // The slot is empty, mark the bit.
             debug_assert!(
-                self.bitfield & occupied_bit(slot) != 0,
+                self.bitfield & slot_bit != 0,
                 "slot {slot} already marked as unoccupied",
             );
-            self.bitfield ^= occupied_bit(slot);
+            self.bitfield &= !slot_bit;
+            self.dirty_slots &= !slot_bit;
             self.slot_deadlines[slot] = None;
         } else if removed.is_some() && self.slot_deadlines[slot] == Some(expiration) {
-            self.slot_deadlines[slot] = self.slots[slot].iter().map(Entry::expiration).min();
+            self.dirty_slots |= slot_bit;
         }
         removed
     }
 
     pub(crate) fn take_slot(&mut self, slot: usize) -> cordyceps::List<Entry> {
-        self.bitfield &= !occupied_bit(slot);
+        let slot_bit = occupied_bit(slot);
+        self.bitfield &= !slot_bit;
+        self.dirty_slots &= !slot_bit;
         self.slot_deadlines[slot] = None;
         self.slots[slot].split_off(0)
     }
@@ -169,7 +188,7 @@ mod tests {
 
     #[test]
     fn empty_wheel() {
-        let wheel = Level::new(0);
+        let mut wheel = Level::new(0);
         assert_eq!(None, wheel.next_expiration(0));
     }
 

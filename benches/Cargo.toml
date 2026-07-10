@@ -26,6 +26,7 @@ http-body-util = "0.1.0"
 bencher = "0.1.5"
 futures = "0.3.29"
 pprof = { version = "0.15", features = ["flamegraph", "prost-codec"] }
+tokio = { version = "1.35.0", features = ["rt", "time"] }
 
 [[bench]]
 name = "schedule_task"

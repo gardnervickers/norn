@@ -14,6 +14,49 @@ fn new_sleep(wheels: &Rc<Wheels>, dur: Duration) -> Pin<Box<entry::Sleep<Rc<Whee
 
 proptest! {
     #[test]
+    fn cancellations_preserve_exact_deadlines(
+        cases in prop::collection::vec((1..64 * 128_u64, any::<bool>()), 1..1000)
+    ) {
+        let mut cx = futures_test::task::noop_context();
+        let wheels = Rc::new(Wheels::new());
+        let mut timers = Vec::with_capacity(cases.len());
+
+        for &(timestamp, cancel) in &cases {
+            let mut timer = new_sleep(&wheels, Duration::from_millis(timestamp));
+            assert!(timer.as_mut().poll(&mut cx).is_pending());
+            timers.push((timestamp, cancel, Some(timer)));
+        }
+
+        let mut expected = Vec::new();
+        for (timestamp, cancel, timer) in &mut timers {
+            if *cancel {
+                drop(timer.take());
+            } else {
+                expected.push(*timestamp);
+            }
+        }
+        expected.sort_unstable();
+
+        let mut fired_total = 0;
+        let mut now = 0;
+        loop {
+            let due = expected[fired_total..].partition_point(|deadline| *deadline <= now);
+            let (fired, next) = wheels.advance(now);
+            prop_assert_eq!(fired, due);
+            fired_total += due;
+
+            let Some(next) = next else {
+                break;
+            };
+            prop_assert!(fired_total < expected.len());
+            prop_assert_eq!(next.deadline(), expected[fired_total]);
+            now = next.deadline();
+        }
+
+        prop_assert_eq!(fired_total, expected.len());
+    }
+
+    #[test]
     fn advance_prop(mut timestamps in prop::collection::vec(1..64*32u64, 1..10000),
                     mut poll_times in prop::collection::vec(0..64*32u64, 1..100)) {
         // 1. Generate a bunch of timestamps and a bunch of poll times.
