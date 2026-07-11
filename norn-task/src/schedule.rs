@@ -49,7 +49,6 @@ impl Runnable {
     /// Run the task.
     ///
     /// This will advance the task to completion, or until it is parked.
-    #[inline]
     pub fn run(self) {
         self.0.run();
     }
