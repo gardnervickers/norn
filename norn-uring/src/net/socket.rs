@@ -804,6 +804,16 @@ impl RecvMsgRingBuf {
     }
 }
 
+unsafe impl StableBuf for RecvMsgRingBuf {
+    fn stable_ptr(&self) -> *const u8 {
+        self.payload().as_ptr()
+    }
+
+    fn bytes_init(&self) -> usize {
+        self.payload_len
+    }
+}
+
 #[derive(Debug)]
 pub struct RecvFromRingMulti {
     fd: NornFd,

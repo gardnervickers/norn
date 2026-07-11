@@ -226,6 +226,35 @@ fn send_recv_ring_multi_msg() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn recv_msg_ring_buf_can_be_sent_directly() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let ring = BufRing::builder(9).buf_cnt(32).buf_len(2048).build()?;
+        let client = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let server = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+
+        client
+            .send_to(Bytes::from_static(b"echo"), server.local_addr()?)
+            .await
+            .0?;
+
+        let mut recv = pin!(server.recv_from_ring_multi(&ring));
+        let (buf, peer) = recv.next().await.expect("multishot stream ended")?;
+        assert_eq!(&buf[..], b"echo");
+
+        let (res, buf) = server.send_to(buf, peer).await;
+        assert_eq!(res?, b"echo".len());
+        drop(buf);
+
+        let (res, reply) = client.recv_from(BytesMut::with_capacity(16)).await;
+        let (n, peer) = res?;
+        assert_eq!(peer, server.local_addr()?);
+        assert_eq!(&reply[..n], b"echo");
+
+        Ok(())
+    })
+}
+
+#[test]
 fn connected_send_recv_ring_multi() -> Result<(), Box<dyn std::error::Error>> {
     util::with_test_env(|| async {
         let ring = BufRing::builder(5).buf_cnt(32).buf_len(2048).build()?;

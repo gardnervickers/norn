@@ -68,22 +68,21 @@ impl Drop for BenchDir {
     }
 }
 
-async fn norn_udp_echo_server(
+async fn norn_udp_echo_server_multi(
     socket: &NornUdpSocket,
+    recv_ring: &BufRing,
     payload_len: usize,
     total_requests: usize,
 ) -> io::Result<()> {
-    let mut buf = vec![0u8; payload_len];
+    let mut recv = pin!(socket.recv_from_ring_multi(recv_ring));
     for _ in 0..total_requests {
-        let (recv_res, recv) = socket.recv_from(buf).await;
-        buf = recv;
-        let (n, peer) = recv_res?;
-        assert_eq!(n, payload_len);
+        let (buf, peer) = recv.next().await.expect("server multishot stream ended")?;
+        assert_eq!(buf.len(), payload_len);
 
-        let (send_res, send) = socket.send_to(buf, peer).await;
-        buf = send;
+        let (send_res, buf) = socket.send_to(buf, peer).await;
         let sent = send_res?;
         assert_eq!(sent, payload_len);
+        drop(buf);
     }
     Ok(())
 }
@@ -92,7 +91,6 @@ async fn norn_udp_request_response_worker(
     sockets: &[NornUdpSocket],
     recv_mode: UdpRecvMode,
     recv_rings: &[BufRing],
-    server_addr: std::net::SocketAddr,
     payload_len: usize,
     total_requests: usize,
 ) -> io::Result<()> {
@@ -109,18 +107,12 @@ async fn norn_udp_request_response_worker(
         let lane_requests = per_lane + usize::from(lane < extra);
         if lane_requests > 0 {
             match recv_mode {
-                UdpRecvMode::Single => {
-                    pending.push(Box::pin(norn_udp_request_response_lane_single(
-                        socket,
-                        server_addr,
-                        payload_len,
-                        lane_requests,
-                    )))
-                }
+                UdpRecvMode::Single => pending.push(Box::pin(
+                    norn_udp_request_response_lane_single(socket, payload_len, lane_requests),
+                )),
                 UdpRecvMode::Multi => pending.push(Box::pin(norn_udp_request_response_lane_multi(
                     socket,
                     &recv_rings[lane],
-                    server_addr,
                     payload_len,
                     lane_requests,
                 ))),
@@ -137,23 +129,21 @@ async fn norn_udp_request_response_worker(
 
 async fn norn_udp_request_response_lane_single(
     socket: &NornUdpSocket,
-    server_addr: std::net::SocketAddr,
     payload_len: usize,
     requests: usize,
 ) -> io::Result<()> {
     let mut send_buf = vec![0x5A; payload_len];
     let mut recv_buf = vec![0u8; payload_len];
     for _ in 0..requests {
-        let (send_res, send) = socket.send_to(send_buf, server_addr).await;
+        let (send_res, send) = socket.send(send_buf).await;
         send_buf = send;
         let sent = send_res?;
         assert_eq!(sent, payload_len);
 
-        let (recv_res, recv) = socket.recv_from(recv_buf).await;
+        let (recv_res, recv) = socket.recv(recv_buf).await;
         recv_buf = recv;
-        let (n, addr) = recv_res?;
+        let n = recv_res?;
         assert_eq!(n, payload_len);
-        assert_eq!(addr, server_addr);
     }
     Ok(())
 }
@@ -161,20 +151,18 @@ async fn norn_udp_request_response_lane_single(
 async fn norn_udp_request_response_lane_multi(
     socket: &NornUdpSocket,
     recv_ring: &BufRing,
-    server_addr: std::net::SocketAddr,
     payload_len: usize,
     requests: usize,
 ) -> io::Result<()> {
     let mut send_buf = vec![0x5A; payload_len];
-    let mut recv = pin!(socket.recv_from_ring_multi(recv_ring));
+    let mut recv = pin!(socket.recv_ring_multi(recv_ring));
     for _ in 0..requests {
-        let (send_res, send) = socket.send_to(send_buf, server_addr).await;
+        let (send_res, send) = socket.send(send_buf).await;
         send_buf = send;
         let sent = send_res?;
         assert_eq!(sent, payload_len);
 
-        let (buf, addr) = recv.next().await.expect("multishot stream ended")?;
-        assert_eq!(addr, server_addr);
+        let buf = recv.next().await.expect("multishot stream ended")?;
         assert_eq!(buf.len(), payload_len);
     }
     Ok(())
@@ -354,49 +342,60 @@ impl UdpRequestResponseBench {
         let mut ex = new_executor();
         let lane_count = cmp::max(1, cmp::min(self.window, self.total_requests));
         let recv_mode = self.recv_mode;
-        let (server_socket, server_addr, mut client_sockets, mut recv_rings) = ex.block_on(async {
-            let server_socket = NornUdpSocket::bind("127.0.0.1:0".parse().unwrap())
-                .await
-                .unwrap();
-            let server_addr = server_socket.local_addr().unwrap();
-            let mut sockets = Vec::with_capacity(lane_count);
-            for _ in 0..lane_count {
-                sockets.push(
-                    NornUdpSocket::bind("127.0.0.1:0".parse().unwrap())
+        let (server_socket, server_recv_ring, mut client_sockets, mut recv_rings) =
+            ex.block_on(async {
+                let server_socket = NornUdpSocket::bind("127.0.0.1:0".parse().unwrap())
+                    .await
+                    .unwrap();
+                let server_addr = server_socket.local_addr().unwrap();
+                let mut sockets = Vec::with_capacity(lane_count);
+                for _ in 0..lane_count {
+                    let socket = NornUdpSocket::bind("127.0.0.1:0".parse().unwrap())
                         .await
-                        .unwrap(),
-                );
-            }
-            let mut rings = Vec::with_capacity(lane_count);
-            if recv_mode == UdpRecvMode::Multi {
-                let ring_buf_len = cmp::max(2048, self.payload_len * 2);
-                for lane in 0..lane_count {
-                    rings.push(
-                        BufRing::builder((100 + lane) as u16)
-                            .buf_cnt(32)
-                            .buf_len(ring_buf_len)
-                            .build()
-                            .unwrap(),
-                    );
+                        .unwrap();
+                    socket.connect(server_addr).await.unwrap();
+                    sockets.push(socket);
                 }
-            }
-            (server_socket, server_addr, sockets, rings)
-        });
+                let mut rings = Vec::with_capacity(lane_count);
+                if recv_mode == UdpRecvMode::Multi {
+                    let ring_buf_len = cmp::max(2048, self.payload_len * 2);
+                    for lane in 0..lane_count {
+                        rings.push(
+                            BufRing::builder((100 + lane) as u16)
+                                .buf_cnt(64)
+                                .buf_len(ring_buf_len)
+                                .build()
+                                .unwrap(),
+                        );
+                    }
+                }
+                let server_ring = BufRing::builder(99)
+                    .buf_cnt(256)
+                    .buf_len(cmp::max(2048, self.payload_len * 2))
+                    .build()
+                    .unwrap();
+                (server_socket, server_ring, sockets, rings)
+            });
 
         b.iter(|| {
             let total_requests = self.total_requests;
             let payload_len = self.payload_len;
             ex.block_on(async {
+                let clients = norn_udp_request_response_worker(
+                    &client_sockets,
+                    recv_mode,
+                    &recv_rings,
+                    payload_len,
+                    total_requests,
+                );
                 futures::try_join!(
-                    norn_udp_echo_server(&server_socket, payload_len, total_requests),
-                    norn_udp_request_response_worker(
-                        &client_sockets,
-                        recv_mode,
-                        &recv_rings,
-                        server_addr,
+                    norn_udp_echo_server_multi(
+                        &server_socket,
+                        &server_recv_ring,
                         payload_len,
                         total_requests,
-                    )
+                    ),
+                    clients,
                 )
                 .unwrap();
             });
@@ -407,6 +406,7 @@ impl UdpRequestResponseBench {
                 socket.close().await.unwrap();
             }
             recv_rings.clear();
+            drop(server_recv_ring);
             server_socket.close().await.unwrap();
         });
     }
