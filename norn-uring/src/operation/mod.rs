@@ -609,6 +609,39 @@ mod tests {
     }
 
     #[test]
+    fn first_poll_submits_without_allocating_backpressure_future() {
+        #[derive(Debug)]
+        struct NopOp;
+
+        impl Operation for NopOp {
+            fn cleanup(&mut self, _: CQEResult) {}
+
+            fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+                io_uring::opcode::Nop::new().build()
+            }
+        }
+
+        impl Singleshot for NopOp {
+            type Output = io::Result<()>;
+
+            fn complete(self, result: CQEResult) -> Self::Output {
+                result.result.map(drop)
+            }
+        }
+
+        let driver = crate::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let handle = driver.handle();
+        let mut op = std::pin::pin!(handle.submit(NopOp));
+        let waker = futures_test::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+
+        assert!(Future::poll(op.as_mut(), &mut cx).is_pending());
+        let op = op.as_ref().get_ref();
+        assert!(op.submit.is_none());
+        assert!(matches!(op.state, State::Submitted { .. }));
+    }
+
+    #[test]
     fn multishot_terminal_completion_is_not_sent_to_update() {
         #[derive(Debug)]
         struct TerminalMultishot {
