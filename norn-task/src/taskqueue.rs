@@ -79,7 +79,6 @@ impl TaskQueue {
     }
 
     /// Returns the number of [`Runnable`]s in the queue.
-    #[inline]
     pub fn runnable(&self) -> usize {
         self.shared.runnable_len()
     }
@@ -99,7 +98,6 @@ impl Schedule for Rc<Shared> {
         self.push_runnable(runnable);
     }
 
-    #[inline]
     fn unbind(&self, registered: &crate::RegisteredTask) {
         unsafe { self.taskset.remove(registered) };
     }

@@ -350,7 +350,6 @@ impl TaskRef {
         Self(ptr)
     }
 
-    #[inline]
     pub(crate) fn run(self) {
         // Safety: The task is valid as long as we have a TaskRef.
         unsafe {
