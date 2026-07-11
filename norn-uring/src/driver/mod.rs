@@ -64,6 +64,12 @@ pub(super) enum Status {
     Shutdown,
 }
 
+pub(crate) enum TryPush {
+    Submitted,
+    Full(ConfiguredEntry),
+    Failed(SubmitError),
+}
+
 impl std::fmt::Debug for Handle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Handle").finish()
@@ -117,6 +123,21 @@ impl Handle {
     /// is space or the driver has shutdown.
     pub(crate) fn push(&self, entry: ConfiguredEntry) -> PushFuture {
         PushFuture::new(Rc::clone(&self.shared), entry)
+    }
+
+    pub(crate) fn try_push(&self, entry: ConfiguredEntry) -> TryPush {
+        if self.shared.status() != Status::Running {
+            let err = if let Some(err) = self.shared.health_error() {
+                SubmitError::broken(err)
+            } else {
+                SubmitError::shutting_down()
+            };
+            return TryPush::Failed(err);
+        }
+        match self.shared.try_push(entry) {
+            Ok(()) => TryPush::Submitted,
+            Err(entry) => TryPush::Full(entry),
+        }
     }
 
     /// Attempt to push a new batch of entries into the submission queue.

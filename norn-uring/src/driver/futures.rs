@@ -44,7 +44,7 @@ impl PushFuture {
         let shared = into_static_shared(shared);
         let inner = PushFutureInner {
             shared,
-            notify: None,
+            notify: Some(shared.backpressure.wait()),
             pending: PendingSubmission::Single(Some(entry)),
         };
         PushFuture {

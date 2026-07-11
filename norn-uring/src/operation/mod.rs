@@ -12,7 +12,7 @@ pub(crate) use raw::{CQEResult, RawOpRef};
 use io_uring::squeue::Flags;
 use smallvec::SmallVec;
 
-use crate::driver::PushFuture;
+use crate::driver::{PushFuture, TryPush};
 use crate::error::SubmitError;
 use header::CompletionQueue;
 
@@ -256,7 +256,11 @@ where
                     .state
                     .start_submit()
                     .expect("prepared operation missing entry");
-                this.submit.set(Some(this.reactor.push(entry)));
+                match this.reactor.try_push(entry) {
+                    TryPush::Submitted => this.state.finish_submit(),
+                    TryPush::Full(entry) => this.submit.set(Some(this.reactor.push(entry))),
+                    TryPush::Failed(err) => this.state.fail_submit(&err),
+                }
             }
         }
 
@@ -602,6 +606,39 @@ mod tests {
             Poll::Ready(Err(_)) => {}
             other => panic!("expected ready error, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn first_poll_submits_without_allocating_backpressure_future() {
+        #[derive(Debug)]
+        struct NopOp;
+
+        impl Operation for NopOp {
+            fn cleanup(&mut self, _: CQEResult) {}
+
+            fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+                io_uring::opcode::Nop::new().build()
+            }
+        }
+
+        impl Singleshot for NopOp {
+            type Output = io::Result<()>;
+
+            fn complete(self, result: CQEResult) -> Self::Output {
+                result.result.map(drop)
+            }
+        }
+
+        let driver = crate::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let handle = driver.handle();
+        let mut op = std::pin::pin!(handle.submit(NopOp));
+        let waker = futures_test::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+
+        assert!(Future::poll(op.as_mut(), &mut cx).is_pending());
+        let op = op.as_ref().get_ref();
+        assert!(op.submit.is_none());
+        assert!(matches!(op.state, State::Submitted { .. }));
     }
 
     #[test]
