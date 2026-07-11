@@ -12,7 +12,7 @@ pub(crate) use raw::{CQEResult, RawOpRef};
 use io_uring::squeue::Flags;
 use smallvec::SmallVec;
 
-use crate::driver::PushFuture;
+use crate::driver::{PushFuture, TryPush};
 use crate::error::SubmitError;
 use header::CompletionQueue;
 
@@ -256,7 +256,11 @@ where
                     .state
                     .start_submit()
                     .expect("prepared operation missing entry");
-                this.submit.set(Some(this.reactor.push(entry)));
+                match this.reactor.try_push(entry) {
+                    TryPush::Submitted => this.state.finish_submit(),
+                    TryPush::Full(entry) => this.submit.set(Some(this.reactor.push(entry))),
+                    TryPush::Failed(err) => this.state.fail_submit(&err),
+                }
             }
         }
 
