@@ -4,7 +4,7 @@ use std::cell::Cell;
 
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-    struct Flags: u8 {
+    struct Flags: u32 {
         /// The task has been notified and should be polled.
         const NOTIFIED    = 1<<0;
         /// The task is currently running.
