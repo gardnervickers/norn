@@ -106,7 +106,7 @@ where
         self.entry.complete.set(Ok(()));
         self.entry.deadline.set(0);
         // Safety: Reset has exclusive access to the sleep and entry.
-        unsafe { (&mut *self.entry.waker.get()).take() };
+        unsafe { (*self.entry.waker.get()).take() };
     }
 }
 
@@ -177,7 +177,7 @@ impl Entry {
         self.complete.set(completion);
         // Take the waker before invoking it so no mutable entry access spans
         // the callback.
-        let waker = unsafe { (&mut *self.waker.get()).take() };
+        let waker = unsafe { (*self.waker.get()).take() };
         if let Some(waker) = waker {
             waker.wake();
         }
