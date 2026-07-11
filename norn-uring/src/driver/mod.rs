@@ -47,7 +47,7 @@ pub struct Handle {
 }
 
 struct Shared {
-    ring: RefCell<IoUring>,
+    ring: UnsafeCell<IoUring>,
     backpressure: Notify,
     status: Cell<Status>,
     submit_error: RefCell<Option<(io::ErrorKind, String)>>,
@@ -184,7 +184,7 @@ impl Driver {
         let ring = builder.dontfork().build(size)?;
         Ok(Self {
             shared: Rc::new(Shared {
-                ring: RefCell::new(ring),
+                ring: UnsafeCell::new(ring),
                 backpressure: Notify::default(),
                 status: Cell::new(Status::Running),
                 submit_error: RefCell::new(None),
@@ -406,11 +406,25 @@ impl Park for Driver {
 }
 
 impl Shared {
+    #[inline]
+    fn ring(&self) -> &IoUring {
+        // Safety: The driver is local-only, and ring access never spans a
+        // callback into user code or another ring access.
+        unsafe { &*self.ring.get() }
+    }
+
+    #[inline]
+    fn ring_mut(&self) -> &mut IoUring {
+        // Safety: See `ring`; all mutable accesses are short-lived and the
+        // single-threaded driver never overlaps them.
+        unsafe { &mut *self.ring.get() }
+    }
+
     fn validate_batch_len(&self, batch_len: usize) -> Result<(), SubmitError> {
         if batch_len <= 1 {
             return Ok(());
         }
-        let mut ring = self.ring.borrow_mut();
+        let ring = self.ring_mut();
         let sq = ring.submission();
         let capacity = sq.capacity();
         if batch_len > capacity {
@@ -460,7 +474,7 @@ impl Shared {
     ///
     /// If the submission queue is full, this returns the original entry.
     fn try_push(&self, entry: ConfiguredEntry) -> Result<(), ConfiguredEntry> {
-        let mut ring = self.ring.borrow_mut();
+        let ring = self.ring_mut();
         let mut sq = ring.submission();
         if sq.is_full() {
             Err(entry)
@@ -479,7 +493,7 @@ impl Shared {
         &self,
         mut entries: SmallVec<[ConfiguredEntry; 4]>,
     ) -> Result<(), SmallVec<[ConfiguredEntry; 4]>> {
-        let mut ring = self.ring.borrow_mut();
+        let ring = self.ring_mut();
         let mut sq = ring.submission();
         if sq.capacity() - sq.len() < entries.len() {
             return Err(entries);
@@ -510,7 +524,7 @@ impl Shared {
     ///
     /// If the submission queue is full, this will return an error.
     unsafe fn try_push_raw(&self, entry: &io_uring::squeue::Entry) -> Result<(), PushError> {
-        let mut ring = self.ring.borrow_mut();
+        let ring = self.ring_mut();
         let mut sq = ring.submission();
         sq.push(entry)
     }
@@ -536,13 +550,13 @@ impl Shared {
     }
 
     fn with_submitter<U>(&self, f: impl FnOnce(&Submitter<'_>) -> U) -> U {
-        let ring = self.ring.borrow();
+        let ring = self.ring();
         let sq = ring.submitter();
         f(&sq)
     }
 
     fn submit_once(&self, mode: ParkMode) -> io::Result<usize> {
-        let mut ring = self.ring.borrow_mut();
+        let ring = self.ring_mut();
         Ok(match mode {
             ParkMode::Timeout(duration) => {
                 let ts = Timespec::new()
@@ -614,7 +628,7 @@ impl Shared {
         self.submit(ParkMode::NoPark)?;
 
         // First try to submit an async cancel request, this avoids a syscall.
-        let mut ring = self.ring.borrow_mut();
+        let ring = self.ring_mut();
         if !sync {
             let mut sq = ring.submission();
             if !sq.is_full() {
@@ -646,7 +660,7 @@ impl Shared {
 
     /// Cancel all outstanding requests synchronously.
     pub(crate) fn cancel_all(&self) -> io::Result<()> {
-        let ring = self.ring.borrow();
+        let ring = self.ring();
         let criteria = CancelBuilder::any();
         ring.submitter().register_sync_cancel(None, criteria)?;
         Ok(())
@@ -659,7 +673,7 @@ impl Shared {
             return true;
         }
         if NEEDS_PARK_CHECK_RINGS {
-            let mut ring = self.ring.borrow_mut();
+            let ring = self.ring_mut();
             let (_, sq, cq) = ring.split();
             sq.is_full() || cq.is_full()
         } else {
@@ -675,7 +689,7 @@ impl Shared {
         &'a self,
         entries: &'a mut [mem::MaybeUninit<cqueue::Entry>; N],
     ) -> (&'a mut [cqueue::Entry], bool) {
-        let mut ring = self.ring.borrow_mut();
+        let ring = self.ring_mut();
         let mut cq = ring.completion();
         let has_more = cq.len() > entries.len();
         (cq.fill(entries), has_more)
@@ -806,7 +820,7 @@ mod tests {
         let driver = Driver::new(io_uring::IoUring::builder(), 2).unwrap();
         let _op = driver.handle().submit(NopOp);
 
-        let mut ring = driver.shared.ring.borrow_mut();
+        let ring = driver.shared.ring_mut();
         let sq = ring.submission();
         assert_eq!(sq.len(), 0, "request construction must not enqueue");
     }
@@ -852,7 +866,7 @@ mod tests {
             .expect_err("batch should wait for full capacity");
         assert_eq!(batch.len(), 2);
 
-        let mut ring = driver.shared.ring.borrow_mut();
+        let ring = driver.shared.ring_mut();
         let sq = ring.submission();
         assert_eq!(sq.len(), 1, "failed batch enqueue must not partially push");
     }
