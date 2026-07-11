@@ -784,9 +784,11 @@ mod tests {
         let left_driver = crate::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
         let right_driver = crate::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
 
-        let _ = left_driver
-            .handle()
-            .submit(TaggedNop(1))
-            .then(right_driver.handle().submit(TaggedNop(2)));
+        drop(
+            left_driver
+                .handle()
+                .submit(TaggedNop(1))
+                .then(right_driver.handle().submit(TaggedNop(2))),
+        );
     }
 }
