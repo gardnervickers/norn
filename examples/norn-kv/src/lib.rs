@@ -1,7 +1,8 @@
 use std::io;
 use std::path::Path;
 
-use block::BlockFile;
+use block::{BlockBuf, BlockFile};
+use futures::stream::{FuturesUnordered, StreamExt};
 use thiserror::Error;
 
 const DEFAULT_SLOT_COUNT: usize = 1024;
@@ -12,6 +13,7 @@ const MAGIC: u32 = u32::from_le_bytes(*b"NKV1");
 const VERSION: u16 = 1;
 const FLAG_DELETED: u32 = 1 << 0;
 const CRC_OFFSET: usize = 36;
+const RECOVERY_READ_WINDOW: usize = 64;
 
 /// Opaque handle returned by [`Store::put`] and accepted by [`Store::get`] and
 /// [`Store::delete`].
@@ -94,6 +96,7 @@ pub struct Store {
     generations: Vec<u64>,
     index_bits: u32,
     index_mask: u64,
+    scratch: Option<BlockBuf>,
 }
 
 impl Store {
@@ -115,6 +118,7 @@ impl Store {
             generations: vec![0; config.slot_count],
             index_bits,
             index_mask,
+            scratch: None,
         };
         store.recover().await?;
         Ok(store)
@@ -139,7 +143,7 @@ impl Store {
 
         let generation = self.next_generation(slot);
         let key = self.make_key(slot, generation);
-        let mut buf = vec![0; self.config.slot_size];
+        let mut buf = self.take_block()?;
         buf[HEADER_SIZE..HEADER_SIZE + value.len()].copy_from_slice(&value);
         write_header(
             &mut buf,
@@ -171,6 +175,9 @@ impl Store {
         let Some((slot, generation)) = self.decode_key(key) else {
             return Ok(None);
         };
+        if self.free.is_free(slot) || self.generations[slot] != generation {
+            return Ok(None);
+        }
 
         let buf = self.read_slot(slot).await?;
         let Some(header) = self.valid_header(slot, &buf, false) else {
@@ -189,17 +196,11 @@ impl Store {
         let Some((slot, generation)) = self.decode_key(key) else {
             return Ok(false);
         };
-
-        let buf = self.read_slot(slot).await?;
-        let Some(header) = self.valid_header(slot, &buf, false) else {
-            self.free.set_free(slot);
-            return Ok(false);
-        };
-        if header.generation != generation || header.key != key.0 {
+        if self.free.is_free(slot) || self.generations[slot] != generation {
             return Ok(false);
         }
 
-        let mut delete_buf = vec![0; self.config.slot_size];
+        let mut delete_buf = self.take_block()?;
         write_header(
             &mut delete_buf,
             Header {
@@ -223,40 +224,63 @@ impl Store {
     }
 
     async fn recover(&mut self) -> Result<()> {
-        for slot in 0..self.config.slot_count {
-            let buf = self.read_slot(slot).await?;
-            match self.valid_header(slot, &buf, true) {
-                Some(header) if header.is_deleted() => {
-                    self.generations[slot] = header.generation;
-                    self.free.set_free(slot);
-                }
-                Some(header) => {
-                    self.generations[slot] = header.generation;
-                    self.free.set_used(slot);
-                }
-                None => {
-                    if let Some(header) = self.plausible_header(slot, &buf) {
+        let mut next_slot = 0;
+        while next_slot < self.config.slot_count {
+            let end = (next_slot + RECOVERY_READ_WINDOW).min(self.config.slot_count);
+            let mut reads = FuturesUnordered::new();
+            for slot in next_slot..end {
+                let file = &self.file;
+                reads.push(async move { (slot, file.read_block(slot).await) });
+            }
+
+            while let Some((slot, buf)) = reads.next().await {
+                let buf = buf.map_err(|err| Error::io("read slot", err))?;
+                match self.valid_header(slot, &buf, true) {
+                    Some(header) if header.is_deleted() => {
                         self.generations[slot] = header.generation;
+                        self.free.set_free(slot);
                     }
-                    self.free.set_free(slot);
+                    Some(header) => {
+                        self.generations[slot] = header.generation;
+                        self.free.set_used(slot);
+                    }
+                    None => {
+                        if let Some(header) = self.plausible_header(slot, &buf) {
+                            self.generations[slot] = header.generation;
+                        }
+                        self.free.set_free(slot);
+                    }
                 }
             }
+
+            next_slot = end;
         }
         Ok(())
     }
 
-    async fn read_slot(&self, slot: usize) -> Result<Vec<u8>> {
+    async fn read_slot(&self, slot: usize) -> Result<BlockBuf> {
         self.file
             .read_block(slot)
             .await
             .map_err(|err| Error::io("read slot", err))
     }
 
-    async fn write_slot(&self, slot: usize, buf: Vec<u8>) -> Result<()> {
-        self.file
-            .write_block(slot, &buf)
+    async fn write_slot(&mut self, slot: usize, buf: BlockBuf) -> Result<()> {
+        let buf = self
+            .file
+            .write_block(slot, buf)
             .await
-            .map_err(|err| Error::io("write slot", err))
+            .map_err(|err| Error::io("write slot", err))?;
+        self.scratch = Some(buf);
+        Ok(())
+    }
+
+    fn take_block(&mut self) -> Result<BlockBuf> {
+        if let Some(mut buf) = self.scratch.take() {
+            buf.fill(0);
+            return Ok(buf);
+        }
+        block::zeroed(self.config.slot_size).map_err(|err| Error::io("allocate block", err))
     }
 
     fn decode_key(&self, key: Key) -> Option<(usize, u64)> {
@@ -327,7 +351,7 @@ impl StoreConfig {
         if self.slot_size <= HEADER_SIZE {
             return Err(Error::InvalidConfig("slot_size must exceed header size"));
         }
-        if self.slot_size % BLOCK_ALIGNMENT != 0 {
+        if !self.slot_size.is_multiple_of(BLOCK_ALIGNMENT) {
             return Err(Error::InvalidConfig(
                 "slot_size must be a multiple of 4096 for O_DIRECT",
             ));
@@ -474,6 +498,15 @@ impl FreeList {
         self.set_leaf(slot, false);
     }
 
+    fn is_free(&self, slot: usize) -> bool {
+        if slot >= self.slot_count {
+            return true;
+        }
+        let word = self.levels[0][slot / 64];
+        let mask = 1_u64 << (slot % 64);
+        word & mask != 0
+    }
+
     fn set_leaf(&mut self, slot: usize, free: bool) {
         if slot >= self.slot_count {
             return;
@@ -503,9 +536,19 @@ fn set_bit(word: &mut u64, bit: usize, enabled: bool) {
 
 mod block {
     #[cfg(not(target_os = "linux"))]
-    pub use blocking::BlockFile;
+    pub use blocking::{BlockBuf, BlockFile};
     #[cfg(target_os = "linux")]
-    pub use linux::BlockFile;
+    pub use linux::{BlockBuf, BlockFile};
+
+    #[cfg(target_os = "linux")]
+    pub fn zeroed(len: usize) -> std::io::Result<BlockBuf> {
+        BlockBuf::zeroed(len)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn zeroed(len: usize) -> std::io::Result<BlockBuf> {
+        Ok(vec![0; len])
+    }
 
     #[cfg(target_os = "linux")]
     mod linux {
@@ -515,6 +558,8 @@ mod block {
 
         use norn_uring::buf::{StableBuf, StableBufMut};
         use norn_uring::fs;
+
+        pub type BlockBuf = AlignedBuf;
 
         #[derive(Debug)]
         pub struct BlockFile {
@@ -544,7 +589,7 @@ mod block {
                 Ok(Self { file, block_size })
             }
 
-            pub async fn read_block(&self, block: usize) -> io::Result<Vec<u8>> {
+            pub async fn read_block(&self, block: usize) -> io::Result<BlockBuf> {
                 let buf = AlignedBuf::zeroed(self.block_size)?;
                 let (res, buf) = self.file.read_at(buf, self.offset(block)).await;
                 let n = res?;
@@ -557,24 +602,21 @@ mod block {
                         ),
                     ));
                 }
-                Ok(buf.as_slice().to_vec())
+                Ok(buf)
             }
 
-            pub async fn write_block(&self, block: usize, bytes: &[u8]) -> io::Result<()> {
-                if bytes.len() != self.block_size {
+            pub async fn write_block(&self, block: usize, buf: BlockBuf) -> io::Result<BlockBuf> {
+                if buf.len != self.block_size {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
                         format!(
                             "block write length mismatch: expected {}, got {}",
-                            self.block_size,
-                            bytes.len()
+                            self.block_size, buf.len
                         ),
                     ));
                 }
 
-                let mut buf = AlignedBuf::zeroed(self.block_size)?;
-                buf.as_mut_slice().copy_from_slice(bytes);
-                let (res, _) = self.file.write_at(buf, self.offset(block)).await;
+                let (res, buf) = self.file.write_at(buf, self.offset(block)).await;
                 let n = res?;
                 if n != self.block_size {
                     return Err(io::Error::new(
@@ -585,7 +627,7 @@ mod block {
                         ),
                     ));
                 }
-                Ok(())
+                Ok(buf)
             }
 
             fn offset(&self, block: usize) -> u64 {
@@ -594,13 +636,13 @@ mod block {
         }
 
         #[derive(Debug)]
-        struct AlignedBuf {
+        pub struct AlignedBuf {
             ptr: NonNull<u8>,
             len: usize,
         }
 
         impl AlignedBuf {
-            fn zeroed(len: usize) -> io::Result<Self> {
+            pub fn zeroed(len: usize) -> io::Result<Self> {
                 let mut ptr = std::ptr::null_mut();
                 let res =
                     unsafe { libc::posix_memalign(&mut ptr, super::super::BLOCK_ALIGNMENT, len) };
@@ -617,12 +659,26 @@ mod block {
                 Ok(this)
             }
 
-            fn as_slice(&self) -> &[u8] {
+            pub fn as_slice(&self) -> &[u8] {
                 unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
             }
 
-            fn as_mut_slice(&mut self) -> &mut [u8] {
+            pub fn as_mut_slice(&mut self) -> &mut [u8] {
                 unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+            }
+        }
+
+        impl std::ops::Deref for AlignedBuf {
+            type Target = [u8];
+
+            fn deref(&self) -> &Self::Target {
+                self.as_slice()
+            }
+        }
+
+        impl std::ops::DerefMut for AlignedBuf {
+            fn deref_mut(&mut self) -> &mut Self::Target {
+                self.as_mut_slice()
             }
         }
 
@@ -664,6 +720,8 @@ mod block {
         use std::path::Path;
         use std::sync::Mutex;
 
+        pub type BlockBuf = Vec<u8>;
+
         #[derive(Debug)]
         pub struct BlockFile {
             file: Mutex<File>,
@@ -698,7 +756,7 @@ mod block {
                 Ok(buf)
             }
 
-            pub async fn write_block(&self, block: usize, bytes: &[u8]) -> io::Result<()> {
+            pub async fn write_block(&self, block: usize, bytes: BlockBuf) -> io::Result<BlockBuf> {
                 if bytes.len() != self.block_size {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
@@ -715,8 +773,9 @@ mod block {
                     .lock()
                     .map_err(|_| io::Error::other("blocking file mutex poisoned"))?;
                 file.seek(SeekFrom::Start(self.offset(block)))?;
-                file.write_all(bytes)?;
-                file.sync_data()
+                file.write_all(&bytes)?;
+                file.sync_data()?;
+                Ok(bytes)
             }
 
             fn offset(&self, block: usize) -> u64 {

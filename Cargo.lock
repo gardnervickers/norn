@@ -1023,6 +1023,7 @@ name = "norn-kv"
 version = "0.1.0"
 dependencies = [
  "crc-fast",
+ "futures",
  "io-uring",
  "libc",
  "norn-executor",

@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 crc-fast = { version = "=1.9.0", default-features = false, features = ["std"] }
+futures.workspace = true
 thiserror.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
