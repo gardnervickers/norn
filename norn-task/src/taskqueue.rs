@@ -73,6 +73,7 @@ impl TaskQueue {
     }
 
     /// Returns the next [`Runnable`] to be executed.
+    #[inline]
     pub fn next(&self) -> Option<Runnable> {
         self.shared.pop_runnable()
     }
@@ -92,6 +93,7 @@ impl TaskQueue {
 }
 
 impl Schedule for Rc<Shared> {
+    #[inline]
     fn schedule(&self, runnable: Runnable) {
         self.push_runnable(runnable);
     }
