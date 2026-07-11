@@ -13,7 +13,7 @@ const MAGIC: u32 = u32::from_le_bytes(*b"NKV1");
 const VERSION: u16 = 1;
 const FLAG_DELETED: u32 = 1 << 0;
 const CRC_OFFSET: usize = 36;
-const RECOVERY_READ_WINDOW: usize = 64;
+const RECOVERY_READ_WINDOW: usize = 128;
 
 /// Opaque handle returned by [`Store::put`] and accepted by [`Store::get`] and
 /// [`Store::delete`].
@@ -85,6 +85,10 @@ impl Error {
     fn io(op: &'static str, source: io::Error) -> Self {
         Self::Io { op, source }
     }
+}
+
+async fn read_recovery_slot(file: &BlockFile, slot: usize) -> (usize, io::Result<BlockBuf>) {
+    (slot, file.read_block(slot).await)
 }
 
 /// Fixed-slot flat-file KV store backed by platform-selected block I/O.
@@ -224,36 +228,36 @@ impl Store {
     }
 
     async fn recover(&mut self) -> Result<()> {
+        let mut reads = FuturesUnordered::new();
         let mut next_slot = 0;
-        while next_slot < self.config.slot_count {
-            let end = (next_slot + RECOVERY_READ_WINDOW).min(self.config.slot_count);
-            let mut reads = FuturesUnordered::new();
-            for slot in next_slot..end {
-                let file = &self.file;
-                reads.push(async move { (slot, file.read_block(slot).await) });
-            }
+        while next_slot < self.config.slot_count && reads.len() < RECOVERY_READ_WINDOW {
+            reads.push(read_recovery_slot(&self.file, next_slot));
+            next_slot += 1;
+        }
 
-            while let Some((slot, buf)) = reads.next().await {
-                let buf = buf.map_err(|err| Error::io("read slot", err))?;
-                match self.valid_header(slot, &buf, true) {
-                    Some(header) if header.is_deleted() => {
+        while let Some((slot, buf)) = reads.next().await {
+            let buf = buf.map_err(|err| Error::io("read slot", err))?;
+            match self.valid_header(slot, &buf, true) {
+                Some(header) if header.is_deleted() => {
+                    self.generations[slot] = header.generation;
+                    self.free.set_free(slot);
+                }
+                Some(header) => {
+                    self.generations[slot] = header.generation;
+                    self.free.set_used(slot);
+                }
+                None => {
+                    if let Some(header) = self.plausible_header(slot, &buf) {
                         self.generations[slot] = header.generation;
-                        self.free.set_free(slot);
                     }
-                    Some(header) => {
-                        self.generations[slot] = header.generation;
-                        self.free.set_used(slot);
-                    }
-                    None => {
-                        if let Some(header) = self.plausible_header(slot, &buf) {
-                            self.generations[slot] = header.generation;
-                        }
-                        self.free.set_free(slot);
-                    }
+                    self.free.set_free(slot);
                 }
             }
 
-            next_slot = end;
+            if next_slot < self.config.slot_count {
+                reads.push(read_recovery_slot(&self.file, next_slot));
+                next_slot += 1;
+            }
         }
         Ok(())
     }
@@ -341,7 +345,7 @@ impl Store {
 }
 
 impl StoreConfig {
-    #[allow(clippy::manual_is_multiple_of)]
+    #[allow(unknown_lints, clippy::manual_is_multiple_of)]
     fn validate(self) -> Result<()> {
         if self.slot_count == 0 {
             return Err(Error::InvalidConfig("slot_count must be greater than zero"));
@@ -425,15 +429,11 @@ fn slot_crc32c(slot: &[u8], payload_len: usize) -> u32 {
     header.copy_from_slice(&slot[..HEADER_SIZE]);
     header[CRC_OFFSET..CRC_OFFSET + 4].fill(0);
 
-    let header_crc = crc_fast::crc32_iscsi(&header);
+    let mut digest = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32Iscsi);
+    digest.update(&header);
     let payload = &slot[HEADER_SIZE..HEADER_SIZE + payload_len];
-    let payload_crc = crc_fast::crc32_iscsi(payload);
-    crc_fast::checksum_combine(
-        crc_fast::CrcAlgorithm::Crc32Iscsi,
-        header_crc as u64,
-        payload_crc as u64,
-        payload_len as u64,
-    ) as u32
+    digest.update(payload);
+    digest.finalize() as u32
 }
 
 fn read_u16(buf: &[u8], offset: usize) -> u16 {
@@ -860,6 +860,31 @@ mod tests {
         StoreConfig {
             slot_count,
             slot_size: DEFAULT_SLOT_SIZE,
+        }
+    }
+
+    #[test]
+    fn streaming_crc_matches_combined_format() {
+        for payload_len in [0, 1, 8, 64, 1024, DEFAULT_SLOT_SIZE - HEADER_SIZE] {
+            let mut slot = vec![0; DEFAULT_SLOT_SIZE];
+            for (index, byte) in slot.iter_mut().enumerate() {
+                *byte = index.wrapping_mul(17) as u8;
+            }
+
+            let mut header = [0_u8; HEADER_SIZE];
+            header.copy_from_slice(&slot[..HEADER_SIZE]);
+            header[CRC_OFFSET..CRC_OFFSET + 4].fill(0);
+            let header_crc = crc_fast::crc32_iscsi(&header);
+            let payload = &slot[HEADER_SIZE..HEADER_SIZE + payload_len];
+            let payload_crc = crc_fast::crc32_iscsi(payload);
+            let combined = crc_fast::checksum_combine(
+                crc_fast::CrcAlgorithm::Crc32Iscsi,
+                header_crc as u64,
+                payload_crc as u64,
+                payload_len as u64,
+            ) as u32;
+
+            assert_eq!(slot_crc32c(&slot, payload_len), combined);
         }
     }
 

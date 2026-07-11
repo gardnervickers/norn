@@ -581,3 +581,50 @@ Tried and rejected:
 - Replace the driver's ring `RefCell` with unchecked local `UnsafeCell`
   access: about `1.1%` on noop submission and `1.2%` on forced
   backpressure, below the threshold for added unsafe code.
+
+### Workstation completion pass
+
+The direct-buffer UDP benchmark change was revalidated against its immediate
+parent (`2e1cd68`) on the same pinned CPU:
+
+- Single receive, window 32 / 4,096 requests:
+  - Before: `30.904`, `30.627`, and `30.554 ms`; median `30.627 ms`.
+  - Current master: `24.529`, `24.293`, and `24.305 ms`; median
+    `24.305 ms`, `20.6%` faster.
+- Multishot receive, window 64 / 8,192 requests:
+  - Before: `55.862`, `55.987`, and `55.926 ms`; median `55.926 ms`.
+  - Current master: `49.519`, `49.486`, and `49.563 ms`; median
+    `49.519 ms`, `11.5%` faster.
+
+The current UDP profile was diffuse. The largest runtime-specific self costs
+were `Handle::try_push` at `4.5%` and `Op::poll` at `4.0%`.
+`FuturesUnordered` coordination was about `3%`; prior scan and `PollSet`
+comparisons already showed no material general win.
+
+The first concurrent KV recovery implementation still drained reads in
+discrete batches of 64. Keeping one `FuturesUnordered` queue continuously
+replenished removed the batch barriers. Window-size screening found:
+
+- 64 reads: `3.477 ms` median (`3.477`, `3.645`, `3.312 ms`).
+- 128 reads: `2.493 ms` median (`2.527`, `2.480`, `2.493 ms`).
+- 256 reads: `2.846 ms` in the screening run.
+
+The selected 128-read window was `46.7%` faster than the established current
+baseline of `4.680 ms`. With the example's smaller 64-entry ring, a focused
+check improved from `4.854 ms` to `2.501 ms`, confirming that submission
+backpressure does not erase the win.
+
+Profiling the sliding window showed `crc_fast::checksum_combine` at `53%` of
+sampled CPU cycles. Streaming the zeroed header and payload through one
+`crc_fast::Digest` preserves the existing on-disk checksum while avoiding
+polynomial combination:
+
+- Sliding window only: `2.493 ms` median.
+- Streaming CRC: `2.132 ms` median (`2.024`, `2.132`, `2.301 ms`),
+  another `14.5%` improvement.
+- Cumulative versus current master: `54.4%` faster.
+
+The final profile had no comparable CPU hotspot: block-read setup was `6.4%`,
+memset `5.5%`, and CRC `2.2%`. Skipping the aligned-buffer zero fill with
+tracked initialization was tested and rejected at `2.146 ms`, slightly slower
+than the retained shape and below the materiality threshold.
