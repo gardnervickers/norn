@@ -125,7 +125,6 @@ impl Handle {
         PushFuture::new(Rc::clone(&self.shared), entry)
     }
 
-    #[inline]
     pub(crate) fn try_push(&self, entry: ConfiguredEntry) -> TryPush {
         if self.shared.status() != Status::Running {
             let err = if let Some(err) = self.shared.health_error() {
