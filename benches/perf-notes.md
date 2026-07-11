@@ -522,3 +522,62 @@ existing Norn receive path. It adds a separate kernel/NIC facility, and its
 microbenchmark measures only its own completion parsing and refill helper with
 no existing-path comparator. Evaluate it as a feature on supported hardware,
 not as evidence for a portable runtime fast-path change.
+
+## 2026-07-11: Zen 3 Workstation Follow-up
+
+Linux measurements used a Ryzen 9 5950X with the governor set to
+`performance`. Focused cases were pinned to CPU 15, whose SMT sibling was
+idle. The clean baseline was current master at `e719d3a`.
+
+Retained changes:
+
+- Submit an `io_uring` operation immediately when the SQ has capacity, and
+  construct the backpressure waiter only after a known-full result.
+  - 64 tasks / 100,000 noops: `15.907 ms` to `14.089 ms` median,
+    `11.4%` faster.
+  - Forced backpressure: `2.142 ms` to `2.186 ms`, `2.1%` slower and below
+    the materiality threshold.
+  - File round trips improved by `1.1%`; repeated loopback UDP/TCP checks were
+    neutral to slightly faster.
+- Inline `TaskQueue::next` and `Rc<Shared>::schedule`, the two task dispatch
+  boundaries that remained visible in the profile.
+  - 32 tasks x 32 yields: `11,205 ns` to `9,449 ns` median, `15.7%`
+    faster.
+  - 128 tasks x 32 yields: `45,437 ns` to `37,382 ns` median, `17.7%`
+    faster.
+  - Spawn 1,024 tasks: `39,369 ns` to `37,728 ns`, `4.2%` faster.
+- Replace the executor TLS context's `RefCell` with the same scoped
+  `UnsafeCell` discipline already used by the timer context.
+  - Ready `block_on`: `5 ns` to `4 ns` median.
+  - Yield-once `block_on`: `7 ns` to `6 ns` median.
+  - `cargo miri test -p norn-executor` passed all seven tests.
+- Pipeline up to 64 norn-kv recovery reads and preserve aligned Linux buffers
+  across block I/O instead of copying through `Vec`.
+  - 256 live slots, three current-master runs: `11.315`, `11.309`, and
+    `11.308 ms`; median `11.309 ms`.
+  - Optimized runs: `4.631`, `4.704`, and `4.680 ms`; median
+    `4.680 ms`, `58.6%` faster.
+  - The recovered prototype's buffer allocation was generalized so the
+    non-Linux `Vec` backend still compiles and passes tests.
+
+Profiles explained the retained wins:
+
+- Before task dispatch inlining, `Schedule` and `TaskQueue::next` accounted
+  for about `18.5%` and `12.4%` of samples. Both disappeared from the
+  post-change profile.
+- Before immediate submission, `PushFuture::poll` and `Handle::push`
+  accounted for about `8.4%` and `5.4%`. The waiter path disappeared from
+  the common-case profile after the change.
+- Removing executor context borrow checks roughly halved the sampled
+  `Context::enter` share in the yield-once target.
+
+Tried and rejected:
+
+- Widen task state flags from `u8` to `u32`: at most about `4.2%` on the
+  largest yield case, with smaller results elsewhere.
+- Inline the `Runnable::run` wrapper: no incremental gain after the two
+  retained dispatch annotations.
+- Force-inline the immediate SQ push helper: no measurable improvement.
+- Replace the driver's ring `RefCell` with unchecked local `UnsafeCell`
+  access: about `1.1%` on noop submission and `1.2%` on forced
+  backpressure, below the threshold for added unsafe code.
