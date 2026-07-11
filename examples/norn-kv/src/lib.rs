@@ -341,6 +341,7 @@ impl Store {
 }
 
 impl StoreConfig {
+    #[allow(clippy::manual_is_multiple_of)]
     fn validate(self) -> Result<()> {
         if self.slot_count == 0 {
             return Err(Error::InvalidConfig("slot_count must be greater than zero"));
@@ -351,7 +352,7 @@ impl StoreConfig {
         if self.slot_size <= HEADER_SIZE {
             return Err(Error::InvalidConfig("slot_size must exceed header size"));
         }
-        if !self.slot_size.is_multiple_of(BLOCK_ALIGNMENT) {
+        if self.slot_size % BLOCK_ALIGNMENT != 0 {
             return Err(Error::InvalidConfig(
                 "slot_size must be a multiple of 4096 for O_DIRECT",
             ));
