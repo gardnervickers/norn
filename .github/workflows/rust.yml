@@ -20,10 +20,14 @@ jobs:
     - uses: Swatinem/rust-cache@v2.7.0
       with:
         shared-key: nix-rust
+    - name: Check formatting
+      run: nix develop -c cargo fmt --all --check
+    - name: Run Clippy
+      run: nix develop -c cargo clippy --workspace --all-targets --all-features -- -D warnings
     - name: Build
       run: nix develop -c cargo build
     - name: Run tests
-      run: nix develop -c cargo test
+      run: nix develop -c cargo test --workspace
 
   miri:
     runs-on: ubuntu-latest
@@ -34,6 +38,8 @@ jobs:
         - norn-nursery
         - norn-task
         - norn-executor
+        - norn-timer
+        - norn-util
 
     steps:
     - uses: actions/checkout@v3

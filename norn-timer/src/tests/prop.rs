@@ -13,6 +13,7 @@ fn new_sleep(wheels: &Rc<Wheels>, dur: Duration) -> Pin<Box<entry::Sleep<Rc<Whee
 }
 
 proptest! {
+    #[cfg_attr(miri, ignore = "proptest is prohibitively slow under Miri")]
     #[test]
     fn cancellations_preserve_exact_deadlines(
         cases in prop::collection::vec((1..64 * 128_u64, any::<bool>()), 1..1000)
@@ -56,6 +57,7 @@ proptest! {
         prop_assert_eq!(fired_total, expected.len());
     }
 
+    #[cfg_attr(miri, ignore = "proptest is prohibitively slow under Miri")]
     #[test]
     fn advance_prop(mut timestamps in prop::collection::vec(1..64*32u64, 1..10000),
                     mut poll_times in prop::collection::vec(0..64*32u64, 1..100)) {
@@ -99,6 +101,7 @@ proptest! {
         }
     }
 
+    #[cfg_attr(miri, ignore = "proptest is prohibitively slow under Miri")]
     #[test]
     fn advance_always_terminates_prop(timestamps in prop::collection::vec(1..64*32u64, 1..10000)) {
         // 1. Generate a bunch of timestamps.

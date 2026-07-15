@@ -26,7 +26,10 @@ struct BlockOnYieldBench;
 impl bencher::TDynBenchFn for BlockOnYieldBench {
     fn run(&self, b: &mut Bencher) {
         let mut executor = LocalExecutor::new(SpinPark);
-        b.iter(|| black_box(executor.block_on(YieldOnce(false))));
+        b.iter(|| {
+            executor.block_on(YieldOnce(false));
+            black_box(())
+        });
     }
 }
 
