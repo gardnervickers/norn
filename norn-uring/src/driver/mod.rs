@@ -1,5 +1,6 @@
+use std::any::Any;
 use std::cell::{Cell, RefCell, UnsafeCell};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::{io, mem};
 
@@ -13,8 +14,17 @@ use smallvec::SmallVec;
 use crate::error::SubmitError;
 use crate::fd;
 use crate::operation::{complete_operation, ConfiguredEntry, Op, Operation};
+use crate::registered_buffers::Registry as RegisteredBuffers;
+pub(crate) use crate::registered_buffers::{
+    Generation as FixedBufGeneration, Release as FixedBufRelease,
+    ReleaseError as FixedBufReleaseError, ReserveError as ReserveFixedBufError,
+    Retention as FixedBufRetention,
+};
 use crate::util::notify::Notify;
 pub(crate) use futures::PushFuture;
+
+#[cfg(test)]
+use crate::registered_buffers::State as FixedBufState;
 
 mod context;
 mod futures;
@@ -51,6 +61,20 @@ struct Shared {
     backpressure: Notify,
     status: Cell<Status>,
     submit_error: RefCell<Option<(io::ErrorKind, String)>>,
+    // This field must be declared after `ring`: fields are dropped in declaration
+    // order, so retained registered storage is released only after the ring.
+    registered_buffers: RegisteredBuffers,
+}
+
+pub(crate) struct FixedBufReservation {
+    shared: Rc<Shared>,
+    generation: FixedBufGeneration,
+    committed: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct FixedBufDriver {
+    shared: Weak<Shared>,
 }
 
 /// The status of the driver.
@@ -79,6 +103,75 @@ impl std::fmt::Debug for Handle {
 impl std::fmt::Debug for Driver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Driver").finish()
+    }
+}
+
+impl FixedBufReservation {
+    pub(crate) fn generation(&self) -> FixedBufGeneration {
+        self.generation
+    }
+
+    pub(crate) fn with_submitter<U>(&self, f: impl FnOnce(&Submitter<'_>) -> U) -> U {
+        self.shared.with_submitter(f)
+    }
+
+    pub(crate) fn arm_kernel_call(&self) {
+        self.shared
+            .registered_buffers
+            .arm_kernel_call(self.generation);
+    }
+
+    pub(crate) fn kernel_call_failed(&self) {
+        self.shared
+            .registered_buffers
+            .kernel_call_failed(self.generation);
+    }
+
+    pub(crate) fn commit(mut self) -> FixedBufDriver {
+        let driver = FixedBufDriver {
+            shared: Rc::downgrade(&self.shared),
+        };
+        self.shared.registered_buffers.commit(self.generation);
+        self.committed = true;
+        driver
+    }
+}
+
+impl Drop for FixedBufReservation {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.shared.registered_buffers.rollback(self.generation);
+        }
+    }
+}
+
+impl FixedBufDriver {
+    pub(crate) fn same_driver(&self, handle: &Handle) -> bool {
+        self.shared.as_ptr() == Rc::as_ptr(&handle.shared)
+    }
+
+    pub(crate) fn unregister(
+        &self,
+        generation: FixedBufGeneration,
+    ) -> Result<FixedBufRelease, FixedBufReleaseError> {
+        let Some(shared) = self.shared.upgrade() else {
+            return Ok(FixedBufRelease::RingGone);
+        };
+        shared
+            .registered_buffers
+            .unregister(&shared.ring, generation)
+    }
+
+    pub(crate) fn retain(
+        &self,
+        generation: FixedBufGeneration,
+        storage: Box<dyn Any>,
+    ) -> FixedBufRetention {
+        let Some(shared) = self.shared.upgrade() else {
+            drop(storage);
+            return FixedBufRetention::RingGone;
+        };
+        shared.registered_buffers.retain(generation, storage)
     }
 }
 
@@ -156,6 +249,43 @@ impl Handle {
         self.shared.with_submitter(f)
     }
 
+    pub(crate) fn reserve_fixed_buffers(
+        &self,
+    ) -> Result<FixedBufReservation, ReserveFixedBufError> {
+        if self.shared.status() != Status::Running {
+            return Err(ReserveFixedBufError::DriverStopped);
+        }
+        let generation = self.shared.registered_buffers.reserve(&self.shared.ring)?;
+
+        Ok(FixedBufReservation {
+            shared: Rc::clone(&self.shared),
+            generation,
+            committed: false,
+        })
+    }
+
+    pub(crate) fn fixed_buf_driver(&self) -> FixedBufDriver {
+        FixedBufDriver {
+            shared: Rc::downgrade(&self.shared),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_forget_fixed_buffers(&self) {
+        self.shared.registered_buffers.test_forget();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_retained_fixed_buffers(&self) -> usize {
+        self.shared.registered_buffers.test_retained_len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_with_ring_borrowed_mut(&self, f: impl FnOnce()) {
+        let _ring = self.shared.ring.borrow_mut();
+        f();
+    }
+
     /// Returns the first recorded fatal driver submit error, if any.
     pub fn health_error(&self) -> Option<io::Error> {
         self.shared.health_error()
@@ -188,6 +318,7 @@ impl Driver {
                 backpressure: Notify::default(),
                 status: Cell::new(Status::Running),
                 submit_error: RefCell::new(None),
+                registered_buffers: RegisteredBuffers::new(),
             }),
             unparker: Arc::new(unpark::Unparker::new()?),
             unparker_buf: mem::ManuallyDrop::new(Box::new(UnsafeCell::new([0; 8]))),
@@ -735,7 +866,7 @@ mod tests {
         #[derive(Debug)]
         struct NopOp;
 
-        impl Operation for NopOp {
+        unsafe impl Operation for NopOp {
             fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
                 io_uring::opcode::Nop::new().build()
             }
@@ -787,7 +918,7 @@ mod tests {
         #[derive(Debug)]
         struct NopOp;
 
-        impl Operation for NopOp {
+        unsafe impl Operation for NopOp {
             fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
                 io_uring::opcode::Nop::new().build()
             }
@@ -816,7 +947,7 @@ mod tests {
         #[derive(Debug)]
         struct NopOp;
 
-        impl Operation for NopOp {
+        unsafe impl Operation for NopOp {
             fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
                 io_uring::opcode::Nop::new().build()
             }
@@ -862,7 +993,7 @@ mod tests {
         #[derive(Debug)]
         struct NopOp;
 
-        impl Operation for NopOp {
+        unsafe impl Operation for NopOp {
             fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
                 io_uring::opcode::Nop::new().build()
             }
@@ -911,6 +1042,54 @@ mod tests {
         assert!(
             Shared::should_record_submit_error(&eio),
             "hard submit failures should still transition driver health"
+        );
+    }
+
+    #[test]
+    fn fixed_buffer_reservation_is_exclusive_and_rolls_back() {
+        let driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let handle = driver.handle();
+
+        let reservation = handle.reserve_fixed_buffers().unwrap();
+        assert_eq!(reservation.generation(), 1);
+        assert_eq!(
+            handle.reserve_fixed_buffers().err(),
+            Some(ReserveFixedBufError::TableInUse)
+        );
+        drop(reservation);
+        assert_eq!(
+            driver.shared.registered_buffers.test_state(),
+            FixedBufState::Empty
+        );
+
+        let reservation = handle.reserve_fixed_buffers().unwrap();
+        assert_eq!(reservation.generation(), 2);
+        reservation.arm_kernel_call();
+        let token = reservation.commit();
+        assert!(token.same_driver(&handle));
+        assert_eq!(
+            driver.shared.registered_buffers.test_state(),
+            FixedBufState::Registered(2)
+        );
+        assert_eq!(
+            handle.reserve_fixed_buffers().err(),
+            Some(ReserveFixedBufError::TableInUse)
+        );
+    }
+
+    #[test]
+    fn fixed_buffer_reservation_rejects_stopped_driver() {
+        let driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let handle = driver.handle();
+        driver.shared.set_status(Status::Shutdown);
+
+        assert_eq!(
+            handle.reserve_fixed_buffers().err(),
+            Some(ReserveFixedBufError::DriverStopped)
+        );
+        assert_eq!(
+            driver.shared.registered_buffers.test_state(),
+            FixedBufState::Empty
         );
     }
 }

@@ -1,7 +1,11 @@
 #![cfg(target_os = "linux")]
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
+use futures_core::Future;
+use futures_util::future::poll_fn;
+use norn_uring::fixedbuf::{AcquireError, FixedBuffer, RegisterErrorKind, UnregisterErrorKind};
 use norn_uring::fs;
+use std::task::Poll;
 
 mod util;
 
@@ -59,6 +63,270 @@ fn read_write() -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(buf, b"hello world");
         Ok(())
     })
+}
+
+#[repr(C, align(4096))]
+struct AlignedBlock([u8; 4096]);
+
+// Safety: the array is inline in `AlignedBlock`, and fixed-buffer registration
+// captures its address only after the wrapper reaches final pool storage.
+unsafe impl FixedBuffer for AlignedBlock {
+    fn fixed_region(&mut self) -> &mut [u8] {
+        &mut self.0
+    }
+}
+
+#[test]
+fn fixed_buffers_support_custom_inline_storage() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let dir = util::ThreadNameTestDir::new();
+        let path = dir.join("fixed-inline");
+        let mut opts = fs::OpenOptions::new();
+        opts.create(true).truncate(true).write(true).read(true);
+        let file = opts.open(path).await?;
+
+        let pool = norn_uring::Handle::current()
+            .register_fixed_buffers(vec![AlignedBlock([0; 4096]), AlignedBlock([0; 4096])])?;
+        let payload = b"caller-selected fixed buffer";
+
+        let mut write_buf = pool.try_acquire()?;
+        write_buf.set_range(0..payload.len())?;
+        write_buf.as_full_slice_mut().copy_from_slice(payload);
+        write_buf.set_len(payload.len())?;
+        let (result, write_buf) = file.write_fixed_at(write_buf, 0).await;
+        assert_eq!(result?, payload.len());
+        drop(write_buf);
+
+        let mut read_buf = pool.try_acquire()?;
+        read_buf.set_range(0..payload.len())?;
+        let (result, read_buf) = file.read_fixed_at(read_buf, 0).await;
+        assert_eq!(result?, payload.len());
+        assert_eq!(read_buf.len(), payload.len());
+        assert_eq!(&*read_buf, payload);
+        drop(read_buf);
+
+        let buffers = pool.unregister()?;
+        assert_eq!(buffers.len(), 2);
+        Ok(())
+    })
+}
+
+#[test]
+fn fixed_buffer_range_and_logical_len_bound_the_io() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let dir = util::ThreadNameTestDir::new();
+        let path = dir.join("fixed-range");
+        let mut opts = fs::OpenOptions::new();
+        opts.create(true).truncate(true).write(true).read(true);
+        let file = opts.open(&path).await?;
+
+        let pool = norn_uring::Handle::current().register_fixed_buffers(vec![[0u8; 32]])?;
+        let mut buffer = pool.try_acquire()?;
+        buffer.set_range(8..24)?;
+        buffer.set_payload(b"hello")?;
+        let (result, mut buffer) = file.write_fixed_at(buffer, 0).await;
+        assert_eq!(result?, 5);
+        assert_eq!(std::fs::read(&path)?, b"hello");
+
+        buffer.set_range(12..20)?;
+        let (result, buffer) = file.read_fixed_at(buffer, 0).await;
+        assert_eq!(result?, 5);
+        assert_eq!(buffer.range(), 12..20);
+        assert_eq!(&*buffer, b"hello");
+        drop(buffer);
+
+        assert_eq!(pool.unregister()?.len(), 1);
+        Ok(())
+    })
+}
+
+#[test]
+fn fixed_buffers_support_heterogeneous_and_projected_types(
+) -> Result<(), Box<dyn std::error::Error>> {
+    fn cursor_region(cursor: &mut std::io::Cursor<[u8; 64]>) -> &mut [u8] {
+        cursor.get_mut().as_mut_slice()
+    }
+
+    util::with_test_env(|| async {
+        let dir = util::ThreadNameTestDir::new();
+        let path = dir.join("fixed-erased-and-foreign");
+        let mut opts = fs::OpenOptions::new();
+        opts.create(true).truncate(true).write(true).read(true);
+        let file = opts.open(&path).await?;
+        let handle = norn_uring::Handle::current();
+        let buffers: Vec<Box<dyn FixedBuffer>> = vec![
+            Box::new(vec![0u8; 32]),
+            Box::new(vec![0u8; 32].into_boxed_slice()),
+            Box::new(BytesMut::from(&[0u8; 32][..])),
+            Box::new([0u8; 32]),
+        ];
+        let pool = handle.register_fixed_buffers(buffers)?;
+        let mut erased = pool.try_acquire_at(0)?;
+        erased.set_payload(b"erased")?;
+        let (result, erased) = file.write_fixed_at(erased, 0).await;
+        assert_eq!(result?, 6);
+        drop(erased);
+        let acquired = (1..pool.len())
+            .map(|index| pool.try_acquire_at(index))
+            .collect::<Result<Vec<_>, _>>()?;
+        for (expected, buffer) in acquired.iter().enumerate() {
+            let expected = expected + 1;
+            assert_eq!(buffer.index(), expected);
+            assert_eq!(buffer.capacity(), 32);
+        }
+        drop(acquired);
+        assert_eq!(pool.unregister()?.len(), 4);
+
+        let mut cursor = std::io::Cursor::new([0u8; 64]);
+        cursor.set_position(7);
+        // Safety: the projection selects the cursor's initialized inline array.
+        // The cursor is inaccessible and never moved while registered.
+        let pool = unsafe { handle.register_fixed_buffers_with(vec![cursor], cursor_region)? };
+        let mut projected = pool.try_acquire()?;
+        projected.set_range(8..32)?;
+        projected.set_payload(b"foreign")?;
+        let (result, projected) = file.write_fixed_at(projected, 16).await;
+        assert_eq!(result?, 7);
+        drop(projected);
+        let recovered = pool.unregister()?;
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].position(), 7);
+        assert_eq!(&recovered[0].get_ref()[8..15], b"foreign");
+        Ok(())
+    })
+}
+
+#[test]
+fn fixed_buffer_pool_reports_exclusion_and_recovers() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let handle = norn_uring::Handle::current();
+        let pool = handle.register_fixed_buffers(vec![vec![0u8; 32]])?;
+        let held = pool.try_acquire()?;
+        assert_eq!(
+            pool.try_acquire_at(0).unwrap_err(),
+            AcquireError::InUse { index: 0 }
+        );
+
+        let err = pool.unregister().unwrap_err();
+        assert!(matches!(
+            err.kind(),
+            UnregisterErrorKind::Busy { acquired: 1 }
+        ));
+        let pool = err.into_pool();
+        drop(held);
+
+        let second = handle
+            .register_fixed_buffers(vec![vec![0u8; 8]])
+            .unwrap_err();
+        assert!(matches!(
+            second.kind(),
+            RegisterErrorKind::AlreadyRegistered
+        ));
+        assert_eq!(second.into_buffers().len(), 1);
+
+        assert_eq!(pool.unregister()?.len(), 1);
+        let replacement = handle.register_fixed_buffers(vec![vec![0u8; 8]])?;
+        assert_eq!(replacement.unregister()?.len(), 1);
+        Ok(())
+    })
+}
+
+#[test]
+fn fixed_read_error_preserves_payload_and_unpolled_op_holds_slot(
+) -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let dir = util::ThreadNameTestDir::new();
+        let path = dir.join("fixed-read-error");
+        let mut opts = fs::OpenOptions::new();
+        opts.create(true).truncate(true).write(true);
+        let file = opts.open(path).await?;
+
+        let pool = norn_uring::Handle::current()
+            .register_fixed_buffers(vec![b"existing payload".to_vec()])?;
+        let buffer = pool.try_acquire()?;
+        let op = file.read_fixed_at(buffer, 0);
+        assert_eq!(
+            pool.try_acquire_at(0).unwrap_err(),
+            AcquireError::InUse { index: 0 }
+        );
+
+        drop(op);
+        let buffer = pool.try_acquire_at(0)?;
+        let (result, buffer) = file.read_fixed_at(buffer, 0).await;
+        assert!(result.is_err());
+        assert_eq!(&*buffer, b"existing payload");
+        drop(buffer);
+        assert_eq!(pool.unregister()?.len(), 1);
+        Ok(())
+    })
+}
+
+#[test]
+fn submitted_then_cancelled_fixed_op_holds_slot_until_terminal_cqe(
+) -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let dir = util::ThreadNameTestDir::new();
+        let path = dir.join("fixed-cancel");
+        std::fs::write(&path, b"completion")?;
+        let file = fs::File::open(path).await?;
+        let pool = norn_uring::Handle::current().register_fixed_buffers(vec![vec![0u8; 32]])?;
+
+        let buffer = pool.try_acquire()?;
+        let mut op = Box::pin(file.read_fixed_at(buffer, 0));
+        poll_fn(|cx| {
+            assert!(op.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        drop(op);
+        assert_eq!(pool.try_acquire().unwrap_err(), AcquireError::Exhausted);
+
+        let mut recovered = None;
+        for _ in 0..4 {
+            norn_uring::noop().await;
+            if let Ok(buffer) = pool.try_acquire() {
+                recovered = Some(buffer);
+                break;
+            }
+        }
+        drop(recovered.expect("cancelled fixed operation did not reach a terminal CQE"));
+        assert_eq!(pool.unregister()?.len(), 1);
+        Ok(())
+    })
+}
+
+#[test]
+fn fixed_operations_reject_another_driver_but_ordinary_io_composes(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let dir = util::ThreadNameTestDir::new();
+    let path = dir.join("fixed-driver-identity");
+    std::fs::write(&path, b"cross-driver ordinary read")?;
+
+    let left_driver = norn_uring::Driver::new(io_uring::IoUring::builder(), 16)?;
+    let mut left_executor = norn_executor::LocalExecutor::new(left_driver);
+    let file = left_executor.block_on(fs::File::open(&path))?;
+
+    let right_driver = norn_uring::Driver::new(io_uring::IoUring::builder(), 16)?;
+    let right_handle = right_driver.handle();
+    let pool = right_handle.register_fixed_buffers(vec![vec![0u8; 64]])?;
+
+    let wrong_driver = pool.try_acquire()?;
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drop(file.read_fixed_at(wrong_driver, 0));
+    }));
+    assert!(panic.is_err());
+
+    let ordinary = pool.try_acquire_at(0)?;
+    let (result, ordinary) = left_executor.block_on(file.read_at(ordinary, 0));
+    let n = result?;
+    assert_eq!(&ordinary[..n], b"cross-driver ordinary read");
+    drop(ordinary);
+
+    left_executor.block_on(file.close())?;
+    assert_eq!(pool.unregister()?.len(), 1);
+    drop(right_handle);
+    drop(right_driver);
+    Ok(())
 }
 
 #[test]

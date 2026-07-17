@@ -492,7 +492,9 @@ struct OpenSocket {
     protocol: Option<Protocol>,
 }
 
-impl Operation for OpenSocket {
+// Safety: the socket SQE contains only copied scalar arguments; cleanup closes
+// a descriptor returned by an unconsumed successful CQE.
+unsafe impl Operation for OpenSocket {
     fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
         let ty: i32 = self.socket_type.into();
         let ty = ty | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC;
@@ -546,7 +548,9 @@ where
     }
 }
 
-impl<B> Operation for SendTo<B>
+// Safety: the owned stable buffer, socket address, msghdr, and iovec storage
+// remain pinned and live through the terminal CQE.
+unsafe impl<B> Operation for SendTo<B>
 where
     B: StableBuf,
 {
@@ -635,7 +639,9 @@ where
     }
 }
 
-impl<B> Operation for RecvFrom<B>
+// Safety: the owned mutable stable buffer, socket address, msghdr, and iovec
+// storage remain pinned and exclusive through the terminal CQE.
+unsafe impl<B> Operation for RecvFrom<B>
 where
     B: StableBufMut,
 {
@@ -722,7 +728,9 @@ impl RecvFromRing {
     }
 }
 
-impl Operation for RecvFromRing {
+// Safety: `NornFd` and `BufRing` retain the socket and registered buffer group;
+// inline recvmsg metadata remains pinned, and cleanup returns selected buffers.
+unsafe impl Operation for RecvFromRing {
     fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
         let this = unsafe { self.get_unchecked_mut() };
 
@@ -860,7 +868,9 @@ impl RecvFromRingMulti {
     }
 }
 
-impl Operation for RecvFromRingMulti {
+// Safety: `NornFd` and `BufRing` retain all referenced resources through the
+// multishot terminal CQE; each selected buffer is either yielded or cleaned up.
+unsafe impl Operation for RecvFromRingMulti {
     fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
         let this = unsafe { self.get_unchecked_mut() };
         let msghdr = this.msghdr.as_mut_ptr();
@@ -920,7 +930,9 @@ impl RecvRingMulti {
     }
 }
 
-impl Operation for RecvRingMulti {
+// Safety: `NornFd` and `BufRing` retain all referenced resources through the
+// multishot terminal CQE; each selected buffer is either yielded or cleaned up.
+unsafe impl Operation for RecvRingMulti {
     fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
         let this = unsafe { self.get_unchecked_mut() };
         match this.fd.kind() {
@@ -967,7 +979,9 @@ impl RecvRingBundle {
     }
 }
 
-impl Operation for RecvRingBundle {
+// Safety: `NornFd` and `BufRing` retain the descriptor and registered group;
+// completion ownership accounts for every selected buffer in the bundle.
+unsafe impl Operation for RecvRingBundle {
     fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
         let this = unsafe { self.get_unchecked_mut() };
         match this.fd.kind() {
@@ -1016,7 +1030,9 @@ impl RecvRingBundleMulti {
     }
 }
 
-impl Operation for RecvRingBundleMulti {
+// Safety: `NornFd` and `BufRing` retain resources through the multishot
+// terminal CQE; yielded and unconsumed bundles are returned by completion logic.
+unsafe impl Operation for RecvRingBundleMulti {
     fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
         let this = unsafe { self.get_unchecked_mut() };
         match this.fd.kind() {
@@ -1094,7 +1110,9 @@ impl<const MULTI: bool> Accept<MULTI> {
     }
 }
 
-impl<const MULTI: bool> Operation for Accept<MULTI> {
+// Safety: `NornFd` retains the listener and the pinned socket-address storage
+// remains valid for every CQE; cleanup closes unconsumed accepted descriptors.
+unsafe impl<const MULTI: bool> Operation for Accept<MULTI> {
     fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
         let this = unsafe { self.get_unchecked_mut() };
 
@@ -1176,7 +1194,9 @@ impl BindSocket {
     }
 }
 
-impl Operation for BindSocket {
+// Safety: `NornFd` retains the socket and the owned address storage remains
+// live and pinned through completion.
+unsafe impl Operation for BindSocket {
     fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
         let this = unsafe { self.get_unchecked_mut() };
         match this.fd.kind() {
@@ -1211,7 +1231,8 @@ impl ListenSocket {
     }
 }
 
-impl Operation for ListenSocket {
+// Safety: `NornFd` retains the only resource referenced by this SQE.
+unsafe impl Operation for ListenSocket {
     fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
         let this = unsafe { self.get_unchecked_mut() };
         match this.fd.kind() {
@@ -1252,7 +1273,9 @@ where
     }
 }
 
-impl<T> Operation for SetSockOpt<T>
+// Safety: `NornFd` retains the socket and the pinned inline option value keeps
+// the SQE pointer valid through completion.
+unsafe impl<T> Operation for SetSockOpt<T>
 where
     T: Copy,
 {
@@ -1302,7 +1325,9 @@ impl Connect {
     }
 }
 
-impl Operation for Connect {
+// Safety: `NornFd` retains the socket and the owned address storage remains
+// live and pinned through completion.
+unsafe impl Operation for Connect {
     fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
         let this = unsafe { self.get_unchecked_mut() };
         match this.fd.kind() {
@@ -1339,7 +1364,8 @@ impl Shutdown {
     }
 }
 
-impl Operation for Shutdown {
+// Safety: `NornFd` retains the only resource referenced by this SQE.
+unsafe impl Operation for Shutdown {
     fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
         let this = unsafe { self.get_unchecked_mut() };
         match this.fd.kind() {
@@ -1374,7 +1400,9 @@ where
     }
 }
 
-impl<B> Operation for Recv<B>
+// Safety: `NornFd` retains the socket and the owned `StableBufMut` keeps the
+// writable region stable and exclusive through completion.
+unsafe impl<B> Operation for Recv<B>
 where
     B: StableBufMut,
 {
@@ -1428,7 +1456,9 @@ where
     }
 }
 
-impl<B> Operation for Send<B>
+// Safety: `NornFd` retains the socket and the owned `StableBuf` keeps its
+// initialized bytes stable through every kernel read.
+unsafe impl<B> Operation for Send<B>
 where
     B: StableBuf,
 {
@@ -1502,7 +1532,9 @@ where
     }
 }
 
-impl<B> Operation for SendZc<B>
+// Safety: the owned stable buffer remains live through both the primary and
+// notification CQEs; the completion state treats only the notification as final.
+unsafe impl<B> Operation for SendZc<B>
 where
     B: StableBuf,
 {
@@ -1572,7 +1604,9 @@ where
     }
 }
 
-impl<B> Operation for SendMsgZc<B>
+// Safety: the owned stable buffer and pinned msghdr/iovec storage remain live
+// through both zerocopy CQEs; completion state accounts for the notification.
+unsafe impl<B> Operation for SendMsgZc<B>
 where
     B: StableBuf,
 {
@@ -1638,7 +1672,9 @@ impl<const MULTI: bool> Poll<MULTI> {
     }
 }
 
-impl<const MULTI: bool> Operation for Poll<MULTI> {
+// Safety: `NornFd` retains the descriptor through the single or multishot
+// terminal CQE; the SQE references no userspace memory.
+unsafe impl<const MULTI: bool> Operation for Poll<MULTI> {
     fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
         let this = unsafe { self.get_unchecked_mut() };
         match this.fd.kind() {

@@ -119,7 +119,9 @@ impl LinkTimeoutOp {
     }
 }
 
-impl Operation for LinkTimeoutOp {
+// Safety: the timeout specification is stored inline in this pinned operation,
+// so its SQE pointer remains valid until the terminal completion.
+unsafe impl Operation for LinkTimeoutOp {
     fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
         let this = self.as_ref().get_ref();
         io_uring::opcode::LinkTimeout::new(&this.timespec).build()
@@ -680,7 +682,7 @@ mod tests {
     #[derive(Debug)]
     struct TaggedNop(u8);
 
-    impl Operation for TaggedNop {
+    unsafe impl Operation for TaggedNop {
         fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
             io_uring::opcode::Nop::new().build()
         }

@@ -8,6 +8,7 @@ use io_uring::{opcode, types};
 
 use crate::buf::{StableBuf, StableBufMut};
 use crate::fd::{FdKind, NornFd};
+use crate::fixedbuf::FixedBuf;
 use crate::fs::opts;
 use crate::operation::{CQEResult, Operation, Singleshot};
 
@@ -120,6 +121,59 @@ impl File {
         B: StableBuf + 'static,
     {
         let write = WriteAt::new(self.fd.clone(), buf, offset);
+        self.handle.submit(write)
+    }
+
+    /// Read bytes into a registered fixed buffer.
+    ///
+    /// The read starts at `offset` and may fill the buffer's entire selected
+    /// capacity. The operation returns ownership of the buffer with its result.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixed buffer was registered with another driver.
+    #[track_caller]
+    pub fn read_fixed_at<B>(
+        &self,
+        buf: FixedBuf<B>,
+        offset: u64,
+    ) -> impl crate::Request<Output = (io::Result<usize>, FixedBuf<B>)>
+    where
+        B: 'static,
+    {
+        assert!(
+            buf.same_driver(&self.handle),
+            "fixed buffer and file must target the same driver"
+        );
+        let read = ReadFixedAt::new(self.fd.clone(), buf, offset);
+        self.handle.submit(read)
+    }
+
+    /// Write a registered fixed buffer's logical payload.
+    ///
+    /// The write starts at `offset` and returns ownership of the buffer with
+    /// its result.
+    ///
+    /// Short writes can be retried by calling [`FixedBuf::consume`] on the
+    /// returned buffer and advancing `offset` by the completed byte count.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixed buffer was registered with another driver.
+    #[track_caller]
+    pub fn write_fixed_at<B>(
+        &self,
+        buf: FixedBuf<B>,
+        offset: u64,
+    ) -> impl crate::Request<Output = (io::Result<usize>, FixedBuf<B>)>
+    where
+        B: 'static,
+    {
+        assert!(
+            buf.same_driver(&self.handle),
+            "fixed buffer and file must target the same driver"
+        );
+        let write = WriteFixedAt::new(self.fd.clone(), buf, offset);
         self.handle.submit(write)
     }
 
@@ -368,7 +422,9 @@ impl Open {
     }
 }
 
-impl Operation for Open {
+// Safety: the owned CString and inline `OpenHow` keep both SQE pointers valid;
+// cleanup closes a descriptor returned by an unconsumed successful CQE.
+unsafe impl Operation for Open {
     fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
         let this = self.get_mut();
         let ptr = this.path.as_ptr();
@@ -431,7 +487,9 @@ impl<B> ReadAt<B> {
     }
 }
 
-impl<B> Operation for ReadAt<B>
+// Safety: `NornFd` retains the descriptor and the owned `StableBufMut` keeps
+// the writable region stable and exclusive through the terminal CQE.
+unsafe impl<B> Operation for ReadAt<B>
 where
     B: StableBufMut,
 {
@@ -472,6 +530,54 @@ where
     }
 }
 
+#[derive(Debug)]
+struct ReadFixedAt<B: 'static> {
+    fd: NornFd,
+    buf: FixedBuf<B>,
+    offset: u64,
+}
+
+impl<B: 'static> ReadFixedAt<B> {
+    fn new(fd: NornFd, buf: FixedBuf<B>, offset: u64) -> Self {
+        Self { fd, buf, offset }
+    }
+}
+
+// Safety: `FixedBuf` owns the registered slot until the terminal CQE and the
+// same-driver check is performed before this operation is constructed.
+unsafe impl<B: 'static> Operation for ReadFixedAt<B> {
+    fn configure(mut self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+        let ptr = self.buf.fixed_ptr_mut();
+        let len = self.buf.read_capacity_u32();
+        let index = self.buf.kernel_index();
+        match self.fd.kind() {
+            FdKind::Fd(fd) => opcode::ReadFixed::new(*fd, ptr, len, index),
+            FdKind::Fixed(fd) => opcode::ReadFixed::new(*fd, ptr, len, index),
+        }
+        .offset(self.offset)
+        .build()
+    }
+
+    fn cleanup(&mut self, _: CQEResult) {}
+}
+
+impl<B: 'static> Singleshot for ReadFixedAt<B> {
+    type Output = (io::Result<usize>, FixedBuf<B>);
+
+    fn complete(mut self, result: CQEResult) -> Self::Output {
+        match result.result {
+            Ok(n) => {
+                let n = n as usize;
+                match self.buf.set_len_after_read(n) {
+                    Ok(()) => (Ok(n), self.buf),
+                    Err(err) => (Err(err), self.buf),
+                }
+            }
+            Err(err) => (Err(err), self.buf),
+        }
+    }
+}
+
 struct WriteAt<B> {
     fd: NornFd,
     buf: B,
@@ -484,7 +590,9 @@ impl<B> WriteAt<B> {
     }
 }
 
-impl<B> Operation for WriteAt<B>
+// Safety: `NornFd` retains the descriptor and the owned `StableBuf` keeps its
+// initialized bytes stable through every kernel read.
+unsafe impl<B> Operation for WriteAt<B>
 where
     B: StableBuf,
 {
@@ -516,6 +624,48 @@ where
     }
 }
 
+#[derive(Debug)]
+struct WriteFixedAt<B: 'static> {
+    fd: NornFd,
+    buf: FixedBuf<B>,
+    offset: u64,
+}
+
+impl<B: 'static> WriteFixedAt<B> {
+    fn new(fd: NornFd, buf: FixedBuf<B>, offset: u64) -> Self {
+        Self { fd, buf, offset }
+    }
+}
+
+// Safety: `FixedBuf` owns the initialized registered payload until the
+// terminal CQE and the same-driver check happens before construction.
+unsafe impl<B: 'static> Operation for WriteFixedAt<B> {
+    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+        let ptr = self.buf.fixed_ptr();
+        let len = self.buf.write_len_u32();
+        let index = self.buf.kernel_index();
+        match self.fd.kind() {
+            FdKind::Fd(fd) => opcode::WriteFixed::new(*fd, ptr, len, index),
+            FdKind::Fixed(fd) => opcode::WriteFixed::new(*fd, ptr, len, index),
+        }
+        .offset(self.offset)
+        .build()
+    }
+
+    fn cleanup(&mut self, _: CQEResult) {}
+}
+
+impl<B: 'static> Singleshot for WriteFixedAt<B> {
+    type Output = (io::Result<usize>, FixedBuf<B>);
+
+    fn complete(self, result: CQEResult) -> Self::Output {
+        match result.result {
+            Ok(n) => (Ok(n as usize), self.buf),
+            Err(err) => (Err(err), self.buf),
+        }
+    }
+}
+
 struct ReadVectoredAt<B> {
     fd: NornFd,
     bufs: Vec<B>,
@@ -534,7 +684,9 @@ impl<B> ReadVectoredAt<B> {
     }
 }
 
-impl<B> Operation for ReadVectoredAt<B>
+// Safety: every owned `StableBufMut` remains live and exclusive, and the
+// operation-owned iovec array is built only after the operation is pinned.
+unsafe impl<B> Operation for ReadVectoredAt<B>
 where
     B: StableBufMut,
 {
@@ -607,7 +759,9 @@ impl<B> WriteVectoredAt<B> {
     }
 }
 
-impl<B> Operation for WriteVectoredAt<B>
+// Safety: every owned `StableBuf` remains live, and the operation-owned iovec
+// array is built only after the operation is pinned.
+unsafe impl<B> Operation for WriteVectoredAt<B>
 where
     B: StableBuf,
 {
@@ -667,7 +821,9 @@ impl Advise {
     }
 }
 
-impl Operation for Advise {
+// Safety: `NornFd` retains the only resource referenced by this pointer-free
+// advisory SQE until completion.
+unsafe impl Operation for Advise {
     fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
         match self.fd.kind() {
             FdKind::Fd(fd) => opcode::Fadvise::new(*fd, self.len, self.advice),
@@ -712,7 +868,9 @@ where
     }
 }
 
-impl<B> Operation for FileGetXattr<B>
+// Safety: the owned name CString and `StableBufMut` retain every SQE pointer;
+// operation ownership keeps the destination exclusive.
+unsafe impl<B> Operation for FileGetXattr<B>
 where
     B: StableBufMut,
 {
@@ -777,7 +935,9 @@ where
     }
 }
 
-impl<B> Operation for FileSetXattr<B>
+// Safety: the owned name CString and `StableBuf` retain every SQE pointer and
+// all initialized value bytes through completion.
+unsafe impl<B> Operation for FileSetXattr<B>
 where
     B: StableBuf,
 {
@@ -816,7 +976,8 @@ impl Sync {
     }
 }
 
-impl Operation for Sync {
+// Safety: `NornFd` retains the descriptor; the SQE references no memory.
+unsafe impl Operation for Sync {
     fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
         match self.fd.kind() {
             FdKind::Fd(fd) => opcode::Fsync::new(*fd),
@@ -854,7 +1015,8 @@ impl SyncRange {
     }
 }
 
-impl Operation for SyncRange {
+// Safety: `NornFd` retains the descriptor; the SQE references no memory.
+unsafe impl Operation for SyncRange {
     fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
         match self.fd.kind() {
             FdKind::Fd(fd) => opcode::SyncFileRange::new(*fd, self.len),
@@ -894,7 +1056,8 @@ impl Fallocate {
     }
 }
 
-impl Operation for Fallocate {
+// Safety: `NornFd` retains the descriptor; the SQE references no memory.
+unsafe impl Operation for Fallocate {
     fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
         match self.fd.kind() {
             FdKind::Fd(fd) => opcode::Fallocate::new(*fd, self.len),
@@ -927,7 +1090,8 @@ impl Truncate {
     }
 }
 
-impl Operation for Truncate {
+// Safety: `NornFd` retains the descriptor; the SQE references no memory.
+unsafe impl Operation for Truncate {
     fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
         match self.fd.kind() {
             FdKind::Fd(fd) => opcode::Ftruncate::new(*fd, self.len),
@@ -969,7 +1133,9 @@ impl SpliceOp {
     }
 }
 
-impl Operation for SpliceOp {
+// Safety: both `NornFd` values retain the copied descriptors used by the SQE;
+// no userspace memory is referenced.
+unsafe impl Operation for SpliceOp {
     fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
         let this = self.get_mut();
         match (*this.fd_in.kind(), *this.fd_out.kind()) {
@@ -1019,7 +1185,9 @@ impl TeeOp {
     }
 }
 
-impl Operation for TeeOp {
+// Safety: both `NornFd` values retain the copied descriptors used by the SQE;
+// no userspace memory is referenced.
+unsafe impl Operation for TeeOp {
     fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
         let this = self.get_mut();
         match (*this.fd_in.kind(), *this.fd_out.kind()) {
@@ -1051,5 +1219,18 @@ fn option_offset_to_i64(offset: Option<u64>) -> io::Result<i64> {
             i64::try_from(offset).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))
         }
         None => Ok(-1),
+    }
+}
+
+#[cfg(all(test, target_pointer_width = "64"))]
+mod layout_tests {
+    use super::*;
+
+    #[test]
+    fn fixed_operation_payloads_stay_within_the_expected_size_class() {
+        assert_eq!(std::mem::size_of::<ReadAt<usize>>(), 24);
+        assert_eq!(std::mem::size_of::<WriteAt<usize>>(), 24);
+        assert_eq!(std::mem::size_of::<ReadFixedAt<[u8; 1]>>(), 48);
+        assert_eq!(std::mem::size_of::<WriteFixedAt<[u8; 1]>>(), 48);
     }
 }

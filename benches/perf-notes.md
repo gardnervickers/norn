@@ -804,3 +804,152 @@ No source change was retained. The remaining sampled costs require a
 state-machine or queue-layout experiment rather than more inline annotations.
 Raw logs are under
 `target/bench-results/inline-candidates/20260715T055214Z/`.
+
+## 2026-07-17: Generic fixed buffers versus ordinary buffers
+
+The paired matrix ran against `47bd600f00c69d7f963095a0e6acb9b6088e9738`
+on the local Ryzen 9 5950X workstation from `2026-07-17T12:59:01Z` to
+approximately `14:57Z`. CPU 15 used the `performance` governor with SMT sibling
+31 idle. The data path was `/tmp` on ext4, backed by the Samsung 970 EVO Plus
+(`/dev/nvme1n1p2`), and the locked-memory limit was 8192 KiB. The working tree
+was clean when the run started.
+
+The command was:
+
+```text
+NORN_FIXEDBUF_RESULT_DIR=/tmp/norn-fixedbuf-2026-07-17 \
+  nix develop -c ./benches/run-fixed-buffer-pairs.sh
+```
+
+The runner completed all 84 isolated invocations: ordinary and fixed
+`O_DIRECT` reads and writes, 4-KiB blocks, 16,384 operations, queue depths
+1/32/128, and seven alternating-order pairs per case. Raw logs, the execution
+manifest, checked per-pair rows, and the summary remain under
+`/tmp/norn-fixedbuf-2026-07-17/`. Reproduce the analysis with:
+
+```text
+./benches/summarize-fixed-buffer-pairs.sh \
+  /tmp/norn-fixedbuf-2026-07-17
+```
+
+`delta` is the median of per-trial `100 * (fixed / ordinary - 1)` values, so a
+negative value favors fixed buffers. `MAD` and `range` describe those paired
+deltas. `signs` is the number of pairs in which fixed was faster. The time
+columns are independent medians and are included for scale, not used as the
+primary effect estimate.
+
+| direction | QD | ordinary median | fixed median | paired delta | MAD | range | signs |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| read | 1 | 236.691 ms | 231.072 ms | -2.85% | 0.55 pp | -7.70%..-1.25% | 7/7 |
+| read | 32 | 35.235 ms | 36.052 ms | +5.71% | 3.49 pp | +1.24%..+14.00% | 0/7 |
+| read | 128 | 31.379 ms | 26.274 ms | -16.31% | 0.04 pp | -16.37%..-16.24% | 7/7 |
+| write | 1 | 284.776 ms | 279.533 ms | -1.84% | 0.31 pp | -3.68%..-0.13% | 7/7 |
+| write | 32 | 62.317 ms | 62.172 ms | -0.45% | 0.27 pp | -1.39%..+1.15% | 6/7 |
+| write | 128 | 65.421 ms | 64.639 ms | -1.24% | 0.53 pp | -2.62%..-0.55% | 7/7 |
+
+Interpretation:
+
+- QD128 reads show a large, extremely stable fixed-buffer win. Both execution
+  orders agree (`-16.33%` ordinary-first, `-16.28%` fixed-first), and median
+  Bencher dispersion was below 0.7% for both modes.
+- QD1 reads and writes show smaller directional wins. Every pair favored fixed,
+  but read dispersion was around 3%, comparable to its effect size. The QD1
+  no-regression gate passed.
+- QD32 reads show a credible regression direction: every pair favored ordinary
+  and the paired median crossed the 5% gate. Its magnitude is less precise than
+  the sign because median reported dispersion was 10.3% ordinary and 21.7%
+  fixed. Fixed buffers are opt-in, so this does not block the feature.
+- QD32 writes are unresolved: the median effect is below 0.5%, one pair reverses
+  sign, and reported dispersion is 15-18%. QD128 writes have a consistent but
+  small directional improvement below the noise/materiality threshold.
+
+### QD32/QD128 read profile follow-up
+
+The worst and best read cases were profiled after the paired run. To avoid the
+adaptive Bencher iteration counts confounding the comparison, each profile ran
+the harness once and put exactly 100 repetitions of the 16,384-operation
+steady-state loop inside that timed iteration. Setup and integrity validation
+still ran only once. The symbolized binary was built with:
+
+```text
+CARGO_PROFILE_BENCH_DEBUG=true \
+  cargo bench -p benches --bench fixed_buffers --no-run
+```
+
+Each of the four profiles used this shape, changing only the benchmark filter:
+
+```text
+taskset -c 15 env \
+  NORN_BENCH_PPROF=/tmp/norn-fixedbuf-profile-steady-2026-07-17 \
+  NORN_BENCH_PPROF_RUN_ONCE=1 \
+  NORN_FIXEDBUF_PROFILE_REPETITIONS=100 \
+  NORN_FIXEDBUF_BENCH_DIR=/tmp \
+  target/release/deps/fixed_buffers-<hash> --bench <filter>
+```
+
+The generated protobuf profiles and flamegraphs remain under
+`/tmp/norn-fixedbuf-profile-steady-2026-07-17/fixed_buffers/`.
+
+| QD | mode | profile duration | sampled CPU in `Bencher::iter` |
+| ---: | --- | ---: | ---: |
+| 32 | ordinary | 3.70 s | 102 ms |
+| 32 | fixed | 4.08 s | 113 ms |
+| 128 | ordinary | 3.44 s | 95 ms |
+| 128 | fixed | 2.97 s | 115 ms |
+
+The controlled profiles reproduce both directions: fixed is about 10% slower
+at QD32 and about 14% faster at QD128. There is no fixed-buffer-specific user
+space hotspot. All four timed call graphs are dominated by the shared
+`FuturesUnordered`, operation submission/completion, atomic wake, CQ drain, and
+driver park paths. Fixed-buffer lease `Rc` work accounts for only a couple of
+sampled milliseconds. The fixed QD128 case actually uses slightly more sampled
+CPU while finishing substantially sooner, so the high-QD win is not explained
+by removing Norn work.
+
+There is also no relevant runtime threshold between these cases. The benchmark
+ring has 256 entries, so both QD32 and QD128 remain below SQ capacity and use
+the same non-full submission path. CQ drain uses a 32-entry stack batch, but it
+loops until the queue is empty; its cost did not become a fixed-only hotspot at
+QD32. The evidence therefore points to a queue-depth-dependent kernel/device
+effect of `ReadFixed` rather than an inefficiency in Norn's fixed-buffer state
+or coordinator. No optimization change was made from this profile follow-up.
+
+The raw run predated the runner's stricter provenance checks. The host storage
+and sibling state were verified separately before starting. The runner now
+requires an explicit data directory, rejects nonempty result directories,
+records mount/device/topology metadata and before/after process snapshots, and
+automatically emits checked pair and summary TSV files.
+
+## 2026-07-15: Fixed-buffer benchmark contract
+
+The fixed-buffer feature adds `benches/fixed_buffers.rs` and a paired-run
+driver at `benches/run-fixed-buffer-pairs.sh`. The contract below preceded the
+accepted run recorded above.
+
+The primary throughput matrix is ordinary versus fixed `O_DIRECT` file reads
+and writes, 4-KiB blocks, queue depths 1/32/128, and 16,384 operations per
+sample. Each case performs a full untimed offset-derived data-integrity pass
+before timing. Registration, acquisition, sync, and validation are outside the
+steady-state interval. Registration+unregistration round trips are separate
+cases at 1/32/128/512/1024 registered 4-KiB buffers.
+
+Proposed host contract:
+
+- local Ryzen 9 5950X workstation;
+- CPU 15 pinned with the `performance` governor and idle SMT sibling 31;
+- ext4 on the Samsung 970 EVO Plus used through `O_DIRECT`;
+- seven trials per primary case, alternating ordinary/fixed order;
+- raw logs under `/tmp/norn-fixedbuf-2026-07-15/`;
+- QD1 paired regression no greater than 2% when noise supports that precision;
+- no statistically credible regression of 5% or more at QD32/128; and
+- existing ordinary noop and file-I/O cases remain within the same gates.
+
+Original proposed command, to run only after explicit agreement:
+
+```text
+NORN_FIXEDBUF_RESULT_DIR=/tmp/norn-fixedbuf-2026-07-15 \
+  nix develop -c ./benches/run-fixed-buffer-pairs.sh
+```
+
+After execution, preserve all raw pairs and add medians, paired deltas, noise
+assessment, ordinary regression cross-checks, and the final disposition here.

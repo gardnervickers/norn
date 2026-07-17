@@ -7,7 +7,8 @@ mod header;
 mod raw;
 
 use io_uring::types::CancelBuilder;
-pub(crate) use raw::{CQEResult, RawOpRef};
+pub use raw::CQEResult;
+pub(crate) use raw::RawOpRef;
 
 use io_uring::squeue::Flags;
 use smallvec::SmallVec;
@@ -17,16 +18,47 @@ use crate::error::SubmitError;
 use header::CompletionQueue;
 
 /// Low-level request customization for advanced io_uring users.
-pub trait Operation {
+///
+/// # Safety
+///
+/// Implementing this trait asserts that every entry returned by [`Operation::configure`]
+/// remains valid for the complete lifetime of the kernel operation. In particular:
+///
+/// - every pointer, file descriptor, fixed-resource index, and other resource referenced by
+///   the entry must remain valid for every access the opcode permits, through the terminal CQE;
+/// - memory that the kernel may read or write must remain allocated at a stable address and
+///   must obey Rust's aliasing rules for the entire period of kernel access. An implementation
+///   must not expose references that conflict with those accesses;
+/// - the operation must account for every CQE the entry can produce. The runtime treats the
+///   first CQE without `IORING_CQE_F_MORE` as terminal, so the entry must not permit any later
+///   CQE or kernel access associated with the operation;
+/// - requesting cancellation does not end the operation's lifetime. All referenced resources
+///   must remain valid until the original operation produces its terminal CQE; and
+/// - [`Operation::cleanup`] must correctly dispose of resources represented by each unconsumed
+///   CQE. It may be called more than once and must handle success, failure, and cancellation
+///   results without double-freeing or otherwise invalidating resources.
+///
+/// The runtime pins the operation before calling [`Operation::configure`] and does not move it
+/// until after the terminal CQE. It overwrites the SQE's `user_data` field for its own tracking.
+/// The runtime cannot verify any of the requirements above.
+pub unsafe trait Operation {
     /// Configure a new [`io_uring::squeue::Entry`] for this operation.
     ///
-    /// Self will be pinned for the duration of the operation.
+    /// `Self` is pinned before this method is called. If the entry is submitted, it remains
+    /// pinned until the operation's terminal completion has been reaped.
     fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry;
 
-    /// Called (potentially multiple) times when the operation is dropped by the application.
+    /// Release resources represented by an unconsumed completion.
     ///
-    /// This should be used to cleanup resources created by the kernel, such as buffers and
-    /// file descriptors.
+    /// When an application drops a submitted operation, the runtime continues reaping its
+    /// completions. Once the terminal completion has been reaped, this method is called once
+    /// for each completion the application did not consume, in completion order. It can
+    /// therefore be called multiple times for one operation. It is also called with a synthetic
+    /// error completion when submission itself fails; in that case the kernel never saw the
+    /// entry.
+    ///
+    /// Implementations should use this hook to release per-completion resources created or
+    /// selected by the kernel, such as provided buffers or file descriptors.
     fn cleanup(&mut self, result: CQEResult);
 }
 
@@ -478,7 +510,7 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct TestOp(Vec<CQEResult>);
-    impl Operation for TestOp {
+    unsafe impl Operation for TestOp {
         fn cleanup(&mut self, result: CQEResult) {
             self.0.push(result);
         }
@@ -525,7 +557,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct TestMultishot;
 
-    impl Operation for TestMultishot {
+    unsafe impl Operation for TestMultishot {
         fn cleanup(&mut self, _: CQEResult) {}
 
         fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
@@ -573,7 +605,7 @@ mod tests {
         #[derive(Debug)]
         struct SubmitFailureOp;
 
-        impl Operation for SubmitFailureOp {
+        unsafe impl Operation for SubmitFailureOp {
             fn cleanup(&mut self, _: CQEResult) {}
 
             fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
@@ -613,7 +645,7 @@ mod tests {
         #[derive(Debug)]
         struct NopOp;
 
-        impl Operation for NopOp {
+        unsafe impl Operation for NopOp {
             fn cleanup(&mut self, _: CQEResult) {}
 
             fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
@@ -649,7 +681,7 @@ mod tests {
             complete: Rc<Cell<usize>>,
         }
 
-        impl Operation for TerminalMultishot {
+        unsafe impl Operation for TerminalMultishot {
             fn cleanup(&mut self, _: CQEResult) {}
 
             fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {

@@ -148,7 +148,8 @@ impl UnlinkAt {
     }
 }
 
-impl Operation for UnlinkAt {
+// Safety: the owned CString keeps the pathname pointer live through completion.
+unsafe impl Operation for UnlinkAt {
     fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
         let this = self.get_mut();
         let ptr = this.path.as_ptr();
@@ -183,7 +184,8 @@ impl MkDirAt {
     }
 }
 
-impl Operation for MkDirAt {
+// Safety: the owned CString keeps the pathname pointer live through completion.
+unsafe impl Operation for MkDirAt {
     fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
         let this = self.get_mut();
         let ptr = this.path.as_ptr();
@@ -219,7 +221,9 @@ impl RenameAt {
     }
 }
 
-impl Operation for RenameAt {
+// Safety: both pathname pointers refer to owned CStrings retained by the
+// operation through its terminal CQE.
+unsafe impl Operation for RenameAt {
     fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
         let this = self.get_mut();
         opcode::RenameAt::new(
@@ -257,7 +261,9 @@ impl SymlinkAt {
     }
 }
 
-impl Operation for SymlinkAt {
+// Safety: both pathname pointers refer to owned CStrings retained by the
+// operation through its terminal CQE.
+unsafe impl Operation for SymlinkAt {
     fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
         let this = self.get_mut();
         opcode::SymlinkAt::new(
@@ -295,7 +301,9 @@ impl LinkAt {
     }
 }
 
-impl Operation for LinkAt {
+// Safety: both pathname pointers refer to owned CStrings retained by the
+// operation through its terminal CQE.
+unsafe impl Operation for LinkAt {
     fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
         let this = self.get_mut();
         opcode::LinkAt::new(
@@ -337,7 +345,9 @@ impl Statx {
     }
 }
 
-impl Operation for Statx {
+// Safety: the owned path and pinned inline output remain live until completion;
+// the output is read only after a successful terminal CQE.
+unsafe impl Operation for Statx {
     fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
         let this = self.get_mut();
         opcode::Statx::new(
@@ -396,7 +406,9 @@ where
     }
 }
 
-impl<B> Operation for PathGetXattr<B>
+// Safety: owned CStrings retain both names, while `StableBufMut` and operation
+// ownership keep the writable value region valid and exclusive.
+unsafe impl<B> Operation for PathGetXattr<B>
 where
     B: crate::buf::StableBufMut,
 {
@@ -461,7 +473,9 @@ where
     }
 }
 
-impl<B> Operation for PathSetXattr<B>
+// Safety: owned CStrings retain both names, while `StableBuf` and operation
+// ownership keep the value bytes valid for all kernel reads.
+unsafe impl<B> Operation for PathSetXattr<B>
 where
     B: crate::buf::StableBuf,
 {
