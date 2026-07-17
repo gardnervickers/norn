@@ -5,15 +5,17 @@
 //! executor. A [`Driver`] running on the destination thread observes ready
 //! channels and invokes receiver wakers locally.
 //!
-//! The initial channel flavor is a bounded, multi-producer, single-consumer
-//! queue with bounded bulk receive support in [`mpsc`].
+//! The initial channel flavors are a bounded multi-producer queue and an
+//! explicitly sharded fan-in queue. Both provide bounded bulk receive support
+//! in [`mpsc`].
 //!
 //! # Application shape
 //!
 //! A sharded application can run one Norn executor per disk scheduler and give
-//! each scheduler its own receiver. Frontend threads retain cloned senders and
-//! route requests to a scheduler shard. Sending only touches thread-safe queue
-//! and unpark state; task wakers remain on the scheduler's executor thread.
+//! each scheduler its own receiver. A scheduler can give each frontend thread
+//! a separate ingress lane, avoiding shared producer state in the steady state.
+//! Sending only touches thread-safe queue and unpark state; task wakers remain
+//! on the scheduler's executor thread.
 //!
 //! ```no_run
 //! use std::thread;
@@ -26,12 +28,19 @@
 //! struct DiskRequest(u64);
 //!
 //! let driver = Driver::new(ThreadPark::default());
-//! let (frontend_tx, mut disk_rx) = mpsc::bounded(&driver.handle(), 4_096);
+//! let (frontend_txs, mut disk_rx) =
+//!     mpsc::bounded_sharded(&driver.handle(), 4_096, 4);
 //! let mut disk_executor = LocalExecutor::new(driver);
 //!
-//! let frontend = thread::spawn(move || {
-//!     frontend_tx.try_send(DiskRequest(7)).unwrap();
-//! });
+//! let frontends: Vec<_> = frontend_txs
+//!     .into_iter()
+//!     .enumerate()
+//!     .map(|(frontend, tx)| {
+//!         thread::spawn(move || {
+//!             tx.try_send(DiskRequest(frontend as u64)).unwrap();
+//!         })
+//!     })
+//!     .collect();
 //!
 //! disk_executor.block_on(async move {
 //!     let mut batch = Vec::with_capacity(32);
@@ -42,7 +51,9 @@
 //!         }
 //!     }
 //! });
-//! frontend.join().unwrap();
+//! for frontend in frontends {
+//!     frontend.join().unwrap();
+//! }
 //! ```
 #![deny(
     missing_docs,

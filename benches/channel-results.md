@@ -39,7 +39,9 @@
 
 - Workloads:
   - one producer / one consumer throughput with receive limits 1, 16, and 32;
-  - four producers / one consumer throughput with receive limit 32;
+  - four producers / one consumer sharing one MPSC queue, receive limit 32;
+  - four producers / one consumer using four fixed ingress lanes, receive limit
+    32;
   - one producer / one consumer single-message round trip;
   - executor yield-once control with and without the channel driver installed.
 - Queue capacity: fixed for each case and excluded from timed setup.
@@ -183,21 +185,214 @@ whose spread was 3.3%. A separate seven-process focused capture in
 fast outlier. Report this case as bimodal; do not use it to support small
 performance comparisons.
 
+### B0: benchmark-driven development baseline on PR commit `c72884e`
+
+Raw logs: `/tmp/norn-channel-benchmark/bdd-baseline-c728/`.
+
+This recapture followed two upstream rebases and is the comparison point for
+the optimization loop. One process experienced a host-wide disturbance (13 ns
+driver yield and 9,015 ns round trip versus the usual 8 ns and roughly 6,200
+ns); the robust process median is retained, but that run is not evidence for a
+candidate-level delta.
+
+| Workload | Median | Derived rate |
+| --- | ---: | ---: |
+| 1P/1C, receive limit 1 | 1,646,526 ns/262,144 | 6.281 ns/message, 159.210 Mmsg/s |
+| 1P/1C, receive limit 16 | 1,853,897 ns/262,144 | 7.072 ns/message, 141.402 Mmsg/s |
+| 1P/1C, receive limit 32 | 1,780,140 ns/262,144 | 6.791 ns/message, 147.260 Mmsg/s |
+| 4P/1C, receive limit 32 | 45,451,780 ns/262,144 | 173.385 ns/message, 5.768 Mmsg/s |
+| 1P/1C round trip | 6,218 ns/round trip | - |
+| executor yield, channel vs plain | 8 ns vs 5 ns | - |
+
+Decision: use B0 as the current-tree baseline. The roughly 27.6x gap between
+1P and 4P aggregate throughput is reproducible and is the first optimization
+target.
+
+### B1: profile the multi-producer collapse
+
+Profiles: `/tmp/norn-channel-profile/b0/` and
+`/tmp/norn-channel-profile/b0-debug/`.
+
+The symbolized 1 kHz process-wide profile collected 7,574 samples from the
+four-producer workload. Producer-side `Sender::try_send` accounted for 6,629
+samples (87.5%). Within that path, `ArrayQueue::push` accounted for 5,148
+samples (68.0% of the total profile): 2,558 samples were atomic tail loads,
+1,342 were contention backoff, and 1,248 were failed or successful weak CAS
+operations. `Remote::notify` and its atomic swap accounted for another 1,446
+samples (19.1%). Consumer-side `ArrayQueue::pop` accounted for 890 samples
+(11.8%); driver parking and actual OS unparks were below 1%.
+
+Decision: optimize producer contention first. Bulk-drain tuning cannot address
+the dominant cost, and the driver is not the source of the 4P collapse. The
+first candidate will give independently cloned producers separate ingress
+lanes while retaining one exact channel-wide bound.
+
+### B2: dynamically sharded segmented ingress
+
+Raw log: `/tmp/norn-channel-benchmark/b2-sharded-segqueue-smoke/run-1.log`.
+
+Each cloned sender received a private `SegQueue`; one channel-wide atomic
+occupancy reservation retained the exact configured bound. The receiver
+refreshed its lane list only when senders were cloned and drained ready lanes
+round-robin. The existing notification handshake was unchanged. All channel
+tests passed.
+
+| Workload | B0 median | B2 screening run | Delta |
+| --- | ---: | ---: | ---: |
+| 1P/1C, receive limit 1 | 1,646,526 ns | 12,757,503 ns | +674.8% |
+| 1P/1C, receive limit 16 | 1,853,897 ns | 12,346,730 ns | +566.0% |
+| 1P/1C, receive limit 32 | 1,780,140 ns | 11,914,430 ns | +569.3% |
+| 4P/1C, receive limit 32 | 45,451,780 ns | 21,860,076 ns | -51.9% |
+
+Rejected. Sharding removed enough shared-tail contention to more than double
+4P throughput, but segmented queue traversal and the channel-wide occupancy
+accounting caused an unacceptable single-producer regression. Retain the
+sharded topology as a lead, but screen preallocated per-producer rings before
+considering its memory/API tradeoffs.
+
+### B3: dynamically sharded preallocated rings
+
+Raw log: `/tmp/norn-channel-benchmark/b3-sharded-arrayqueue-smoke/run-1.log`.
+
+This candidate replaced each segmented lane with a preallocated `ArrayQueue`
+while keeping the exact channel-wide occupancy reservation.
+
+| Workload | B0 median | B3 screening run | Delta |
+| --- | ---: | ---: | ---: |
+| 1P/1C, receive limit 1 | 1,646,526 ns | 10,114,532 ns | +514.3% |
+| 1P/1C, receive limit 16 | 1,853,897 ns | 9,350,800 ns | +404.4% |
+| 1P/1C, receive limit 32 | 1,780,140 ns | 8,933,170 ns | +401.8% |
+| 4P/1C, receive limit 32 | 45,451,780 ns | 21,840,990 ns | -52.0% |
+
+Rejected. Preallocation recovered part of the single-producer loss but left it
+more than 5x slower, while 4P was essentially unchanged from B2. The global
+occupancy cache line, which is modified by every producer and the consumer, is
+the remaining architectural bottleneck. Do not retain hidden dynamic lanes;
+test an explicit fixed-lane fan-in API whose lane capacities sum to the exact
+channel bound and require no shared per-message occupancy counter.
+
+### B4: explicit fixed-lane fan-in
+
+Raw logs: `/tmp/norn-channel-benchmark/b4-fixed-lanes-smoke/` and
+`/tmp/norn-channel-benchmark/b4-fixed-lanes-full-smoke/`.
+
+The new `bounded_sharded` constructor returns one sender per requested
+producer. Its preallocated lane capacities sum exactly to the requested total;
+the local receiver drains them round-robin. Cloning a sender deliberately
+shares only that sender's lane, while ordinary `bounded` remains a one-lane
+MPSC. No per-message global occupancy counter is required. Channel tests pass,
+including 100,000 messages from each of four lanes with per-producer FIFO
+validation.
+
+The first focused 4P run measured 6,696,996 ns and the full-matrix process
+measured 7,059,695 ns, versus the 45,451,780 ns B0 median: a 6.4x to 6.8x
+speedup. The same full process kept unsharded 4P at 44,582,111 ns and round-trip
+latency at 6,178 ns, confirming that the new result comes from removing the
+shared producer tail rather than a host-wide fast mode.
+
+The initial receiver used the general round-robin loop even for one lane. Its
+single-receive case regressed to 2,614,154 ns (+58.8%), although the bulk cases
+were faster in this screening process. Retain the architecture provisionally,
+specialize the one-lane pop path, and require a full seven-process matrix
+before accepting it.
+
+Splitting the ordinary and sharded APIs into distinct concrete sender/receiver
+types preserved the original channel's generated hot path. After removing
+benchmark-only enum dispatch, the focused ordinary 1P limit-1 screen measured
+1,728,251 ns, within 5.0% of B0. The sharded path remained at 7,201,475 ns in
+the preceding full screen. Retain the explicit fixed-lane design.
+
+### B5: per-lane notification coalescing
+
+Raw log: `/tmp/norn-channel-benchmark/b5-lane-notify-smoke/run-1.log`.
+
+The B4 profile contained 6,601 samples. The global `Remote::notify` swap was
+3,065 samples (46.4%), producer queue push was 1,026 (15.5%), and receiver pop
+was 2,142 (32.4%). Each lane now owns a notification bit. A successful send
+swaps that non-contended bit and only the first send in an active burst touches
+the driver-wide remote state. When a lane appears empty, the receiver clears
+the bit and rechecks the queue: publication before the clear is observed by
+the recheck, while publication after the clear performs a remote notification.
+
+The first pinned process measured 1,128,809 ns/262,144 messages, or 4.306
+ns/message and 232.232 Mmsg/s aggregate. That is 83.1% faster than the first B4
+screen and 97.5% faster (40.3x throughput) than the B0 shared-MPSC median.
+Retain provisionally; validate forced empty-transition races, recapture the
+seven-process matrix, and profile the new ceiling.
+
+### B6: drain one lane at a time within the bounded batch
+
+Raw log: `/tmp/norn-channel-benchmark/b6-lane-bulk-drain-smoke/run-1.log`.
+
+The candidate replaced per-message round-robin selection with a bounded drain
+from one lane before advancing to the next lane. It retained the caller's exact
+limit and passed all channel tests. The pinned screen measured 1,137,272 ns,
+0.75% slower than B5's 1,128,809 ns and far below the 5% materiality threshold.
+
+Rejected. Lane selection is not a material cost at four lanes and a batch of
+32; retain message-level round-robin fairness.
+
+### B5 final validation: seven-process matrix
+
+Raw logs: `/tmp/norn-channel-benchmark/b5-lane-notify-final/`.
+
+| Workload | B0 median | B5 median | Delta / derived rate |
+| --- | ---: | ---: | ---: |
+| executor yield, channel vs plain | 8 vs 5 ns | 8 vs 5 ns | unchanged |
+| 1P/1C round trip | 6,218 ns | 6,126 ns | -1.5% |
+| 1P/1C, receive limit 1 | 1,646,526 ns | 1,710,085 ns | +3.9% |
+| 1P/1C, receive limit 16 | 1,853,897 ns | 1,843,289 ns | -0.6% |
+| 1P/1C, receive limit 32 | 1,780,140 ns | 1,822,051 ns | +2.4% |
+| 4P/1C, shared queue | 45,451,780 ns | 45,430,386 ns | -0.05% |
+| 4P/1C, four lanes | - | 1,135,596 ns | 4.332 ns/message, 230.843 Mmsg/s |
+
+The sharded result's full seven-process range was 1,130,320 to 1,140,785 ns
+(0.9%). Relative to the unchanged shared-MPSC baseline, it reduces transfer
+time by 97.5% and increases aggregate throughput by 40.0x. Every pre-existing
+workload remained within the 5% process-level noise/materiality threshold.
+
+Accepted. Fixed producer lanes and per-lane notification coalescing are both
+material, repeatable wins. The forced empty-transition test completed 25,000
+one-message handoffs alternating across two capacity-one lanes without a lost
+wakeup.
+
+### B7: specialized SPSC lane rings
+
+Raw log: `/tmp/norn-channel-benchmark/b7-spsc-lanes-smoke/run-1.log`.
+
+Because `bounded_sharded` already returns one handle per producer, this
+candidate made those handles non-cloneable and replaced each generic MPMC lane
+with a cache-padded SPSC ring. Producer and consumer indices were cached
+locally; a slot was published only after its value was initialized. The
+candidate passed all channel tests, including the empty-transition race.
+
+Rejected. The pinned screen measured 2,191,609 ns, 93.0% slower than the B5
+median. The simpler unsafe ring did not outperform `ArrayQueue`'s mature cache
+layout and algorithms. Revert the unsafe implementation and retain cloneable
+lane senders backed by safe library queues.
+
 ## Cumulative Result
 
 - Accepted changes: correctness-complete bounded MPSC channel, bounded bulk
-  drain API, local-waker driver integration, and corrected transfer benchmark.
-- Baseline summary: the forced-saturation measurements exposed unstable caller
-  backoff behavior and were retained as diagnostics rather than headline data.
-- Final summary: 157.377 Mmsg/s for 1P/1C limit 1, 143.732 Mmsg/s for limit 16,
-  145.333 Mmsg/s for limit 32, 5.906 Mmsg/s for 4P/1C limit 32, 6.273
-  microsecond round trip, and a 3 ns median incremental idle-driver cost.
-- Cumulative delta: not applicable; this is a new crate with no pre-change
-  channel implementation. The unsafe specialized queue candidate was rejected
-  after a measured 220% regression in a primary case.
-- Confidence: high for the limit-1 and limit-16 throughput medians; moderate for
-  round-trip and 4P/1C; limit-32 is explicitly bimodal and should not support
-  small comparative claims.
-- Remaining ideas: bounded bulk submit is intentionally deferred; evaluate a
-  bulk enqueue API only after the receive-side design and traffic profiles are
-  established.
+  drain API, local-waker driver integration, explicit fixed-lane fan-in, and
+  lost-wakeup-safe per-lane notification coalescing.
+- Final ordinary-channel summary: 153.293 Mmsg/s for 1P/1C limit 1, 142.214
+  Mmsg/s for limit 16, 143.873 Mmsg/s for limit 32, 5.770 Mmsg/s for shared
+  4P/1C, 6.126 microsecond round trip, and a 3 ns median incremental idle-driver
+  cost. All are within 5% of B0.
+- Final sharded summary: 230.843 Mmsg/s aggregate for four producer lanes,
+  4.332 ns/message, with a 0.9% seven-process range.
+- Cumulative delta: the new sharded API is 40.0x faster than four producers
+  cloning one shared sender (97.5% lower transfer time) while retaining an
+  exact total capacity and bounded receive work.
+- Confidence: high. The retained sharded result is exceptionally stable, the
+  unchanged paths were recaptured in the same seven processes, and the
+  notification race has a forced empty-transition stress test.
+- Exhausted candidates: generic dynamic sharding, preallocated dynamic lanes,
+  lane-local bulk drain, and a specialized unsafe SPSC ring were all rejected
+  on measured regressions or sub-threshold results. The remaining per-message
+  notification RMW is required by the safe lost-wakeup handshake; removing it
+  would require a different queue/wait protocol and did not survive the
+  specialized-ring trial.
+- Deliberately deferred: bounded bulk submit still needs partial-enqueue and
+  ownership-return semantics; it is not part of this PR.

@@ -20,11 +20,58 @@ const STOP: usize = usize::MAX;
 struct ThroughputBench {
     producers: usize,
     receive_limit: usize,
+    sharded: bool,
+}
+
+enum ThroughputSender {
+    Shared(Sender<usize>),
+    Sharded(norn_channel::mpsc::ShardedSender<usize>),
+}
+
+macro_rules! consume_throughput {
+    ($receiver:ident, $consumer_done:ident, $receive_limit:expr) => {
+        async move {
+            let mut messages = Vec::with_capacity($receive_limit);
+            let mut round_messages = 0;
+            loop {
+                let received = $receiver.recv_many(&mut messages, $receive_limit).await;
+                if received == 0 {
+                    break;
+                }
+                assert!(received <= $receive_limit);
+                for message in messages.drain(..) {
+                    assert_ne!(message, STOP);
+                    round_messages += 1;
+                }
+                if round_messages == MESSAGES_PER_ROUND {
+                    $consumer_done.send(()).unwrap();
+                    round_messages = 0;
+                } else {
+                    assert!(round_messages < MESSAGES_PER_ROUND);
+                }
+            }
+            assert_eq!(round_messages, 0);
+        }
+    };
+}
+
+macro_rules! spawn_throughput_producer {
+    ($sender:ident, $cpu:ident, $start_rx:ident, $done_tx:ident, $messages:ident, $send:ident) => {
+        thread::spawn(move || {
+            pin_current_thread($cpu);
+            while $start_rx.recv().is_ok() {
+                for value in 0..$messages {
+                    $send(&$sender, value);
+                }
+                $done_tx.send(()).unwrap();
+            }
+        })
+    };
 }
 
 impl bencher::TDynBenchFn for ThroughputBench {
     fn run(&self, b: &mut Bencher) {
-        let mut runtime = ThroughputRuntime::new(self.producers, self.receive_limit);
+        let mut runtime = ThroughputRuntime::new(self.producers, self.receive_limit, self.sharded);
         b.bytes = (MESSAGES_PER_ROUND * std::mem::size_of::<usize>()) as u64;
         b.iter(|| {
             runtime.run_round();
@@ -42,7 +89,7 @@ struct ThroughputRuntime {
 }
 
 impl ThroughputRuntime {
-    fn new(producers: usize, receive_limit: usize) -> Self {
+    fn new(producers: usize, receive_limit: usize, sharded: bool) -> Self {
         assert!(producers > 0);
         assert_eq!(MESSAGES_PER_ROUND % producers, 0);
 
@@ -51,60 +98,74 @@ impl ThroughputRuntime {
         let consumer = thread::spawn(move || {
             pin_current_thread(consumer_cpu());
             let driver = Driver::new(ThreadPark::default());
-            let (sender, mut receiver) = mpsc::bounded(&driver.handle(), QUEUE_CAPACITY);
-            let mut executor = LocalExecutor::new(driver);
-            startup_tx.send(sender).unwrap();
-
-            executor.block_on(async move {
-                let mut messages = Vec::with_capacity(receive_limit);
-                let mut round_messages = 0;
-                loop {
-                    let received = receiver.recv_many(&mut messages, receive_limit).await;
-                    if received == 0 {
-                        break;
-                    }
-                    assert!(received <= receive_limit);
-                    for message in messages.drain(..) {
-                        assert_ne!(message, STOP);
-                        round_messages += 1;
-                    }
-                    if round_messages == MESSAGES_PER_ROUND {
-                        consumer_done_tx.send(()).unwrap();
-                        round_messages = 0;
-                    } else {
-                        assert!(round_messages < MESSAGES_PER_ROUND);
-                    }
-                }
-                assert_eq!(round_messages, 0);
-            });
+            if sharded {
+                let (senders, mut receiver) =
+                    mpsc::bounded_sharded(&driver.handle(), QUEUE_CAPACITY, producers);
+                let senders = senders.into_iter().map(ThroughputSender::Sharded).collect();
+                let mut executor = LocalExecutor::new(driver);
+                startup_tx.send(senders).unwrap();
+                executor.block_on(consume_throughput!(
+                    receiver,
+                    consumer_done_tx,
+                    receive_limit
+                ));
+            } else {
+                let (sender, mut receiver) = mpsc::bounded(&driver.handle(), QUEUE_CAPACITY);
+                let mut executor = LocalExecutor::new(driver);
+                startup_tx
+                    .send(vec![ThroughputSender::Shared(sender)])
+                    .unwrap();
+                executor.block_on(consume_throughput!(
+                    receiver,
+                    consumer_done_tx,
+                    receive_limit
+                ));
+            }
         });
 
-        let sender = startup_rx.recv().unwrap();
+        let mut senders = startup_rx.recv().unwrap();
+        if senders.len() == 1 {
+            for _ in 1..producers {
+                let sender = match &senders[0] {
+                    ThroughputSender::Shared(sender) => ThroughputSender::Shared(sender.clone()),
+                    ThroughputSender::Sharded(_) => unreachable!(),
+                };
+                senders.push(sender);
+            }
+        }
+        assert_eq!(senders.len(), producers);
         let producer_cpus = producer_cpus();
         let messages_per_producer = MESSAGES_PER_ROUND / producers;
         let mut starts = Vec::with_capacity(producers);
         let mut producer_done = Vec::with_capacity(producers);
         let mut producer_threads = Vec::with_capacity(producers);
 
-        for index in 0..producers {
-            let sender = sender.clone();
+        for (index, sender) in senders.into_iter().enumerate() {
             let (start_tx, start_rx) = std_mpsc::sync_channel(1);
             let (done_tx, done_rx) = std_mpsc::sync_channel(1);
             let cpu = producer_cpus.get(index).copied();
-            producer_threads.push(thread::spawn(move || {
-                pin_current_thread(cpu);
-                while start_rx.recv().is_ok() {
-                    for value in 0..messages_per_producer {
-                        send_retry(&sender, value);
-                    }
-                    done_tx.send(()).unwrap();
-                }
-            }));
+            let producer = match sender {
+                ThroughputSender::Shared(sender) => spawn_throughput_producer!(
+                    sender,
+                    cpu,
+                    start_rx,
+                    done_tx,
+                    messages_per_producer,
+                    send_retry
+                ),
+                ThroughputSender::Sharded(sender) => spawn_throughput_producer!(
+                    sender,
+                    cpu,
+                    start_rx,
+                    done_tx,
+                    messages_per_producer,
+                    send_sharded_retry
+                ),
+            };
+            producer_threads.push(producer);
             starts.push(start_tx);
             producer_done.push(done_rx);
         }
-        drop(sender);
-
         Self {
             starts,
             producer_done,
@@ -262,6 +323,19 @@ fn send_retry<T>(sender: &Sender<T>, mut value: T) {
     }
 }
 
+fn send_sharded_retry(sender: &norn_channel::mpsc::ShardedSender<usize>, mut value: usize) {
+    loop {
+        match sender.try_send(value) {
+            Ok(()) => return,
+            Err(TrySendError::Full(returned)) => {
+                value = returned;
+                std::hint::spin_loop();
+            }
+            Err(TrySendError::Closed(_)) => panic!("channel closed early"),
+        }
+    }
+}
+
 fn benches() -> Vec<TestDescAndFn> {
     let mut benches = vec![
         dynamic_bench(
@@ -269,6 +343,7 @@ fn benches() -> Vec<TestDescAndFn> {
             ThroughputBench {
                 producers: 1,
                 receive_limit: 1,
+                sharded: false,
             },
         ),
         dynamic_bench(
@@ -276,6 +351,7 @@ fn benches() -> Vec<TestDescAndFn> {
             ThroughputBench {
                 producers: 1,
                 receive_limit: 16,
+                sharded: false,
             },
         ),
         dynamic_bench(
@@ -283,6 +359,7 @@ fn benches() -> Vec<TestDescAndFn> {
             ThroughputBench {
                 producers: 1,
                 receive_limit: 32,
+                sharded: false,
             },
         ),
         dynamic_bench(
@@ -290,6 +367,15 @@ fn benches() -> Vec<TestDescAndFn> {
             ThroughputBench {
                 producers: 4,
                 receive_limit: 32,
+                sharded: false,
+            },
+        ),
+        dynamic_bench(
+            "throughput/4p1c/sharded/recv_limit=32/messages=262144",
+            ThroughputBench {
+                producers: 4,
+                receive_limit: 32,
+                sharded: true,
             },
         ),
         dynamic_bench("latency/1p1c/round_trip", RoundTripBench),
