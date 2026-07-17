@@ -1,6 +1,4 @@
 use std::io;
-use std::pin::Pin;
-
 pub(crate) mod notify;
 
 /// A no-op operation, useful for testing.
@@ -17,7 +15,7 @@ pub async fn noop() {
     struct Nop;
     // Safety: a NOP SQE references no external resources.
     unsafe impl crate::operation::Operation for Nop {
-        fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+        fn configure(&mut self) -> io_uring::squeue::Entry {
             io_uring::opcode::Nop::new().build()
         }
 

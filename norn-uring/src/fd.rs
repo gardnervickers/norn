@@ -150,7 +150,7 @@ struct CloseFd {
 // Safety: the SQE contains only the copied descriptor value; completion owns
 // no borrowed memory, and cleanup closes a successfully returned descriptor.
 unsafe impl Operation for CloseFd {
-    fn configure(self: std::pin::Pin<&mut Self>) -> io_uring::squeue::Entry {
+    fn configure(&mut self) -> io_uring::squeue::Entry {
         match self.fd {
             FdKind::Fd(fd) => opcode::Close::new(types::Fd(fd.0)),
             FdKind::Fixed(fd) => opcode::Close::new(types::Fixed(fd.0)),

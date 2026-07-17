@@ -1,7 +1,6 @@
 #![cfg(target_os = "linux")]
 
 use std::io;
-use std::pin::Pin;
 
 use norn_uring::{CQEResult, Handle, Operation, Singleshot};
 
@@ -13,7 +12,7 @@ struct PublicNop;
 // Safety: NOP has no referenced resources and produces exactly one terminal
 // completion. `cleanup` consumes every unobserved completion result.
 unsafe impl Operation for PublicNop {
-    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+    fn configure(&mut self) -> io_uring::squeue::Entry {
         io_uring::opcode::Nop::new().build()
     }
 

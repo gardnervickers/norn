@@ -2,16 +2,14 @@
 //!
 //! [Socket] is the core socket type
 //! used by both TCP and UDP sockets
-use std::io;
-use std::mem::{ManuallyDrop, MaybeUninit};
-use std::net::SocketAddr;
-use std::os::fd::FromRawFd;
-use std::pin::Pin;
-
 use io_uring::squeue::Flags;
 use io_uring::{opcode, types};
 use libc::O_NONBLOCK;
 use socket2::{Domain, Protocol, SockAddr, Type};
+use std::io;
+use std::mem::{ManuallyDrop, MaybeUninit};
+use std::net::SocketAddr;
+use std::os::fd::FromRawFd;
 
 use crate::buf::{StableBuf, StableBufMut};
 use crate::bufring::{BufRing, BufRingBuf, BufRingBufBundle};
@@ -495,7 +493,7 @@ struct OpenSocket {
 // Safety: the socket SQE contains only copied scalar arguments; cleanup closes
 // a descriptor returned by an unconsumed successful CQE.
 unsafe impl Operation for OpenSocket {
-    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+    fn configure(&mut self) -> io_uring::squeue::Entry {
         let ty: i32 = self.socket_type.into();
         let ty = ty | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC;
         io_uring::opcode::Socket::new(
@@ -554,8 +552,8 @@ unsafe impl<B> Operation for SendTo<B>
 where
     B: StableBuf,
 {
-    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
-        let this = unsafe { self.get_unchecked_mut() };
+    fn configure(&mut self) -> io_uring::squeue::Entry {
+        let this = self;
 
         // Initialize the slice.
         {
@@ -645,8 +643,8 @@ unsafe impl<B> Operation for RecvFrom<B>
 where
     B: StableBufMut,
 {
-    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
-        let this = unsafe { self.get_unchecked_mut() };
+    fn configure(&mut self) -> io_uring::squeue::Entry {
+        let this = self;
 
         let ptr = this.buf.stable_ptr_mut();
         let len = this.buf.bytes_remaining();
@@ -731,8 +729,8 @@ impl RecvFromRing {
 // Safety: `NornFd` and `BufRing` retain the socket and registered buffer group;
 // inline recvmsg metadata remains pinned, and cleanup returns selected buffers.
 unsafe impl Operation for RecvFromRing {
-    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
-        let this = unsafe { self.get_unchecked_mut() };
+    fn configure(&mut self) -> io_uring::squeue::Entry {
+        let this = self;
 
         // Next we initialize the msghdr.
         let msghdr = this.msghdr.as_mut_ptr();
@@ -871,8 +869,8 @@ impl RecvFromRingMulti {
 // Safety: `NornFd` and `BufRing` retain all referenced resources through the
 // multishot terminal CQE; each selected buffer is either yielded or cleaned up.
 unsafe impl Operation for RecvFromRingMulti {
-    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
-        let this = unsafe { self.get_unchecked_mut() };
+    fn configure(&mut self) -> io_uring::squeue::Entry {
+        let this = self;
         let msghdr = this.msghdr.as_mut_ptr();
         unsafe {
             (*msghdr).msg_name = this.addr.as_ptr() as *mut libc::c_void;
@@ -933,8 +931,8 @@ impl RecvRingMulti {
 // Safety: `NornFd` and `BufRing` retain all referenced resources through the
 // multishot terminal CQE; each selected buffer is either yielded or cleaned up.
 unsafe impl Operation for RecvRingMulti {
-    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
-        let this = unsafe { self.get_unchecked_mut() };
+    fn configure(&mut self) -> io_uring::squeue::Entry {
+        let this = self;
         match this.fd.kind() {
             crate::fd::FdKind::Fd(fd) => opcode::RecvMulti::new(types::Fd(fd.0), this.ring.bgid())
                 .flags(this.flags)
@@ -982,8 +980,8 @@ impl RecvRingBundle {
 // Safety: `NornFd` and `BufRing` retain the descriptor and registered group;
 // completion ownership accounts for every selected buffer in the bundle.
 unsafe impl Operation for RecvRingBundle {
-    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
-        let this = unsafe { self.get_unchecked_mut() };
+    fn configure(&mut self) -> io_uring::squeue::Entry {
+        let this = self;
         match this.fd.kind() {
             crate::fd::FdKind::Fd(fd) => opcode::RecvBundle::new(types::Fd(fd.0), this.ring.bgid())
                 .flags(this.flags)
@@ -1033,8 +1031,8 @@ impl RecvRingBundleMulti {
 // Safety: `NornFd` and `BufRing` retain resources through the multishot
 // terminal CQE; yielded and unconsumed bundles are returned by completion logic.
 unsafe impl Operation for RecvRingBundleMulti {
-    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
-        let this = unsafe { self.get_unchecked_mut() };
+    fn configure(&mut self) -> io_uring::squeue::Entry {
+        let this = self;
         match this.fd.kind() {
             crate::fd::FdKind::Fd(fd) => {
                 opcode::RecvMultiBundle::new(types::Fd(fd.0), this.ring.bgid())
@@ -1113,8 +1111,8 @@ impl<const MULTI: bool> Accept<MULTI> {
 // Safety: `NornFd` retains the listener and the pinned socket-address storage
 // remains valid for every CQE; cleanup closes unconsumed accepted descriptors.
 unsafe impl<const MULTI: bool> Operation for Accept<MULTI> {
-    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
-        let this = unsafe { self.get_unchecked_mut() };
+    fn configure(&mut self) -> io_uring::squeue::Entry {
+        let this = self;
 
         // Finally we create the operation.
         match this.fd.kind() {
@@ -1197,8 +1195,8 @@ impl BindSocket {
 // Safety: `NornFd` retains the socket and the owned address storage remains
 // live and pinned through completion.
 unsafe impl Operation for BindSocket {
-    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
-        let this = unsafe { self.get_unchecked_mut() };
+    fn configure(&mut self) -> io_uring::squeue::Entry {
+        let this = self;
         match this.fd.kind() {
             crate::fd::FdKind::Fd(fd) => {
                 opcode::Bind::new(*fd, this.addr.as_ptr() as *const _, this.addr.len() as _).build()
@@ -1233,8 +1231,8 @@ impl ListenSocket {
 
 // Safety: `NornFd` retains the only resource referenced by this SQE.
 unsafe impl Operation for ListenSocket {
-    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
-        let this = unsafe { self.get_unchecked_mut() };
+    fn configure(&mut self) -> io_uring::squeue::Entry {
+        let this = self;
         match this.fd.kind() {
             crate::fd::FdKind::Fd(fd) => opcode::Listen::new(*fd, this.backlog).build(),
             crate::fd::FdKind::Fixed(fd) => opcode::Listen::new(*fd, this.backlog).build(),
@@ -1279,8 +1277,8 @@ unsafe impl<T> Operation for SetSockOpt<T>
 where
     T: Copy,
 {
-    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
-        let this = unsafe { self.get_unchecked_mut() };
+    fn configure(&mut self) -> io_uring::squeue::Entry {
+        let this = self;
         let optlen = std::mem::size_of::<T>() as u32;
         let optval = &this.value as *const T as *const libc::c_void;
         match this.fd.kind() {
@@ -1328,8 +1326,8 @@ impl Connect {
 // Safety: `NornFd` retains the socket and the owned address storage remains
 // live and pinned through completion.
 unsafe impl Operation for Connect {
-    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
-        let this = unsafe { self.get_unchecked_mut() };
+    fn configure(&mut self) -> io_uring::squeue::Entry {
+        let this = self;
         match this.fd.kind() {
             crate::fd::FdKind::Fd(fd) => {
                 opcode::Connect::new(*fd, this.addr.as_ptr() as *mut _, this.addr.len() as _)
@@ -1366,8 +1364,8 @@ impl Shutdown {
 
 // Safety: `NornFd` retains the only resource referenced by this SQE.
 unsafe impl Operation for Shutdown {
-    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
-        let this = unsafe { self.get_unchecked_mut() };
+    fn configure(&mut self) -> io_uring::squeue::Entry {
+        let this = self;
         match this.fd.kind() {
             crate::fd::FdKind::Fd(fd) => opcode::Shutdown::new(*fd, this.how).build(),
             crate::fd::FdKind::Fixed(fd) => opcode::Shutdown::new(*fd, this.how).build(),
@@ -1406,7 +1404,7 @@ unsafe impl<B> Operation for Recv<B>
 where
     B: StableBufMut,
 {
-    fn configure(mut self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+    fn configure(&mut self) -> io_uring::squeue::Entry {
         let ptr = self.buf.stable_ptr_mut();
         let len = self.buf.bytes_remaining();
 
@@ -1462,7 +1460,7 @@ unsafe impl<B> Operation for Send<B>
 where
     B: StableBuf,
 {
-    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+    fn configure(&mut self) -> io_uring::squeue::Entry {
         let ptr = self.buf.stable_ptr();
         let len = self.buf.bytes_init();
 
@@ -1538,8 +1536,8 @@ unsafe impl<B> Operation for SendZc<B>
 where
     B: StableBuf,
 {
-    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
-        let this = unsafe { self.get_unchecked_mut() };
+    fn configure(&mut self) -> io_uring::squeue::Entry {
+        let this = self;
         let ptr = this.buf.stable_ptr();
         let len = this.buf.bytes_init();
 
@@ -1610,8 +1608,8 @@ unsafe impl<B> Operation for SendMsgZc<B>
 where
     B: StableBuf,
 {
-    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
-        let this = unsafe { self.get_unchecked_mut() };
+    fn configure(&mut self) -> io_uring::squeue::Entry {
+        let this = self;
 
         let slice = io::IoSlice::new(unsafe {
             std::slice::from_raw_parts(this.buf.stable_ptr(), this.buf.bytes_init())
@@ -1675,8 +1673,8 @@ impl<const MULTI: bool> Poll<MULTI> {
 // Safety: `NornFd` retains the descriptor through the single or multishot
 // terminal CQE; the SQE references no userspace memory.
 unsafe impl<const MULTI: bool> Operation for Poll<MULTI> {
-    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
-        let this = unsafe { self.get_unchecked_mut() };
+    fn configure(&mut self) -> io_uring::squeue::Entry {
+        let this = self;
         match this.fd.kind() {
             crate::fd::FdKind::Fd(fd) => {
                 opcode::PollAdd::new(*fd, this.events).multi(MULTI).build()
