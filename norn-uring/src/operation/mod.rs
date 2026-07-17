@@ -38,15 +38,18 @@ use header::CompletionQueue;
 ///   CQE. It may be called more than once and must handle success, failure, and cancellation
 ///   results without double-freeing or otherwise invalidating resources.
 ///
-/// The runtime pins the operation before calling [`Operation::configure`] and does not move it
-/// until after the terminal CQE. It overwrites the SQE's `user_data` field for its own tracking.
-/// The runtime cannot verify any of the requirements above.
+/// The runtime places the operation at a stable address before calling
+/// [`Operation::configure`] and does not move it while the entry may be submitted or accessed by
+/// the kernel. After the operation is known not to be in flight, it may be moved into its
+/// completion handler. The runtime overwrites the SQE's `user_data` field for its own tracking
+/// and cannot verify any of the requirements above.
 pub unsafe trait Operation {
     /// Configure a new [`io_uring::squeue::Entry`] for this operation.
     ///
-    /// `Self` is pinned before this method is called. If the entry is submitted, it remains
-    /// pinned until the operation's terminal completion has been reaped.
-    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry;
+    /// The address of `self` remains stable while the returned entry may be accessed by the
+    /// kernel. Implementations may store pointers to fields of `self` in the entry, but must not
+    /// invalidate the pointed-to storage during that period.
+    fn configure(&mut self) -> io_uring::squeue::Entry;
 
     /// Release resources represented by an unconsumed completion.
     ///
@@ -227,11 +230,9 @@ where
 {
     pub(crate) fn new(data: T, reactor: crate::Handle) -> Self {
         let mut handle = TypedHandle::new(data);
-        let data =
-            // Safety: We will not move `data` after this point, so it is safe to create a pin. The only time
-            // we will move `data` is when the operation is complete. That will only happen after all sqes have
-            // been submitted and completed.
-            unsafe { Pin::new_unchecked(handle.data_mut().expect("operation already completed")) };
+        // Safety: The handle was just created and no other references to its operation data
+        // exist. `RawOp` keeps the data at a stable address until the operation completes.
+        let data = unsafe { handle.data_mut().expect("operation already completed") };
 
         let entry = T::configure(data);
         let entry = ConfiguredEntry::new(handle.untyped(), entry);
@@ -502,7 +503,6 @@ where
 mod tests {
     use std::cell::Cell;
     use std::future::Future;
-    use std::pin::Pin;
     use std::rc::Rc;
     use std::task::Poll;
 
@@ -515,7 +515,7 @@ mod tests {
             self.0.push(result);
         }
 
-        fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+        fn configure(&mut self) -> io_uring::squeue::Entry {
             unimplemented!()
         }
     }
@@ -560,7 +560,7 @@ mod tests {
     unsafe impl Operation for TestMultishot {
         fn cleanup(&mut self, _: CQEResult) {}
 
-        fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+        fn configure(&mut self) -> io_uring::squeue::Entry {
             unimplemented!()
         }
     }
@@ -608,7 +608,7 @@ mod tests {
         unsafe impl Operation for SubmitFailureOp {
             fn cleanup(&mut self, _: CQEResult) {}
 
-            fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+            fn configure(&mut self) -> io_uring::squeue::Entry {
                 io_uring::opcode::Nop::new().build()
             }
         }
@@ -648,7 +648,7 @@ mod tests {
         unsafe impl Operation for NopOp {
             fn cleanup(&mut self, _: CQEResult) {}
 
-            fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+            fn configure(&mut self) -> io_uring::squeue::Entry {
                 io_uring::opcode::Nop::new().build()
             }
         }
@@ -684,7 +684,7 @@ mod tests {
         unsafe impl Operation for TerminalMultishot {
             fn cleanup(&mut self, _: CQEResult) {}
 
-            fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+            fn configure(&mut self) -> io_uring::squeue::Entry {
                 unimplemented!()
             }
         }

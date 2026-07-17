@@ -1,10 +1,8 @@
+use io_uring::types::FsyncFlags;
+use io_uring::{opcode, types};
 use std::io;
 use std::os::fd::RawFd;
 use std::path::Path;
-use std::pin::Pin;
-
-use io_uring::types::FsyncFlags;
-use io_uring::{opcode, types};
 
 use crate::buf::{StableBuf, StableBufMut};
 use crate::fd::{FdKind, NornFd};
@@ -425,8 +423,8 @@ impl Open {
 // Safety: the owned CString and inline `OpenHow` keep both SQE pointers valid;
 // cleanup closes a descriptor returned by an unconsumed successful CQE.
 unsafe impl Operation for Open {
-    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
-        let this = self.get_mut();
+    fn configure(&mut self) -> io_uring::squeue::Entry {
+        let this = self;
         let ptr = this.path.as_ptr();
         opcode::OpenAt2::new(types::Fd(libc::AT_FDCWD), ptr, &this.how).build()
     }
@@ -493,7 +491,7 @@ unsafe impl<B> Operation for ReadAt<B>
 where
     B: StableBufMut,
 {
-    fn configure(mut self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+    fn configure(&mut self) -> io_uring::squeue::Entry {
         let buf = self.buf.stable_ptr_mut();
         let len = self.buf.bytes_remaining();
         match self.fd.kind() {
@@ -546,7 +544,7 @@ impl<B: 'static> ReadFixedAt<B> {
 // Safety: `FixedBuf` owns the registered slot until the terminal CQE and the
 // same-driver check is performed before this operation is constructed.
 unsafe impl<B: 'static> Operation for ReadFixedAt<B> {
-    fn configure(mut self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+    fn configure(&mut self) -> io_uring::squeue::Entry {
         let ptr = self.buf.fixed_ptr_mut();
         let len = self.buf.read_capacity_u32();
         let index = self.buf.kernel_index();
@@ -596,7 +594,7 @@ unsafe impl<B> Operation for WriteAt<B>
 where
     B: StableBuf,
 {
-    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+    fn configure(&mut self) -> io_uring::squeue::Entry {
         let buf = self.buf.stable_ptr();
         let len = self.buf.bytes_init();
         match self.fd.kind() {
@@ -640,7 +638,7 @@ impl<B: 'static> WriteFixedAt<B> {
 // Safety: `FixedBuf` owns the initialized registered payload until the
 // terminal CQE and the same-driver check happens before construction.
 unsafe impl<B: 'static> Operation for WriteFixedAt<B> {
-    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+    fn configure(&mut self) -> io_uring::squeue::Entry {
         let ptr = self.buf.fixed_ptr();
         let len = self.buf.write_len_u32();
         let index = self.buf.kernel_index();
@@ -690,8 +688,8 @@ unsafe impl<B> Operation for ReadVectoredAt<B>
 where
     B: StableBufMut,
 {
-    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
-        let this = self.get_mut();
+    fn configure(&mut self) -> io_uring::squeue::Entry {
+        let this = self;
         this.iovecs.clear();
         this.iovecs.reserve(this.bufs.len());
         for buf in &mut this.bufs {
@@ -765,8 +763,8 @@ unsafe impl<B> Operation for WriteVectoredAt<B>
 where
     B: StableBuf,
 {
-    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
-        let this = self.get_mut();
+    fn configure(&mut self) -> io_uring::squeue::Entry {
+        let this = self;
         this.iovecs.clear();
         this.iovecs.reserve(this.bufs.len());
         for buf in &this.bufs {
@@ -824,7 +822,7 @@ impl Advise {
 // Safety: `NornFd` retains the only resource referenced by this pointer-free
 // advisory SQE until completion.
 unsafe impl Operation for Advise {
-    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+    fn configure(&mut self) -> io_uring::squeue::Entry {
         match self.fd.kind() {
             FdKind::Fd(fd) => opcode::Fadvise::new(*fd, self.len, self.advice),
             FdKind::Fixed(fd) => opcode::Fadvise::new(*fd, self.len, self.advice),
@@ -874,7 +872,7 @@ unsafe impl<B> Operation for FileGetXattr<B>
 where
     B: StableBufMut,
 {
-    fn configure(mut self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+    fn configure(&mut self) -> io_uring::squeue::Entry {
         let ptr = self.buf.stable_ptr_mut() as *mut libc::c_void;
         match self.fd.kind() {
             FdKind::Fd(fd) => opcode::FGetXattr::new(*fd, self.name.as_ptr(), ptr, self.len),
@@ -941,7 +939,7 @@ unsafe impl<B> Operation for FileSetXattr<B>
 where
     B: StableBuf,
 {
-    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+    fn configure(&mut self) -> io_uring::squeue::Entry {
         let ptr = self.value.stable_ptr() as *const libc::c_void;
         match self.fd.kind() {
             FdKind::Fd(fd) => opcode::FSetXattr::new(*fd, self.name.as_ptr(), ptr, self.len),
@@ -978,7 +976,7 @@ impl Sync {
 
 // Safety: `NornFd` retains the descriptor; the SQE references no memory.
 unsafe impl Operation for Sync {
-    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+    fn configure(&mut self) -> io_uring::squeue::Entry {
         match self.fd.kind() {
             FdKind::Fd(fd) => opcode::Fsync::new(*fd),
             FdKind::Fixed(fd) => opcode::Fsync::new(*fd),
@@ -1017,7 +1015,7 @@ impl SyncRange {
 
 // Safety: `NornFd` retains the descriptor; the SQE references no memory.
 unsafe impl Operation for SyncRange {
-    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+    fn configure(&mut self) -> io_uring::squeue::Entry {
         match self.fd.kind() {
             FdKind::Fd(fd) => opcode::SyncFileRange::new(*fd, self.len),
             FdKind::Fixed(fd) => opcode::SyncFileRange::new(*fd, self.len),
@@ -1058,7 +1056,7 @@ impl Fallocate {
 
 // Safety: `NornFd` retains the descriptor; the SQE references no memory.
 unsafe impl Operation for Fallocate {
-    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+    fn configure(&mut self) -> io_uring::squeue::Entry {
         match self.fd.kind() {
             FdKind::Fd(fd) => opcode::Fallocate::new(*fd, self.len),
             FdKind::Fixed(fd) => opcode::Fallocate::new(*fd, self.len),
@@ -1092,7 +1090,7 @@ impl Truncate {
 
 // Safety: `NornFd` retains the descriptor; the SQE references no memory.
 unsafe impl Operation for Truncate {
-    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+    fn configure(&mut self) -> io_uring::squeue::Entry {
         match self.fd.kind() {
             FdKind::Fd(fd) => opcode::Ftruncate::new(*fd, self.len),
             FdKind::Fixed(fd) => opcode::Ftruncate::new(*fd, self.len),
@@ -1136,8 +1134,8 @@ impl SpliceOp {
 // Safety: both `NornFd` values retain the copied descriptors used by the SQE;
 // no userspace memory is referenced.
 unsafe impl Operation for SpliceOp {
-    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
-        let this = self.get_mut();
+    fn configure(&mut self) -> io_uring::squeue::Entry {
+        let this = self;
         match (*this.fd_in.kind(), *this.fd_out.kind()) {
             (FdKind::Fd(fd_in), FdKind::Fd(fd_out)) => {
                 opcode::Splice::new(fd_in, this.off_in, fd_out, this.off_out, this.len)
@@ -1188,8 +1186,8 @@ impl TeeOp {
 // Safety: both `NornFd` values retain the copied descriptors used by the SQE;
 // no userspace memory is referenced.
 unsafe impl Operation for TeeOp {
-    fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
-        let this = self.get_mut();
+    fn configure(&mut self) -> io_uring::squeue::Entry {
+        let this = self;
         match (*this.fd_in.kind(), *this.fd_out.kind()) {
             (FdKind::Fd(fd_in), FdKind::Fd(fd_out)) => opcode::Tee::new(fd_in, fd_out, this.len),
             (FdKind::Fd(fd_in), FdKind::Fixed(fd_out)) => opcode::Tee::new(fd_in, fd_out, this.len),

@@ -822,7 +822,6 @@ impl Drop for Driver {
 #[cfg(test)]
 mod tests {
     use std::future::Future;
-    use std::pin::Pin;
     use std::task::Poll;
 
     use smallvec::SmallVec;
@@ -867,7 +866,7 @@ mod tests {
         struct NopOp;
 
         unsafe impl Operation for NopOp {
-            fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+            fn configure(&mut self) -> io_uring::squeue::Entry {
                 io_uring::opcode::Nop::new().build()
             }
 
@@ -919,7 +918,7 @@ mod tests {
         struct NopOp;
 
         unsafe impl Operation for NopOp {
-            fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+            fn configure(&mut self) -> io_uring::squeue::Entry {
                 io_uring::opcode::Nop::new().build()
             }
 
@@ -948,7 +947,7 @@ mod tests {
         struct NopOp;
 
         unsafe impl Operation for NopOp {
-            fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+            fn configure(&mut self) -> io_uring::squeue::Entry {
                 io_uring::opcode::Nop::new().build()
             }
 
@@ -994,7 +993,7 @@ mod tests {
         struct NopOp;
 
         unsafe impl Operation for NopOp {
-            fn configure(self: Pin<&mut Self>) -> io_uring::squeue::Entry {
+            fn configure(&mut self) -> io_uring::squeue::Entry {
                 io_uring::opcode::Nop::new().build()
             }
 
