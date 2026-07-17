@@ -783,3 +783,24 @@ ownership and owner-aware remote unparking.
   stable across seven runs and the original tree was refreshed after the final
   candidate. Absolute deltas below one nanosecond remain below harness
   resolution.
+
+## 2026-07-15: Task Dispatch Inline Follow-up
+
+The focused `bench_task_yield/tasks=128/yields=32` baseline was `38,144 ns`
+median (`37,990`, `38,144`, and `38,265 ns`) on CPU 2. A 277-sample profile
+attributed self cost primarily to `State::prepare_poll` (`56.68%`, already
+inline and doing real state work), `VecDeque::wrap_index` (`16.25%`),
+`TaskRef::run` (`9.39%`), the raw-waker callback (`8.30%`), and
+`Header::vtable` (`7.58%`).
+
+Two remaining Norn-owned call boundaries were tested and rejected:
+
+- Inline `TaskRef::run`: `42,725 ns` median (`49,833`, `42,579`, and
+  `42,725 ns`), a `12.0%` regression.
+- Inline `Header::vtable`: `37,886 ns` median (`37,780`, `38,487`, and
+  `37,886 ns`), only `0.68%` faster and within run noise.
+
+No source change was retained. The remaining sampled costs require a
+state-machine or queue-layout experiment rather than more inline annotations.
+Raw logs are under
+`target/bench-results/inline-candidates/20260715T055214Z/`.

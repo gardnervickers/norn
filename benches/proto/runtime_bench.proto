@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package norn.bench.v1;
+
+service RuntimeBench {
+  rpc RoundTrip(BenchRequest) returns (BenchReply);
+}
+
+message BenchRequest {
+  uint64 request_id = 1;
+  bytes payload = 2;
+}
+
+message BenchReply {
+  uint64 request_id = 1;
+  uint64 checksum = 2;
+}
