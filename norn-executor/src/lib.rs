@@ -26,7 +26,7 @@ pub struct LocalExecutor<P: park::Park> {
     /// Task queue contains tasks which are ready to be executed.
     taskqueue: norn_task::TaskQueue,
     park: P,
-    root_notifier: Option<wakerfn::RootNotifier>,
+    root_notifier: Option<wakerfn::RootNotifier<P::Unparker>>,
 }
 
 impl<P: park::Park> std::fmt::Debug for LocalExecutor<P> {
@@ -43,10 +43,11 @@ impl<P: park::Park> LocalExecutor<P> {
     /// The [`LocalExecutor`] will use the given [`park::Park`] to block the
     /// driver thread when there are no tasks ready to be executed.
     pub fn new(park: P) -> Self {
+        let root_notifier = Some(wakerfn::root_notifier(park.unparker()));
         Self {
             taskqueue: norn_task::TaskQueue::new(),
             park,
-            root_notifier: Some(wakerfn::root_notifier()),
+            root_notifier,
         }
     }
 
@@ -72,10 +73,10 @@ impl<P: park::Park> LocalExecutor<P> {
     {
         let _g = self.enter();
         let fut = pin!(fut);
-        let notifier = self
-            .root_notifier
-            .take()
-            .unwrap_or_else(wakerfn::root_notifier);
+        let notifier = match self.root_notifier.take() {
+            Some(notifier) => notifier,
+            None => wakerfn::root_notifier(self.park.unparker()),
+        };
         let mut root = wakerfn::FutureHarness::new(fut, notifier);
 
         loop {
@@ -157,6 +158,8 @@ mod tests {
     use std::future;
     use std::io;
     use std::rc::Rc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::task::Poll;
     use std::task::Waker;
 
@@ -189,6 +192,87 @@ mod tests {
 
         executor.block_on(async {});
         assert!(executor.root_notifier.is_some());
+    }
+
+    #[test]
+    fn root_waker_can_wake_from_another_thread() {
+        let mut executor = LocalExecutor::new(crate::park::ThreadPark::default());
+        let completed = Arc::new(AtomicBool::new(false));
+        let completed_by_worker = Arc::clone(&completed);
+        let (waker_tx, waker_rx) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let waker: Waker = waker_rx.recv().unwrap();
+            completed_by_worker.store(true, Ordering::Release);
+            waker.wake();
+        });
+
+        let mut sent_waker = false;
+        executor.block_on(future::poll_fn(|cx| {
+            if completed.load(Ordering::Acquire) {
+                return Poll::Ready(());
+            }
+            if !sent_waker {
+                waker_tx.send(cx.waker().clone()).unwrap();
+                sent_waker = true;
+            }
+            Poll::Pending
+        }));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    #[allow(clippy::waker_clone_wake)]
+    fn same_thread_root_wake_does_not_unpark() {
+        #[derive(Clone, Debug)]
+        struct CountingUnparker(Arc<AtomicUsize>);
+
+        impl park::Unpark for CountingUnparker {
+            fn unpark(&self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        #[derive(Debug)]
+        struct CountingPark(CountingUnparker);
+
+        impl park::Park for CountingPark {
+            type Unparker = CountingUnparker;
+            type Guard = ();
+
+            fn park(&mut self, _: park::ParkMode) -> io::Result<()> {
+                Ok(())
+            }
+
+            fn enter(&self) -> Self::Guard {}
+
+            fn unparker(&self) -> Self::Unparker {
+                self.0.clone()
+            }
+
+            fn needs_park(&self) -> bool {
+                false
+            }
+
+            fn shutdown(&mut self) {}
+        }
+
+        let unpark_count = Arc::new(AtomicUsize::new(0));
+        let park = CountingPark(CountingUnparker(Arc::clone(&unpark_count)));
+        let mut executor = LocalExecutor::new(park);
+        let mut yielded = false;
+        executor.block_on(future::poll_fn(|cx| {
+            if yielded {
+                Poll::Ready(())
+            } else {
+                yielded = true;
+                // Exercise the owned vtable while remaining on the executor
+                // thread. `wake_by_ref` would only test the borrowed vtable.
+                cx.waker().clone().wake();
+                Poll::Pending
+            }
+        }));
+
+        assert_eq!(unpark_count.load(Ordering::Relaxed), 0);
     }
 
     #[test]

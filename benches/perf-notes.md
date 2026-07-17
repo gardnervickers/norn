@@ -628,3 +628,158 @@ The final profile had no comparable CPU hotspot: block-read setup was `6.4%`,
 memset `5.5%`, and CRC `2.2%`. Skipping the aligned-buffer zero fill with
 tracked initialization was tested and rejected at `2.146 ms`, slightly slower
 than the retained shape and below the materiality threshold.
+
+## 2026-07-14: Thread-safe Root Waker
+
+Goal: replace the executor root waker's `Rc<Cell<bool>>`-backed raw `Waker`
+with a thread-safe implementation while measuring the cost on the root
+`block_on` path. Lower `ns/iter` is better. Correctness requires executor tests
+and a cross-thread wake test through `ThreadPark`.
+
+Environment and methodology:
+
+- Local NixOS Linux host, AMD Ryzen 9 5950X (16 cores / 32 threads), 62 GiB
+  memory, Linux 6.18.38.
+- Repository state: clean `codex/optimize-udp-kv-performance` at
+  `4b369f50df8eb60152b8350f319cc885db50a941` before the experiment.
+- Toolchain: `rustc 1.85.0-nightly (6d9f6ae36 2024-12-16)`, Cargo
+  `1.85.0-nightly (769f622e1 2024-12-14)` from `nix develop`.
+- Command: `taskset -c 2 nix develop -c cargo bench -p benches --bench executor`.
+- Seven complete runs before and after the change. Primary metric is the median
+  `bench_block_on_yield` result; `bench_block_on_ready` is secondary. Raw logs
+  are stored under `/tmp/norn-root-waker-benchmark/`.
+- Any movement is reported; a regression above 5% requires investigation.
+
+### Baseline
+
+- Seven `bench_block_on_ready` runs: `4`, `4`, `4`, `4`, `4`, `4`, and
+  `4 ns/iter`; median `4 ns/iter`.
+- Seven `bench_block_on_yield` runs: `6`, `6`, `6`, `6`, `6`, `6`, and
+  `6 ns/iter`; median `6 ns/iter`.
+- CPU 2 used the `performance` frequency governor. The harness reported zero
+  integer-nanosecond dispersion in every run, so the baseline is stable but
+  changes smaller than its one-nanosecond output resolution cannot be resolved.
+
+### Attempt 1: `Arc<AtomicBool>` root notification
+
+Hypothesis: a stable `Wake` implementation backed by `Arc<AtomicBool>` and the
+park driver's `Unparker` closes the raw-waker thread-safety hole; latching
+`ThreadPark` notifications prevents wake-before-park loss.
+
+- Correctness: `cargo test -p norn-executor` passed all nine tests, including a
+  root waker fired from another thread and a deterministic pre-park unpark test.
+- Seven ready runs: `6`, `8`, `6`, `6`, `6`, `6`, and `6 ns/iter`; median
+  `6 ns/iter`, 50% slower than baseline.
+- Seven yield-once runs: `8`, `9`, `8`, `8`, `8`, `8`, and `8 ns/iter`;
+  median `8 ns/iter`, 33.3% slower than baseline.
+- Decision: revise. The atomic swap used to consume each notification is the
+  leading candidate: ready performs one swap and yield-once performs two.
+
+### Attempt 2: generation-counted notification
+
+Hypothesis: use a monotonically increasing atomic generation so polling needs
+only atomic loads; the wake side performs the sole read-modify-write. This
+cannot lose a wake between observation and consumption.
+
+- Correctness: all nine executor tests passed.
+- Seven ready runs: all `5 ns/iter`; median `5 ns/iter`, 25% slower than
+  baseline and one nanosecond faster than Attempt 1.
+- Seven yield-once runs: all `7 ns/iter`; median `7 ns/iter`, 16.7% slower than
+  baseline and one nanosecond faster than Attempt 1.
+- Decision: revise. The remaining per-`block_on` difference includes creating
+  and dropping a `Waker` backed by an atomically reference-counted `Arc`.
+
+### Attempt 3: cache the root `Waker`
+
+Hypothesis: retain the stable `Waker` alongside its `Arc` state across
+`block_on` calls, avoiding one atomic clone/drop pair per call.
+
+- Correctness: all nine executor tests passed.
+- Seven ready runs: all `8 ns/iter`; median `8 ns/iter`, 100% slower than
+  baseline and 60% slower than Attempt 2.
+- Seven yield-once runs: all `8 ns/iter`; median `8 ns/iter`, 33.3% slower
+  than baseline and 14.3% slower than Attempt 2.
+- Decision: abandon and restore Attempt 2. The longer-lived state-plus-waker
+  ownership shape consistently optimized worse than reconstructing the waker.
+
+### Attempt 4: cache with separated hot fields
+
+Hypothesis: cache the waker as in Attempt 3, but destructure the reusable bundle
+so `FutureHarness` retains the same separate state and waker field layout as
+Attempt 2.
+
+- Correctness: all nine executor tests passed.
+- Seven ready runs: all `7 ns/iter`; median `7 ns/iter`, 75% slower than
+  baseline and 40% slower than Attempt 2.
+- Seven yield-once runs: all `8 ns/iter`; median `8 ns/iter`, 33.3% slower
+  than baseline and 14.3% slower than Attempt 2.
+- Decision: abandon. Separating the fields recovered one nanosecond in the
+  ready case versus Attempt 3, but both cached forms were clearly worse.
+
+### Attempt 5: borrowed Arc-backed context waker
+
+Hypothesis: keep one executor-owned `Arc` reference and construct a borrowed
+raw `Waker` for each poll context. The borrowed waker is never dropped; only
+clones that escape the poll increment the atomic strong count. Its vtable uses
+`Arc` operations and is fully thread-safe.
+
+- Correctness: all nine executor tests passed.
+- Seven ready runs: `4`, `4`, `4`, `4`, `4`, `4`, and `5 ns/iter`; median
+  `4 ns/iter`, equal to baseline.
+- Seven yield-once runs: all `6 ns/iter`; median `6 ns/iter`, equal to
+  baseline.
+- Decision: revise before accepting. Inspection found that unconditionally
+  invoking the park driver's unparker would make same-thread io_uring
+  completion wakes touch the remote eventfd coordination path.
+
+### Attempt 6: suppress owner-thread unparks
+
+Hypothesis: record the executor owner thread and invoke the park driver's
+unparker only for wakes from a different thread, avoiding redundant io_uring
+eventfd coordination for local completions.
+
+- Correctness: all ten executor tests passed, including explicit checks that a
+  same-thread root wake does not unpark and a remote root wake does.
+- Seven ready runs: `4`, `5`, `4`, `4`, `4`, `4`, and `4 ns/iter`; median
+  `4 ns/iter`, equal to baseline.
+- Seven yield-once runs: `7`, `8`, `7`, `7`, `7`, `7`, and `7 ns/iter`;
+  median `7 ns/iter`, 16.7% slower than baseline.
+- Decision: revise. Thread identity lookup adds one nanosecond to the direct
+  borrowed-waker wake path even though that waker cannot escape the poll.
+
+### Attempt 7: split borrowed and owned vtables
+
+Hypothesis: the context's borrowed waker cannot escape `Future::poll` without
+being cloned, so its direct wake path can increment the generation without an
+owner check. Clones receive a distinct owned vtable that performs atomic Arc
+ownership and owner-aware remote unparking.
+
+- Correctness: all ten executor tests passed. The same-thread test exercises an
+  owned clone, while the remote-thread test sends and consumes an owned clone
+  on another thread.
+- Seven ready runs: all `4 ns/iter`; median `4 ns/iter`, equal to baseline.
+- Seven yield-once runs: all `5 ns/iter`; median `5 ns/iter`, 16.7% faster
+  than the original baseline at the harness's integer-nanosecond resolution.
+- Exact-tree baseline refresh from
+  `4b369f50df8eb60152b8350f319cc885db50a941`: all seven ready runs were
+  `4 ns/iter`, and all seven yield-once runs were `6 ns/iter`, confirming the
+  comparison did not move with workstation drift.
+- Decision: keep. `cargo test` passed the full workspace, including the
+  `norn-uring` integration tests. `cargo fmt --all -- --check` and
+  `cargo clippy --all-targets --all-features -- -D warnings` passed. Targeted
+  `cargo miri test -p norn-executor` passed all ten executor tests and doc
+  tests, covering both borrowed and owned raw-waker paths.
+
+### Cumulative result
+
+- Retained design: an executor-owned `Arc` notification generation, a borrowed
+  context waker whose clones become owned Arc-backed wakers, remote-only
+  unparking, and latched `ThreadPark` notifications.
+- Ready `block_on`: `4 ns/iter` baseline and final median; no measurable
+  regression.
+- Yield-once `block_on`: `6 ns/iter` baseline to `5 ns/iter` final median;
+  one nanosecond faster in this microbenchmark.
+- Confidence: high for the focused executor microbench because both sides were
+  stable across seven runs and the original tree was refreshed after the final
+  candidate. Absolute deltas below one nanosecond remain below harness
+  resolution.

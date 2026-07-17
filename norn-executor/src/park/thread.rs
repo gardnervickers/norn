@@ -29,7 +29,7 @@ impl std::fmt::Debug for ThreadUnpark {
 
 #[derive(Default)]
 struct Inner {
-    mutex: Mutex<()>,
+    notified: Mutex<bool>,
     condvar: Condvar,
 }
 
@@ -66,20 +66,42 @@ impl Park for ThreadPark {
 
 impl Inner {
     fn unpark(&self) {
-        self.condvar.notify_all();
+        let mut notified = self.notified.lock().unwrap();
+        *notified = true;
+        self.condvar.notify_one();
     }
 
     fn park(&self, mode: ParkMode) {
         match mode {
             ParkMode::NoPark => (),
             ParkMode::NextCompletion => {
-                let _guard = self.mutex.lock().unwrap();
-                let _unused = self.condvar.wait(_guard).unwrap();
+                let notified = self.notified.lock().unwrap();
+                let mut notified = self
+                    .condvar
+                    .wait_while(notified, |notified| !*notified)
+                    .unwrap();
+                *notified = false;
             }
             ParkMode::Timeout(timeout) => {
-                let _guard = self.mutex.lock().unwrap();
-                let _unused = self.condvar.wait_timeout(_guard, timeout).unwrap();
+                let notified = self.notified.lock().unwrap();
+                let (mut notified, _) = self
+                    .condvar
+                    .wait_timeout_while(notified, timeout, |notified| !*notified)
+                    .unwrap();
+                *notified = false;
             }
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unpark_before_park_is_observed() {
+        let mut park = ThreadPark::default();
+        park.unparker().unpark();
+        park.park(ParkMode::NextCompletion).unwrap();
     }
 }
