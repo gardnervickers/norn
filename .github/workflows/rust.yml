@@ -35,6 +35,7 @@ jobs:
       fail-fast: false
       matrix:
         package:
+        - norn-channel
         - norn-nursery
         - norn-task
         - norn-executor
