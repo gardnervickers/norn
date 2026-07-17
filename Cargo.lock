@@ -214,6 +214,7 @@ dependencies = [
  "hyper-util",
  "io-uring",
  "libc",
+ "norn-channel",
  "norn-executor",
  "norn-kv",
  "norn-task",
@@ -365,6 +366,21 @@ dependencies = [
  "rustversion",
  "spin",
 ]
+
+[[package]]
+name = "crossbeam-queue"
+version = "0.3.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "803d13fb3b09d88be9f4dbc29062c66b19bf7170867ceb746d2a8689bf6c7a26"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
+name = "crossbeam-utils"
+version = "0.8.22"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "61803da095bee82a81bb1a452ecc25d3b2f1416d1897eb86430c6159ef717c17"
 
 [[package]]
 name = "crypto-common"
@@ -1014,6 +1030,14 @@ dependencies = [
  "bitflags 1.3.2",
  "cfg-if",
  "libc",
+]
+
+[[package]]
+name = "norn-channel"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-queue",
+ "norn-executor",
 ]
 
 [[package]]

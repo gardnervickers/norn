@@ -1,0 +1,8 @@
+[package]
+name = "norn-channel"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+crossbeam-queue.workspace = true
+norn-executor = { path = "../norn-executor" }
