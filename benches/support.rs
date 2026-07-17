@@ -7,6 +7,7 @@ use bencher::{bench, run_tests_console, TestDescAndFn, TestFn, TestOpts};
 use pprof::protos::Message;
 
 const PPROF_OUT_ENV: &str = "NORN_BENCH_PPROF";
+const PPROF_RUN_ONCE_ENV: &str = "NORN_BENCH_PPROF_RUN_ONCE";
 const PPROF_FREQUENCY_HZ: i32 = 1_000;
 const PPROF_BLOCKLIST: &[&str] = &["libc", "libgcc", "pthread", "vdso"];
 
@@ -22,6 +23,7 @@ pub fn run(benches: Vec<TestDescAndFn>) {
 }
 
 fn profile_benches(opts: &TestOpts, benches: Vec<TestDescAndFn>, output: ProfileOutput) {
+    let run_once = env::var_os(PPROF_RUN_ONCE_ENV).is_some();
     let mut benches = benches
         .into_iter()
         .filter(|bench| !bench.desc.ignore)
@@ -52,10 +54,18 @@ fn profile_benches(opts: &TestOpts, benches: Vec<TestDescAndFn>, output: Profile
 
         match bench.testfn {
             TestFn::DynBenchFn(benchfn) => {
-                let _ = bench::benchmark(|harness| benchfn.run(harness));
+                if run_once {
+                    bench::run_once(|harness| benchfn.run(harness));
+                } else {
+                    let _ = bench::benchmark(|harness| benchfn.run(harness));
+                }
             }
             TestFn::StaticBenchFn(benchfn) => {
-                let _ = bench::benchmark(benchfn);
+                if run_once {
+                    bench::run_once(benchfn);
+                } else {
+                    let _ = bench::benchmark(benchfn);
+                }
             }
         }
 

@@ -4,7 +4,7 @@
 //! move for the lifetime of the operation. In other words, the
 //! operation takes ownership of the buffer.
 //!
-//! Some buffer types, such as Bytes or Vec<u8> can move due
+//! Some buffer types, such as `Bytes` or `Vec<u8>`, can move due
 //! to reallocation. To avoid this, we use the StableBuf trait
 //! which restricts the buffer to a stable pointer into memory.
 use std::cmp;
@@ -75,6 +75,86 @@ pub unsafe trait StableBufMut: Unpin + 'static {
     /// ### Safety
     /// Callers should ensure that all bytes from 0..init_len are initialized.
     unsafe fn set_init(&mut self, init_len: usize);
+}
+
+/// A fully initialized, writable memory region suitable for long-lived kernel
+/// registration.
+///
+/// Unlike [`StableBufMut`], this trait describes a region whose address and
+/// length may be cached beyond a single I/O operation. Implementations may
+/// choose any region owned by the buffer; it need not be the buffer's spare
+/// capacity or its entire backing allocation.
+///
+/// # Safety
+///
+/// The region returned by [`FixedBuffer::fixed_region`] is inspected only after
+/// `self` has been placed in its final storage. The guarantees below apply while
+/// the registration attempt may pass the region to the kernel. If registration
+/// becomes active, they continue until the registration is successfully released
+/// or the owning ring is destroyed:
+///
+/// - the region's address and length do not change;
+/// - every byte remains allocated, initialized, and writable;
+/// - the region does not overlap memory exposed independently by the value;
+/// - no hidden alias reads or writes the region while the kernel or the
+///   registered-buffer owner may write it; and
+/// - no interior-mutation path can expose, free, resize, or relocate the
+///   region.
+///
+/// The registration attempt owns the value exclusively and does not move it,
+/// call other methods on it, or expose another reference during those intervals.
+/// If an attempt fails before becoming active, every cached pointer is discarded
+/// before the value is moved or returned to the caller. Moving the value is
+/// permitted before `fixed_region` is called, after a failed attempt returns,
+/// and after an active registration is released. Registration additionally
+/// verifies that regions returned by different values in one pool are pairwise
+/// disjoint.
+pub unsafe trait FixedBuffer {
+    /// Return the exact initialized region to register.
+    fn fixed_region(&mut self) -> &mut [u8];
+}
+
+// Safety: the initialized portion of a `Vec` remains allocated and at a stable
+// address while the vector is not moved, resized, or otherwise accessed.
+unsafe impl FixedBuffer for Vec<u8> {
+    fn fixed_region(&mut self) -> &mut [u8] {
+        self.as_mut_slice()
+    }
+}
+
+// Safety: a boxed slice has a fixed address and length for its lifetime, and
+// exclusive ownership of the box gives exclusive access to the elements.
+unsafe impl FixedBuffer for Box<[u8]> {
+    fn fixed_region(&mut self) -> &mut [u8] {
+        self.as_mut()
+    }
+}
+
+// Safety: the initialized portion of `BytesMut` remains allocated and at a
+// stable address while the value is not moved, resized, or otherwise accessed.
+unsafe impl FixedBuffer for BytesMut {
+    fn fixed_region(&mut self) -> &mut [u8] {
+        self.as_mut()
+    }
+}
+
+// Safety: the array is placed in its final storage before this method is
+// called, and its address and length then remain fixed until registration ends.
+unsafe impl<const N: usize> FixedBuffer for [u8; N] {
+    fn fixed_region(&mut self) -> &mut [u8] {
+        self.as_mut_slice()
+    }
+}
+
+// Safety: `Box` keeps its pointee at a stable address, and the delegated
+// implementation supplies the remaining guarantees for its selected region.
+unsafe impl<T> FixedBuffer for Box<T>
+where
+    T: FixedBuffer + ?Sized,
+{
+    fn fixed_region(&mut self) -> &mut [u8] {
+        (**self).fixed_region()
+    }
 }
 
 unsafe impl StableBuf for Vec<u8> {

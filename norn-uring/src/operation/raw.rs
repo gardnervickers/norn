@@ -100,6 +100,11 @@ where
     }
 }
 
+/// The result value and flags from one io_uring completion queue entry.
+///
+/// Values of this type are created by the runtime and passed to
+/// [`Operation`](crate::Operation), [`Singleshot`](crate::Singleshot), and
+/// [`Multishot`](crate::Multishot) implementations.
 #[derive(Debug)]
 pub struct CQEResult {
     pub(crate) result: io::Result<u32>,
@@ -111,8 +116,29 @@ impl CQEResult {
         Self { result, flags }
     }
 
-    pub(crate) fn more(&self) -> bool {
+    /// Consume the completion and return its result value.
+    pub fn into_result(self) -> io::Result<u32> {
+        self.result
+    }
+
+    /// Consume the completion and return its result value and CQE flags.
+    pub fn into_parts(self) -> (io::Result<u32>, u32) {
+        (self.result, self.flags)
+    }
+
+    /// Return the raw CQE flags supplied by the kernel.
+    pub fn flags(&self) -> u32 {
+        self.flags
+    }
+
+    /// Return whether the kernel will produce more completions for this operation.
+    pub fn more(&self) -> bool {
         io_uring::cqueue::more(self.flags)
+    }
+
+    /// Return whether this is a zero-copy notification completion.
+    pub fn is_notification(&self) -> bool {
+        self.notif()
     }
 
     pub(crate) fn notif(&self) -> bool {

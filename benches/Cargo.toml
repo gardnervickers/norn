@@ -85,3 +85,8 @@ harness = false
 name = "norn_kv"
 path = "norn_kv.rs"
 harness = false
+
+[[bench]]
+name = "fixed_buffers"
+path = "fixed_buffers.rs"
+harness = false

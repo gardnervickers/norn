@@ -9,6 +9,7 @@
 //! # Modules
 //! - `buf`: stable buffer traits and adapters used by I/O operations.
 //! - `bufring`: registered io_uring buffer-ring support.
+//! - `fixedbuf`: caller-owned buffers registered for fixed I/O.
 //! - `fs`: asynchronous filesystem operations.
 //! - `net`: asynchronous TCP and UDP networking.
 //!
@@ -26,6 +27,7 @@ pub(crate) mod driver;
 pub(crate) mod error;
 pub(crate) mod fd;
 pub(crate) mod operation;
+mod registered_buffers;
 mod request;
 pub(crate) mod util;
 
@@ -33,12 +35,14 @@ pub(crate) mod util;
 pub mod buf;
 /// Registered io_uring buffer-ring support.
 pub mod bufring;
+/// Owned caller-provided buffers registered for fixed I/O.
+pub mod fixedbuf;
 /// Asynchronous filesystem operations.
 pub mod fs;
 /// Asynchronous TCP and UDP networking.
 pub mod net;
 
 pub use driver::{Driver, Handle};
-pub use operation::{Multishot, Op, Operation, Singleshot};
+pub use operation::{CQEResult, Multishot, Op, Operation, Singleshot};
 pub use request::{Map, Request, Then, ThenAux, WithTimeout};
 pub use util::noop;
