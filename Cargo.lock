@@ -211,6 +211,7 @@ dependencies = [
  "futures",
  "http-body-util",
  "hyper",
+ "hyper-util",
  "io-uring",
  "libc",
  "norn-executor",
@@ -221,7 +222,12 @@ dependencies = [
  "norn-util",
  "pin-project-lite",
  "pprof",
+ "prost 0.14.3",
+ "protoc-bin-vendored",
  "tokio",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
 ]
 
 [[package]]

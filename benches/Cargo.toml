@@ -18,8 +18,12 @@ norn-uring = { path = "../norn-uring" }
 io-uring = "0.7.11"
 libc = "0.2.149"
 hyper = { version = "1", features = ["client", "server", "http2"] }
+hyper-util = { version = "0.1", features = ["service", "tokio"] }
 pin-project-lite = "0.2.13"
-tokio = { version = "1.35.0", features = ["io-util", "net", "rt"] }
+prost = "0.14"
+tokio = { version = "1.35.0", features = ["io-util", "net", "rt", "time"] }
+tonic = { version = "0.14", features = ["transport"] }
+tonic-prost = "0.14"
 http-body-util = "0.1.0"
 
 [dev-dependencies]
@@ -27,6 +31,10 @@ bencher = "0.1.5"
 futures = "0.3.29"
 pprof = { version = "0.15", features = ["flamegraph", "prost-codec"] }
 tokio = { version = "1.35.0", features = ["rt", "time"] }
+
+[build-dependencies]
+protoc-bin-vendored = "3"
+tonic-prost-build = "0.14"
 
 [[bench]]
 name = "schedule_task"
@@ -46,6 +54,11 @@ harness = false
 [[bench]]
 name = "hyper"
 path = "hyper.rs"
+harness = false
+
+[[bench]]
+name = "grpc_runtime"
+path = "grpc_runtime.rs"
 harness = false
 
 [[bench]]
