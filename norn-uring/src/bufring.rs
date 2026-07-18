@@ -614,6 +614,18 @@ struct AnonymousMmap {
 impl AnonymousMmap {
     /// Creates a new anonymous mapping of `len` bytes.
     fn new(len: usize) -> io::Result<Self> {
+        Self::new_with_madvise(len, |addr, len| {
+            match unsafe { libc::madvise(addr.as_ptr(), len, libc::MADV_DONTFORK) } {
+                0 => Ok(()),
+                _ => Err(io::Error::last_os_error()),
+            }
+        })
+    }
+
+    fn new_with_madvise(
+        len: usize,
+        madvise: impl FnOnce(ptr::NonNull<libc::c_void>, usize) -> io::Result<()>,
+    ) -> io::Result<Self> {
         let addr = unsafe {
             match libc::mmap(
                 ptr::null_mut(),
@@ -627,13 +639,9 @@ impl AnonymousMmap {
                 addr => ptr::NonNull::new_unchecked(addr),
             }
         };
-        match unsafe { libc::madvise(addr.as_ptr(), len, libc::MADV_DONTFORK) } {
-            0 => {
-                let mmap = Self { addr, len };
-                Ok(mmap)
-            }
-            _ => Err(io::Error::last_os_error()),
-        }
+        let mmap = Self { addr, len };
+        madvise(mmap.addr, mmap.len)?;
+        Ok(mmap)
     }
 
     /// Get a pointer to the memory.
@@ -667,12 +675,41 @@ impl ops::Deref for BufRingBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::selected_bid_from_flags;
+    use super::{selected_bid_from_flags, AnonymousMmap};
+    use std::cell::Cell;
     use std::io;
+    use std::ptr;
 
     #[test]
     fn selected_bid_requires_buffer_select_flag() {
         let err = selected_bid_from_flags(0).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn anonymous_mmap_is_unmapped_when_madvise_fails() {
+        let len = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let mapped_addr = Cell::new(ptr::null_mut());
+        let result = AnonymousMmap::new_with_madvise(len, |addr, len| {
+            mapped_addr.set(addr.as_ptr());
+
+            let mut residency = 0;
+            let result = unsafe { libc::mincore(addr.as_ptr(), len, &mut residency) };
+            assert_eq!(result, 0, "mapping must be live while madvise runs");
+
+            Err(io::Error::from_raw_os_error(libc::EINVAL))
+        });
+        let Err(err) = result else {
+            panic!("injected madvise failure unexpectedly succeeded");
+        };
+        assert_eq!(err.raw_os_error(), Some(libc::EINVAL));
+
+        let mut residency = 0;
+        let result = unsafe { libc::mincore(mapped_addr.get(), len, &mut residency) };
+        assert_eq!(result, -1);
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ENOMEM)
+        );
     }
 }
