@@ -1,4 +1,4 @@
-use std::cell::{Cell, UnsafeCell};
+use std::cell::UnsafeCell;
 use std::future::Future;
 use std::marker::PhantomData;
 
@@ -10,7 +10,6 @@ use crate::{JoinHandle, RegisteredTask, Runnable, Schedule};
 /// It can be used to cancel all tasks, such as during shutdown.
 pub struct TaskSet {
     inner: UnsafeCell<Inner>,
-    size: Cell<usize>,
     // !Send
     _m: PhantomData<*const ()>,
 }
@@ -34,7 +33,6 @@ impl TaskSet {
                 closed: false,
                 list: cordyceps::List::new(),
             }),
-            size: Cell::new(0),
             _m: PhantomData,
         }
     }
@@ -71,7 +69,6 @@ impl TaskSet {
             return (None, JoinHandle::from(handle));
         }
         this.list.push_back(bound);
-        self.size.set(self.size.get() + 1);
         (Some(Runnable::from(task)), JoinHandle::from(handle))
     }
 
@@ -85,7 +82,6 @@ impl TaskSet {
 
         while let Some(task) = this.list.pop_front() {
             task.shutdown();
-            self.size.set(self.size.get() - 1);
         }
     }
 
@@ -97,11 +93,7 @@ impl TaskSet {
     pub unsafe fn remove(&self, task: &RegisteredTask) -> Option<RegisteredTask> {
         // Safety: `TaskSet` is `!Send` and only accessed from one thread.
         let inner = unsafe { &mut *self.inner.get() };
-        let task = unsafe { inner.list.remove(task.as_ptr()) };
-        if task.is_some() {
-            self.size.set(self.size.get() - 1);
-        }
-        task
+        unsafe { inner.list.remove(task.as_ptr()) }
     }
 }
 
