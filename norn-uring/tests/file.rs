@@ -523,7 +523,8 @@ fn advise_and_xattr_ops() -> Result<(), Box<dyn std::error::Error>> {
         file.advise(0, 0, libc::POSIX_FADV_SEQUENTIAL).await?;
 
         let fd_name = b"user.norn.fd";
-        let fd_value = Bytes::from_static(b"fd-value");
+        let fd_expected = b"fd-value";
+        let fd_value = Bytes::from_static(fd_expected);
         let (res, _) = file.set_xattr(fd_name, fd_value, 0).await;
         match res {
             Ok(()) => {}
@@ -539,8 +540,24 @@ fn advise_and_xattr_ops() -> Result<(), Box<dyn std::error::Error>> {
         };
         assert_eq!(&buf[..n], b"fd-value");
 
+        let (res, buf) = file.get_xattr(fd_name, Vec::<u8>::new()).await;
+        assert_eq!(res?, fd_expected.len());
+        assert!(buf.is_empty());
+        assert_eq!(buf.capacity(), 0);
+
+        let exact = vec![0u8; fd_expected.len()].into_boxed_slice();
+        let (res, exact) = file.get_xattr(fd_name, exact).await;
+        assert_eq!(res?, fd_expected.len());
+        assert_eq!(&*exact, fd_expected);
+
+        let undersized = vec![0u8; fd_expected.len() - 1].into_boxed_slice();
+        let (res, undersized) = file.get_xattr(fd_name, undersized).await;
+        assert_eq!(res.unwrap_err().raw_os_error(), Some(libc::ERANGE));
+        assert_eq!(undersized.len(), fd_expected.len() - 1);
+
         let path_name = b"user.norn.path";
-        let path_value = Bytes::from_static(b"path-value");
+        let path_expected = b"path-value";
+        let path_value = Bytes::from_static(path_expected);
         let (res, _) = fs::set_xattr(&path, path_name, path_value, 0).await;
         match res {
             Ok(()) => {}
@@ -555,6 +572,21 @@ fn advise_and_xattr_ops() -> Result<(), Box<dyn std::error::Error>> {
             Err(err) => return Err(err.into()),
         };
         assert_eq!(&buf[..n], b"path-value");
+
+        let (res, buf) = fs::get_xattr(&path, path_name, Vec::<u8>::new()).await;
+        assert_eq!(res?, path_expected.len());
+        assert!(buf.is_empty());
+        assert_eq!(buf.capacity(), 0);
+
+        let exact = vec![0u8; path_expected.len()].into_boxed_slice();
+        let (res, exact) = fs::get_xattr(&path, path_name, exact).await;
+        assert_eq!(res?, path_expected.len());
+        assert_eq!(&*exact, path_expected);
+
+        let undersized = vec![0u8; path_expected.len() - 1].into_boxed_slice();
+        let (res, undersized) = fs::get_xattr(&path, path_name, undersized).await;
+        assert_eq!(res.unwrap_err().raw_os_error(), Some(libc::ERANGE));
+        assert_eq!(undersized.len(), path_expected.len() - 1);
 
         file.close().await?;
         Ok(())
