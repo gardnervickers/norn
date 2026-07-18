@@ -272,7 +272,8 @@ impl File {
 
     /// Read an extended attribute from this file into the provided buffer.
     ///
-    /// On success, returns the number of bytes written into `buf`.
+    /// On success, returns the attribute size. When the buffer has zero
+    /// capacity, this performs a size query and leaves the buffer unchanged.
     pub async fn get_xattr<N, B>(&self, name: N, buf: B) -> (io::Result<usize>, B)
     where
         N: AsRef<[u8]>,
@@ -892,11 +893,10 @@ where
 
     fn complete(mut self, result: CQEResult) -> Self::Output {
         match result.result {
-            Ok(n) => {
-                let n = n as usize;
-                unsafe { self.buf.set_init(n) };
-                (Ok(n), self.buf)
-            }
+            Ok(n) => (
+                super::complete_get_xattr(&mut self.buf, self.len, n),
+                self.buf,
+            ),
             Err(err) => (Err(err), self.buf),
         }
     }
