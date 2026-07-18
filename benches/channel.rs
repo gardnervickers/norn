@@ -7,7 +7,7 @@ use std::thread::{self, JoinHandle};
 
 use bencher::{Bencher, TestDesc, TestDescAndFn, TestFn};
 use norn_channel::mpsc::{self, Sender, TrySendError};
-use norn_channel::Driver;
+use norn_channel::{Driver, DriverBuilder};
 use norn_executor::park::{SpinPark, ThreadPark};
 use norn_executor::LocalExecutor;
 
@@ -93,37 +93,41 @@ impl ThroughputRuntime {
         assert!(producers > 0);
         assert_eq!(MESSAGES_PER_ROUND % producers, 0);
 
-        let (startup_tx, startup_rx) = std_mpsc::sync_channel(1);
         let (consumer_done_tx, consumer_done) = std_mpsc::sync_channel(1);
-        let consumer = thread::spawn(move || {
-            pin_current_thread(consumer_cpu());
-            let driver = Driver::new(ThreadPark::default());
-            if sharded {
-                let (senders, mut receiver) =
-                    mpsc::bounded_sharded(&driver.handle(), QUEUE_CAPACITY, producers);
-                let senders = senders.into_iter().map(ThroughputSender::Sharded).collect();
+        let (mut senders, consumer) = if sharded {
+            let driver = DriverBuilder::new();
+            let (senders, receiver) =
+                mpsc::bounded_sharded(driver.endpoint(), QUEUE_CAPACITY, producers);
+            let senders = senders.into_iter().map(ThroughputSender::Sharded).collect();
+            let consumer = thread::spawn(move || {
+                pin_current_thread(consumer_cpu());
+                let driver = driver.build(ThreadPark::default());
+                let mut receiver = receiver.attach(&driver.handle());
                 let mut executor = LocalExecutor::new(driver);
-                startup_tx.send(senders).unwrap();
                 executor.block_on(consume_throughput!(
                     receiver,
                     consumer_done_tx,
                     receive_limit
                 ));
-            } else {
-                let (sender, mut receiver) = mpsc::bounded(&driver.handle(), QUEUE_CAPACITY);
+            });
+            (senders, consumer)
+        } else {
+            let driver = DriverBuilder::new();
+            let (sender, receiver) = mpsc::bounded(driver.endpoint(), QUEUE_CAPACITY);
+            let consumer = thread::spawn(move || {
+                pin_current_thread(consumer_cpu());
+                let driver = driver.build(ThreadPark::default());
+                let mut receiver = receiver.attach(&driver.handle());
                 let mut executor = LocalExecutor::new(driver);
-                startup_tx
-                    .send(vec![ThroughputSender::Shared(sender)])
-                    .unwrap();
                 executor.block_on(consume_throughput!(
                     receiver,
                     consumer_done_tx,
                     receive_limit
                 ));
-            }
-        });
+            });
+            (vec![ThroughputSender::Shared(sender)], consumer)
+        };
 
-        let mut senders = startup_rx.recv().unwrap();
         if senders.len() == 1 {
             for _ in 1..producers {
                 let sender = match &senders[0] {
@@ -223,17 +227,21 @@ struct RoundTripRuntime {
 
 impl RoundTripRuntime {
     fn new() -> Self {
-        let driver = Driver::new(ThreadPark::default());
-        let (response_tx, response) = mpsc::bounded(&driver.handle(), 1);
+        // Construct both directions before either runtime starts.
+        let local_driver = DriverBuilder::new();
+        let worker_driver = DriverBuilder::new();
+        let (request, request_rx) = mpsc::bounded(worker_driver.endpoint(), 1);
+        let (response_tx, response) = mpsc::bounded(local_driver.endpoint(), 1);
+
+        let driver = local_driver.build(ThreadPark::default());
+        let response = response.attach(&driver.handle());
         let executor = LocalExecutor::new(driver);
 
-        let (startup_tx, startup_rx) = std_mpsc::sync_channel(1);
         let worker = thread::spawn(move || {
             pin_current_thread(consumer_cpu());
-            let driver = Driver::new(ThreadPark::default());
-            let (request_tx, mut request_rx) = mpsc::bounded(&driver.handle(), 1);
+            let driver = worker_driver.build(ThreadPark::default());
+            let mut request_rx = request_rx.attach(&driver.handle());
             let mut executor = LocalExecutor::new(driver);
-            startup_tx.send(request_tx).unwrap();
 
             executor.block_on(async move {
                 while let Some(message) = request_rx.recv().await {
@@ -247,7 +255,7 @@ impl RoundTripRuntime {
 
         Self {
             executor,
-            request: startup_rx.recv().unwrap(),
+            request,
             response,
             worker: Some(worker),
         }

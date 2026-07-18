@@ -371,28 +371,132 @@ median. The simpler unsafe ring did not outperform `ArrayQueue`'s mature cache
 layout and algorithms. Revert the unsafe implementation and retain cloneable
 lane senders backed by safe library queues.
 
+### C0: detached receiver with a per-send attachment lookup
+
+Raw logs: `/tmp/norn-channel-benchmark/detached-api-head-final/` and
+`/tmp/norn-channel-benchmark/detached-api-base-final/`.
+
+The first detached-receiver design stored the destination `Remote` in a
+`OnceLock` owned by each channel. It made topology construction clean, and all
+new pre-attachment and cross-thread tests passed, but ordinary senders queried
+the cell after every successful queue push. The seven-process candidate was
+stable at 1,940,741 ns for receive limit 16 and 1,917,199 ns for receive limit
+32. Those results were 5.3% and 5.2% slower than the retained B5 medians.
+
+The exact-tree baseline recapture entered faster but highly multimodal bulk
+modes: its limit-16 spread was 33.8% and its limit-32 spread was 14.9%. Stable
+paired cases showed no regression, but the direct lookup was still above the
+5% threshold relative to the trustworthy retained matrix.
+
+Rejected. Keep detached construction, but move attachment discovery off the
+ordinary per-message path.
+
+### C1: embedded ordinary-channel notification bit
+
+Raw log: `/tmp/norn-channel-benchmark/detached-api-coalesced-screen/run-1.log`
+(incomplete trial).
+
+This candidate placed an ordinary-channel notification bit next to the queue
+and consulted the attachment cell only when that bit became active. The 1P
+screen recovered bulk throughput, but the shared 4P calibration failed to
+complete. Placing another producer-contended atomic in the queue allocation was
+not acceptable for the existing shared-MPSC path.
+
+Rejected. Preserve the old separately allocated notification cache line.
+
+### C2: separate attachment-aware notification proxy
+
+Raw logs: `/tmp/norn-channel-benchmark/detached-api-proxy-screen/` and
+`/tmp/norn-channel-benchmark/detached-api-proxy-final/` (incomplete trial).
+
+A separately allocated proxy restored the old send-path shape: every send does
+one pending-bit RMW, while only the first notification in a driver cycle reads
+the attached target. The first complete screen was fast, but the repeated
+round-trip capture stalled. Its driver-side clear used a release-only store, so
+a coalesced producer could observe the old active state without the driver
+acquiring that producer's preceding queue publication before checking
+readiness.
+
+Rejected. An attachment-aware pending bit needs an acquire-release clear.
+
+### C3: acquire-release attachment proxy
+
+Raw logs: `/tmp/norn-channel-benchmark/detached-api-final/`.
+
+This candidate cleared the separate channel pending bit with an
+acquire-release swap before checking receiver readiness. If a producer
+coalesces its notification against the old active state, that swap acquires the
+producer's queue publication. Attachment is still one-time, and the send hot
+path retains one separately allocated notification RMW per message.
+
+| Workload | B5 retained median | Detached median | Delta | Detached spread |
+| --- | ---: | ---: | ---: | ---: |
+| executor yield, channel vs plain | 8 vs 5 ns | 8 vs 5 ns | unchanged | 1 ns timer resolution |
+| 1P/1C round trip | 6,126 ns | 6,128 ns | +0.03% | 2.1% |
+| 1P/1C, receive limit 1 | 1,710,085 ns | 1,541,610 ns | -9.9% | 0.4% |
+| 1P/1C, receive limit 16 | 1,843,289 ns | 1,901,378 ns | +3.2% | 1.3% |
+| 1P/1C, receive limit 32 | 1,822,051 ns | 1,871,251 ns | +2.7% | 0.9% |
+| 4P/1C, shared queue | 45,430,386 ns | 44,672,487 ns | -1.7% | 1.9% |
+| 4P/1C, four lanes | 1,135,596 ns | 1,119,466 ns | -1.4% | 0.5% |
+
+Rejected despite the native benchmark. The full Miri suite deterministically
+deadlocked in the forced ordinary empty-transition test. A second pending-bit
+protocol between each channel and the driver duplicated the driver's existing
+notification state and remained too difficult to make obviously correct.
+
+### C4: preconstructed driver endpoint
+
+Raw logs: `/tmp/norn-channel-benchmark/detached-api-endpoint-final/`.
+
+The final API moves attachment up one level. A sendable `DriverBuilder` owns
+the destination's real `Remote` before runtime threads start, and channels are
+constructed against its `Endpoint`. The builder moves to the destination
+thread and installs the inner park layer's unparker exactly once. Senders and
+the destination driver therefore share the original single pending bit; there
+is no per-channel proxy or per-message attachment lookup. A detached receiver
+also verifies that it is attached to the driver for its endpoint.
+
+| Workload | B5 retained median | Endpoint median | Delta | Endpoint spread |
+| --- | ---: | ---: | ---: | ---: |
+| executor yield, channel vs plain | 8 vs 5 ns | 8 vs 6 ns | 1 ns timer resolution | 1 ns timer resolution |
+| 1P/1C round trip | 6,126 ns | 6,165 ns | +0.6% | 4.9% |
+| 1P/1C, receive limit 1 | 1,710,085 ns | 1,491,801 ns | -12.8% | 0.9% |
+| 1P/1C, receive limit 16 | 1,843,289 ns | 1,905,894 ns | +3.4% | 1.1% |
+| 1P/1C, receive limit 32 | 1,822,051 ns | 1,885,382 ns | +3.5% | 0.8% |
+| 4P/1C, shared queue | 45,430,386 ns | 44,449,039 ns | -2.2% | 1.7% |
+| 4P/1C, four lanes | 1,135,596 ns | 1,117,053 ns | -1.6% | 0.4% |
+
+Accepted. Every retained workload remains within the 5% regression threshold,
+and the final sharded result is 4.261 ns/message and 234.675 Mmsg/s. The full
+Miri suite passes, including messages and last-sender closure before runtime
+startup, 25,000 forced ordinary and sharded empty transitions, portable setup
+types, endpoint mismatch rejection, and two Norn runtimes exchanging messages
+without a bootstrap transport.
+
 ## Cumulative Result
 
 - Accepted changes: correctness-complete bounded MPSC channel, bounded bulk
-  drain API, local-waker driver integration, explicit fixed-lane fan-in, and
-  lost-wakeup-safe per-lane notification coalescing.
-- Final ordinary-channel summary: 153.293 Mmsg/s for 1P/1C limit 1, 142.214
-  Mmsg/s for limit 16, 143.873 Mmsg/s for limit 32, 5.770 Mmsg/s for shared
-  4P/1C, 6.126 microsecond round trip, and a 3 ns median incremental idle-driver
-  cost. All are within 5% of B0.
-- Final sharded summary: 230.843 Mmsg/s aggregate for four producer lanes,
-  4.332 ns/message, with a 0.9% seven-process range.
-- Cumulative delta: the new sharded API is 40.0x faster than four producers
+  drain API, local-waker driver integration, pre-runtime detached receiver
+  construction, explicit fixed-lane fan-in, and lost-wakeup-safe notification
+  coalescing.
+- Final ordinary-channel summary: 175.723 Mmsg/s for 1P/1C limit 1, 137.544
+  Mmsg/s for limit 16, 139.040 Mmsg/s for limit 32, 5.898 Mmsg/s for shared
+  4P/1C, 6.165 microsecond round trip, and a 2 ns median incremental idle-driver
+  cost. All retained workloads are within the 5% regression threshold.
+- Final sharded summary: 234.675 Mmsg/s aggregate for four producer lanes,
+  4.261 ns/message, with a 0.4% seven-process range.
+- Cumulative delta: the new sharded API is 39.8x faster than four producers
   cloning one shared sender (97.5% lower transfer time) while retaining an
   exact total capacity and bounded receive work.
 - Confidence: high. The retained sharded result is exceptionally stable, the
-  unchanged paths were recaptured in the same seven processes, and the
-  notification race has a forced empty-transition stress test.
+  unchanged stable paths were recaptured against the exact old tree, and both
+  ordinary and sharded notification races have forced empty-transition stress
+  tests plus Miri-scaled variants.
 - Exhausted candidates: generic dynamic sharding, preallocated dynamic lanes,
-  lane-local bulk drain, and a specialized unsafe SPSC ring were all rejected
-  on measured regressions or sub-threshold results. The remaining per-message
-  notification RMW is required by the safe lost-wakeup handshake; removing it
-  would require a different queue/wait protocol and did not survive the
-  specialized-ring trial.
+  lane-local bulk drain, a specialized unsafe SPSC ring, per-send attachment
+  lookup, embedded notification state, and per-channel attachment proxies were
+  all rejected on measured regressions, correctness failures, or sub-threshold
+  results. The remaining per-message notification RMW is required by the safe
+  lost-wakeup handshake.
 - Deliberately deferred: bounded bulk submit still needs partial-enqueue and
   ownership-return semantics; it is not part of this PR.

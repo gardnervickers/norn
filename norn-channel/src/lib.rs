@@ -11,26 +11,42 @@
 //!
 //! # Application shape
 //!
-//! A sharded application can run one Norn executor per disk scheduler and give
-//! each scheduler its own receiver. A scheduler can give each frontend thread
-//! a separate ingress lane, avoiding shared producer state in the steady state.
-//! Sending only touches thread-safe queue and unpark state; task wakers remain
-//! on the scheduler's executor thread.
+//! A sharded application can assemble its channels before starting any Norn
+//! executors. Each detached receiver then moves to its disk scheduler thread
+//! and attaches to that thread's driver. A scheduler can give each frontend
+//! thread a separate ingress lane, avoiding shared producer state in the steady
+//! state. Sending only touches thread-safe queue and unpark state; task wakers
+//! remain on the scheduler's executor thread.
 //!
 //! ```no_run
 //! use std::thread;
 //!
-//! use norn_channel::{mpsc, Driver};
+//! use norn_channel::{mpsc, DriverBuilder};
 //! use norn_executor::park::ThreadPark;
 //! use norn_executor::LocalExecutor;
 //!
 //! #[derive(Debug)]
 //! struct DiskRequest(u64);
 //!
-//! let driver = Driver::new(ThreadPark::default());
-//! let (frontend_txs, mut disk_rx) =
-//!     mpsc::bounded_sharded(&driver.handle(), 4_096, 4);
-//! let mut disk_executor = LocalExecutor::new(driver);
+//! // Assemble the topology before any runtime thread starts.
+//! let disk_driver = DriverBuilder::new();
+//! let (frontend_txs, disk_rx) =
+//!     mpsc::bounded_sharded::<DiskRequest>(disk_driver.endpoint(), 4_096, 4);
+//! let disk = thread::spawn(move || {
+//!     let driver = disk_driver.build(ThreadPark::default());
+//!     let mut disk_rx = disk_rx.attach(&driver.handle());
+//!     let mut disk_executor = LocalExecutor::new(driver);
+//!
+//!     disk_executor.block_on(async move {
+//!         let mut batch = Vec::with_capacity(32);
+//!         while disk_rx.recv_many(&mut batch, 32).await != 0 {
+//!             for request in batch.drain(..) {
+//!                 // Submit `request` to this shard's local I/O scheduler.
+//!                 let _ = request.0;
+//!             }
+//!         }
+//!     });
+//! });
 //!
 //! let frontends: Vec<_> = frontend_txs
 //!     .into_iter()
@@ -42,18 +58,10 @@
 //!     })
 //!     .collect();
 //!
-//! disk_executor.block_on(async move {
-//!     let mut batch = Vec::with_capacity(32);
-//!     while disk_rx.recv_many(&mut batch, 32).await != 0 {
-//!         for request in batch.drain(..) {
-//!             // Submit `request` to this shard's local I/O scheduler.
-//!             let _ = request.0;
-//!         }
-//!     }
-//! });
 //! for frontend in frontends {
 //!     frontend.join().unwrap();
 //! }
+//! disk.join().unwrap();
 //! ```
 #![deny(
     missing_docs,
@@ -65,4 +73,4 @@
 mod driver;
 pub mod mpsc;
 
-pub use driver::{Driver, Handle};
+pub use driver::{Driver, DriverBuilder, Endpoint, Handle};

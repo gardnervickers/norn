@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use norn_executor::park::{Park, ParkMode, Unpark};
 
@@ -65,7 +65,7 @@ impl Registry {
 
 pub(crate) struct Remote {
     pending: AtomicBool,
-    unparker: Box<dyn Unpark + Send + Sync>,
+    unparker: OnceLock<Box<dyn Unpark + Send + Sync>>,
 }
 
 impl fmt::Debug for Remote {
@@ -77,19 +77,35 @@ impl fmt::Debug for Remote {
 }
 
 impl Remote {
-    fn new<U>(unparker: U) -> Self
+    fn new() -> Self {
+        Self {
+            pending: AtomicBool::new(false),
+            unparker: OnceLock::new(),
+        }
+    }
+
+    fn attach<U>(&self, unparker: U)
     where
         U: Unpark + Send + Sync + 'static,
     {
-        Self {
-            pending: AtomicBool::new(false),
-            unparker: Box::new(unparker),
+        assert!(
+            self.unparker.set(Box::new(unparker)).is_ok(),
+            "channel driver endpoint attached more than once"
+        );
+
+        if self.pending.load(Ordering::Acquire) {
+            self.unparker
+                .get()
+                .expect("channel driver endpoint was just attached")
+                .unpark();
         }
     }
 
     pub(crate) fn notify(&self) {
         if !self.pending.swap(true, Ordering::AcqRel) {
-            self.unparker.unpark();
+            if let Some(unparker) = self.unparker.get() {
+                unparker.unpark();
+            }
         }
     }
 
@@ -102,11 +118,81 @@ impl Remote {
     }
 }
 
-/// A destination-thread handle used to create channels.
+/// A sendable destination endpoint used to construct channels.
 ///
-/// The handle is deliberately not [`Send`]. Channels must be registered on the
-/// same thread that owns the associated [`Driver`]. The senders returned by
-/// [`crate::mpsc::bounded`] are the cross-thread part of the API.
+/// An endpoint identifies one channel [`Driver`]. It may be borrowed on a
+/// parent thread while assembling channels before the destination runtime
+/// starts. Obtain one from [`DriverBuilder::endpoint`].
+#[derive(Clone)]
+pub struct Endpoint {
+    remote: Arc<Remote>,
+}
+
+impl fmt::Debug for Endpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Endpoint").finish_non_exhaustive()
+    }
+}
+
+impl Endpoint {
+    pub(crate) fn remote(&self) -> Arc<Remote> {
+        Arc::clone(&self.remote)
+    }
+}
+
+/// A portable builder for a channel driver destination.
+///
+/// Construct this value before starting a runtime thread, create channels
+/// against [`DriverBuilder::endpoint`], then move the builder to the
+/// destination thread and call [`DriverBuilder::build`].
+pub struct DriverBuilder {
+    endpoint: Endpoint,
+}
+
+impl fmt::Debug for DriverBuilder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DriverBuilder").finish_non_exhaustive()
+    }
+}
+
+impl Default for DriverBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DriverBuilder {
+    /// Create a portable driver builder and destination endpoint.
+    pub fn new() -> Self {
+        Self {
+            endpoint: Endpoint {
+                remote: Arc::new(Remote::new()),
+            },
+        }
+    }
+
+    /// Return the endpoint used to construct channels for this destination.
+    pub fn endpoint(&self) -> &Endpoint {
+        &self.endpoint
+    }
+
+    /// Attach the endpoint to `inner` and construct its destination driver.
+    ///
+    /// Call this on the thread that will run the executor.
+    pub fn build<P>(self, inner: P) -> Driver<P>
+    where
+        P: Park,
+    {
+        self.endpoint.remote.attach(inner.unparker());
+        Driver::from_parts(inner, self.endpoint.remote)
+    }
+}
+
+/// A destination-thread handle used to attach channel receivers.
+///
+/// The handle is deliberately not [`Send`]. Detached receivers must be
+/// attached on the same thread that owns the associated [`Driver`]. Channel
+/// senders are the cross-thread part of the API.
 #[derive(Clone)]
 pub struct Handle {
     registry: Rc<Registry>,
@@ -128,8 +214,8 @@ impl Handle {
         self.registry.unregister(id);
     }
 
-    pub(crate) fn remote(&self) -> Arc<Remote> {
-        Arc::clone(&self.remote)
+    pub(crate) fn belongs_to(&self, remote: &Arc<Remote>) -> bool {
+        Arc::ptr_eq(&self.remote, remote)
     }
 }
 
@@ -163,8 +249,11 @@ where
     ///
     /// Construct the driver on the thread that will run the executor.
     pub fn new(inner: P) -> Self {
+        DriverBuilder::new().build(inner)
+    }
+
+    fn from_parts(inner: P, remote: Arc<Remote>) -> Self {
         let registry = Rc::new(Registry::new());
-        let remote = Arc::new(Remote::new(inner.unparker()));
         Self {
             inner,
             registry,
@@ -172,7 +261,17 @@ where
         }
     }
 
-    /// Return a destination-thread handle used to create channels.
+    /// Return the sendable endpoint used to construct channels for this driver.
+    ///
+    /// Use [`DriverBuilder`] instead when channels must be constructed before
+    /// the destination runtime thread starts.
+    pub fn endpoint(&self) -> Endpoint {
+        Endpoint {
+            remote: Arc::clone(&self.remote),
+        }
+    }
+
+    /// Return a destination-thread handle used to attach channel receivers.
     pub fn handle(&self) -> Handle {
         Handle {
             registry: Rc::clone(&self.registry),
