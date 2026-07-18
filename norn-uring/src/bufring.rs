@@ -269,7 +269,12 @@ impl Builder {
 struct InnerBufRing {
     handle: Handle,
 
-    // All these fields are constant once the struct is instantiated except the one of type Cell<u16>.
+    // True only after this instance has successfully registered its BGID with
+    // the kernel. A failed candidate must never unregister another live ring
+    // that happens to use the same BGID.
+    registered: Cell<bool>,
+
+    // All remaining fields are constant once the struct is instantiated except the Cell fields.
     bgid: Bgid,
 
     ring_entries_mask: u16, // Invariant one less than ring_entries which is > 0, power of 2, max 2^15 (32768).
@@ -345,6 +350,7 @@ impl InnerBufRing {
 
         let buf_ring = InnerBufRing {
             handle,
+            registered: Cell::new(false),
             bgid,
             ring_entries_mask,
             buf_cnt,
@@ -401,6 +407,11 @@ impl InnerBufRing {
                 }
             }
         };
+
+        // From this point on, Drop owns the matching unregister operation. Set
+        // the state before initializing userspace entries so unwinding cannot
+        // leave a successful kernel registration behind.
+        self.registered.set(true);
 
         for bid in 0..self.buf_cnt {
             self.buf_ring_push(bid);
@@ -596,6 +607,10 @@ impl InnerBufRing {
 
 impl Drop for InnerBufRing {
     fn drop(&mut self) {
+        if !self.registered.replace(false) {
+            return;
+        }
+
         // Best-effort unregister on drop. If this fails we prefer logging over panicking
         // during teardown; the process can still exit safely.
         if let Err(err) = self.handle.with_submitter(|s| self.unregister(s)) {
