@@ -204,6 +204,42 @@ fn send_recv_ring() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn duplicate_bgid_failure_keeps_original_ring_registered() -> Result<(), Box<dyn std::error::Error>>
+{
+    util::with_test_env(|| async {
+        let ring = BufRing::builder(10).buf_cnt(1).buf_len(128).build()?;
+        let err = BufRing::builder(10)
+            .buf_cnt(1)
+            .buf_len(128)
+            .build()
+            .unwrap_err();
+        assert!(err.to_string().contains("already registered"));
+
+        let sender = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let receiver = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+
+        sender
+            .send_to(Bytes::from_static(b"first"), receiver.local_addr()?)
+            .await
+            .0?;
+        let (buf, addr) = receiver.recv_from_ring(&ring).await?;
+        assert_eq!(addr, sender.local_addr()?);
+        assert_eq!(&buf[..], b"first");
+        drop(buf);
+
+        sender
+            .send_to(Bytes::from_static(b"second"), receiver.local_addr()?)
+            .await
+            .0?;
+        let (buf, addr) = receiver.recv_from_ring(&ring).await?;
+        assert_eq!(addr, sender.local_addr()?);
+        assert_eq!(&buf[..], b"second");
+
+        Ok(())
+    })
+}
+
+#[test]
 fn send_recv_ring_multi_msg() -> Result<(), Box<dyn std::error::Error>> {
     util::with_test_env(|| async {
         let ring = BufRing::builder(4).buf_cnt(32).buf_len(2048).build()?;
