@@ -235,31 +235,55 @@ impl TcpSocket {
     /// A buffer will be taken from the ring when the operation is completed
     /// and returned. If there are no buffers available, the operation will
     /// fail.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the buffer ring was registered with another driver.
     pub fn recv_ring(&self, ring: &BufRing) -> Op<socket::RecvFromRing> {
         self.socket.recv_from_ring(ring)
     }
 
     /// Receive data using a multishot recv operation and a provided buffer ring.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the buffer ring was registered with another driver.
     pub fn recv_ring_multi(&self, ring: &BufRing) -> Op<socket::RecvRingMulti> {
         self.socket.recv_ring_multi(ring)
     }
 
     /// Receive data using a single-shot recv bundle operation and a provided buffer ring.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the buffer ring was registered with another driver.
     pub fn recv_bundle(&self, ring: &BufRing) -> Op<socket::RecvRingBundle> {
         self.socket.recv_ring_bundle(ring)
     }
 
     /// Receive data using a single-shot recv bundle operation and a provided buffer ring.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the buffer ring was registered with another driver.
     pub fn recv_bundle_with_flags(&self, ring: &BufRing, flags: i32) -> Op<socket::RecvRingBundle> {
         self.socket.recv_ring_bundle_with_flags(ring, flags)
     }
 
     /// Receive data using a multishot recv bundle operation and a provided buffer ring.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the buffer ring was registered with another driver.
     pub fn recv_bundle_multi(&self, ring: &BufRing) -> Op<socket::RecvRingBundleMulti> {
         self.socket.recv_ring_bundle_multi(ring)
     }
 
     /// Receive data using a multishot recv bundle operation and a provided buffer ring.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the buffer ring was registered with another driver.
     pub fn recv_bundle_multi_with_flags(
         &self,
         ring: &BufRing,
