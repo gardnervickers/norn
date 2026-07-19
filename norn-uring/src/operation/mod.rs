@@ -145,7 +145,10 @@ pin_project_lite::pin_project! {
                         let _ = this.reactor.cancel(criteria, false);
                     }
                 }
-                State::Prepared { .. } | State::Waiting { .. } | State::Done => {}
+                State::Prepared { .. }
+                | State::ConfigureFailed { .. }
+                | State::Waiting { .. }
+                | State::Done => {}
             }
         }
     }
@@ -158,6 +161,10 @@ where
     Prepared {
         handle: Option<TypedHandle<T>>,
         entry: Option<ConfiguredEntry>,
+    },
+    ConfigureFailed {
+        handle: Option<TypedHandle<T>>,
+        error: Option<io::Error>,
     },
     Waiting {
         handle: Option<TypedHandle<T>>,
@@ -172,7 +179,7 @@ impl<T> State<T>
 where
     T: Operation + 'static,
 {
-    fn start_submit(&mut self) -> Option<ConfiguredEntry> {
+    fn prepare_batch(&mut self, batch: &mut SmallVec<[ConfiguredEntry; 4]>) -> bool {
         let state = mem::replace(self, State::Done);
         match state {
             State::Prepared {
@@ -183,19 +190,60 @@ where
                 *self = State::Waiting {
                     handle: Some(handle.take().expect("handle missing")),
                 };
-                Some(entry)
+                batch.push(entry);
+                true
+            }
+            State::ConfigureFailed {
+                mut handle,
+                mut error,
+            } => {
+                let handle = handle.take().expect("handle missing");
+                handle.untyped().complete(CQEResult::new(
+                    Err(error.take().expect("configuration error missing")),
+                    0,
+                ));
+                *self = State::Submitted {
+                    inner: SubmittedOp { inner: handle },
+                };
+                false
             }
             state => {
                 *self = state;
-                None
+                false
             }
         }
     }
 
-    fn prepare_batch(&mut self, batch: &mut SmallVec<[ConfiguredEntry; 4]>) {
-        if let Some(entry) = self.start_submit() {
-            batch.push(entry);
-        }
+    fn start_submit(&mut self) -> Option<ConfiguredEntry> {
+        let mut batch = SmallVec::new();
+        self.prepare_batch(&mut batch);
+        batch.pop()
+    }
+
+    fn cancel_unsubmitted(&mut self) -> bool {
+        let state = mem::replace(self, State::Done);
+        let handle = match state {
+            State::Prepared { mut handle, entry } => {
+                drop(entry);
+                handle.take().expect("handle missing")
+            }
+            State::ConfigureFailed { mut handle, error } => {
+                drop(error);
+                handle.take().expect("handle missing")
+            }
+            state => {
+                *self = state;
+                return false;
+            }
+        };
+        handle.untyped().complete(CQEResult::new(
+            Err(io::Error::from_raw_os_error(libc::ECANCELED)),
+            0,
+        ));
+        *self = State::Submitted {
+            inner: SubmittedOp { inner: handle },
+        };
+        true
     }
 
     fn finish_submit(&mut self) {
@@ -240,14 +288,14 @@ where
         let entry = match T::configure(data) {
             Ok(entry) => entry,
             Err(err) => {
-                handle.untyped().complete(CQEResult::new(Err(err), 0));
                 return Self {
                     submit: None,
-                    state: State::Submitted {
-                        inner: SubmittedOp { inner: handle },
+                    state: State::ConfigureFailed {
+                        handle: Some(handle),
+                        error: Some(err),
                     },
                     reactor,
-                    completed: true,
+                    completed: false,
                 };
             }
         };
@@ -271,9 +319,20 @@ where
     pub(crate) fn prepare_batch(
         mut self: Pin<&mut Self>,
         batch: &mut SmallVec<[ConfiguredEntry; 4]>,
-    ) {
+    ) -> bool {
         let this = self.as_mut().project();
-        this.state.prepare_batch(batch);
+        let can_continue = this.state.prepare_batch(batch);
+        if !can_continue {
+            *this.completed = true;
+        }
+        can_continue
+    }
+
+    pub(crate) fn cancel_unsubmitted(mut self: Pin<&mut Self>) {
+        let this = self.as_mut().project();
+        if this.state.cancel_unsubmitted() {
+            *this.completed = true;
+        }
     }
 
     pub(crate) fn finish_submit(mut self: Pin<&mut Self>) {
@@ -300,6 +359,13 @@ where
     fn poll_submit(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         {
             let mut this = self.as_mut().project();
+            if this.submit.is_none() && matches!(this.state, State::ConfigureFailed { .. }) {
+                let mut batch = SmallVec::new();
+                let can_continue = this.state.prepare_batch(&mut batch);
+                debug_assert!(!can_continue);
+                debug_assert!(batch.is_empty());
+                *this.completed = true;
+            }
             if this.submit.is_none() && matches!(this.state, State::Prepared { .. }) {
                 let entry = this
                     .state
