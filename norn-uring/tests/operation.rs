@@ -12,8 +12,8 @@ struct PublicNop;
 // Safety: NOP has no referenced resources and produces exactly one terminal
 // completion. `cleanup` consumes every unobserved completion result.
 unsafe impl Operation for PublicNop {
-    fn configure(&mut self) -> io_uring::squeue::Entry {
-        io_uring::opcode::Nop::new().build()
+    fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+        Ok(io_uring::opcode::Nop::new().build())
     }
 
     fn cleanup(&mut self, result: CQEResult) {

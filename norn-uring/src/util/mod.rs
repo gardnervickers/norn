@@ -15,8 +15,8 @@ pub async fn noop() {
     struct Nop;
     // Safety: a NOP SQE references no external resources.
     unsafe impl crate::operation::Operation for Nop {
-        fn configure(&mut self) -> io_uring::squeue::Entry {
-            io_uring::opcode::Nop::new().build()
+        fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+            Ok(io_uring::opcode::Nop::new().build())
         }
 
         fn cleanup(&mut self, _: crate::operation::CQEResult) {}

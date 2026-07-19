@@ -1,6 +1,7 @@
 #![allow(private_interfaces)]
 
 use std::future::Future;
+use std::io;
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
 use std::time::Duration;
@@ -16,7 +17,9 @@ mod private {
 
     pub trait Chainable: Future {
         fn reactor(&self) -> &crate::Handle;
-        fn prepare_batch(self: Pin<&mut Self>, batch: &mut SmallVec<[ConfiguredEntry; 4]>);
+        /// Prepare entries and return whether later linked requests may be submitted.
+        fn prepare_batch(self: Pin<&mut Self>, batch: &mut SmallVec<[ConfiguredEntry; 4]>) -> bool;
+        fn cancel_unsubmitted(self: Pin<&mut Self>);
         fn finish_submit(self: Pin<&mut Self>);
         fn fail_submit(self: Pin<&mut Self>, err: &SubmitError);
         fn cancel_unfinished(self: Pin<&mut Self>);
@@ -26,6 +29,10 @@ mod private {
 /// A lazy request that can be linked with other requests before submission.
 pub trait Request: Future + Sized + private::Chainable {
     /// Link another request and return both results together.
+    ///
+    /// If an operation fails during configuration, earlier configured operations are still
+    /// submitted, while that operation reports its configuration error and later linked
+    /// operations complete with `ECANCELED` without reaching the kernel.
     fn then<R>(self, next: R) -> Then<Self, R>
     where
         R: Request,
@@ -34,6 +41,9 @@ pub trait Request: Future + Sized + private::Chainable {
     }
 
     /// Link another request but discard its output.
+    ///
+    /// Configuration failures short-circuit later linked operations in the same way as
+    /// [`Request::then`].
     fn then_aux<R>(self, next: R) -> ThenAux<Self, R>
     where
         R: Request,
@@ -122,8 +132,8 @@ impl LinkTimeoutOp {
 // Safety: the timeout specification is stored inline in this pinned operation,
 // so its SQE pointer remains valid until the terminal completion.
 unsafe impl Operation for LinkTimeoutOp {
-    fn configure(&mut self) -> io_uring::squeue::Entry {
-        io_uring::opcode::LinkTimeout::new(&self.timespec).build()
+    fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+        Ok(io_uring::opcode::LinkTimeout::new(&self.timespec).build())
     }
 
     fn cleanup(&mut self, _: CQEResult) {}
@@ -229,8 +239,11 @@ where
             if !*submitted {
                 if submit.is_none() {
                     let mut batch = SmallVec::new();
-                    left.as_mut().prepare_batch(&mut batch);
-                    right.as_mut().prepare_batch(&mut batch);
+                    if !left.as_mut().prepare_batch(&mut batch) {
+                        right.as_mut().cancel_unsubmitted();
+                    } else {
+                        right.as_mut().prepare_batch(&mut batch);
+                    }
                     let reactor = left.as_ref().get_ref().reactor().clone();
                     submit.set(Some(reactor.push_batch(batch)));
                 }
@@ -379,8 +392,11 @@ where
             if !*submitted {
                 if submit.is_none() {
                     let mut batch = SmallVec::new();
-                    left.as_mut().prepare_batch(&mut batch);
-                    right.as_mut().prepare_batch(&mut batch);
+                    if !left.as_mut().prepare_batch(&mut batch) {
+                        right.as_mut().cancel_unsubmitted();
+                    } else {
+                        right.as_mut().prepare_batch(&mut batch);
+                    }
                     let reactor = left.as_ref().get_ref().reactor().clone();
                     submit.set(Some(reactor.push_batch(batch)));
                 }
@@ -488,8 +504,12 @@ where
         self.handle()
     }
 
-    fn prepare_batch(self: Pin<&mut Self>, batch: &mut SmallVec<[ConfiguredEntry; 4]>) {
-        Op::prepare_batch(self, batch);
+    fn prepare_batch(self: Pin<&mut Self>, batch: &mut SmallVec<[ConfiguredEntry; 4]>) -> bool {
+        Op::prepare_batch(self, batch)
+    }
+
+    fn cancel_unsubmitted(self: Pin<&mut Self>) {
+        Op::cancel_unsubmitted(self);
     }
 
     fn finish_submit(self: Pin<&mut Self>) {
@@ -517,13 +537,36 @@ where
         }
     }
 
-    fn prepare_batch(self: Pin<&mut Self>, batch: &mut SmallVec<[ConfiguredEntry; 4]>) {
+    fn prepare_batch(self: Pin<&mut Self>, batch: &mut SmallVec<[ConfiguredEntry; 4]>) -> bool {
         let this = self.project();
-        let ThenStateProj::Pending { left, right, .. } = this.state.project() else {
+        let ThenStateProj::Pending {
+            mut left,
+            mut right,
+            ..
+        } = this.state.project()
+        else {
             panic!("cannot prepare completed request");
         };
-        left.prepare_batch(batch);
-        right.prepare_batch(batch);
+        if !left.as_mut().prepare_batch(batch) {
+            right.as_mut().cancel_unsubmitted();
+            false
+        } else {
+            right.as_mut().prepare_batch(batch)
+        }
+    }
+
+    fn cancel_unsubmitted(self: Pin<&mut Self>) {
+        let this = self.project();
+        let ThenStateProj::Pending {
+            mut left,
+            mut right,
+            ..
+        } = this.state.project()
+        else {
+            return;
+        };
+        left.as_mut().cancel_unsubmitted();
+        right.as_mut().cancel_unsubmitted();
     }
 
     fn finish_submit(self: Pin<&mut Self>) {
@@ -585,13 +628,36 @@ where
         }
     }
 
-    fn prepare_batch(self: Pin<&mut Self>, batch: &mut SmallVec<[ConfiguredEntry; 4]>) {
+    fn prepare_batch(self: Pin<&mut Self>, batch: &mut SmallVec<[ConfiguredEntry; 4]>) -> bool {
         let this = self.project();
-        let ThenAuxStateProj::Pending { left, right, .. } = this.state.project() else {
+        let ThenAuxStateProj::Pending {
+            mut left,
+            mut right,
+            ..
+        } = this.state.project()
+        else {
             panic!("cannot prepare completed request");
         };
-        left.prepare_batch(batch);
-        right.prepare_batch(batch);
+        if !left.as_mut().prepare_batch(batch) {
+            right.as_mut().cancel_unsubmitted();
+            false
+        } else {
+            right.as_mut().prepare_batch(batch)
+        }
+    }
+
+    fn cancel_unsubmitted(self: Pin<&mut Self>) {
+        let this = self.project();
+        let ThenAuxStateProj::Pending {
+            mut left,
+            mut right,
+            ..
+        } = this.state.project()
+        else {
+            return;
+        };
+        left.as_mut().cancel_unsubmitted();
+        right.as_mut().cancel_unsubmitted();
     }
 
     fn finish_submit(self: Pin<&mut Self>) {
@@ -650,8 +716,12 @@ where
         self.inner.reactor()
     }
 
-    fn prepare_batch(self: Pin<&mut Self>, batch: &mut SmallVec<[ConfiguredEntry; 4]>) {
-        self.project().inner.prepare_batch(batch);
+    fn prepare_batch(self: Pin<&mut Self>, batch: &mut SmallVec<[ConfiguredEntry; 4]>) -> bool {
+        self.project().inner.prepare_batch(batch)
+    }
+
+    fn cancel_unsubmitted(self: Pin<&mut Self>) {
+        self.project().inner.cancel_unsubmitted();
     }
 
     fn finish_submit(self: Pin<&mut Self>) {
@@ -681,8 +751,8 @@ mod tests {
     struct TaggedNop(u8);
 
     unsafe impl Operation for TaggedNop {
-        fn configure(&mut self) -> io_uring::squeue::Entry {
-            io_uring::opcode::Nop::new().build()
+        fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+            Ok(io_uring::opcode::Nop::new().build())
         }
 
         fn cleanup(&mut self, _: CQEResult) {}
@@ -694,6 +764,163 @@ mod tests {
         fn complete(self, result: CQEResult) -> Self::Output {
             result.result.map(|_| self.0)
         }
+    }
+
+    #[derive(Debug)]
+    struct ConfigureFailed(&'static str);
+
+    unsafe impl Operation for ConfigureFailed {
+        fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+            Err(io::Error::new(io::ErrorKind::InvalidInput, self.0))
+        }
+
+        fn cleanup(&mut self, _: CQEResult) {}
+    }
+
+    impl Singleshot for ConfigureFailed {
+        type Output = std::io::Result<()>;
+
+        fn complete(self, result: CQEResult) -> Self::Output {
+            result.result.map(drop)
+        }
+    }
+
+    fn assert_canceled<T>(result: &io::Result<T>) {
+        let Err(error) = result else {
+            panic!("request should be canceled");
+        };
+        assert_eq!(error.raw_os_error(), Some(libc::ECANCELED));
+    }
+
+    #[test]
+    fn configure_failure_cancels_later_linked_request() {
+        let driver = crate::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let handle = driver.handle();
+        let mut ex = LocalExecutor::new(driver);
+
+        let (failed, later) = ex.block_on(async {
+            handle
+                .submit(ConfigureFailed("first configure failed"))
+                .then(handle.submit(TaggedNop(2)))
+                .await
+        });
+
+        assert_eq!(
+            failed.expect_err("configuration should fail").to_string(),
+            "first configure failed"
+        );
+        assert_canceled(&later);
+    }
+
+    #[test]
+    fn middle_configure_failure_submits_prefix_and_cancels_suffix() {
+        let driver = crate::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let handle = driver.handle();
+        let mut ex = LocalExecutor::new(driver);
+
+        let ((prefix, failed), suffix) = ex.block_on(async {
+            handle
+                .submit(TaggedNop(1))
+                .then(handle.submit(ConfigureFailed("middle configure failed")))
+                .then(handle.submit(TaggedNop(3)))
+                .await
+        });
+
+        assert_eq!(prefix.unwrap(), 1);
+        assert_eq!(
+            failed.expect_err("configuration should fail").to_string(),
+            "middle configure failed"
+        );
+        assert_canceled(&suffix);
+    }
+
+    #[test]
+    fn earlier_configure_failure_dominates_later_configure_failure() {
+        let driver = crate::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let handle = driver.handle();
+        let mut ex = LocalExecutor::new(driver);
+
+        let (first, second) = ex.block_on(async {
+            handle
+                .submit(ConfigureFailed("first configure failed"))
+                .then(handle.submit(ConfigureFailed("second configure failed")))
+                .await
+        });
+
+        assert_eq!(
+            first
+                .expect_err("first configuration should fail")
+                .to_string(),
+            "first configure failed"
+        );
+        assert_canceled(&second);
+    }
+
+    #[test]
+    fn configure_failure_propagates_through_map_and_then_aux() {
+        let driver = crate::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let handle = driver.handle();
+        let mut ex = LocalExecutor::new(driver);
+        let aux_error = Rc::new(Cell::new(None));
+        let aux_error_seen = Rc::clone(&aux_error);
+
+        let failed = ex.block_on(async move {
+            handle
+                .submit(ConfigureFailed("mapped configure failed"))
+                .map(|result| result)
+                .then_aux(handle.submit(TaggedNop(9)).map(move |result| {
+                    aux_error_seen.set(
+                        result
+                            .expect_err("auxiliary request should be canceled")
+                            .raw_os_error(),
+                    );
+                }))
+                .await
+        });
+
+        assert_eq!(
+            failed.expect_err("configuration should fail").to_string(),
+            "mapped configure failed"
+        );
+        assert_eq!(aux_error.get(), Some(libc::ECANCELED));
+    }
+
+    #[test]
+    fn dropping_canceled_unsubmitted_request_runs_cleanup() {
+        #[derive(Debug)]
+        struct CleanupTracked(Rc<Cell<Option<i32>>>);
+
+        unsafe impl Operation for CleanupTracked {
+            fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+                Ok(io_uring::opcode::Nop::new().build())
+            }
+
+            fn cleanup(&mut self, result: CQEResult) {
+                self.0.set(
+                    result
+                        .result
+                        .expect_err("cleanup should see cancellation")
+                        .raw_os_error(),
+                );
+            }
+        }
+
+        impl Singleshot for CleanupTracked {
+            type Output = io::Result<()>;
+
+            fn complete(self, result: CQEResult) -> Self::Output {
+                result.result.map(drop)
+            }
+        }
+
+        let driver = crate::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let cleaned = Rc::new(Cell::new(None));
+        let mut op = Box::pin(driver.handle().submit(CleanupTracked(Rc::clone(&cleaned))));
+
+        op.as_mut().cancel_unsubmitted();
+        drop(op);
+
+        assert_eq!(cleaned.get(), Some(libc::ECANCELED));
     }
 
     #[test]

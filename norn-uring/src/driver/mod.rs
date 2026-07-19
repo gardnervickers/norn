@@ -892,8 +892,8 @@ mod tests {
         struct NopOp;
 
         unsafe impl Operation for NopOp {
-            fn configure(&mut self) -> io_uring::squeue::Entry {
-                io_uring::opcode::Nop::new().build()
+            fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+                Ok(io_uring::opcode::Nop::new().build())
             }
 
             fn cleanup(&mut self, _: CQEResult) {}
@@ -944,8 +944,8 @@ mod tests {
         struct NopOp;
 
         unsafe impl Operation for NopOp {
-            fn configure(&mut self) -> io_uring::squeue::Entry {
-                io_uring::opcode::Nop::new().build()
+            fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+                Ok(io_uring::opcode::Nop::new().build())
             }
 
             fn cleanup(&mut self, _: CQEResult) {}
@@ -973,8 +973,8 @@ mod tests {
         struct NopOp;
 
         unsafe impl Operation for NopOp {
-            fn configure(&mut self) -> io_uring::squeue::Entry {
-                io_uring::opcode::Nop::new().build()
+            fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+                Ok(io_uring::opcode::Nop::new().build())
             }
 
             fn cleanup(&mut self, _: CQEResult) {}
@@ -1019,8 +1019,8 @@ mod tests {
         struct NopOp;
 
         unsafe impl Operation for NopOp {
-            fn configure(&mut self) -> io_uring::squeue::Entry {
-                io_uring::opcode::Nop::new().build()
+            fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+                Ok(io_uring::opcode::Nop::new().build())
             }
 
             fn cleanup(&mut self, _: CQEResult) {}
