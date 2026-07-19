@@ -38,6 +38,16 @@ impl UnparkerState {
     }
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum ParkAction {
+    /// The reactor won the transition to parked and must arm the eventfd read.
+    Arm,
+    /// An eventfd read is already armed.
+    Armed,
+    /// A remote wake was observed, so this park attempt must be skipped.
+    Notified,
+}
+
 impl fmt::Debug for UnparkerState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("UnparkerState")
@@ -93,15 +103,48 @@ impl Unparker {
         UnparkerState(self.inner.flag.load(Ordering::Acquire))
     }
 
-    /// Mark this unparker as "parked". This will signal to future wakers that a write to the eventfd is needed.
-    ///
-    /// The reactor should look at the returned UnparkerState to determine if there was a signal to wake.
-    pub(crate) fn park(&self) -> UnparkerState {
-        let state = self
-            .inner
-            .flag
-            .fetch_or(Self::REACTOR_PARK_BIT, Ordering::AcqRel);
-        UnparkerState(state)
+    /// Consume a pending wake or prepare the unparker for parking.
+    pub(crate) fn park(&self) -> ParkAction {
+        let mut state = self.inner.flag.load(Ordering::Acquire);
+        loop {
+            let current = UnparkerState(state);
+            if current.woken() {
+                if current.is_parked() {
+                    // The eventfd read is still outstanding. Its completion
+                    // will reset both bits, so do not arm another read.
+                    return ParkAction::Notified;
+                }
+
+                let next = state & !Self::REMOTE_THREAD_BIT;
+                match self.inner.flag.compare_exchange_weak(
+                    state,
+                    next,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => return ParkAction::Notified,
+                    Err(actual) => {
+                        state = actual;
+                        continue;
+                    }
+                }
+            }
+
+            if current.is_parked() {
+                return ParkAction::Armed;
+            }
+
+            let next = state | Self::REACTOR_PARK_BIT;
+            match self.inner.flag.compare_exchange_weak(
+                state,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return ParkAction::Arm,
+                Err(actual) => state = actual,
+            }
+        }
     }
 
     /// Reset this unparker. This should be called to clear the parking status from the reactor.
@@ -161,6 +204,8 @@ impl park::Unpark for Unparker {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Barrier;
+
     use super::*;
 
     #[test]
@@ -168,12 +213,11 @@ mod tests {
         let unparker = Unparker::new().unwrap();
         let unparker = Arc::new(unparker);
 
-        let old_state = unparker.park();
-        assert!(!old_state.is_parked());
-        assert!(!old_state.woken());
+        assert_eq!(unparker.park(), ParkAction::Arm);
 
         assert!(unparker.state().is_parked());
         assert!(!unparker.state().woken());
+        assert_eq!(unparker.park(), ParkAction::Armed);
 
         unparker.wake();
         assert!(unparker.state().is_parked());
@@ -182,5 +226,65 @@ mod tests {
         unparker.reset();
         assert!(!unparker.state().is_parked());
         assert!(!unparker.state().woken());
+    }
+
+    #[test]
+    fn wake_before_park_is_consumed_once() {
+        let unparker = Arc::new(Unparker::new().unwrap());
+
+        unparker.wake();
+        assert!(unparker.state().woken());
+        assert!(!unparker.state().is_parked());
+
+        assert_eq!(unparker.park(), ParkAction::Notified);
+        assert!(!unparker.state().woken());
+        assert!(!unparker.state().is_parked());
+
+        assert_eq!(unparker.park(), ParkAction::Arm);
+        assert!(unparker.state().is_parked());
+        assert!(!unparker.state().woken());
+    }
+
+    #[test]
+    fn park_wake_races_leave_a_consistent_state() {
+        const ITERATIONS: usize = if cfg!(miri) { 100 } else { 10_000 };
+
+        let unparker = Arc::new(Unparker::new().unwrap());
+        let start = Arc::new(Barrier::new(2));
+        let done = Arc::new(Barrier::new(2));
+        let worker = {
+            let unparker = Arc::clone(&unparker);
+            let start = Arc::clone(&start);
+            let done = Arc::clone(&done);
+            std::thread::spawn(move || {
+                for _ in 0..ITERATIONS {
+                    start.wait();
+                    unparker.wake_inner();
+                    done.wait();
+                }
+            })
+        };
+
+        for _ in 0..ITERATIONS {
+            unparker.reset();
+            start.wait();
+            let action = unparker.park();
+            done.wait();
+
+            let state = unparker.state();
+            match action {
+                ParkAction::Arm => {
+                    assert!(state.is_parked());
+                    assert!(state.woken());
+                }
+                ParkAction::Notified => {
+                    assert!(!state.is_parked());
+                    assert!(!state.woken());
+                }
+                ParkAction::Armed => panic!("idle unparker was already armed"),
+            }
+        }
+
+        worker.join().unwrap();
     }
 }

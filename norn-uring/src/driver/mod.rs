@@ -341,8 +341,11 @@ impl Driver {
         if self.shared.status() != Status::Running {
             return true;
         }
-        let state = self.unparker.park();
-        if !state.is_parked() {
+        let action = self.unparker.park();
+        if action == unpark::ParkAction::Notified {
+            return false;
+        }
+        if action == unpark::ParkAction::Arm {
             let fd = self.unparker.raw_fd();
             let fd = io_uring::types::Fd(fd);
             // Safety: We use the unparker to track the outstanding requests which use the unparker_buf, preventing
@@ -362,7 +365,7 @@ impl Driver {
                 return false;
             }
         }
-        !state.woken()
+        true
     }
 
     /// Submits all pending entries to the ring.
@@ -829,6 +832,29 @@ mod tests {
     use super::*;
     use crate::operation::{CQEResult, Operation, Singleshot};
     use crate::Request;
+
+    #[test]
+    fn prepare_park_consumes_a_latched_wake_before_arming() {
+        let driver = Driver::new(io_uring::IoUring::builder(), 2).unwrap();
+
+        driver.unparker.wake_inner();
+        assert!(driver.unparker.state().woken());
+        assert!(!driver.prepare_park());
+        assert!(!driver.unparker.state().woken());
+        assert!(!driver.unparker.state().is_parked());
+        {
+            let mut ring = driver.shared.ring.borrow_mut();
+            assert_eq!(ring.submission().len(), 0);
+        }
+
+        assert!(driver.prepare_park());
+        assert!(driver.unparker.state().is_parked());
+        assert!(!driver.unparker.state().woken());
+        {
+            let mut ring = driver.shared.ring.borrow_mut();
+            assert_eq!(ring.submission().len(), 1);
+        }
+    }
 
     #[test]
     fn prepare_park_sq_full_clears_parked_state() {
