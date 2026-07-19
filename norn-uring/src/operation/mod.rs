@@ -501,10 +501,11 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::future::Future;
     use std::rc::Rc;
-    use std::task::Poll;
+    use std::sync::Arc;
+    use std::task::{Poll, Wake, Waker};
 
     use super::*;
 
@@ -583,6 +584,42 @@ mod tests {
             .expect("missing CQE more flag")
     }
 
+    thread_local! {
+        static WAKE_ACTION: RefCell<Option<Box<dyn FnMut()>>> = RefCell::new(None);
+    }
+
+    struct TestWake;
+
+    impl Wake for TestWake {
+        fn wake(self: Arc<Self>) {
+            Self::run();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            Self::run();
+        }
+    }
+
+    impl TestWake {
+        fn run() {
+            WAKE_ACTION.with(|action| {
+                action.borrow_mut().as_mut().expect("wake action missing")();
+            });
+        }
+    }
+
+    fn test_waker(action: impl FnMut() + 'static) -> Waker {
+        WAKE_ACTION.with(|slot| {
+            assert!(slot.borrow().is_none(), "wake action already installed");
+            *slot.borrow_mut() = Some(Box::new(action));
+        });
+        Waker::from(Arc::new(TestWake))
+    }
+
+    fn clear_wake_action() {
+        WAKE_ACTION.with(|slot| *slot.borrow_mut() = None);
+    }
+
     #[test]
     fn multishot_completions_are_fifo() {
         let typed = TypedHandle::new(TestMultishot);
@@ -598,6 +635,59 @@ mod tests {
         assert_eq!(submitted.try_next(), Some(30));
         assert_eq!(submitted.try_next(), None);
         assert!(submitted.inner.is_complete());
+    }
+
+    #[test]
+    fn multishot_more_completion_survives_panicking_waker() {
+        let typed = TypedHandle::new(TestMultishot);
+        let kernel_ref = typed.untyped().into_raw_usize();
+        let waker = test_waker(|| panic!("wake panic"));
+        typed.register_waker(&waker);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let kernel_ref = unsafe { RawOpRef::from_raw_usize(kernel_ref) };
+            kernel_ref.complete(CQEResult::new(Ok(10), more_flag()));
+        }));
+        assert!(result.is_err());
+        clear_wake_action();
+
+        assert_eq!(typed.inner.header().refcount(), 2);
+
+        let terminal_ref = unsafe { RawOpRef::from_raw_usize(kernel_ref) };
+        terminal_ref.complete(CQEResult::new(Ok(20), 0));
+        assert_eq!(typed.inner.header().refcount(), 1);
+
+        let mut submitted = SubmittedOp { inner: typed };
+        assert_eq!(submitted.try_next(), Some(10));
+        assert_eq!(submitted.try_next(), Some(20));
+        assert_eq!(submitted.try_next(), None);
+    }
+
+    #[test]
+    fn multishot_waker_can_poll_synchronously() {
+        let typed = TypedHandle::new(TestMultishot);
+        let kernel_ref = typed.untyped().into_raw_usize();
+        let submitted = Rc::new(RefCell::new(SubmittedOp { inner: typed }));
+        let observed = Rc::new(Cell::new(None));
+        let waker = test_waker({
+            let submitted = Rc::clone(&submitted);
+            let observed = Rc::clone(&observed);
+            move || observed.set(submitted.borrow_mut().try_next())
+        });
+        submitted.borrow().inner.register_waker(&waker);
+
+        let more_ref = unsafe { RawOpRef::from_raw_usize(kernel_ref) };
+        more_ref.complete(CQEResult::new(Ok(10), more_flag()));
+        clear_wake_action();
+
+        assert_eq!(observed.get(), Some(10));
+        assert_eq!(submitted.borrow().inner.inner.header().refcount(), 2);
+
+        let terminal_ref = unsafe { RawOpRef::from_raw_usize(kernel_ref) };
+        terminal_ref.complete(CQEResult::new(Ok(20), 0));
+        assert_eq!(submitted.borrow_mut().try_next(), Some(20));
+        assert_eq!(submitted.borrow_mut().try_next(), None);
+        assert_eq!(submitted.borrow().inner.inner.header().refcount(), 1);
     }
 
     #[test]
