@@ -11,6 +11,7 @@ use crate::{RegisteredTask, Runnable, Schedule};
 mod basic;
 mod combo;
 mod panic;
+mod reentrancy;
 mod wake;
 
 struct TestSpawner {
