@@ -83,8 +83,10 @@ where
         let this = Self::from_raw_header(ptr);
         let header = &this.as_ref().header;
         assert!(!header.is_complete());
-        let mut completions = header.completions().borrow_mut();
-        completions.push(result);
+        {
+            let mut completions = header.completions().borrow_mut();
+            completions.push(result);
+        }
         if !more {
             header.set_complete();
         }
@@ -173,13 +175,16 @@ impl RawOpRef {
 
     pub(crate) fn complete(self, result: CQEResult) -> bool {
         let more = result.more();
-        let header = self.header();
-        let res = unsafe { (header.vtable.complete)(self.inner, result) };
+        let inner = self.inner;
         if more {
-            // We need to keep the handle alive.
+            // Preserve the kernel-owned reference before invoking any operation callback. A
+            // callback may wake arbitrary safe code, including code that panics or polls the
+            // operation synchronously. In either case the kernel still owns this reference
+            // until it reports a terminal completion.
             mem::forget(self);
         }
-        res
+        let header = unsafe { inner.as_ref() };
+        unsafe { (header.vtable.complete)(inner, result) }
     }
 
     fn as_raw(&self) -> *const () {
