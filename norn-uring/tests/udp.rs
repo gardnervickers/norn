@@ -1,8 +1,11 @@
 #![cfg(target_os = "linux")]
 
+use std::future::Future;
 use std::pin::pin;
+use std::task::Poll;
 
 use bytes::{Bytes, BytesMut};
+use futures_util::future::poll_fn;
 use futures_util::StreamExt;
 use norn_uring::bufring::{BufRing, BufRingBufBundle};
 use norn_uring::net::UdpSocket;
@@ -15,6 +18,8 @@ fn flatten_bundle(bundle: &BufRingBufBundle) -> Vec<u8> {
         .flat_map(|chunk| chunk.iter().copied())
         .collect()
 }
+
+const TRUNC_PAYLOAD: &[u8] = b"a datagram much larger than the receive buffer";
 
 #[test]
 fn send_recv() -> Result<(), Box<dyn std::error::Error>> {
@@ -177,6 +182,91 @@ fn send_recv_msg() -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(addr, s1.local_addr()?);
         assert_eq!(&buf[..n], b"hello");
 
+        Ok(())
+    })
+}
+
+#[test]
+fn msg_trunc_direct_recv_from_caps_vec_initialization() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let sender = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let receiver = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+
+        sender
+            .send_to(Bytes::from_static(TRUNC_PAYLOAD), receiver.local_addr()?)
+            .await
+            .0?;
+
+        let buf = Vec::with_capacity(1);
+        let submitted_len = buf.capacity();
+        assert!(submitted_len < TRUNC_PAYLOAD.len());
+        let (res, buf) = receiver.recv_from_with_flags(buf, libc::MSG_TRUNC).await;
+        let (reported_len, addr) = res?;
+
+        assert_eq!(reported_len, TRUNC_PAYLOAD.len());
+        assert_eq!(addr, sender.local_addr()?);
+        assert_eq!(buf.len(), submitted_len);
+        assert_eq!(&buf[..], &TRUNC_PAYLOAD[..submitted_len]);
+        Ok(())
+    })
+}
+
+#[test]
+fn msg_trunc_uring_recv_from_caps_bytes_mut_initialization(
+) -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let sender = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let receiver = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+
+        let buf = BytesMut::with_capacity(1);
+        let submitted_len = buf.capacity();
+        assert!(submitted_len < TRUNC_PAYLOAD.len());
+        let mut recv = pin!(receiver.recv_from_with_flags(buf, libc::MSG_TRUNC));
+        poll_fn(|cx| {
+            assert!(recv.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+
+        sender
+            .send_to(Bytes::from_static(TRUNC_PAYLOAD), receiver.local_addr()?)
+            .await
+            .0?;
+        let (res, buf) = recv.await;
+        let (reported_len, addr) = res?;
+
+        assert_eq!(reported_len, TRUNC_PAYLOAD.len());
+        assert_eq!(addr, sender.local_addr()?);
+        assert_eq!(buf.len(), submitted_len);
+        assert_eq!(&buf[..], &TRUNC_PAYLOAD[..submitted_len]);
+        Ok(())
+    })
+}
+
+#[test]
+fn msg_trunc_connected_recv_caps_vec_and_bytes_mut_initialization(
+) -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let sender = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let receiver = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        sender.connect(receiver.local_addr()?).await?;
+        receiver.connect(sender.local_addr()?).await?;
+
+        sender.send(Bytes::from_static(TRUNC_PAYLOAD)).await.0?;
+        let vec_buf = Vec::with_capacity(1);
+        let vec_submitted_len = vec_buf.capacity();
+        let (res, vec_buf) = receiver.recv_with_flags(vec_buf, libc::MSG_TRUNC).await;
+        assert_eq!(res?, TRUNC_PAYLOAD.len());
+        assert_eq!(vec_buf.len(), vec_submitted_len);
+        assert_eq!(&vec_buf[..], &TRUNC_PAYLOAD[..vec_submitted_len]);
+
+        sender.send(Bytes::from_static(TRUNC_PAYLOAD)).await.0?;
+        let bytes_buf = BytesMut::with_capacity(1);
+        let bytes_submitted_len = bytes_buf.capacity();
+        let (res, bytes_buf) = receiver.recv_with_flags(bytes_buf, libc::MSG_TRUNC).await;
+        assert_eq!(res?, TRUNC_PAYLOAD.len());
+        assert_eq!(bytes_buf.len(), bytes_submitted_len);
+        assert_eq!(&bytes_buf[..], &TRUNC_PAYLOAD[..bytes_submitted_len]);
         Ok(())
     })
 }
