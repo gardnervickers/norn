@@ -6,9 +6,9 @@
 use std::future::Future;
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
+use std::ptr;
 use std::ptr::NonNull;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-use std::{mem, ptr};
 
 use crate::future_cell;
 use crate::header;
@@ -234,15 +234,14 @@ where
             }
         }
 
-        // Finally we need to unbind the task from the scheduler.
-        // We can directly convert this taskref into a registered task
-        // for the unbind step without bumping the refcount, as unbind
-        // takes a reference. We just forget it later to avoid running
-        // the drop logic.
-        let taskref = crate::RegisteredTask::from(TaskRef::from_ptr(ptr));
+        // Finally we need to unbind the task from the scheduler. The
+        // registered task borrows the intrusive-list reference rather than
+        // owning a new reference count. Put it in `ManuallyDrop` before
+        // invoking user scheduler code so unwinding cannot drop that
+        // borrowed reference.
+        let taskref = ManuallyDrop::new(crate::RegisteredTask::from(TaskRef::from_ptr(ptr)));
         let scheduler = this.as_ref().scheduler();
         scheduler.unbind(&taskref);
-        mem::forget(taskref);
     }
 
     unsafe fn dealloc(ptr: NonNull<header::Header>) {

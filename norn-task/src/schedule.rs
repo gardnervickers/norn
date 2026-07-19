@@ -18,6 +18,10 @@ pub trait Schedule: Sized + 'static {
     ///
     /// This should delegate to [`crate::TaskSet::remove`], unregistering
     /// the task from the [`crate::TaskSet`].
+    ///
+    /// If this method panics, the panic propagates. The task system preserves
+    /// its reference counts, but the scheduler remains responsible for whether
+    /// removal occurred and for cleaning up a task that is still registered.
     fn unbind(&self, registered: &RegisteredTask);
 }
 
