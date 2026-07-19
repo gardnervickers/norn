@@ -50,8 +50,10 @@ where
     /// This will set the contents of the [`FutureCell`] to an error indicating
     /// that the future was cancelled.
     pub(crate) fn cancel(&self) {
-        let this = &mut *self.inner.borrow_mut();
-        let old = mem::replace(this, State::FutureResult(Err(TaskError::cancelled())));
+        let old = {
+            let this = &mut *self.inner.borrow_mut();
+            mem::replace(this, State::FutureResult(Err(TaskError::cancelled())))
+        };
         safe_drop_state(old);
     }
 
@@ -60,8 +62,10 @@ where
     /// # Abort
     /// This will abort if dropping the future or its output panics.
     pub(crate) fn destroy(&self) {
-        let this = &mut *self.inner.borrow_mut();
-        let old = mem::replace(this, State::Empty);
+        let old = {
+            let this = &mut *self.inner.borrow_mut();
+            mem::replace(this, State::Empty)
+        };
         safe_drop_state(old);
     }
 
@@ -89,8 +93,18 @@ where
     /// This method will make a pin projection of the [`FutureCell`] for the
     /// contained future.
     pub(crate) unsafe fn poll(&self, cx: Context<'_>) -> Poll<()> {
-        let this = &mut *self.inner.borrow_mut();
-        unsafe { this.poll(cx) }
+        let result = {
+            let this = &mut *self.inner.borrow_mut();
+            unsafe { this.poll(cx) }
+        };
+
+        match result {
+            Poll::Ready(old) => {
+                safe_drop_state(old);
+                Poll::Ready(())
+            }
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
@@ -111,7 +125,7 @@ where
     ///
     /// # Safety
     /// See [`FutureCell::poll`] for safety requirements.
-    unsafe fn poll(&mut self, mut cx: Context<'_>) -> Poll<()> {
+    unsafe fn poll(&mut self, mut cx: Context<'_>) -> Poll<State<F>> {
         match self {
             State::Future(fut) => {
                 // Safety: We require that the caller has pinned this FutureCell in memory,
@@ -121,15 +135,13 @@ where
                 match panic::catch_unwind(panic::AssertUnwindSafe(|| fut.poll(&mut cx))) {
                     Ok(Poll::Ready(result)) => {
                         let old = mem::replace(self, State::FutureResult(Ok(result)));
-                        safe_drop_state(old);
-                        Poll::Ready(())
+                        Poll::Ready(old)
                     }
                     Ok(Poll::Pending) => Poll::Pending,
                     Err(err) => {
                         let old =
                             mem::replace(self, State::FutureResult(Err(TaskError::panic(err))));
-                        safe_drop_state(old);
-                        Poll::Ready(())
+                        Poll::Ready(old)
                     }
                 }
             }

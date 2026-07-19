@@ -45,15 +45,18 @@ impl TaskSet {
     /// will immediately resolve to `Err(crate::TaskError)`.
     ///
     /// # Safety
-    /// Callers must ensure that the provided [`Future`] outlives its captures. The future cannot
-    /// reference **anything** which may drop before the future itself.
+    /// Callers must ensure that the provided [`Future`] remains valid until it
+    /// completes or this task set is closed or dropped. Its output must remain
+    /// valid until the returned [`JoinHandle`] is consumed or dropped.
     ///
     /// An easy way to guarantee this is to require that the future is `'static` along with its output,
     /// however shorter lifetimes are also valid. For example, if you can prove that the [`TaskSet`]
     /// outlives all captures of a future, then you can safely bind that future to the [`TaskSet`].
     ///
-    /// Once the [`TaskSet`] is closed or dropped, all futures (or their output) associated with it will be
-    /// dropped, even if they are not yet complete or still in the scheduler queue.
+    /// Closing or dropping the [`TaskSet`] destroys every incomplete future,
+    /// even if a runnable or waker still references its task allocation. A
+    /// completed output remains owned by its [`JoinHandle`]; dropping the handle
+    /// destroys that output immediately, even if task wakers still exist.
     pub unsafe fn bind<T, S>(
         &self,
         future: T,
