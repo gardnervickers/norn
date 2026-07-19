@@ -4,7 +4,7 @@
 //! used by both TCP and UDP sockets
 use io_uring::squeue::Flags;
 use io_uring::{opcode, types};
-use libc::O_NONBLOCK;
+use libc::{SOCK_CLOEXEC, SOCK_NONBLOCK};
 use socket2::{Domain, Protocol, SockAddr, Type};
 use std::io;
 use std::mem::{ManuallyDrop, MaybeUninit};
@@ -1118,27 +1118,31 @@ unsafe impl<const MULTI: bool> Operation for Accept<MULTI> {
         match this.fd.kind() {
             crate::fd::FdKind::Fd(fd) => {
                 if MULTI {
-                    opcode::AcceptMulti::new(*fd).flags(O_NONBLOCK).build()
+                    opcode::AcceptMulti::new(*fd)
+                        .flags(SOCK_NONBLOCK | SOCK_CLOEXEC)
+                        .build()
                 } else {
                     opcode::Accept::new(
                         *fd,
                         this.addr.as_ptr() as *mut _,
                         &mut this.addr_len as *mut _,
                     )
-                    .flags(O_NONBLOCK)
+                    .flags(SOCK_NONBLOCK | SOCK_CLOEXEC)
                     .build()
                 }
             }
             crate::fd::FdKind::Fixed(fd) => {
                 if MULTI {
-                    opcode::AcceptMulti::new(*fd).flags(O_NONBLOCK).build()
+                    opcode::AcceptMulti::new(*fd)
+                        .flags(SOCK_NONBLOCK | SOCK_CLOEXEC)
+                        .build()
                 } else {
                     opcode::Accept::new(
                         *fd,
                         this.addr.as_ptr() as *mut _,
                         &mut this.addr_len as *mut _,
                     )
-                    .flags(O_NONBLOCK)
+                    .flags(SOCK_NONBLOCK | SOCK_CLOEXEC)
                     .build()
                 }
             }
@@ -1761,7 +1765,76 @@ impl Event {
 
 #[cfg(test)]
 mod tests {
+    use std::pin::pin;
+
+    use futures_util::StreamExt;
+    use norn_executor::LocalExecutor;
+
     use super::*;
+
+    fn assert_accept_flags(fd: &NornFd) {
+        let crate::fd::FdKind::Fd(fd) = fd.kind() else {
+            panic!("accepted socket used a fixed descriptor");
+        };
+
+        let status = unsafe { libc::fcntl(fd.0, libc::F_GETFL) };
+        assert_ne!(status, -1);
+        assert_ne!(status & libc::O_NONBLOCK, 0);
+
+        let descriptor = unsafe { libc::fcntl(fd.0, libc::F_GETFD) };
+        assert_ne!(descriptor, -1);
+        assert_ne!(descriptor & libc::FD_CLOEXEC, 0);
+    }
+
+    fn connect_from_thread(addr: SocketAddr) -> std::thread::JoinHandle<io::Result<()>> {
+        std::thread::spawn(move || std::net::TcpStream::connect(addr).map(drop))
+    }
+
+    #[test]
+    fn single_accept_sets_nonblocking_and_close_on_exec() -> io::Result<()> {
+        let driver = crate::Driver::new(io_uring::IoUring::builder(), 8)?;
+        let mut executor = LocalExecutor::new(driver);
+
+        executor.block_on(async {
+            let listener =
+                Socket::bind("127.0.0.1:0".parse().unwrap(), Domain::IPV4, Type::STREAM).await?;
+            listener.listen(1).await?;
+            let connector = connect_from_thread(listener.local_addr()?);
+
+            let (socket, _) = listener.accept().await?;
+            assert_accept_flags(&socket.fd);
+
+            connector.join().expect("connector thread panicked")?;
+            socket.close().await?;
+            listener.close().await
+        })
+    }
+
+    #[test]
+    fn multishot_accept_sets_nonblocking_and_close_on_exec() -> io::Result<()> {
+        let driver = crate::Driver::new(io_uring::IoUring::builder(), 8)?;
+        let mut executor = LocalExecutor::new(driver);
+
+        executor.block_on(async {
+            let listener =
+                Socket::bind("127.0.0.1:0".parse().unwrap(), Domain::IPV4, Type::STREAM).await?;
+            listener.listen(1).await?;
+            let connector = connect_from_thread(listener.local_addr()?);
+
+            let socket = {
+                let mut incoming = pin!(listener.accept_multi());
+                incoming
+                    .next()
+                    .await
+                    .expect("multishot accept ended before yielding")?
+            };
+            assert_accept_flags(&socket);
+
+            connector.join().expect("connector thread panicked")?;
+            socket.close().await?;
+            listener.close().await
+        })
+    }
 
     fn more_flag() -> u32 {
         (0..=u32::MAX)
