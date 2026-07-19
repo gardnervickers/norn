@@ -254,12 +254,20 @@ impl State {
         res
     }
 
-    /// Mark the task as having it's [`JoinHandle`] dropped.
+    /// Mark the task as having its [`JoinHandle`] dropped.
+    ///
+    /// Returns whether a completed output should be dropped immediately.
     #[inline]
-    pub(crate) fn drop_join_handle(&mut self) {
+    pub(crate) fn drop_join_handle(&mut self) -> DropJoinHandleResult {
         assert!(self.refcount > 0);
         assert!(self.flags.contains(Flags::JOIN_HANDLE));
         self.flags.remove(Flags::JOIN_HANDLE);
+
+        if self.flags.contains(Flags::COMPLETE) {
+            DropJoinHandleResult::DropOutput
+        } else {
+            DropJoinHandleResult::KeepOutput
+        }
     }
 }
 
@@ -291,6 +299,13 @@ pub(crate) enum CompleteTaskResult {
 pub(crate) enum DropRefResult {
     DropTask,
     KeepTask,
+}
+
+#[must_use = "this `DropJoinHandleResult` must be handled"]
+#[derive(Debug, Copy, Clone)]
+pub(crate) enum DropJoinHandleResult {
+    DropOutput,
+    KeepOutput,
 }
 
 #[must_use = "this `NotifyResult` must be handled"]

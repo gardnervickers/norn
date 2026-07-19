@@ -36,7 +36,8 @@ impl<T> JoinHandle<T> {
     ///
     /// This is a convenience method that will drop the [`JoinHandle`] without
     /// cancelling the task. This signals intent to the reader that the task
-    /// result is not needed.
+    /// result is not needed. If the task has already completed, its stored
+    /// output is dropped immediately.
     pub fn detach(self) {}
 }
 

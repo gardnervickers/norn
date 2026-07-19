@@ -74,6 +74,7 @@ where
         VTable {
             dealloc: Self::dealloc,
             abort: Self::abort,
+            drop_join_handle: Self::drop_join_handle,
             poll: Self::poll,
             try_read_output: Self::try_read_output,
             shutdown: Self::shutdown,
@@ -261,6 +262,18 @@ where
         }
     }
 
+    unsafe fn drop_join_handle(ptr: NonNull<header::Header>) {
+        let this = Self::from_raw_header(ptr);
+        let state = this.as_ref().state();
+        let result = state.update(state::State::drop_join_handle);
+
+        if matches!(result, state::DropJoinHandleResult::DropOutput) {
+            // The state update must finish before destroying user output, whose
+            // destructor may re-enter the task system.
+            this.as_ref().future_cell().destroy();
+        }
+    }
+
     unsafe fn shutdown(ptr: NonNull<header::Header>) {
         let this = Self::from_raw_header(ptr);
         let state = this.as_ref().state();
@@ -418,13 +431,17 @@ impl<T> JoinHandleRef<T> {
 
 impl<T> Drop for JoinHandleRef<T> {
     fn drop(&mut self) {
-        self.0.state().update(state::State::drop_join_handle);
+        let vtable = self.0.vtable();
+        // Safety: the join handle owns a task reference, so the allocation is
+        // valid for the duration of this callback.
+        unsafe { (vtable.drop_join_handle)(self.0 .0) }
     }
 }
 
 pub(crate) struct VTable {
     pub(crate) dealloc: unsafe fn(NonNull<header::Header>),
     pub(crate) abort: unsafe fn(NonNull<header::Header>),
+    pub(crate) drop_join_handle: unsafe fn(NonNull<header::Header>),
     pub(crate) poll: unsafe fn(NonNull<header::Header>),
     pub(crate) try_read_output: unsafe fn(NonNull<header::Header>, *mut (), &Waker),
     pub(crate) shutdown: unsafe fn(NonNull<header::Header>),

@@ -12,6 +12,7 @@ mod basic;
 mod combo;
 mod panic;
 mod reentrancy;
+mod scoped;
 mod wake;
 
 struct TestSpawner {
