@@ -64,13 +64,17 @@ impl TaskSet {
         T: Future,
     {
         let (task, bound, handle) = crate::task_cell::TaskCell::allocate(future, scheduler);
-        // Safety: `TaskSet` is `!Send` and only accessed from one thread.
-        let this = unsafe { &mut *self.inner.get() };
-        if this.closed {
+        // Safety: `TaskSet` is `!Send` and only accessed from one thread. The
+        // borrow ends before shutdown, which may drop arbitrary user state and
+        // re-enter this task set.
+        let closed = unsafe { (*self.inner.get()).closed };
+        if closed {
             task.shutdown();
             return (None, JoinHandle::from(handle));
         }
-        this.list.push_back(bound);
+        // Safety: no user code runs between checking `closed` and inserting the
+        // task, so the task set cannot be re-entered between these operations.
+        unsafe { (*self.inner.get()).list.push_back(bound) };
         self.size.set(self.size.get() + 1);
         (Some(Runnable::from(task)), JoinHandle::from(handle))
     }
@@ -79,13 +83,18 @@ impl TaskSet {
     ///
     /// This will prevent any new tasks from being added to the [`TaskSet`].
     pub fn shutdown(&self) {
-        // Safety: `TaskSet` is `!Send` and only accessed from one thread.
-        let this = unsafe { &mut *self.inner.get() };
-        this.closed = true;
+        // Safety: `TaskSet` is `!Send` and only accessed from one thread. Each
+        // mutable borrow ends before a task is cancelled or dropped, since both
+        // operations may run arbitrary user destructors and re-enter this set.
+        unsafe { (*self.inner.get()).closed = true };
 
-        while let Some(task) = this.list.pop_front() {
-            task.shutdown();
+        loop {
+            let task = unsafe { (*self.inner.get()).list.pop_front() };
+            let Some(task) = task else {
+                break;
+            };
             self.size.set(self.size.get() - 1);
+            task.shutdown();
         }
     }
 
