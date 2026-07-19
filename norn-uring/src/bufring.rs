@@ -67,6 +67,10 @@ impl BufRing {
     pub(crate) fn bgid(&self) -> Bgid {
         self.rc.bgid
     }
+
+    pub(crate) fn same_driver(&self, handle: &Handle) -> bool {
+        self.rc.handle.same_driver(handle)
+    }
 }
 
 /// [`BufRingBuf`] is a reference to a buffer in a buffer ring.

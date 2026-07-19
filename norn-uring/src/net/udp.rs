@@ -210,6 +210,10 @@ impl UdpSocket {
     ///
     /// The buffer ring used must contain buffers of sufficient size to hold the message. If
     /// a message is too long to fit in the supplied, buffer, excess bytes may be discarded.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the buffer ring was registered with another driver.
     pub async fn recv_from_ring(&self, ring: &BufRing) -> io::Result<(BufRingBuf, SocketAddr)> {
         self.inner.recv_from_ring(ring).await
     }
@@ -226,32 +230,56 @@ impl UdpSocket {
     /// provided buffer ring.
     ///
     /// Each yielded item includes payload bytes and the sender address.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the buffer ring was registered with another driver.
     pub fn recv_from_ring_multi(&self, ring: &BufRing) -> Op<socket::RecvFromRingMulti> {
         self.inner.recv_from_ring_multi(ring)
     }
 
     /// Receives datagrams from a connected socket using a multishot recv operation backed by the
     /// provided buffer ring.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the buffer ring was registered with another driver.
     pub fn recv_ring_multi(&self, ring: &BufRing) -> Op<socket::RecvRingMulti> {
         self.inner.recv_ring_multi(ring)
     }
 
     /// Receives data from a connected socket using a single-shot recv bundle operation.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the buffer ring was registered with another driver.
     pub fn recv_bundle(&self, ring: &BufRing) -> Op<socket::RecvRingBundle> {
         self.inner.recv_ring_bundle(ring)
     }
 
     /// Receives data from a connected socket using a single-shot recv bundle operation with flags.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the buffer ring was registered with another driver.
     pub fn recv_bundle_with_flags(&self, ring: &BufRing, flags: i32) -> Op<socket::RecvRingBundle> {
         self.inner.recv_ring_bundle_with_flags(ring, flags)
     }
 
     /// Receives data from a connected socket using a multishot recv bundle operation.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the buffer ring was registered with another driver.
     pub fn recv_bundle_multi(&self, ring: &BufRing) -> Op<socket::RecvRingBundleMulti> {
         self.inner.recv_ring_bundle_multi(ring)
     }
 
     /// Receives data from a connected socket using a multishot recv bundle operation with flags.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the buffer ring was registered with another driver.
     pub fn recv_bundle_multi_with_flags(
         &self,
         ring: &BufRing,

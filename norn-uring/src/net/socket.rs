@@ -159,22 +159,34 @@ impl Socket {
         Ok(())
     }
 
+    #[track_caller]
+    fn assert_bufring_driver(&self, ring: &BufRing) {
+        assert!(
+            ring.same_driver(&self.handle),
+            "buffer ring and socket must target the same driver"
+        );
+    }
+
     pub(crate) fn recv_from_ring(&self, ring: &BufRing) -> Op<RecvFromRing> {
+        self.assert_bufring_driver(ring);
         let op = RecvFromRing::new(self.fd.clone(), ring.clone());
         self.handle.submit(op)
     }
 
     pub(crate) fn recv_from_ring_multi(&self, ring: &BufRing) -> Op<RecvFromRingMulti> {
+        self.assert_bufring_driver(ring);
         let op = RecvFromRingMulti::new(self.fd.clone(), ring.clone());
         self.handle.submit(op)
     }
 
     pub(crate) fn recv_ring_multi(&self, ring: &BufRing) -> Op<RecvRingMulti> {
+        self.assert_bufring_driver(ring);
         let op = RecvRingMulti::new(self.fd.clone(), ring.clone(), 0);
         self.handle.submit(op)
     }
 
     pub(crate) fn recv_ring_bundle(&self, ring: &BufRing) -> Op<RecvRingBundle> {
+        self.assert_bufring_driver(ring);
         let op = RecvRingBundle::new(self.fd.clone(), ring.clone(), 0);
         self.handle.submit(op)
     }
@@ -184,11 +196,13 @@ impl Socket {
         ring: &BufRing,
         flags: i32,
     ) -> Op<RecvRingBundle> {
+        self.assert_bufring_driver(ring);
         let op = RecvRingBundle::new(self.fd.clone(), ring.clone(), flags);
         self.handle.submit(op)
     }
 
     pub(crate) fn recv_ring_bundle_multi(&self, ring: &BufRing) -> Op<RecvRingBundleMulti> {
+        self.assert_bufring_driver(ring);
         let op = RecvRingBundleMulti::new(self.fd.clone(), ring.clone(), 0);
         self.handle.submit(op)
     }
@@ -198,6 +212,7 @@ impl Socket {
         ring: &BufRing,
         flags: i32,
     ) -> Op<RecvRingBundleMulti> {
+        self.assert_bufring_driver(ring);
         let op = RecvRingBundleMulti::new(self.fd.clone(), ring.clone(), flags);
         self.handle.submit(op)
     }
@@ -1818,6 +1833,7 @@ impl Event {
 
 #[cfg(test)]
 mod tests {
+    use std::panic::{self, AssertUnwindSafe};
     use std::pin::pin;
 
     use futures_util::StreamExt;
@@ -1901,6 +1917,77 @@ mod tests {
             2
         );
         assert_eq!(buf.len(), 1);
+    }
+
+    fn build_test_ring(driver: &crate::Driver, bgid: u16) -> io::Result<BufRing> {
+        let _guard = norn_executor::park::Park::enter(driver);
+        BufRing::builder(bgid).buf_cnt(8).buf_len(1024).build()
+    }
+
+    fn test_socket(handle: crate::Handle) -> io::Result<Socket> {
+        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Socket {
+            fd: NornFd::from_fd(fd),
+            handle,
+        })
+    }
+
+    fn assert_driver_mismatch(f: impl FnOnce()) {
+        let panic = panic::catch_unwind(AssertUnwindSafe(f)).expect_err("operation must panic");
+        let message = panic
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| panic.downcast_ref::<String>().map(String::as_str));
+        assert_eq!(
+            message,
+            Some("buffer ring and socket must target the same driver")
+        );
+    }
+
+    fn prepare_all_ring_receives(socket: &Socket, ring: &BufRing) {
+        drop(socket.recv_from_ring(ring));
+        drop(socket.recv_from_ring_multi(ring));
+        drop(socket.recv_ring_multi(ring));
+        drop(socket.recv_ring_bundle(ring));
+        drop(socket.recv_ring_bundle_with_flags(ring, libc::MSG_PEEK));
+        drop(socket.recv_ring_bundle_multi(ring));
+        drop(socket.recv_ring_bundle_multi_with_flags(ring, libc::MSG_PEEK));
+    }
+
+    #[test]
+    fn ring_receive_entrypoints_accept_same_driver_ring() -> io::Result<()> {
+        let driver = crate::Driver::new(io_uring::IoUring::builder(), 8)?;
+        let ring = build_test_ring(&driver, 31)?;
+        let socket = test_socket(driver.handle())?;
+
+        prepare_all_ring_receives(&socket, &ring);
+        Ok(())
+    }
+
+    #[test]
+    fn ring_receive_entrypoints_reject_same_bgid_from_another_driver() -> io::Result<()> {
+        let first_driver = crate::Driver::new(io_uring::IoUring::builder(), 8)?;
+        let first_ring = build_test_ring(&first_driver, 31)?;
+        let second_driver = crate::Driver::new(io_uring::IoUring::builder(), 8)?;
+        let second_ring = build_test_ring(&second_driver, 31)?;
+        let socket = test_socket(second_driver.handle())?;
+
+        prepare_all_ring_receives(&socket, &second_ring);
+        assert_driver_mismatch(|| drop(socket.recv_from_ring(&first_ring)));
+        assert_driver_mismatch(|| drop(socket.recv_from_ring_multi(&first_ring)));
+        assert_driver_mismatch(|| drop(socket.recv_ring_multi(&first_ring)));
+        assert_driver_mismatch(|| drop(socket.recv_ring_bundle(&first_ring)));
+        assert_driver_mismatch(|| {
+            drop(socket.recv_ring_bundle_with_flags(&first_ring, libc::MSG_PEEK));
+        });
+        assert_driver_mismatch(|| drop(socket.recv_ring_bundle_multi(&first_ring)));
+        assert_driver_mismatch(|| {
+            drop(socket.recv_ring_bundle_multi_with_flags(&first_ring, libc::MSG_PEEK));
+        });
+        Ok(())
     }
 
     fn more_flag() -> u32 {
