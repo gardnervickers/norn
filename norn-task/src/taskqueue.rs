@@ -140,8 +140,11 @@ impl Shared {
     /// See [`Shared::push_runnable`].
     #[inline]
     fn clear_runqueue(&self) {
-        unsafe {
-            (*self.runqueue.get()).clear();
+        // Pop each runnable under a short-lived queue borrow. Dropping a
+        // runnable performs task refcount and possible deallocation work, which
+        // must remain outside the runqueue's aliasing invariant.
+        while let Some(runnable) = self.pop_runnable() {
+            drop(runnable);
         }
     }
 }
