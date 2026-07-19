@@ -44,6 +44,32 @@ fn fixed_fd_unsupported_error(context: &'static str) -> io::Error {
     )
 }
 
+fn complete_recv_buffer<B>(
+    buf: &mut B,
+    submitted_len: usize,
+    reported_len: usize,
+    flags: u32,
+) -> io::Result<usize>
+where
+    B: StableBufMut,
+{
+    let init_len = if reported_len <= submitted_len {
+        reported_len
+    } else if flags & libc::MSG_TRUNC as u32 != 0 {
+        submitted_len
+    } else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "receive completion exceeded the submitted buffer length",
+        ));
+    };
+
+    // Safety: the completed receive initialized `init_len` bytes, and the
+    // calculation above keeps that length within the submitted writable region.
+    unsafe { buf.set_init(init_len) };
+    Ok(reported_len)
+}
+
 fn as_socket_addr(addr: &SockAddr) -> io::Result<SocketAddr> {
     addr.as_socket().ok_or_else(invalid_socket_addr_error)
 }
@@ -426,12 +452,13 @@ impl Socket {
             crate::fd::FdKind::Fd(fd) => fd.0,
             crate::fd::FdKind::Fixed(_) => return None,
         };
+        let submitted_len = buf.bytes_remaining();
         let addr = unsafe {
             SockAddr::try_init(|storage, len| {
                 let n = libc::recvfrom(
                     fd,
                     buf.stable_ptr_mut().cast(),
-                    buf.bytes_remaining(),
+                    submitted_len,
                     flags,
                     storage.cast(),
                     len,
@@ -448,8 +475,12 @@ impl Socket {
                 if n == 0 && addr.len() == 0 {
                     return Some(Err(no_source_addr_error()));
                 }
-                unsafe { buf.set_init(n as usize) };
-                Some(as_socket_addr(&addr).map(|addr| (n as usize, addr)))
+                let reported_len =
+                    match complete_recv_buffer(buf, submitted_len, n as usize, flags as u32) {
+                        Ok(reported_len) => reported_len,
+                        Err(err) => return Some(Err(err)),
+                    };
+                Some(as_socket_addr(&addr).map(|addr| (reported_len, addr)))
             }
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => None,
             Err(err) => Some(Err(err)),
@@ -615,6 +646,7 @@ struct RecvFrom<B> {
     buf: B,
     addr: SockAddr,
     flags: u32,
+    submitted_len: usize,
     msghdr: MaybeUninit<libc::msghdr>,
     slices: MaybeUninit<[io::IoSliceMut<'static>; 1]>,
 }
@@ -626,11 +658,13 @@ where
     pub(crate) fn new(fd: NornFd, buf: B, flags: u32) -> Self {
         // Safety: We won't read from the socket addr until it's initialized.
         let addr = unsafe { SockAddr::try_init(|_, _| Ok(())) }.unwrap().1;
+        let submitted_len = buf.bytes_remaining();
         Self {
             fd,
             buf,
             addr,
             flags,
+            submitted_len,
             msghdr: MaybeUninit::zeroed(),
             slices: MaybeUninit::zeroed(),
         }
@@ -647,7 +681,7 @@ where
         let this = self;
 
         let ptr = this.buf.stable_ptr_mut();
-        let len = this.buf.bytes_remaining();
+        let len = this.submitted_len;
         let slice = io::IoSliceMut::new(unsafe { std::slice::from_raw_parts_mut(ptr, len) });
         // First we initialize the IoVecMut slice.
         this.slices.write([slice]);
@@ -697,8 +731,16 @@ where
                     Err(err) => return (Err(err), this.buf),
                 };
                 let mut buf = this.buf;
-                unsafe { buf.set_init(bytes_read as usize) };
-                (Ok((bytes_read as usize, addr)), buf)
+                let reported_len = match complete_recv_buffer(
+                    &mut buf,
+                    this.submitted_len,
+                    bytes_read as usize,
+                    this.flags,
+                ) {
+                    Ok(reported_len) => reported_len,
+                    Err(err) => return (Err(err), buf),
+                };
+                (Ok((reported_len, addr)), buf)
             }
             Err(err) => (Err(err), this.buf),
         }
@@ -1391,6 +1433,7 @@ pub struct Recv<B> {
     fd: NornFd,
     buf: B,
     flags: i32,
+    submitted_len: usize,
 }
 
 impl<B> Recv<B>
@@ -1398,7 +1441,13 @@ where
     B: StableBufMut,
 {
     pub(crate) fn new(fd: NornFd, buf: B, flags: i32) -> Self {
-        Self { fd, buf, flags }
+        let submitted_len = buf.bytes_remaining();
+        Self {
+            fd,
+            buf,
+            flags,
+            submitted_len,
+        }
     }
 }
 
@@ -1410,7 +1459,7 @@ where
 {
     fn configure(&mut self) -> io_uring::squeue::Entry {
         let ptr = self.buf.stable_ptr_mut();
-        let len = self.buf.bytes_remaining();
+        let len = self.submitted_len;
 
         // Finally we create the operation.
         match self.fd.kind() {
@@ -1430,12 +1479,16 @@ where
 {
     type Output = (io::Result<usize>, B);
 
-    fn complete(self, result: crate::operation::CQEResult) -> Self::Output {
+    fn complete(mut self, result: crate::operation::CQEResult) -> Self::Output {
         match result.result {
             Ok(bytes_read) => {
-                let mut buf = self.buf;
-                unsafe { buf.set_init(bytes_read as usize) };
-                (Ok(bytes_read as usize), buf)
+                let reported_len = complete_recv_buffer(
+                    &mut self.buf,
+                    self.submitted_len,
+                    bytes_read as usize,
+                    self.flags as u32,
+                );
+                (reported_len, self.buf)
             }
             Err(err) => (Err(err), self.buf),
         }
@@ -1834,6 +1887,20 @@ mod tests {
             socket.close().await?;
             listener.close().await
         })
+    }
+
+    #[test]
+    fn oversized_receive_completion_requires_msg_trunc() {
+        let mut buf = Vec::with_capacity(1);
+        let err = complete_recv_buffer(&mut buf, 1, 2, 0).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(buf.is_empty());
+
+        assert_eq!(
+            complete_recv_buffer(&mut buf, 1, 2, libc::MSG_TRUNC as u32).unwrap(),
+            2
+        );
+        assert_eq!(buf.len(), 1);
     }
 
     fn more_flag() -> u32 {

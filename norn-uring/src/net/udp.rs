@@ -130,6 +130,9 @@ impl UdpSocket {
     }
 
     /// Receives a single datagram message on the socket with the provided recv flags.
+    ///
+    /// With `MSG_TRUNC`, the returned byte count is the full datagram length and may
+    /// exceed the initialized length of the returned buffer.
     pub async fn recv_from_with_flags<B>(
         &self,
         buf: B,
@@ -154,6 +157,9 @@ impl UdpSocket {
 
     /// Receives a single datagram message on a connected socket with the provided
     /// recv flags.
+    ///
+    /// With `MSG_TRUNC`, the returned byte count is the full datagram length and may
+    /// exceed the initialized length of the returned buffer.
     pub async fn recv_with_flags<B>(&self, buf: B, flags: i32) -> (io::Result<usize>, B)
     where
         B: StableBufMut + 'static,
