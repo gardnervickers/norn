@@ -46,10 +46,13 @@ use header::CompletionQueue;
 pub unsafe trait Operation {
     /// Configure a new [`io_uring::squeue::Entry`] for this operation.
     ///
+    /// Configuration failures are delivered through the operation's normal completion path;
+    /// the operation is not submitted to the kernel.
+    ///
     /// The address of `self` remains stable while the returned entry may be accessed by the
     /// kernel. Implementations may store pointers to fields of `self` in the entry, but must not
     /// invalidate the pointed-to storage during that period.
-    fn configure(&mut self) -> io_uring::squeue::Entry;
+    fn configure(&mut self) -> io::Result<io_uring::squeue::Entry>;
 
     /// Release resources represented by an unconsumed completion.
     ///
@@ -57,8 +60,8 @@ pub unsafe trait Operation {
     /// completions. Once the terminal completion has been reaped, this method is called once
     /// for each completion the application did not consume, in completion order. It can
     /// therefore be called multiple times for one operation. It is also called with a synthetic
-    /// error completion when submission itself fails; in that case the kernel never saw the
-    /// entry.
+    /// error completion when configuration or submission fails; in either case the kernel never
+    /// saw the entry.
     ///
     /// Implementations should use this hook to release per-completion resources created or
     /// selected by the kernel, such as provided buffers or file descriptors.
@@ -234,7 +237,20 @@ where
         // exist. `RawOp` keeps the data at a stable address until the operation completes.
         let data = unsafe { handle.data_mut().expect("operation already completed") };
 
-        let entry = T::configure(data);
+        let entry = match T::configure(data) {
+            Ok(entry) => entry,
+            Err(err) => {
+                handle.untyped().complete(CQEResult::new(Err(err), 0));
+                return Self {
+                    submit: None,
+                    state: State::Submitted {
+                        inner: SubmittedOp { inner: handle },
+                    },
+                    reactor,
+                    completed: true,
+                };
+            }
+        };
         let entry = ConfiguredEntry::new(handle.untyped(), entry);
 
         Self {
@@ -516,7 +532,7 @@ mod tests {
             self.0.push(result);
         }
 
-        fn configure(&mut self) -> io_uring::squeue::Entry {
+        fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
             unimplemented!()
         }
     }
@@ -561,7 +577,7 @@ mod tests {
     unsafe impl Operation for TestMultishot {
         fn cleanup(&mut self, _: CQEResult) {}
 
-        fn configure(&mut self) -> io_uring::squeue::Entry {
+        fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
             unimplemented!()
         }
     }
@@ -698,8 +714,8 @@ mod tests {
         unsafe impl Operation for SubmitFailureOp {
             fn cleanup(&mut self, _: CQEResult) {}
 
-            fn configure(&mut self) -> io_uring::squeue::Entry {
-                io_uring::opcode::Nop::new().build()
+            fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+                Ok(io_uring::opcode::Nop::new().build())
             }
         }
 
@@ -731,6 +747,39 @@ mod tests {
     }
 
     #[test]
+    fn configuration_failure_completes_without_submitting() {
+        #[derive(Debug)]
+        struct ConfigurationFailureOp;
+
+        unsafe impl Operation for ConfigurationFailureOp {
+            fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+                Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid op"))
+            }
+
+            fn cleanup(&mut self, _: CQEResult) {}
+        }
+
+        impl Singleshot for ConfigurationFailureOp {
+            type Output = io::Result<()>;
+
+            fn complete(self, result: CQEResult) -> Self::Output {
+                result.result.map(drop)
+            }
+        }
+
+        let driver = crate::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let handle = driver.handle();
+        let mut op = std::pin::pin!(handle.submit(ConfigurationFailureOp));
+        let waker = futures_test::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+
+        let Poll::Ready(Err(err)) = Future::poll(op.as_mut(), &mut cx) else {
+            panic!("configuration failure should complete immediately")
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
     fn first_poll_submits_without_allocating_backpressure_future() {
         #[derive(Debug)]
         struct NopOp;
@@ -738,8 +787,8 @@ mod tests {
         unsafe impl Operation for NopOp {
             fn cleanup(&mut self, _: CQEResult) {}
 
-            fn configure(&mut self) -> io_uring::squeue::Entry {
-                io_uring::opcode::Nop::new().build()
+            fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+                Ok(io_uring::opcode::Nop::new().build())
             }
         }
 
@@ -774,7 +823,7 @@ mod tests {
         unsafe impl Operation for TerminalMultishot {
             fn cleanup(&mut self, _: CQEResult) {}
 
-            fn configure(&mut self) -> io_uring::squeue::Entry {
+            fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
                 unimplemented!()
             }
         }

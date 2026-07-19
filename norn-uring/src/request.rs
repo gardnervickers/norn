@@ -1,6 +1,7 @@
 #![allow(private_interfaces)]
 
 use std::future::Future;
+use std::io;
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
 use std::time::Duration;
@@ -122,8 +123,8 @@ impl LinkTimeoutOp {
 // Safety: the timeout specification is stored inline in this pinned operation,
 // so its SQE pointer remains valid until the terminal completion.
 unsafe impl Operation for LinkTimeoutOp {
-    fn configure(&mut self) -> io_uring::squeue::Entry {
-        io_uring::opcode::LinkTimeout::new(&self.timespec).build()
+    fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+        Ok(io_uring::opcode::LinkTimeout::new(&self.timespec).build())
     }
 
     fn cleanup(&mut self, _: CQEResult) {}
@@ -681,8 +682,8 @@ mod tests {
     struct TaggedNop(u8);
 
     unsafe impl Operation for TaggedNop {
-        fn configure(&mut self) -> io_uring::squeue::Entry {
-            io_uring::opcode::Nop::new().build()
+        fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+            Ok(io_uring::opcode::Nop::new().build())
         }
 
         fn cleanup(&mut self, _: CQEResult) {}

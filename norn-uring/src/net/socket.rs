@@ -539,15 +539,15 @@ struct OpenSocket {
 // Safety: the socket SQE contains only copied scalar arguments; cleanup closes
 // a descriptor returned by an unconsumed successful CQE.
 unsafe impl Operation for OpenSocket {
-    fn configure(&mut self) -> io_uring::squeue::Entry {
+    fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let ty: i32 = self.socket_type.into();
         let ty = ty | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC;
-        io_uring::opcode::Socket::new(
+        Ok(io_uring::opcode::Socket::new(
             self.domain.into(),
             ty,
             self.protocol.map(Into::into).unwrap_or(0),
         )
-        .build()
+        .build())
     }
 
     fn cleanup(&mut self, result: crate::operation::CQEResult) {
@@ -598,7 +598,7 @@ unsafe impl<B> Operation for SendTo<B>
 where
     B: StableBuf,
 {
-    fn configure(&mut self) -> io_uring::squeue::Entry {
+    fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
 
         // Initialize the slice.
@@ -632,14 +632,15 @@ where
         };
 
         let msghdr = this.msghdr.as_ptr();
-
-        // Finally we create the operation.
-        match this.fd.kind() {
-            crate::fd::FdKind::Fd(fd) => opcode::SendMsg::new(types::Fd(fd.0), msghdr),
-            crate::fd::FdKind::Fixed(fd) => opcode::SendMsg::new(types::Fixed(fd.0), msghdr),
-        }
-        .flags(this.flags)
-        .build()
+        Ok(
+            // Finally we create the operation.
+            match this.fd.kind() {
+                crate::fd::FdKind::Fd(fd) => opcode::SendMsg::new(types::Fd(fd.0), msghdr),
+                crate::fd::FdKind::Fixed(fd) => opcode::SendMsg::new(types::Fixed(fd.0), msghdr),
+            }
+            .flags(this.flags)
+            .build(),
+        )
     }
 
     fn cleanup(&mut self, _: crate::operation::CQEResult) {}
@@ -692,7 +693,7 @@ unsafe impl<B> Operation for RecvFrom<B>
 where
     B: StableBufMut,
 {
-    fn configure(&mut self) -> io_uring::squeue::Entry {
+    fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
 
         let ptr = this.buf.stable_ptr_mut();
@@ -710,15 +711,15 @@ where
             (*msghdr).msg_iovlen = slices.len() as _;
             (*msghdr).msg_name = this.addr.as_ptr() as *mut libc::c_void;
             (*msghdr).msg_namelen = this.addr.len() as _;
-        }
+        };
 
         // Finally we create the operation.
-        match this.fd.kind() {
+        Ok(match this.fd.kind() {
             crate::fd::FdKind::Fd(fd) => opcode::RecvMsg::new(types::Fd(fd.0), msghdr),
             crate::fd::FdKind::Fixed(fd) => opcode::RecvMsg::new(types::Fixed(fd.0), msghdr),
         }
         .flags(this.flags)
-        .build()
+        .build())
     }
 
     fn cleanup(&mut self, _: crate::operation::CQEResult) {}
@@ -786,7 +787,7 @@ impl RecvFromRing {
 // Safety: `NornFd` and `BufRing` retain the socket and registered buffer group;
 // inline recvmsg metadata remains pinned, and cleanup returns selected buffers.
 unsafe impl Operation for RecvFromRing {
-    fn configure(&mut self) -> io_uring::squeue::Entry {
+    fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
 
         // Next we initialize the msghdr.
@@ -796,16 +797,16 @@ unsafe impl Operation for RecvFromRing {
             (*msghdr).msg_iovlen = 0;
             (*msghdr).msg_name = this.addr.as_ptr() as *mut libc::c_void;
             (*msghdr).msg_namelen = this.addr.len() as _;
-        }
+        };
 
         // Finally we create the operation.
-        match this.fd.kind() {
+        Ok(match this.fd.kind() {
             crate::fd::FdKind::Fd(fd) => opcode::RecvMsg::new(types::Fd(fd.0), msghdr),
             crate::fd::FdKind::Fixed(fd) => opcode::RecvMsg::new(types::Fixed(fd.0), msghdr),
         }
         .buf_group(this.ring.bgid())
         .build()
-        .flags(Flags::BUFFER_SELECT)
+        .flags(Flags::BUFFER_SELECT))
     }
 
     fn cleanup(&mut self, res: crate::operation::CQEResult) {
@@ -926,7 +927,7 @@ impl RecvFromRingMulti {
 // Safety: `NornFd` and `BufRing` retain all referenced resources through the
 // multishot terminal CQE; each selected buffer is either yielded or cleaned up.
 unsafe impl Operation for RecvFromRingMulti {
-    fn configure(&mut self) -> io_uring::squeue::Entry {
+    fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
         let msghdr = this.msghdr.as_mut_ptr();
         unsafe {
@@ -936,16 +937,16 @@ unsafe impl Operation for RecvFromRingMulti {
             (*msghdr).msg_controllen = 0;
             (*msghdr).msg_iov = std::ptr::null_mut();
             (*msghdr).msg_iovlen = 0;
-        }
+        };
 
-        match this.fd.kind() {
+        Ok(match this.fd.kind() {
             crate::fd::FdKind::Fd(fd) => {
                 opcode::RecvMsgMulti::new(types::Fd(fd.0), msghdr, this.ring.bgid()).build()
             }
             crate::fd::FdKind::Fixed(fd) => {
                 opcode::RecvMsgMulti::new(types::Fixed(fd.0), msghdr, this.ring.bgid()).build()
             }
-        }
+        })
     }
 
     fn cleanup(&mut self, result: crate::operation::CQEResult) {
@@ -988,9 +989,9 @@ impl RecvRingMulti {
 // Safety: `NornFd` and `BufRing` retain all referenced resources through the
 // multishot terminal CQE; each selected buffer is either yielded or cleaned up.
 unsafe impl Operation for RecvRingMulti {
-    fn configure(&mut self) -> io_uring::squeue::Entry {
+    fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
-        match this.fd.kind() {
+        Ok(match this.fd.kind() {
             crate::fd::FdKind::Fd(fd) => opcode::RecvMulti::new(types::Fd(fd.0), this.ring.bgid())
                 .flags(this.flags)
                 .build(),
@@ -999,7 +1000,7 @@ unsafe impl Operation for RecvRingMulti {
                     .flags(this.flags)
                     .build()
             }
-        }
+        })
     }
 
     fn cleanup(&mut self, result: crate::operation::CQEResult) {
@@ -1037,9 +1038,9 @@ impl RecvRingBundle {
 // Safety: `NornFd` and `BufRing` retain the descriptor and registered group;
 // completion ownership accounts for every selected buffer in the bundle.
 unsafe impl Operation for RecvRingBundle {
-    fn configure(&mut self) -> io_uring::squeue::Entry {
+    fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
-        match this.fd.kind() {
+        Ok(match this.fd.kind() {
             crate::fd::FdKind::Fd(fd) => opcode::RecvBundle::new(types::Fd(fd.0), this.ring.bgid())
                 .flags(this.flags)
                 .build(),
@@ -1048,7 +1049,7 @@ unsafe impl Operation for RecvRingBundle {
                     .flags(this.flags)
                     .build()
             }
-        }
+        })
     }
 
     fn cleanup(&mut self, result: crate::operation::CQEResult) {
@@ -1088,9 +1089,9 @@ impl RecvRingBundleMulti {
 // Safety: `NornFd` and `BufRing` retain resources through the multishot
 // terminal CQE; yielded and unconsumed bundles are returned by completion logic.
 unsafe impl Operation for RecvRingBundleMulti {
-    fn configure(&mut self) -> io_uring::squeue::Entry {
+    fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
-        match this.fd.kind() {
+        Ok(match this.fd.kind() {
             crate::fd::FdKind::Fd(fd) => {
                 opcode::RecvMultiBundle::new(types::Fd(fd.0), this.ring.bgid())
                     .flags(this.flags)
@@ -1101,7 +1102,7 @@ unsafe impl Operation for RecvRingBundleMulti {
                     .flags(this.flags)
                     .build()
             }
-        }
+        })
     }
 
     fn cleanup(&mut self, result: crate::operation::CQEResult) {
@@ -1168,42 +1169,43 @@ impl<const MULTI: bool> Accept<MULTI> {
 // Safety: `NornFd` retains the listener and the pinned socket-address storage
 // remains valid for every CQE; cleanup closes unconsumed accepted descriptors.
 unsafe impl<const MULTI: bool> Operation for Accept<MULTI> {
-    fn configure(&mut self) -> io_uring::squeue::Entry {
+    fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
-
-        // Finally we create the operation.
-        match this.fd.kind() {
-            crate::fd::FdKind::Fd(fd) => {
-                if MULTI {
-                    opcode::AcceptMulti::new(*fd)
+        Ok(
+            // Finally we create the operation.
+            match this.fd.kind() {
+                crate::fd::FdKind::Fd(fd) => {
+                    if MULTI {
+                        opcode::AcceptMulti::new(*fd)
+                            .flags(SOCK_NONBLOCK | SOCK_CLOEXEC)
+                            .build()
+                    } else {
+                        opcode::Accept::new(
+                            *fd,
+                            this.addr.as_ptr() as *mut _,
+                            &mut this.addr_len as *mut _,
+                        )
                         .flags(SOCK_NONBLOCK | SOCK_CLOEXEC)
                         .build()
-                } else {
-                    opcode::Accept::new(
-                        *fd,
-                        this.addr.as_ptr() as *mut _,
-                        &mut this.addr_len as *mut _,
-                    )
-                    .flags(SOCK_NONBLOCK | SOCK_CLOEXEC)
-                    .build()
+                    }
                 }
-            }
-            crate::fd::FdKind::Fixed(fd) => {
-                if MULTI {
-                    opcode::AcceptMulti::new(*fd)
+                crate::fd::FdKind::Fixed(fd) => {
+                    if MULTI {
+                        opcode::AcceptMulti::new(*fd)
+                            .flags(SOCK_NONBLOCK | SOCK_CLOEXEC)
+                            .build()
+                    } else {
+                        opcode::Accept::new(
+                            *fd,
+                            this.addr.as_ptr() as *mut _,
+                            &mut this.addr_len as *mut _,
+                        )
                         .flags(SOCK_NONBLOCK | SOCK_CLOEXEC)
                         .build()
-                } else {
-                    opcode::Accept::new(
-                        *fd,
-                        this.addr.as_ptr() as *mut _,
-                        &mut this.addr_len as *mut _,
-                    )
-                    .flags(SOCK_NONBLOCK | SOCK_CLOEXEC)
-                    .build()
+                    }
                 }
-            }
-        }
+            },
+        )
     }
 
     fn cleanup(&mut self, result: crate::operation::CQEResult) {
@@ -1256,16 +1258,16 @@ impl BindSocket {
 // Safety: `NornFd` retains the socket and the owned address storage remains
 // live and pinned through completion.
 unsafe impl Operation for BindSocket {
-    fn configure(&mut self) -> io_uring::squeue::Entry {
+    fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
-        match this.fd.kind() {
+        Ok(match this.fd.kind() {
             crate::fd::FdKind::Fd(fd) => {
                 opcode::Bind::new(*fd, this.addr.as_ptr() as *const _, this.addr.len() as _).build()
             }
             crate::fd::FdKind::Fixed(fd) => {
                 opcode::Bind::new(*fd, this.addr.as_ptr() as *const _, this.addr.len() as _).build()
             }
-        }
+        })
     }
 
     fn cleanup(&mut self, _: crate::operation::CQEResult) {}
@@ -1292,12 +1294,12 @@ impl ListenSocket {
 
 // Safety: `NornFd` retains the only resource referenced by this SQE.
 unsafe impl Operation for ListenSocket {
-    fn configure(&mut self) -> io_uring::squeue::Entry {
+    fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
-        match this.fd.kind() {
+        Ok(match this.fd.kind() {
             crate::fd::FdKind::Fd(fd) => opcode::Listen::new(*fd, this.backlog).build(),
             crate::fd::FdKind::Fixed(fd) => opcode::Listen::new(*fd, this.backlog).build(),
-        }
+        })
     }
 
     fn cleanup(&mut self, _: crate::operation::CQEResult) {}
@@ -1338,11 +1340,11 @@ unsafe impl<T> Operation for SetSockOpt<T>
 where
     T: Copy,
 {
-    fn configure(&mut self) -> io_uring::squeue::Entry {
+    fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
         let optlen = std::mem::size_of::<T>() as u32;
         let optval = &this.value as *const T as *const libc::c_void;
-        match this.fd.kind() {
+        Ok(match this.fd.kind() {
             crate::fd::FdKind::Fd(fd) => {
                 opcode::SetSockOpt::new(types::Fd(fd.0), this.level, this.optname, optval, optlen)
                     .build()
@@ -1355,7 +1357,7 @@ where
                 optlen,
             )
             .build(),
-        }
+        })
     }
 
     fn cleanup(&mut self, _: crate::operation::CQEResult) {}
@@ -1387,9 +1389,9 @@ impl Connect {
 // Safety: `NornFd` retains the socket and the owned address storage remains
 // live and pinned through completion.
 unsafe impl Operation for Connect {
-    fn configure(&mut self) -> io_uring::squeue::Entry {
+    fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
-        match this.fd.kind() {
+        Ok(match this.fd.kind() {
             crate::fd::FdKind::Fd(fd) => {
                 opcode::Connect::new(*fd, this.addr.as_ptr() as *mut _, this.addr.len() as _)
                     .build()
@@ -1398,7 +1400,7 @@ unsafe impl Operation for Connect {
                 opcode::Connect::new(*fd, this.addr.as_ptr() as *mut _, this.addr.len() as _)
                     .build()
             }
-        }
+        })
     }
 
     fn cleanup(&mut self, _: crate::operation::CQEResult) {}
@@ -1425,12 +1427,12 @@ impl Shutdown {
 
 // Safety: `NornFd` retains the only resource referenced by this SQE.
 unsafe impl Operation for Shutdown {
-    fn configure(&mut self) -> io_uring::squeue::Entry {
+    fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
-        match this.fd.kind() {
+        Ok(match this.fd.kind() {
             crate::fd::FdKind::Fd(fd) => opcode::Shutdown::new(*fd, this.how).build(),
             crate::fd::FdKind::Fixed(fd) => opcode::Shutdown::new(*fd, this.how).build(),
-        }
+        })
     }
 
     fn cleanup(&mut self, _: crate::operation::CQEResult) {}
@@ -1472,17 +1474,18 @@ unsafe impl<B> Operation for Recv<B>
 where
     B: StableBufMut,
 {
-    fn configure(&mut self) -> io_uring::squeue::Entry {
+    fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+        let len = checked_scalar_len(self.submitted_len, "receive buffer length")?;
         let ptr = self.buf.stable_ptr_mut();
-        let len = self.submitted_len;
-
-        // Finally we create the operation.
-        match self.fd.kind() {
-            crate::fd::FdKind::Fd(fd) => opcode::Recv::new(*fd, ptr, len as _),
-            crate::fd::FdKind::Fixed(fd) => opcode::Recv::new(*fd, ptr, len as _),
-        }
-        .flags(self.flags)
-        .build()
+        Ok(
+            // Finally we create the operation.
+            match self.fd.kind() {
+                crate::fd::FdKind::Fd(fd) => opcode::Recv::new(*fd, ptr, len),
+                crate::fd::FdKind::Fixed(fd) => opcode::Recv::new(*fd, ptr, len),
+            }
+            .flags(self.flags)
+            .build(),
+        )
     }
 
     fn cleanup(&mut self, _: crate::operation::CQEResult) {}
@@ -1532,17 +1535,18 @@ unsafe impl<B> Operation for Send<B>
 where
     B: StableBuf,
 {
-    fn configure(&mut self) -> io_uring::squeue::Entry {
+    fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+        let len = checked_scalar_len(self.buf.bytes_init(), "send buffer length")?;
         let ptr = self.buf.stable_ptr();
-        let len = self.buf.bytes_init();
-
-        // Finally we create the operation.
-        match self.fd.kind() {
-            crate::fd::FdKind::Fd(fd) => opcode::Send::new(*fd, ptr, len as _),
-            crate::fd::FdKind::Fixed(fd) => opcode::Send::new(*fd, ptr, len as _),
-        }
-        .flags(self.flags)
-        .build()
+        Ok(
+            // Finally we create the operation.
+            match self.fd.kind() {
+                crate::fd::FdKind::Fd(fd) => opcode::Send::new(*fd, ptr, len),
+                crate::fd::FdKind::Fixed(fd) => opcode::Send::new(*fd, ptr, len),
+            }
+            .flags(self.flags)
+            .build(),
+        )
     }
 
     fn cleanup(&mut self, _: crate::operation::CQEResult) {}
@@ -1557,6 +1561,15 @@ where
     fn complete(self, result: crate::operation::CQEResult) -> Self::Output {
         (result.result.map(|v| v as usize), self.buf)
     }
+}
+
+fn checked_scalar_len(len: usize, what: &'static str) -> io::Result<u32> {
+    u32::try_from(len).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{what} exceeds u32::MAX"),
+        )
+    })
 }
 
 fn update_send_zc_primary(
@@ -1608,17 +1621,16 @@ unsafe impl<B> Operation for SendZc<B>
 where
     B: StableBuf,
 {
-    fn configure(&mut self) -> io_uring::squeue::Entry {
+    fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
         let ptr = this.buf.stable_ptr();
         let len = this.buf.bytes_init();
-
-        match this.fd.kind() {
+        Ok(match this.fd.kind() {
             crate::fd::FdKind::Fd(fd) => opcode::SendZc::new(*fd, ptr, len as _),
             crate::fd::FdKind::Fixed(fd) => opcode::SendZc::new(*fd, ptr, len as _),
         }
         .flags(this.flags)
-        .build()
+        .build())
     }
 
     fn cleanup(&mut self, _: crate::operation::CQEResult) {}
@@ -1680,7 +1692,7 @@ unsafe impl<B> Operation for SendMsgZc<B>
 where
     B: StableBuf,
 {
-    fn configure(&mut self) -> io_uring::squeue::Entry {
+    fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
 
         let slice = io::IoSlice::new(unsafe {
@@ -1700,12 +1712,12 @@ where
         }
 
         let msghdr = this.msghdr.as_ptr();
-        match this.fd.kind() {
+        Ok(match this.fd.kind() {
             crate::fd::FdKind::Fd(fd) => opcode::SendMsgZc::new(types::Fd(fd.0), msghdr),
             crate::fd::FdKind::Fixed(fd) => opcode::SendMsgZc::new(types::Fixed(fd.0), msghdr),
         }
         .flags(this.flags as u32)
-        .build()
+        .build())
     }
 
     fn cleanup(&mut self, _: crate::operation::CQEResult) {}
@@ -1745,16 +1757,16 @@ impl<const MULTI: bool> Poll<MULTI> {
 // Safety: `NornFd` retains the descriptor through the single or multishot
 // terminal CQE; the SQE references no userspace memory.
 unsafe impl<const MULTI: bool> Operation for Poll<MULTI> {
-    fn configure(&mut self) -> io_uring::squeue::Entry {
+    fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
-        match this.fd.kind() {
+        Ok(match this.fd.kind() {
             crate::fd::FdKind::Fd(fd) => {
                 opcode::PollAdd::new(*fd, this.events).multi(MULTI).build()
             }
             crate::fd::FdKind::Fixed(fd) => {
                 opcode::PollAdd::new(*fd, this.events).multi(MULTI).build()
             }
-        }
+        })
     }
 
     fn cleanup(&mut self, _: crate::operation::CQEResult) {}
@@ -1990,6 +2002,44 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_pointer_width = "64")]
+    #[derive(Debug)]
+    struct FakeBuf {
+        len: usize,
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    unsafe impl StableBuf for FakeBuf {
+        fn stable_ptr(&self) -> *const u8 {
+            std::ptr::NonNull::<u8>::dangling().as_ptr()
+        }
+
+        fn bytes_init(&self) -> usize {
+            self.len
+        }
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    unsafe impl StableBufMut for FakeBuf {
+        fn stable_ptr_mut(&mut self) -> *mut u8 {
+            std::ptr::NonNull::<u8>::dangling().as_ptr()
+        }
+
+        fn bytes_remaining(&self) -> usize {
+            self.len
+        }
+
+        unsafe fn set_init(&mut self, _: usize) {}
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    fn test_fd() -> NornFd {
+        use std::os::fd::IntoRawFd;
+
+        let file = std::fs::File::open("/dev/null").unwrap();
+        NornFd::from_fd(file.into_raw_fd())
+    }
+
     fn more_flag() -> u32 {
         (0..=u32::MAX)
             .find(|flags| io_uring::cqueue::more(*flags))
@@ -2028,5 +2078,57 @@ mod tests {
             complete_send_zc_result(None, crate::operation::CQEResult::new(Ok(0), notif_flag()))
                 .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn connected_scalar_io_rejects_lengths_above_u32_max() {
+        let fd = test_fd();
+        let mut recv = Recv::new(
+            fd.clone(),
+            FakeBuf {
+                len: u32::MAX as usize + 1,
+            },
+            0,
+        );
+        let mut send = Send::new(
+            fd,
+            FakeBuf {
+                len: u32::MAX as usize + 1,
+            },
+            0,
+        );
+
+        assert_eq!(
+            recv.configure().unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            send.configure().unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn connected_scalar_io_preserves_u32_max_length() {
+        let fd = test_fd();
+        let mut recv = Recv::new(
+            fd.clone(),
+            FakeBuf {
+                len: u32::MAX as usize,
+            },
+            0,
+        );
+        let mut send = Send::new(
+            fd,
+            FakeBuf {
+                len: u32::MAX as usize,
+            },
+            0,
+        );
+
+        assert!(recv.configure().is_ok());
+        assert!(send.configure().is_ok());
     }
 }
