@@ -32,7 +32,7 @@ pub struct SendBufRing {
 }
 
 /// [`SendBundleBatch`] is a one-shot collection of send buffers staged for a single
-/// `SendBundle` request.
+/// `SendBundle` request and UDP datagram.
 #[derive(Debug)]
 pub struct SendBundleBatch {
     rc: Rc<InnerSendBundleBatch>,
@@ -112,7 +112,11 @@ impl SendBufRing {
     pub fn batch(&self) -> io::Result<SendBundleBatch> {
         let id = self.rc.begin_batch()?;
         Ok(SendBundleBatch {
-            rc: Rc::new(InnerSendBundleBatch::new(self.clone(), id)),
+            rc: Rc::new(InnerSendBundleBatch::new(
+                self.clone(),
+                id,
+                Some(SendBundleBatch::MAX_SEGMENTS),
+            )),
         })
     }
 
@@ -131,6 +135,9 @@ impl SendBufRing {
 }
 
 impl SendBundleBatch {
+    /// Maximum number of buffers that can be committed to one UDP datagram batch.
+    pub const MAX_SEGMENTS: usize = 256;
+
     /// Check out a writable buffer from this batch.
     pub fn checkout(&self) -> io::Result<SendBuf> {
         let bid = self.rc.ring.rc.checkout_bid(self.rc.id)?;
@@ -172,13 +179,18 @@ impl SendBundleBatch {
         self.rc.on_submit_rollback();
     }
 
-    pub(crate) fn finish_send(&self, result: crate::operation::CQEResult) -> io::Result<usize> {
+    pub(crate) fn complete_send(&self, result: crate::operation::CQEResult) -> io::Result<usize> {
         if !self.rc.submitted.get() {
+            debug_assert!(!result.more());
             self.rc.ring.rc.abandon_batch(self.rc.id);
             return result.result.map(|bytes| bytes as usize);
         }
-        let out = self.rc.ring.rc.finish_send(self.rc.id, result);
-        self.rc.publish_start_tail.set(None);
+        let terminal = !result.more();
+        let out = self.rc.ring.rc.complete_udp_send(self.rc.id, result);
+        if terminal {
+            self.rc.publish_start_tail.set(None);
+            self.rc.submitted.set(false);
+        }
         out
     }
 }
@@ -342,10 +354,7 @@ impl SendBuf {
 
     /// Commits this buffer into the owning batch as one bundle segment.
     pub fn commit(mut self) -> io::Result<()> {
-        self.batch
-            .ring
-            .rc
-            .commit_bid(self.batch.id, self.bid, self.len)?;
+        self.batch.commit_segment(self.bid, self.len)?;
         self.committed = true;
         Ok(())
     }
@@ -527,6 +536,7 @@ struct InnerSendBufRing {
 struct InnerSendBundleBatch {
     ring: SendBufRing,
     id: u64,
+    segment_limit: Option<usize>,
     submitted: Cell<bool>,
     publish_start_tail: Cell<Option<u16>>,
 }
@@ -1000,20 +1010,28 @@ impl SendQueueState {
         }
     }
 
-    fn finish_send(
+    fn complete_udp_send(
         &mut self,
         batch_id: u64,
         result: crate::operation::CQEResult,
     ) -> io::Result<usize> {
         self.ensure_active_batch(batch_id)?;
-        let out = match result.result {
-            Ok(bytes) => self.complete_udp_send(bytes as usize, result.flags),
-            Err(err) => {
-                // A failed kernel send may leave some or all published entries available in the
-                // kernel-side ring. Their ownership cannot be reconstructed from an error CQE,
-                // so prevent any later batch from mutating or republishing those buffers.
-                self.poisoned = true;
-                Err(err)
+        let more = result.more();
+        let out = if self.poisoned {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "send buffer ring is poisoned",
+            ))
+        } else {
+            match result.result {
+                Ok(bytes) => self.reconcile_udp_send(bytes as usize, result.flags, more),
+                Err(err) => {
+                    // A failed kernel send may leave some or all published entries available in
+                    // the kernel-side ring. Their ownership cannot be reconstructed from an error
+                    // CQE, so prevent any later batch from mutating or republishing those buffers.
+                    self.poisoned = true;
+                    Err(err)
+                }
             }
         };
         if out.is_err() {
@@ -1021,12 +1039,14 @@ impl SendQueueState {
             // ownership. Keep the original error, but make the ring permanently unavailable.
             self.poisoned = true;
         }
-        self.inflight = false;
-        self.active_batch = None;
+        if !more {
+            self.inflight = false;
+            self.active_batch = None;
+        }
         out
     }
 
-    fn complete_udp_send(&mut self, bytes: usize, flags: u32) -> io::Result<usize> {
+    fn reconcile_udp_send(&mut self, bytes: usize, flags: u32, more: bool) -> io::Result<usize> {
         let start_bid = selected_bid_from_flags(flags)?;
         let Some(front) = self.queued.front() else {
             return self.poison("send bundle completion arrived with no queued segments");
@@ -1038,29 +1058,51 @@ impl SendQueueState {
             ));
         }
 
+        // Validate the entire completion before releasing any BID. If the kernel reports an
+        // impossible boundary, none of the potentially affected buffers become reusable.
         let mut remaining = bytes;
-        while remaining > 0 {
-            let Some(front) = self.queued.front() else {
-                return self.poison(format!(
-                    "send bundle completion consumed {} bytes beyond queued segments",
-                    remaining
-                ));
-            };
-            if remaining < front.len {
+        let mut consumed = 0;
+        for segment in &self.queued {
+            if remaining == 0 {
+                break;
+            }
+            if remaining < segment.len {
                 return self.poison(format!(
                     "send bundle completion stopped mid-segment (remaining={} segment_len={})",
-                    remaining, front.len
+                    remaining, segment.len
                 ));
             }
-            remaining -= front.len;
-            let bid = front.bid;
-            self.queued.pop_front();
-            self.free_bids.push(bid);
+            remaining -= segment.len;
+            consumed += 1;
+        }
+        if remaining != 0 {
+            return self.poison(format!(
+                "send bundle completion consumed {} bytes beyond queued segments",
+                remaining
+            ));
+        }
+        if consumed == 0 {
+            return self.poison("send bundle completion consumed no queued segments");
         }
 
-        if !self.queued.is_empty() {
-            return self
-                .poison("send bundle completion stopped before the end of the active batch");
+        let queued_after = self.queued.len() - consumed;
+        if more && queued_after == 0 {
+            return self.poison(
+                "send bundle completion promised another CQE after consuming the active batch",
+            );
+        }
+        if !more && queued_after != 0 {
+            return self.poison(
+                "terminal send bundle completion left queued segments in the active batch",
+            );
+        }
+
+        for _ in 0..consumed {
+            let segment = self
+                .queued
+                .pop_front()
+                .expect("validated send bundle segment missing");
+            self.free_bids.push(segment.bid);
         }
 
         Ok(bytes)
@@ -1233,8 +1275,12 @@ impl InnerSendBufRing {
         self.state.borrow_mut().rollback_submit(batch_id);
     }
 
-    fn finish_send(&self, batch_id: u64, result: crate::operation::CQEResult) -> io::Result<usize> {
-        self.state.borrow_mut().finish_send(batch_id, result)
+    fn complete_udp_send(
+        &self,
+        batch_id: u64,
+        result: crate::operation::CQEResult,
+    ) -> io::Result<usize> {
+        self.state.borrow_mut().complete_udp_send(batch_id, result)
     }
 
     fn buf_capacity(&self) -> usize {
@@ -1276,13 +1322,26 @@ impl InnerSendBufRing {
 }
 
 impl InnerSendBundleBatch {
-    fn new(ring: SendBufRing, id: u64) -> Self {
+    fn new(ring: SendBufRing, id: u64, segment_limit: Option<usize>) -> Self {
         Self {
             ring,
             id,
+            segment_limit,
             submitted: Cell::new(false),
             publish_start_tail: Cell::new(None),
         }
+    }
+
+    fn commit_segment(&self, bid: Bid, len: usize) -> io::Result<()> {
+        if let Some(limit) = self.segment_limit {
+            if self.ring.rc.queued_buffers(self.id) >= limit {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("UDP send bundle batches support at most {limit} committed buffers"),
+                ));
+            }
+        }
+        self.ring.rc.commit_bid(self.id, bid, len)
     }
 
     fn on_submit(&self) -> io::Result<()> {
@@ -1421,6 +1480,12 @@ mod tests {
         IORING_CQE_F_BUFFER | ((bid as u32) << IORING_CQE_BUFFER_SHIFT)
     }
 
+    fn more_flag() -> u32 {
+        (0..=u32::MAX)
+            .find(|flags| io_uring::cqueue::more(*flags))
+            .expect("missing CQE more flag")
+    }
+
     #[test]
     fn selected_bid_requires_buffer_select_flag() {
         let err = selected_bid_from_flags(0).unwrap_err();
@@ -1451,11 +1516,134 @@ mod tests {
         state.mark_submitted(batch).unwrap();
 
         let sent = state
-            .complete_udp_send(8, selected_bid_flag(first))
+            .complete_udp_send(
+                batch,
+                crate::operation::CQEResult::new(Ok(8), selected_bid_flag(first)),
+            )
             .unwrap();
         assert_eq!(sent, 8);
-        assert_eq!(state.queued_buffers(batch), 0);
+        assert!(state.queued.is_empty());
         assert_eq!(state.available_buffers(), 3);
+        assert!(!state.inflight);
+        assert!(state.active_batch.is_none());
+    }
+
+    #[test]
+    fn udp_send_bundle_more_reconciles_prefix_but_keeps_batch_inflight() {
+        let mut state = SendQueueState::new(3);
+        let batch = state.begin_batch().unwrap();
+        let first = state.checkout_bid(batch).unwrap();
+        let second = state.checkout_bid(batch).unwrap();
+        let third = state.checkout_bid(batch).unwrap();
+        state.commit_datagram(batch, first, 3).unwrap();
+        state.commit_datagram(batch, second, 5).unwrap();
+        state.commit_datagram(batch, third, 7).unwrap();
+        state.mark_submitted(batch).unwrap();
+
+        let first_cqe = state
+            .complete_udp_send(
+                batch,
+                crate::operation::CQEResult::new(Ok(8), selected_bid_flag(first) | more_flag()),
+            )
+            .unwrap();
+
+        assert_eq!(first_cqe, 8);
+        assert_eq!(state.queued_buffers(batch), 1);
+        assert_eq!(state.queued_len(batch), 7);
+        assert_eq!(state.available_buffers(), 2);
+        assert!(state.inflight);
+        assert_eq!(state.active_batch, Some(batch));
+        assert_eq!(
+            state.begin_batch().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+
+        let terminal_cqe = state
+            .complete_udp_send(
+                batch,
+                crate::operation::CQEResult::new(Ok(7), selected_bid_flag(third)),
+            )
+            .unwrap();
+
+        assert_eq!(terminal_cqe, 7);
+        assert_eq!(state.available_buffers(), 3);
+        assert!(!state.inflight);
+        assert!(state.active_batch.is_none());
+    }
+
+    #[test]
+    fn udp_send_bundle_more_error_keeps_ownership_until_terminal_cqe() {
+        let mut state = SendQueueState::new(2);
+        let batch = state.begin_batch().unwrap();
+        let first = state.checkout_bid(batch).unwrap();
+        let second = state.checkout_bid(batch).unwrap();
+        state.commit_datagram(batch, first, 3).unwrap();
+        state.commit_datagram(batch, second, 5).unwrap();
+        state.mark_submitted(batch).unwrap();
+
+        let err = state
+            .complete_udp_send(
+                batch,
+                crate::operation::CQEResult::new(Ok(3), selected_bid_flag(second) | more_flag()),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(state.poisoned);
+        assert!(state.inflight);
+        assert_eq!(state.active_batch, Some(batch));
+        assert_eq!(state.available_buffers(), 0);
+
+        let terminal_err = state
+            .complete_udp_send(
+                batch,
+                crate::operation::CQEResult::new(Ok(5), selected_bid_flag(second)),
+            )
+            .unwrap_err();
+        assert_eq!(terminal_err.kind(), io::ErrorKind::InvalidData);
+        assert!(!state.inflight);
+        assert!(state.active_batch.is_none());
+        assert_eq!(state.available_buffers(), 0);
+    }
+
+    #[test]
+    fn send_bundle_batch_keeps_submission_state_until_terminal_cqe() {
+        let driver = crate::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let ring = SendBufRing::new(InnerSendBufRing::new(37, 2, 2, 64, driver.handle()).unwrap());
+        let batch = ring.batch().unwrap();
+        let mut first = batch.checkout().unwrap();
+        first.set_len(3).unwrap();
+        first.commit().unwrap();
+        let mut second = batch.checkout().unwrap();
+        second.set_len(5).unwrap();
+        second.commit().unwrap();
+        let [first_bid, second_bid] = {
+            let state = ring.rc.state.borrow();
+            [state.queued[0].bid, state.queued[1].bid]
+        };
+
+        batch.on_submit().unwrap();
+        batch
+            .complete_send(crate::operation::CQEResult::new(
+                Ok(3),
+                selected_bid_flag(first_bid) | more_flag(),
+            ))
+            .unwrap();
+
+        assert!(batch.rc.submitted.get());
+        assert!(batch.rc.publish_start_tail.get().is_some());
+        assert_eq!(batch.queued_buffers(), 1);
+        assert_eq!(ring.available_buffers(), 1);
+
+        batch
+            .complete_send(crate::operation::CQEResult::new(
+                Ok(5),
+                selected_bid_flag(second_bid),
+            ))
+            .unwrap();
+
+        assert!(!batch.rc.submitted.get());
+        assert!(batch.rc.publish_start_tail.get().is_none());
+        assert_eq!(ring.available_buffers(), 2);
     }
 
     #[test]
@@ -1470,11 +1658,14 @@ mod tests {
         state.mark_submitted(batch).unwrap();
 
         let err = state
-            .complete_udp_send(3, selected_bid_flag(first))
+            .complete_udp_send(
+                batch,
+                crate::operation::CQEResult::new(Ok(3), selected_bid_flag(first)),
+            )
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        assert_eq!(state.queued_buffers(batch), 1);
-        assert_eq!(state.available_buffers(), 2);
+        assert_eq!(state.queued.len(), 2);
+        assert_eq!(state.available_buffers(), 1);
         assert!(state.poisoned);
     }
 
@@ -1488,7 +1679,10 @@ mod tests {
         state.mark_submitted(batch).unwrap();
 
         let err = state
-            .complete_udp_send(2, selected_bid_flag(first))
+            .complete_udp_send(
+                batch,
+                crate::operation::CQEResult::new(Ok(2), selected_bid_flag(first)),
+            )
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(state.poisoned);
@@ -1506,7 +1700,10 @@ mod tests {
         state.mark_submitted(batch).unwrap();
 
         let err = state
-            .complete_udp_send(4, selected_bid_flag(second))
+            .complete_udp_send(
+                batch,
+                crate::operation::CQEResult::new(Ok(4), selected_bid_flag(second)),
+            )
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(state.poisoned);
@@ -1548,7 +1745,7 @@ mod tests {
         state.commit_datagram(first_batch, sent_bid, 4).unwrap();
         state.mark_submitted(first_batch).unwrap();
         state
-            .finish_send(
+            .complete_udp_send(
                 first_batch,
                 crate::operation::CQEResult::new(Ok(4), selected_bid_flag(sent_bid)),
             )
@@ -1574,7 +1771,7 @@ mod tests {
         state.commit_datagram(first_batch, sent_bid, 4).unwrap();
         state.mark_submitted(first_batch).unwrap();
         state
-            .finish_send(
+            .complete_udp_send(
                 first_batch,
                 crate::operation::CQEResult::new(Ok(4), selected_bid_flag(sent_bid)),
             )
@@ -1602,7 +1799,7 @@ mod tests {
         state.mark_submitted(batch).unwrap();
 
         let err = state
-            .finish_send(
+            .complete_udp_send(
                 batch,
                 crate::operation::CQEResult::new(
                     Err(io::Error::from_raw_os_error(libc::ECANCELED)),
@@ -1660,7 +1857,7 @@ mod tests {
         state.mark_submitted(batch).unwrap();
 
         let err = state
-            .finish_send(batch, crate::operation::CQEResult::new(Ok(4), 0))
+            .complete_udp_send(batch, crate::operation::CQEResult::new(Ok(4), 0))
             .unwrap_err();
 
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);

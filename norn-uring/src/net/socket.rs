@@ -1590,16 +1590,65 @@ fn checked_scalar_len(len: usize, what: &'static str) -> io::Result<u32> {
     })
 }
 
+/// Accumulates the per-CQE byte counts from one send bundle submission.
+///
+/// Send bundle operations may produce multiple CQEs. The operation-specific batch reconciler runs
+/// before each result is recorded here.
+#[derive(Debug, Default)]
+pub(crate) struct SendBundleCompletion {
+    total_bytes: usize,
+    error: Option<io::Error>,
+}
+
+impl SendBundleCompletion {
+    pub(crate) fn record(&mut self, result: io::Result<usize>) {
+        if self.error.is_some() {
+            return;
+        }
+        match result {
+            Ok(bytes) => match self.total_bytes.checked_add(bytes) {
+                Some(total) => self.total_bytes = total,
+                None => {
+                    self.error = Some(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "send bundle completion byte count overflowed usize",
+                    ));
+                }
+            },
+            Err(err) => self.error = Some(err),
+        }
+    }
+
+    pub(crate) fn finish(mut self, result: io::Result<usize>) -> io::Result<usize> {
+        self.record(result);
+        match self.error {
+            Some(err) => Err(err),
+            None => Ok(self.total_bytes),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct SendBundleUdp {
     fd: NornFd,
     batch: SendBundleBatch,
     flags: i32,
+    completion: SendBundleCompletion,
 }
 
 impl SendBundleUdp {
     fn new(fd: NornFd, batch: SendBundleBatch, flags: i32) -> Self {
-        Self { fd, batch, flags }
+        Self {
+            fd,
+            batch,
+            flags,
+            completion: SendBundleCompletion::default(),
+        }
+    }
+
+    fn record_completion(&mut self, result: crate::operation::CQEResult) {
+        let result = self.batch.complete_send(result);
+        self.completion.record(result);
     }
 }
 
@@ -1629,15 +1678,22 @@ unsafe impl Operation for SendBundleUdp {
     }
 
     fn cleanup(&mut self, result: crate::operation::CQEResult) {
-        let _ = self.batch.finish_send(result);
+        self.record_completion(result);
     }
 }
 
 impl Singleshot for SendBundleUdp {
     type Output = io::Result<usize>;
 
+    fn update(&mut self, result: crate::operation::CQEResult) {
+        debug_assert!(result.more());
+        self.record_completion(result);
+    }
+
     fn complete(self, result: crate::operation::CQEResult) -> Self::Output {
-        self.batch.finish_send(result)
+        debug_assert!(!result.more());
+        let result = self.batch.complete_send(result);
+        self.completion.finish(result)
     }
 }
 
@@ -2104,6 +2160,29 @@ mod tests {
         (0..=u32::MAX)
             .find(|flags| io_uring::cqueue::notif(*flags))
             .expect("missing CQE notif flag")
+    }
+
+    #[test]
+    fn send_bundle_completion_accumulates_updates_and_terminal_result() {
+        let mut completion = SendBundleCompletion::default();
+        completion.record(Ok(256));
+
+        assert_eq!(completion.finish(Ok(1)).unwrap(), 257);
+    }
+
+    #[test]
+    fn send_bundle_completion_preserves_first_reconciliation_error() {
+        let mut completion = SendBundleCompletion::default();
+        completion.record(Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "intermediate completion mismatch",
+        )));
+
+        let err = completion
+            .finish(Err(io::Error::from_raw_os_error(libc::ECANCELED)))
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "intermediate completion mismatch");
     }
 
     #[test]

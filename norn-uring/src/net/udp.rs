@@ -95,10 +95,11 @@ impl UdpSocket {
         self.inner.send_with_flags(buf, flags).await
     }
 
-    /// Sends one datagram assembled from one or more committed buffers in a send bundle batch on a
+    /// Sends one datagram assembled from the committed buffers in a send bundle batch on a
     /// connected socket.
     ///
-    /// The batch must have at least one committed buffer queued.
+    /// The batch must have at least one and at most [`SendBundleBatch::MAX_SEGMENTS`] committed
+    /// buffers.
     ///
     /// # Panics
     ///
@@ -107,8 +108,10 @@ impl UdpSocket {
         self.inner.send_bundle_udp(batch).await
     }
 
-    /// Sends one datagram assembled from one or more committed buffers in a send bundle batch on a
+    /// Sends one datagram assembled from the committed buffers in a send bundle batch on a
     /// connected socket with the provided send flags.
+    ///
+    /// The batch must contain at most [`SendBundleBatch::MAX_SEGMENTS`] committed buffers.
     ///
     /// # Panics
     ///

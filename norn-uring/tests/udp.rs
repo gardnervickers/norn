@@ -579,6 +579,58 @@ fn connected_send_bundle_reuses_ring_after_send() -> Result<(), Box<dyn std::err
 }
 
 #[test]
+fn connected_send_bundle_rejects_segment_over_single_datagram_cap(
+) -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        const SEGMENTS: usize = SendBundleBatch::MAX_SEGMENTS;
+        let ring = BufRing::builder(14)
+            .ring_entries(512)
+            .buf_cnt((SEGMENTS + 1) as u16)
+            .buf_len(1)
+            .build_send()?;
+        let sender = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let receiver = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        sender.connect(receiver.local_addr()?).await?;
+        receiver.connect(sender.local_addr()?).await?;
+
+        let batch = ring.batch()?;
+        for sequence in 0..SEGMENTS {
+            stage_bundle_segment(&batch, &[sequence as u8])?;
+        }
+        let mut overflow = batch.checkout()?;
+        overflow.as_mut_slice()[0] = 0xff;
+        overflow.set_len(1)?;
+        let err = overflow.commit().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(batch.queued_buffers(), SEGMENTS);
+        assert_eq!(ring.available_buffers(), 1);
+
+        let sent = match sender.send_bundle(batch).await {
+            Ok(sent) => sent,
+            Err(err) if util::send_bundle_unsupported(&err) => return Ok(()),
+            Err(err) => return Err(err.into()),
+        };
+        assert_eq!(sent, SEGMENTS);
+        assert_eq!(ring.available_buffers(), SEGMENTS + 1);
+
+        let (result, buf) = receiver
+            .recv_with_flags(BytesMut::with_capacity(SEGMENTS), libc::MSG_DONTWAIT)
+            .await;
+        let received = result?;
+        assert_eq!(received, SEGMENTS);
+        let expected: Vec<u8> = (0..SEGMENTS).map(|sequence| sequence as u8).collect();
+        assert_eq!(&buf[..received], expected.as_slice());
+
+        let (result, _) = receiver
+            .recv_with_flags(BytesMut::with_capacity(1), libc::MSG_DONTWAIT)
+            .await;
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+
+        Ok(())
+    })
+}
+
+#[test]
 fn connected_send_bundle_sqpoll_publishes_buffers_before_sqe_visibility(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut builder = io_uring::IoUring::builder();
