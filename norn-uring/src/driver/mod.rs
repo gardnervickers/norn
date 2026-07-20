@@ -2,6 +2,7 @@ use std::any::Any;
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
+use std::time::Duration;
 use std::{io, mem};
 
 use io_uring::squeue::{Flags, PushError};
@@ -37,6 +38,12 @@ const LOG: &str = "norn_uring::driver";
 /// This will have a perf impact on each poll, but may ensure better overall performance.
 const NEEDS_PARK_CHECK_RINGS: bool = true;
 
+/// Maximum time shutdown waits for the kernel to cancel all submitted requests.
+///
+/// `IORING_REGISTER_SYNC_CANCEL` accepts a timeout, so teardown does not need to
+/// enter an unbounded syscall when a request cannot be cancelled.
+const SHUTDOWN_CANCEL_TIMEOUT: Duration = Duration::from_millis(100);
+
 /// [`Driver`] provides a [`Park`] implementation which will drive
 /// a [`IoUring`] instance, submitting new requests and waiting
 /// for completions.
@@ -61,6 +68,9 @@ struct Shared {
     backpressure: Notify,
     status: Cell<Status>,
     submit_error: RefCell<Option<(io::ErrorKind, String)>>,
+    shutdown_outcome: Cell<Option<ShutdownOutcome>>,
+    #[cfg(test)]
+    cancel_all_error: Cell<Option<i32>>,
     // This field must be declared after `ring`: fields are dropped in declaration
     // order, so retained registered storage is released only after the ring.
     registered_buffers: RegisteredBuffers,
@@ -86,6 +96,15 @@ pub(super) enum Status {
     Draining,
     /// The driver has shutdown and will not accept new requests.
     Shutdown,
+}
+
+/// Describes whether shutdown reached the normal reclamation boundary.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum ShutdownOutcome {
+    /// The drain sentinel completed, so every earlier request reached a terminal CQE.
+    CleanDrained,
+    /// Teardown stopped waiting and quarantined the ring and kernel-owned allocations.
+    Abandoned,
 }
 
 pub(crate) enum TryPush {
@@ -341,6 +360,9 @@ impl Driver {
                 backpressure: Notify::default(),
                 status: Cell::new(Status::Running),
                 submit_error: RefCell::new(None),
+                shutdown_outcome: Cell::new(None),
+                #[cfg(test)]
+                cancel_all_error: Cell::new(None),
                 registered_buffers: RegisteredBuffers::new(),
             }),
             unparker: Arc::new(unpark::Unparker::new()?),
@@ -429,7 +451,7 @@ impl Driver {
                 let user_data = cqe.user_data() as usize;
                 if user_data == Self::DRAIN_TOKEN {
                     trace!(target: LOG, "drain.token");
-                    self.shared.set_status(Status::Shutdown);
+                    self.shared.finish_shutdown(ShutdownOutcome::CleanDrained);
                     continue;
                 }
                 if user_data == Self::UNPARKER_WAKE_TOKEN {
@@ -517,12 +539,21 @@ impl Park for Driver {
     }
 
     fn shutdown(&mut self) {
+        let _ = self.shutdown_with_outcome();
+    }
+}
+
+impl Driver {
+    fn shutdown_with_outcome(&mut self) -> ShutdownOutcome {
+        if let Some(outcome) = self.shared.shutdown_outcome() {
+            return outcome;
+        }
         if self.shared.status() == Status::Shutdown {
-            return;
-        };
+            return self.abandon();
+        }
         loop {
-            if self.shared.status() == Status::Shutdown {
-                return;
+            if let Some(outcome) = self.shared.shutdown_outcome() {
+                return outcome;
             }
             if self.shared.status() == Status::Running {
                 self.unparker.wake();
@@ -532,11 +563,11 @@ impl Park for Driver {
                     // This may abandon in-flight work, but avoids use-after-free style
                     // teardown hazards by not forcing partially-failed transitions.
                     warn!(target: LOG, "shutdown.submit.failed {:?}", err);
-                    self.shared.set_status(Status::Shutdown);
-                    return;
+                    return self.abandon();
                 }
                 if let Err(err) = self.shared.cancel_all() {
                     warn!(target: LOG, "shutdown.cancel_all.failed {:?}", err);
+                    return self.abandon();
                 }
                 let opcode = io_uring::opcode::Nop::new()
                     .build()
@@ -554,11 +585,25 @@ impl Park for Driver {
                     // Same fail-soft policy as above: prefer an explicit shutdown stop
                     // over panic while dropping the driver.
                     warn!(target: LOG, "shutdown.park.failed {:?}", err);
-                    self.shared.set_status(Status::Shutdown);
-                    return;
+                    return self.abandon();
                 }
             }
         }
+    }
+
+    /// Stop driving the ring without releasing memory the kernel may still access.
+    ///
+    /// The extra strong reference intentionally quarantines `Shared`, including the
+    /// ring and registered storage. This is the bounded fallback for cancellation
+    /// failure. A future ownership/reaper design (tracked separately) can replace
+    /// this quarantine with deferred ring destruction and reclamation.
+    fn abandon(&self) -> ShutdownOutcome {
+        if self.shared.shutdown_outcome() == Some(ShutdownOutcome::Abandoned) {
+            return ShutdownOutcome::Abandoned;
+        }
+        self.shared.finish_shutdown(ShutdownOutcome::Abandoned);
+        mem::forget(Rc::clone(&self.shared));
+        ShutdownOutcome::Abandoned
     }
 }
 
@@ -583,6 +628,17 @@ impl Shared {
     /// Get the current status of the driver.
     fn status(&self) -> Status {
         self.status.get()
+    }
+
+    fn shutdown_outcome(&self) -> Option<ShutdownOutcome> {
+        self.shutdown_outcome.get()
+    }
+
+    fn finish_shutdown(&self, outcome: ShutdownOutcome) {
+        if self.shutdown_outcome.get().is_none() {
+            self.shutdown_outcome.set(Some(outcome));
+        }
+        self.set_status(Status::Shutdown);
     }
 
     fn health_error(&self) -> Option<io::Error> {
@@ -796,10 +852,23 @@ impl Shared {
 
     /// Cancel all outstanding requests synchronously.
     pub(crate) fn cancel_all(&self) -> io::Result<()> {
+        #[cfg(test)]
+        if let Some(errno) = self.cancel_all_error.take() {
+            return Err(io::Error::from_raw_os_error(errno));
+        }
+
         let ring = self.ring.borrow();
         let criteria = CancelBuilder::any();
-        ring.submitter().register_sync_cancel(None, criteria)?;
-        Ok(())
+        let timeout = Timespec::from(SHUTDOWN_CANCEL_TIMEOUT);
+        match ring
+            .submitter()
+            .register_sync_cancel(Some(timeout), criteria)
+        {
+            Ok(()) => Ok(()),
+            // No matching requests means there is nothing left to cancel.
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err),
+        }
     }
 
     fn needs_park(&self) -> bool {
@@ -841,13 +910,148 @@ impl Drop for Driver {
 #[cfg(test)]
 mod tests {
     use std::future::Future;
+    use std::net::TcpListener;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc, Arc};
     use std::task::Poll;
+    use std::time::Duration;
 
     use smallvec::SmallVec;
 
     use super::*;
     use crate::operation::{CQEResult, Operation, Singleshot};
     use crate::Request;
+
+    enum LongLivedIo {
+        Read {
+            reader: UnixStream,
+            _writer: UnixStream,
+            buf: Box<[u8; 8]>,
+        },
+        Accept(TcpListener),
+    }
+
+    struct LongLivedOp {
+        io: LongLivedIo,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Drop for LongLivedOp {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::Release);
+        }
+    }
+
+    unsafe impl Operation for LongLivedOp {
+        fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+            Ok(match &mut self.io {
+                LongLivedIo::Read { reader, buf, .. } => opcode::Read::new(
+                    types::Fd(reader.as_raw_fd()),
+                    buf.as_mut_ptr(),
+                    buf.len() as u32,
+                )
+                .build(),
+                LongLivedIo::Accept(listener) => opcode::Accept::new(
+                    types::Fd(listener.as_raw_fd()),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+                .build(),
+            })
+        }
+
+        fn cleanup(&mut self, result: CQEResult) {
+            if matches!(self.io, LongLivedIo::Accept(_)) {
+                if let Ok(fd) = result.result {
+                    // Safety: a successful accept completion returns a newly owned fd.
+                    unsafe { libc::close(fd as i32) };
+                }
+            }
+        }
+    }
+
+    impl Singleshot for LongLivedOp {
+        type Output = io::Result<u32>;
+
+        fn complete(self, result: CQEResult) -> Self::Output {
+            result.result
+        }
+    }
+
+    fn assert_cancel_failure_abandons(op: LongLivedOp) {
+        let dropped = Arc::clone(&op.dropped);
+        let (tx, rx) = mpsc::channel();
+
+        std::thread::spawn(move || {
+            let mut driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+            let handle = driver.handle();
+            let mut op = Box::pin(handle.submit(op));
+            let waker = futures_test::task::noop_waker();
+            let mut cx = std::task::Context::from_waker(&waker);
+
+            assert!(Future::poll(op.as_mut(), &mut cx).is_pending());
+            driver
+                .park(ParkMode::NoPark)
+                .expect("long-lived operation submission failed");
+
+            driver.shared.cancel_all_error.set(Some(libc::EIO));
+            let outcome = driver.shutdown_with_outcome();
+            drop(op);
+            drop(handle);
+
+            let shared_refs = Rc::strong_count(&driver.shared);
+            drop(driver);
+            tx.send((outcome, shared_refs)).unwrap();
+        });
+
+        let (outcome, shared_refs) = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("shutdown did not take the bounded abandonment path");
+        assert_eq!(outcome, ShutdownOutcome::Abandoned);
+        assert_eq!(
+            shared_refs, 2,
+            "abandonment must add exactly one quarantine reference"
+        );
+        assert!(
+            !dropped.load(Ordering::Acquire),
+            "kernel-referenced operation storage was released before ring destruction"
+        );
+    }
+
+    #[test]
+    fn cancel_all_failure_abandons_long_lived_read() {
+        let (reader, writer) = UnixStream::pair().unwrap();
+        let dropped = Arc::new(AtomicBool::new(false));
+        assert_cancel_failure_abandons(LongLivedOp {
+            io: LongLivedIo::Read {
+                reader,
+                _writer: writer,
+                buf: Box::new([0; 8]),
+            },
+            dropped,
+        });
+    }
+
+    #[test]
+    fn cancel_all_failure_abandons_long_lived_accept() {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let dropped = Arc::new(AtomicBool::new(false));
+        assert_cancel_failure_abandons(LongLivedOp {
+            io: LongLivedIo::Accept(listener),
+            dropped,
+        });
+    }
+
+    #[test]
+    fn shutdown_without_pending_requests_is_clean_drained() {
+        let mut driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        assert_eq!(
+            driver.shutdown_with_outcome(),
+            ShutdownOutcome::CleanDrained
+        );
+    }
 
     #[test]
     fn prepare_park_consumes_a_latched_wake_before_arming() {
