@@ -438,7 +438,7 @@ fn path_and_metadata_ops() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         match fs::symlink(&renamed, &symlink).await {
-            Ok(()) => match fs::read_link(&symlink).await {
+            Ok(()) => match std::fs::read_link(&symlink) {
                 Ok(target) => assert_eq!(target, renamed),
                 Err(err)
                     if err.kind() == std::io::ErrorKind::PermissionDenied

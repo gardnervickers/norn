@@ -12,8 +12,8 @@ use std::io;
 use crate::buf::StableBufMut;
 
 pub use dir::{
-    create_dir, get_xattr, hard_link, metadata, read_link, remove_dir, remove_file, rename,
-    set_xattr, statx, symlink,
+    create_dir, get_xattr, hard_link, metadata, remove_dir, remove_file, rename, set_xattr, statx,
+    symlink,
 };
 pub use file::{pipe, File, PipeReader, PipeWriter};
 pub use opts::OpenOptions;
