@@ -130,6 +130,23 @@ impl State {
         res
     }
 
+    /// Conclude a poll that returned ready.
+    ///
+    /// The task remains marked as running until [`State::complete_task`] records
+    /// the terminal state. This transition only determines whether cancellation
+    /// requested during the poll must replace the task's output.
+    #[inline]
+    pub(crate) fn complete_ready_poll(&mut self) -> CompleteReadyPollResult {
+        assert!(self.flags.contains(Flags::RUNNING));
+        assert!(self.refcount > 0);
+
+        if self.flags.contains(Flags::CANCELLED) {
+            CompleteReadyPollResult::Cancelled
+        } else {
+            CompleteReadyPollResult::Ok
+        }
+    }
+
     /// Mark the task as complete.
     ///
     /// Returns whether the task output should be dropped or if the join
@@ -200,15 +217,16 @@ impl State {
 
     /// Shutdown the task.
     ///
-    /// This is to be called from the executor during shutdown. As a result,
-    /// we enforce that the task is not running.
+    /// Running tasks defer destruction of their future until their current poll
+    /// returns. All other incomplete tasks become complete immediately.
     #[inline]
     pub(crate) fn shutdown(&mut self) -> ShutdownResult {
         assert!(self.refcount > 0);
-        assert!(!self.flags.contains(Flags::RUNNING));
         self.flags.insert(Flags::CANCELLED);
         if self.flags.contains(Flags::COMPLETE) {
             ShutdownResult::AlreadyCompleted
+        } else if self.flags.contains(Flags::RUNNING) {
+            ShutdownResult::Deferred
         } else {
             self.flags.insert(Flags::COMPLETE);
             ShutdownResult::NotCompleted
@@ -287,6 +305,13 @@ pub(crate) enum CompletePollResult {
     Ok,
 }
 
+#[must_use = "this `CompleteReadyPollResult` must be handled"]
+#[derive(Debug, Copy, Clone)]
+pub(crate) enum CompleteReadyPollResult {
+    Cancelled,
+    Ok,
+}
+
 #[must_use = "this `CompleteTaskResult` must be handled"]
 #[derive(Debug, Copy, Clone)]
 pub(crate) enum CompleteTaskResult {
@@ -319,6 +344,7 @@ pub(crate) enum NotifyResult {
 #[derive(Debug, Copy, Clone)]
 pub(crate) enum ShutdownResult {
     AlreadyCompleted,
+    Deferred,
     NotCompleted,
 }
 
