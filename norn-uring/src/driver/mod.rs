@@ -42,10 +42,10 @@ const NEEDS_PARK_CHECK_RINGS: bool = true;
 /// Number of CQEs copied out of the ring at once while draining.
 const COMPLETION_DRAIN_BATCH: usize = 32;
 
-/// Maximum time shutdown waits for the kernel to cancel all submitted requests.
+/// Maximum time each shutdown cancellation attempt waits for the kernel.
 ///
-/// `IORING_REGISTER_SYNC_CANCEL` accepts a timeout, so teardown does not need to
-/// enter an unbounded syscall when a request cannot be cancelled.
+/// `IORING_REGISTER_SYNC_CANCEL` accepts a timeout, so teardown can retry without
+/// entering one unbounded syscall when a request cannot be cancelled.
 const SHUTDOWN_CANCEL_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Options controlling normal [`Driver`] operation.
@@ -69,15 +69,19 @@ pub struct DriverOptions {
 ///
 /// Interaction with the driver is done via [`Handle`]. The handle
 /// can be used to submit new requests to the driver.
+///
+/// Shutdown stops accepting new requests, cancels outstanding work, and waits
+/// for every kernel-owned operation to reach a terminal completion. Teardown
+/// retries transient and fatal submission errors indefinitely; consequently,
+/// dropping a driver can block forever if its ring can no longer make progress.
 pub struct Driver {
     options: DriverOptions,
     shared: Rc<Shared>,
     unparker: Arc<unpark::Unparker>,
     /// Storage passed to the kernel for the eventfd read.
     ///
-    /// The buffer is manually dropped because an abandoned ring may still hold
-    /// its address. [`Driver::drop`] releases it only after the drain sentinel
-    /// proves every earlier request, including the eventfd read, is terminal.
+    /// [`Driver::drop`] releases the buffer only after the drain sentinel proves
+    /// every earlier request, including the eventfd read, is terminal.
     unparker_buf: mem::ManuallyDrop<UnparkerBuffer>,
 }
 
@@ -112,6 +116,8 @@ struct Shared {
     shutdown_outcome: Cell<Option<ShutdownOutcome>>,
     #[cfg(test)]
     cancel_all_error: Cell<Option<i32>>,
+    #[cfg(test)]
+    submit_failures: RefCell<std::collections::VecDeque<i32>>,
     // This field must be declared after `ring`: fields are dropped in declaration
     // order, so retained registered storage is released only after the ring.
     registered_buffers: RegisteredBuffers,
@@ -133,7 +139,9 @@ pub(crate) struct FixedBufDriver {
 pub(super) enum Status {
     /// The driver is running and accepting new requests.
     Running,
-    /// The driver is draining and will not accept new requests.
+    /// The driver is closing and will not accept new requests.
+    Closing,
+    /// The driver has queued its drain barrier and is waiting for completion.
     Draining,
     /// The driver has shutdown and will not accept new requests.
     Shutdown,
@@ -144,8 +152,6 @@ pub(super) enum Status {
 enum ShutdownOutcome {
     /// The drain sentinel completed, so every earlier request reached a terminal CQE.
     CleanDrained,
-    /// Teardown stopped waiting and quarantined the ring and kernel-owned allocations.
-    Abandoned,
 }
 
 pub(crate) enum TryPush {
@@ -438,6 +444,8 @@ impl Driver {
                 shutdown_outcome: Cell::new(None),
                 #[cfg(test)]
                 cancel_all_error: Cell::new(None),
+                #[cfg(test)]
+                submit_failures: RefCell::new(std::collections::VecDeque::new()),
                 registered_buffers: RegisteredBuffers::new(),
             }),
             unparker: Arc::new(unpark::Unparker::new()?),
@@ -575,6 +583,15 @@ impl Driver {
         total_drained
     }
 
+    fn retry_shutdown(&self, stage: &'static str, err: &io::Error) {
+        warn!(target: LOG, "shutdown.{stage}.retry {err:?}");
+        let drained = self.drain_exhaustive();
+        trace!(target: LOG, "shutdown.{stage}.retry drained={drained}");
+        if self.shared.status() != Status::Shutdown {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     fn drain_normal(&self, remaining: &mut Option<usize>) -> usize {
         let drained = self.drain::<COMPLETION_DRAIN_BATCH>(remaining.unwrap_or(usize::MAX));
         if let Some(remaining) = remaining {
@@ -655,62 +672,59 @@ impl Driver {
         if let Some(outcome) = self.shared.shutdown_outcome() {
             return outcome;
         }
-        if self.shared.status() == Status::Shutdown {
-            return self.abandon();
+        if matches!(self.shared.status(), Status::Running | Status::Shutdown) {
+            self.shared.set_status(Status::Closing);
         }
+
+        // Once an SQE may have reached the kernel, returning before its terminal CQE
+        // is unsafe: the operation can retain buffers, descriptors, and this driver.
+        // Teardown therefore retries indefinitely. A permanently broken ring can
+        // make shutdown block forever, but it cannot make shutdown abandon memory
+        // still owned by the kernel.
         loop {
             if let Some(outcome) = self.shared.shutdown_outcome() {
                 return outcome;
             }
-            if self.shared.status() == Status::Running {
-                self.unparker.wake();
-                if let Err(err) = self.shared.submit(ParkMode::NoPark) {
-                    // Fail-soft shutdown path: if we can't submit during teardown,
-                    // stop driving the ring instead of panicking in Drop.
-                    // This may abandon in-flight work, but avoids use-after-free style
-                    // teardown hazards by not forcing partially-failed transitions.
-                    warn!(target: LOG, "shutdown.submit.failed {:?}", err);
-                    return self.abandon();
-                }
-                if let Err(err) = self.shared.cancel_all() {
-                    warn!(target: LOG, "shutdown.cancel_all.failed {:?}", err);
-                    return self.abandon();
-                }
-                let opcode = io_uring::opcode::Nop::new()
-                    .build()
-                    .flags(io_uring::squeue::Flags::IO_DRAIN)
-                    .user_data(Self::DRAIN_TOKEN as u64);
-                if unsafe { self.shared.try_push_raw(&opcode) }.is_ok() {
-                    self.shared.set_status(Status::Draining);
-                } else {
-                    let drained = self.drain_exhaustive();
-                    trace!(target: LOG, "shutdown.push_drain.retry drained={}", drained);
-                }
-            }
-            if self.shared.status() == Status::Draining {
-                if let Err(err) = self.park_with_completion_budget(ParkMode::NextCompletion, None) {
-                    // Same fail-soft policy as above: prefer an explicit shutdown stop
-                    // over panic while dropping the driver.
-                    warn!(target: LOG, "shutdown.park.failed {:?}", err);
-                    return self.abandon();
-                }
-            }
-        }
-    }
+            match self.shared.status() {
+                Status::Shutdown => self.shared.set_status(Status::Closing),
+                Status::Running => self.shared.set_status(Status::Closing),
+                Status::Closing => {
+                    self.unparker.wake();
+                    if let Err(err) = self.shared.submit(ParkMode::NoPark) {
+                        self.retry_shutdown("submit", &err);
+                        continue;
+                    }
 
-    /// Stop driving the ring without releasing memory the kernel may still access.
-    ///
-    /// The extra strong reference intentionally quarantines `Shared`, including the
-    /// ring and registered storage. This is the bounded fallback for cancellation
-    /// failure. A future ownership/reaper design (tracked separately) can replace
-    /// this quarantine with deferred ring destruction and reclamation.
-    fn abandon(&self) -> ShutdownOutcome {
-        if self.shared.shutdown_outcome() == Some(ShutdownOutcome::Abandoned) {
-            return ShutdownOutcome::Abandoned;
+                    if let Err(err) = self.shared.cancel_all() {
+                        if err.raw_os_error() != Some(libc::ENOENT) {
+                            self.retry_shutdown("cancel_all", &err);
+                            continue;
+                        }
+                    }
+
+                    let opcode = io_uring::opcode::Nop::new()
+                        .build()
+                        .flags(io_uring::squeue::Flags::IO_DRAIN)
+                        .user_data(Self::DRAIN_TOKEN as u64);
+                    if unsafe { self.shared.try_push_raw(&opcode) }.is_ok() {
+                        self.shared.set_status(Status::Draining);
+                    } else {
+                        let drained = self.drain_exhaustive();
+                        trace!(target: LOG, "shutdown.push_drain.retry drained={drained}");
+                        if drained == 0 {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                    }
+                }
+                Status::Draining => {
+                    if let Err(err) =
+                        self.park_with_completion_budget(ParkMode::NextCompletion, None)
+                    {
+                        self.retry_shutdown("park", &err);
+                    }
+                }
+            }
         }
-        self.shared.finish_shutdown(ShutdownOutcome::Abandoned);
-        mem::forget(Rc::clone(&self.shared));
-        ShutdownOutcome::Abandoned
     }
 }
 
@@ -761,7 +775,9 @@ impl Shared {
             *slot = Some((err.kind(), err.to_string()));
         }
         drop(slot);
-        self.set_status(Status::Shutdown);
+        if self.status() == Status::Running {
+            self.set_status(Status::Closing);
+        }
     }
 
     /// Set the status of the driver.
@@ -839,6 +855,11 @@ impl Shared {
     }
 
     fn submit_once(&self, mode: ParkMode) -> io::Result<usize> {
+        #[cfg(test)]
+        if let Some(errno) = self.submit_failures.borrow_mut().pop_front() {
+            return Err(io::Error::from_raw_os_error(errno));
+        }
+
         let mut ring = self.ring.borrow_mut();
         Ok(match mode {
             ParkMode::Timeout(duration) => {
@@ -975,6 +996,11 @@ impl Shared {
         }
     }
 
+    #[cfg(test)]
+    fn fail_next_submit(&self, errno: i32) {
+        self.submit_failures.borrow_mut().push_back(errno);
+    }
+
     fn needs_park(&self, completion_drain_is_bounded: bool) -> bool {
         // First check if there are any waiters, this is a cheap check
         // compared to checking the ring.
@@ -1070,6 +1096,7 @@ mod tests {
 
     struct LongLivedOp {
         io: LongLivedIo,
+        _driver: Handle,
         dropped: Arc<AtomicBool>,
     }
 
@@ -1115,8 +1142,8 @@ mod tests {
         }
     }
 
-    fn assert_cancel_failure_abandons(op: LongLivedOp) {
-        let dropped = Arc::clone(&op.dropped);
+    fn assert_cancel_failure_retries(io: LongLivedIo, dropped: Arc<AtomicBool>) {
+        let thread_dropped = Arc::clone(&dropped);
         let unparker_buf_drops = Arc::new(AtomicUsize::new(0));
         let thread_unparker_buf_drops = Arc::clone(&unparker_buf_drops);
         let (tx, rx) = mpsc::channel();
@@ -1125,6 +1152,11 @@ mod tests {
             let mut driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
             driver.unparker_buf.track_drop(thread_unparker_buf_drops);
             let handle = driver.handle();
+            let op = LongLivedOp {
+                io,
+                _driver: handle.clone(),
+                dropped: thread_dropped,
+            };
             let mut op = Box::pin(handle.submit(op));
             let waker = futures_test::task::noop_waker();
             let mut cx = std::task::Context::from_waker(&waker);
@@ -1139,11 +1171,10 @@ mod tests {
                 .submit(ParkMode::NoPark)
                 .expect("eventfd read submission failed");
 
-            driver.shared.cancel_all_error.set(Some(libc::EIO));
-            let outcome = driver.shutdown_with_outcome();
             drop(op);
             drop(handle);
-
+            driver.shared.cancel_all_error.set(Some(libc::EIO));
+            let outcome = driver.shutdown_with_outcome();
             let shared_refs = Rc::strong_count(&driver.shared);
             drop(driver);
             tx.send((outcome, shared_refs)).unwrap();
@@ -1151,45 +1182,42 @@ mod tests {
 
         let (outcome, shared_refs) = rx
             .recv_timeout(Duration::from_secs(2))
-            .expect("shutdown did not take the bounded abandonment path");
-        assert_eq!(outcome, ShutdownOutcome::Abandoned);
+            .expect("shutdown did not recover from the injected cancellation failure");
+        assert_eq!(outcome, ShutdownOutcome::CleanDrained);
         assert_eq!(
-            shared_refs, 2,
-            "abandonment must add exactly one quarantine reference"
+            shared_refs, 1,
+            "clean drain must release the operation-owned driver reference"
         );
         assert!(
-            !dropped.load(Ordering::Acquire),
-            "kernel-referenced operation storage was released before ring destruction"
+            dropped.load(Ordering::Acquire),
+            "the cancelled operation must be reclaimed after its terminal CQE"
         );
         assert_eq!(
             unparker_buf_drops.load(Ordering::Acquire),
-            0,
-            "abandoned shutdown must quarantine the kernel-referenced unparker buffer"
+            1,
+            "clean shutdown must release the kernel-referenced unparker buffer once"
         );
     }
 
     #[test]
-    fn cancel_all_failure_abandons_long_lived_read() {
+    fn cancel_all_failure_retries_long_lived_read() {
         let (reader, writer) = UnixStream::pair().unwrap();
         let dropped = Arc::new(AtomicBool::new(false));
-        assert_cancel_failure_abandons(LongLivedOp {
-            io: LongLivedIo::Read {
+        assert_cancel_failure_retries(
+            LongLivedIo::Read {
                 reader,
                 _writer: writer,
                 buf: Box::new([0; 8]),
             },
             dropped,
-        });
+        );
     }
 
     #[test]
-    fn cancel_all_failure_abandons_long_lived_accept() {
+    fn cancel_all_failure_retries_long_lived_accept() {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
         let dropped = Arc::new(AtomicBool::new(false));
-        assert_cancel_failure_abandons(LongLivedOp {
-            io: LongLivedIo::Accept(listener),
-            dropped,
-        });
+        assert_cancel_failure_retries(LongLivedIo::Accept(listener), dropped);
     }
 
     #[test]
@@ -1342,6 +1370,7 @@ mod tests {
         driver
             .shared
             .record_submit_error(&io::Error::from_raw_os_error(libc::EIO));
+        assert_eq!(driver.shared.status(), Status::Closing);
 
         let health = handle
             .health_error()
@@ -1366,6 +1395,120 @@ mod tests {
             "unexpected submit error: {}",
             err
         );
+    }
+
+    #[test]
+    fn shutdown_retries_submit_failure_and_releases_fd_operations() {
+        #[derive(Debug)]
+        struct PendingFdOp {
+            fd: fd::NornFd,
+            timeout: Timespec,
+            dropped: Rc<Cell<usize>>,
+        }
+
+        impl Drop for PendingFdOp {
+            fn drop(&mut self) {
+                self.dropped.set(self.dropped.get() + 1);
+            }
+        }
+
+        // Safety: RawOp keeps the timeout storage stable until the terminal CQE.
+        unsafe impl Operation for PendingFdOp {
+            fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+                let _ = self.fd.kind();
+                Ok(opcode::Timeout::new(&self.timeout).build())
+            }
+
+            fn cleanup(&mut self, _: CQEResult) {}
+        }
+
+        impl Singleshot for PendingFdOp {
+            type Output = io::Result<()>;
+
+            fn complete(self, result: CQEResult) -> Self::Output {
+                result.result.map(drop)
+            }
+        }
+
+        #[derive(Debug)]
+        struct PendingFixedFdOp {
+            fd: fd::NornFd,
+            buf: crate::fixedbuf::FixedBuf<Vec<u8>>,
+            timeout: Timespec,
+            dropped: Rc<Cell<usize>>,
+        }
+
+        impl Drop for PendingFixedFdOp {
+            fn drop(&mut self) {
+                self.dropped.set(self.dropped.get() + 1);
+            }
+        }
+
+        // Safety: RawOp keeps the timeout storage stable until the terminal CQE.
+        // The operation also retains a registered fixed buffer during that period.
+        unsafe impl Operation for PendingFixedFdOp {
+            fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+                let _ = self.fd.kind();
+                let _ = self.buf.index();
+                Ok(opcode::Timeout::new(&self.timeout).build())
+            }
+
+            fn cleanup(&mut self, _: CQEResult) {}
+        }
+
+        impl Singleshot for PendingFixedFdOp {
+            type Output = io::Result<()>;
+
+            fn complete(self, result: CQEResult) -> Self::Output {
+                result.result.map(drop)
+            }
+        }
+
+        let mut driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let weak_shared = Rc::downgrade(&driver.shared);
+        let dropped = Rc::new(Cell::new(0));
+        let guard = driver.enter();
+        let handle = driver.handle();
+        let pool = handle.register_fixed_buffers(vec![vec![0u8; 32]]).unwrap();
+        let fixed_buf = pool.try_acquire().unwrap();
+        let fd = fd::NornFd::from_fd(-1);
+        let mut op = Box::pin(handle.submit(PendingFdOp {
+            fd: fd.clone(),
+            timeout: Timespec::new().sec(3_600),
+            dropped: Rc::clone(&dropped),
+        }));
+        let mut fixed_op = Box::pin(handle.submit(PendingFixedFdOp {
+            fd,
+            buf: fixed_buf,
+            timeout: Timespec::new().sec(3_600),
+            dropped: Rc::clone(&dropped),
+        }));
+        let waker = futures_test::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+
+        assert!(Future::poll(op.as_mut(), &mut cx).is_pending());
+        assert!(Future::poll(fixed_op.as_mut(), &mut cx).is_pending());
+        driver.shared.submit(ParkMode::NoPark).unwrap();
+        drop(op);
+        drop(fixed_op);
+        driver.shared.fail_next_submit(libc::EIO);
+        drop(handle);
+        drop(guard);
+
+        Park::shutdown(&mut driver);
+
+        assert_eq!(driver.shared.status(), Status::Shutdown);
+        assert_eq!(
+            dropped.get(),
+            2,
+            "both cancelled operations must be reclaimed"
+        );
+        drop(driver);
+        assert!(
+            weak_shared.upgrade().is_none(),
+            "shutdown must break the operation/descriptor/driver ownership cycle"
+        );
+        assert_eq!(pool.unregister().unwrap().len(), 1);
     }
 
     #[test]
