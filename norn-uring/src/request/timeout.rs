@@ -532,14 +532,34 @@ impl private::Chainable for LinkedTimeout {
 
     fn finish_submit(self: Pin<&mut Self>) {
         let this = self.project();
-        this.inner.finish_submit();
-        this.control.target.state.mark_submitted();
+        match this.control.target.state.lifecycle.get() {
+            TimeoutLifecycle::Queued => {
+                this.inner.finish_submit();
+                this.control.target.state.mark_submitted();
+            }
+            TimeoutLifecycle::Complete => {}
+            TimeoutLifecycle::Prepared
+            | TimeoutLifecycle::Submitted
+            | TimeoutLifecycle::CanceledBeforeSubmit => {
+                panic!("cannot submit linked timeout more than once")
+            }
+        }
     }
 
     fn fail_submit(self: Pin<&mut Self>, err: &SubmitError) {
         let this = self.project();
-        this.inner.fail_submit(err);
-        this.control.target.state.mark_complete();
+        match this.control.target.state.lifecycle.get() {
+            TimeoutLifecycle::Queued => {
+                this.inner.fail_submit(err);
+                this.control.target.state.mark_complete();
+            }
+            TimeoutLifecycle::Complete => {}
+            TimeoutLifecycle::Prepared
+            | TimeoutLifecycle::Submitted
+            | TimeoutLifecycle::CanceledBeforeSubmit => {
+                panic!("cannot fail linked timeout submission more than once")
+            }
+        }
     }
 
     fn cancel_unfinished(self: Pin<&mut Self>) {
@@ -1238,6 +1258,47 @@ mod tests {
         assert_eq!(failed.unwrap_err().raw_os_error(), Some(libc::EINVAL));
         assert_eq!(cancel.unwrap_err().raw_os_error(), Some(libc::ECANCELED));
         drop(timeout);
+    }
+
+    #[test]
+    fn configure_failure_before_linked_timeout_returns_the_error() {
+        let driver = crate::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let handle = driver.handle();
+        let request = handle
+            .submit(ConfigureFails)
+            .timeout(Duration::from_secs(60));
+        let control = request.control();
+        let mut executor = LocalExecutor::new(driver);
+
+        let error = executor.block_on(request).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
+        assert_eq!(
+            control.target.state.lifecycle.get(),
+            TimeoutLifecycle::Complete
+        );
+
+        let mut reset = std::pin::pin!(control.reset(Duration::from_secs(1)));
+        assert!(!poll_ready(reset.as_mut()).unwrap());
+    }
+
+    #[test]
+    fn partial_batch_configure_failure_cancels_linked_timeout() {
+        let driver = crate::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let handle = driver.handle();
+        let request = handle
+            .submit(Nop)
+            .then(handle.submit(ConfigureFails))
+            .timeout(Duration::from_secs(60));
+        let control = request.control();
+        let mut executor = LocalExecutor::new(driver);
+
+        let (nop, failed) = executor.block_on(request);
+        nop.unwrap();
+        assert_eq!(failed.unwrap_err().raw_os_error(), Some(libc::EINVAL));
+        assert_eq!(
+            control.target.state.lifecycle.get(),
+            TimeoutLifecycle::Complete
+        );
     }
 
     #[test]
