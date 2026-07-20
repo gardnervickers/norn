@@ -4,6 +4,7 @@ members = [
     "benches",
     "examples/norn-kv",
     "examples/ping-pong-grpc",
+    "norn-channel",
     "norn-executor",
     "norn-nursery",
     "norn-task",
@@ -12,6 +13,7 @@ members = [
     "norn-util",
 ]
 default-members = [
+    "norn-channel",
     "norn-executor",
     "norn-nursery",
     "norn-task",
@@ -29,6 +31,7 @@ futures-test = { version = "0.3" }
 futures-core = { version = "0.3" }
 log = { version = "0.4" }
 bytes = { version = "1" }
+crossbeam-queue = "0.3"
 
 [profile.release]
 codegen-units = 1

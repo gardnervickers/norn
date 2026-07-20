@@ -24,6 +24,8 @@ and in most cases non-existant.
   any substantial changes to the API.
 - [`norn-executor`] is the single-threaded executor. It is not complete. The
   API is likely to change.
+- [`norn-channel`] provides bounded cross-thread channels whose receive-side
+  wakers remain local to a destination executor.
 - [`norn-nursery`] provides scoped async concurrency on top of `norn-task`.
   It is inspired by [moro].
 - [`norn-uring`] is a uring-based backend for the executor. It is not complete
