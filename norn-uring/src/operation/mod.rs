@@ -54,6 +54,12 @@ pub unsafe trait Operation {
     /// invalidate the pointed-to storage during that period.
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry>;
 
+    /// Called after the SQE has been queued for submission.
+    ///
+    /// This is the point where operations may safely publish userspace state that must only
+    /// become visible once the SQE exists in the submission queue.
+    fn on_submit(&mut self) {}
+
     /// Release resources represented by an unconsumed completion.
     ///
     /// When an application drops a submitted operation, the runtime continues reaping its
@@ -264,14 +270,28 @@ where
 
     fn finish_submit(&mut self) {
         let state = mem::replace(self, State::Done);
-        *self = match state {
-            State::Waiting { mut handle } => State::Submitted {
-                inner: SubmittedOp {
-                    inner: handle.take().expect("handle missing"),
-                },
-            },
-            state => state,
+        let State::Waiting { mut handle } = state else {
+            *self = state;
+            return;
         };
+        *self = State::Submitted {
+            inner: SubmittedOp {
+                inner: handle.take().expect("handle missing"),
+            },
+        };
+        let State::Submitted { inner } = self else {
+            unreachable!("operation did not transition to submitted")
+        };
+        // Safety: queueing succeeded, the operation remains pinned in RawOp, and this is the
+        // only mutable access before the kernel completion path. Transitioning the state first
+        // ensures a panicking hook still leaves Drop able to cancel the queued operation.
+        unsafe {
+            inner
+                .inner
+                .data_mut()
+                .expect("operation data missing after submission")
+                .on_submit();
+        }
     }
 
     fn fail_submit(&mut self, err: &SubmitError) {
@@ -899,6 +919,36 @@ mod tests {
         let op = op.as_ref().get_ref();
         assert!(op.submit.is_none());
         assert!(matches!(op.state, State::Submitted { .. }));
+    }
+
+    #[test]
+    fn on_submit_runs_only_after_sqe_is_queued() {
+        #[derive(Debug)]
+        struct SubmitHookOp(Rc<Cell<bool>>);
+
+        unsafe impl Operation for SubmitHookOp {
+            fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+                Ok(io_uring::opcode::Nop::new().build())
+            }
+
+            fn on_submit(&mut self) {
+                self.0.set(true);
+            }
+
+            fn cleanup(&mut self, _: CQEResult) {}
+        }
+
+        let submitted = Rc::new(Cell::new(false));
+        let handle = TypedHandle::new(SubmitHookOp(Rc::clone(&submitted)));
+        let mut state = State::Waiting {
+            handle: Some(handle),
+        };
+        assert!(!submitted.get());
+
+        state.finish_submit();
+
+        assert!(submitted.get());
+        assert!(matches!(state, State::Submitted { .. }));
     }
 
     #[test]
