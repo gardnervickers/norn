@@ -726,7 +726,9 @@ impl Park for Driver {
     type Guard = context::DriverContextGuard;
 
     fn park(&mut self, mut mode: ParkMode) -> Result<(), io::Error> {
+        self.shared.flush_zcrx_refills();
         let drained = self.drain::<32>(usize::MAX);
+        self.shared.flush_zcrx_refills();
         if drained > 0 {
             trace!(target: LOG, "park.drained {}", drained);
             mode = ParkMode::NoPark;
@@ -738,6 +740,7 @@ impl Park for Driver {
                 Err(err) if err.raw_os_error() == Some(libc::EBUSY) => {
                     trace!(target: LOG, "park.ebusy");
                     let drained = self.drain::<32>(usize::MAX);
+                    self.shared.flush_zcrx_refills();
                     trace!(target: LOG, "park.drained {}", drained);
                     mode = ParkMode::NoPark;
                     continue;
@@ -833,6 +836,12 @@ impl Driver {
 }
 
 impl Shared {
+    fn flush_zcrx_refills(&self) {
+        for registration in self.zcrx_ifqs.borrow().iter() {
+            registration.flush_refills();
+        }
+    }
+
     fn validate_batch_len(&self, batch_len: usize) -> Result<(), SubmitError> {
         if batch_len <= 1 {
             return Ok(());

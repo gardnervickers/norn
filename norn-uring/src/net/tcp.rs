@@ -263,7 +263,8 @@ impl TcpSocket {
     /// The IFQ must be registered with the same CQE32 driver as this socket.
     /// This method does not fall back to buffered receive when zero-copy
     /// receive is unavailable. A second active stream for the same IFQ yields
-    /// [`io::ErrorKind::WouldBlock`].
+    /// [`io::ErrorKind::WouldBlock`]. A `len` of zero lets the kernel select
+    /// the receive size, bounded by the registered area.
     pub fn recv_zc_multi(&self, len: u32, ifq: &crate::zcrx::ZcRxIfq) -> Op<socket::RecvZc> {
         self.socket.recv_zc_multi(len, ifq)
     }

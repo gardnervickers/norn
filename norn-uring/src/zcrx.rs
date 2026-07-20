@@ -1,6 +1,7 @@
 //! Zero-copy receive queue registration and buffers.
 
-use std::cell::{Cell, UnsafeCell};
+use std::cell::{Cell, RefCell, UnsafeCell};
+use std::collections::VecDeque;
 use std::fmt;
 use std::io;
 use std::ptr::NonNull;
@@ -72,12 +73,21 @@ struct Inner {
     area_token: u64,
     zcrx_id: u32,
     local_tail: Cell<u32>,
+    pending_refills: RefCell<VecDeque<Refill>>,
     inflight: Cell<bool>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Refill {
+    offset: u64,
+    len: u32,
 }
 
 struct AnonymousMmap {
     ptr: NonNull<u8>,
     len: usize,
+    #[cfg(test)]
+    drop_result: Option<Rc<Cell<Option<i32>>>>,
 }
 
 impl ZcRxIfq {
@@ -92,6 +102,7 @@ impl ZcRxIfq {
                 "zero-copy receive IFQ and socket must target the same CQE32 driver",
             ));
         }
+        self.flush_refills();
         self.inner.acquire()
     }
 
@@ -113,6 +124,22 @@ impl ZcRxIfq {
             )
         })?;
         self.inner.recv_buf(submitted_len, len, extra[0])
+    }
+
+    pub(crate) fn recycle_completion(&self, submitted_len: u32, result: CQEResult) {
+        // Only positive multishot data CQEs name an area region. The terminal
+        // CQE may be Ok(0) with zeroed extra fields and must not publish a
+        // duplicate offset-zero refill.
+        let is_data = result.more() && matches!(&result.result, Ok(len) if *len > 0);
+        if is_data {
+            if let Ok(buf) = self.parse_completion(submitted_len, result) {
+                drop(buf);
+            }
+        }
+    }
+
+    pub(crate) fn flush_refills(&self) {
+        self.inner.flush_refills();
     }
 }
 
@@ -229,13 +256,25 @@ impl Registration {
         // code can access these stack-local `UnsafeCell` values.
         let registered = unsafe { *ifq_reg.get() };
         let registered_area = unsafe { *area_reg.get() };
+        let rq_entries =
+            match validate_registered_rq_entries(config.rq_entries, registered.rq_entries) {
+                Ok(rq_entries) => rq_entries,
+                Err(err) => {
+                    // Registration succeeded, so the kernel may retain these
+                    // mappings until ring destruction. Quarantine them rather
+                    // than releasing memory through an invalid registration.
+                    std::mem::forget(area);
+                    std::mem::forget(region);
+                    return Err(err);
+                }
+            };
         let pointers = (|| {
             let head = pointer_at::<AtomicU32>(&region, registered.offsets.head as usize, 1)?;
             let tail = pointer_at::<AtomicU32>(&region, registered.offsets.tail as usize, 1)?;
             let rqes = pointer_at::<types::io_uring_zcrx_rqe>(
                 &region,
                 registered.offsets.rqes as usize,
-                config.rq_entries as usize,
+                rq_entries as usize,
             )?;
             Ok::<_, io::Error>((head, tail, rqes))
         })();
@@ -261,11 +300,12 @@ impl Registration {
                 head,
                 tail,
                 rqes,
-                rq_entries: config.rq_entries,
+                rq_entries,
                 area_len,
                 area_token: registered_area.rq_area_token,
                 zcrx_id: registered.zcrx_id,
                 local_tail: Cell::new(local_tail),
+                pending_refills: RefCell::new(VecDeque::new()),
                 inflight: Cell::new(false),
             }),
         })
@@ -276,6 +316,10 @@ impl Registration {
             inner: Rc::clone(&self.inner),
             handle,
         }
+    }
+
+    pub(crate) fn flush_refills(&self) {
+        self.inner.flush_refills();
     }
 }
 
@@ -296,7 +340,7 @@ impl Inner {
         len: u32,
         cqe_offset: u64,
     ) -> io::Result<ZcRecvBuf> {
-        if len > submitted_len {
+        if submitted_len != 0 && len > submitted_len {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "zero-copy receive completion exceeds the submitted length",
@@ -341,26 +385,43 @@ impl Inner {
 
     fn return_buffer(&self, cqe_offset: u64, len: u32) {
         // The ZCRX RQ is a userspace-producer/kernel-consumer refill queue.
-        // Publish the descriptor before the release-store to the shared tail.
-        let tail = self.local_tail.get();
-        // Safety: registration validated the shared head pointer.
-        let head = unsafe { self.head.as_ref().load(Ordering::Acquire) };
-        if tail.wrapping_sub(head) >= self.rq_entries {
-            log::error!("zero-copy receive refill queue is full; buffer cannot be returned");
+        // Retain every descriptor in userspace until it can be published; the
+        // kernel may temporarily leave the shared ring full.
+        self.pending_refills.borrow_mut().push_back(Refill {
+            offset: (cqe_offset & !area_mask()) | (self.area_token & area_mask()),
+            len,
+        });
+        self.flush_refills();
+    }
+
+    fn flush_refills(&self) {
+        let mut pending = self.pending_refills.borrow_mut();
+        if pending.is_empty() {
             return;
         }
 
-        let index = tail & (self.rq_entries - 1);
-        let rqe = types::io_uring_zcrx_rqe {
-            off: (cqe_offset & !area_mask()) | (self.area_token & area_mask()),
-            len,
-            ..Default::default()
-        };
-        // Safety: `rqes` points to `rq_entries` registered entries and `index`
-        // is masked into that range. This single-threaded driver is the sole
-        // userspace producer.
-        unsafe { self.rqes.as_ptr().add(index as usize).write(rqe) };
-        let next = tail.wrapping_add(1);
+        let tail = self.local_tail.get();
+        // Safety: registration validated the shared head pointer.
+        let head = unsafe { self.head.as_ref().load(Ordering::Acquire) };
+        let available = self.rq_entries.saturating_sub(tail.wrapping_sub(head)) as usize;
+        let publish = available.min(pending.len());
+        let mut next = tail;
+        for refill in pending.drain(..publish) {
+            let index = next & (self.rq_entries - 1);
+            let rqe = types::io_uring_zcrx_rqe {
+                off: refill.offset,
+                len: refill.len,
+                ..Default::default()
+            };
+            // Safety: `rqes` points to `rq_entries` registered entries and
+            // `index` is masked into that range. This single-threaded driver is
+            // the sole userspace producer.
+            unsafe { self.rqes.as_ptr().add(index as usize).write(rqe) };
+            next = next.wrapping_add(1);
+        }
+        if next == tail {
+            return;
+        }
         self.local_tail.set(next);
         // Safety: registration validated the shared tail pointer.
         unsafe { self.tail.as_ref().store(next, Ordering::Release) };
@@ -369,6 +430,37 @@ impl Inner {
 
 impl AnonymousMmap {
     fn new(len: usize) -> io::Result<Self> {
+        Self::new_with_madvise(len, |ptr, len| {
+            // Safety: `ptr..ptr+len` is the live mapping just returned by mmap.
+            match unsafe { libc::madvise(ptr.as_ptr().cast(), len, libc::MADV_DONTFORK) } {
+                0 => Ok(()),
+                _ => Err(io::Error::last_os_error()),
+            }
+        })
+    }
+
+    fn new_with_madvise(
+        len: usize,
+        madvise: impl FnOnce(NonNull<u8>, usize) -> io::Result<()>,
+    ) -> io::Result<Self> {
+        let mapping = Self::map(len)?;
+        madvise(mapping.ptr, mapping.len)?;
+        Ok(mapping)
+    }
+
+    #[cfg(test)]
+    fn new_with_madvise_and_drop_result(
+        len: usize,
+        drop_result: Rc<Cell<Option<i32>>>,
+        madvise: impl FnOnce(NonNull<u8>, usize) -> io::Result<()>,
+    ) -> io::Result<Self> {
+        let mut mapping = Self::map(len)?;
+        mapping.drop_result = Some(drop_result);
+        madvise(mapping.ptr, mapping.len)?;
+        Ok(mapping)
+    }
+
+    fn map(len: usize) -> io::Result<Self> {
         // Safety: the arguments request a private anonymous mapping with no fd.
         let ptr = unsafe {
             libc::mmap(
@@ -386,6 +478,8 @@ impl AnonymousMmap {
         Ok(Self {
             ptr: NonNull::new(ptr.cast()).expect("mmap returned a null success pointer"),
             len,
+            #[cfg(test)]
+            drop_result: None,
         })
     }
 }
@@ -395,6 +489,10 @@ impl Drop for AnonymousMmap {
         // Safety: this is the exact mapping returned by `mmap` and it is
         // released only after the ring no longer owns the registration.
         let result = unsafe { libc::munmap(self.ptr.as_ptr().cast(), self.len) };
+        #[cfg(test)]
+        if let Some(drop_result) = &self.drop_result {
+            drop_result.set(Some(result));
+        }
         if result != 0 {
             log::error!(
                 "failed to unmap zero-copy receive memory: {:?}",
@@ -418,6 +516,16 @@ fn align_up(value: usize, alignment: usize) -> io::Result<usize> {
         .checked_add(alignment - 1)
         .map(|value| value & !(alignment - 1))
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "mapping length overflowed"))
+}
+
+fn validate_registered_rq_entries(requested: u32, registered: u32) -> io::Result<u32> {
+    if registered == 0 || !registered.is_power_of_two() || registered > requested {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "kernel returned invalid zero-copy receive rq_entries",
+        ));
+    }
+    Ok(registered)
 }
 
 fn pointer_at<T>(mapping: &AnonymousMmap, offset: usize, count: usize) -> io::Result<NonNull<T>> {
@@ -470,6 +578,7 @@ mod tests {
             area_token: 3u64 << types::IORING_ZCRX_AREA_SHIFT,
             zcrx_id: 7,
             local_tail: Cell::new(0),
+            pending_refills: RefCell::new(VecDeque::new()),
             inflight: Cell::new(false),
         })
     }
@@ -487,6 +596,120 @@ mod tests {
         let rqe = unsafe { inner.rqes.as_ptr().read() };
         assert_eq!(rqe.off, cqe_offset);
         assert_eq!(rqe.len, 64);
+    }
+
+    #[test]
+    fn terminal_cleanup_does_not_recycle_a_live_offset_zero_buffer() {
+        let driver = crate::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let inner = test_inner(4096, 8);
+        let ifq = ZcRxIfq {
+            inner: Rc::clone(&inner),
+            handle: driver.handle(),
+        };
+        let held = inner.recv_buf(0, 64, inner.area_token).unwrap();
+
+        ifq.recycle_completion(0, CQEResult::new_big(Ok(0), 0, [inner.area_token, 0]));
+        ifq.recycle_completion(
+            64,
+            CQEResult::new_big(Ok(32), 0, [inner.area_token | 128, 0]),
+        );
+        assert_eq!(inner.local_tail.get(), 0);
+        assert!(inner.pending_refills.borrow().is_empty());
+
+        drop(held);
+        assert_eq!(inner.local_tail.get(), 1);
+        let rqe = unsafe { inner.rqes.as_ptr().read() };
+        assert_eq!(rqe.off, inner.area_token);
+        assert_eq!(rqe.len, 64);
+
+        ifq.recycle_completion(
+            64,
+            CQEResult::new_big(Ok(32), more_flag(), [inner.area_token | 256, 0]),
+        );
+        assert_eq!(inner.local_tail.get(), 2);
+        let rqe = unsafe { inner.rqes.as_ptr().add(1).read() };
+        assert_eq!(rqe.off, inner.area_token | 256);
+        assert_eq!(rqe.len, 32);
+    }
+
+    #[test]
+    fn zero_submitted_length_accepts_kernel_selected_size() {
+        let driver = crate::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let inner = test_inner(4096, 8);
+        let ifq = ZcRxIfq {
+            inner: Rc::clone(&inner),
+            handle: driver.handle(),
+        };
+        let buf = ifq
+            .parse_completion(
+                0,
+                CQEResult::new_big(Ok(512), more_flag(), [inner.area_token | 128, 0]),
+            )
+            .unwrap();
+        assert_eq!(buf.len(), 512);
+    }
+
+    #[test]
+    fn full_refill_ring_defers_without_losing_descriptors() {
+        let inner = test_inner(4096, 2);
+        for offset in [0, 64, 128] {
+            drop(inner.recv_buf(0, 32, inner.area_token | offset).unwrap());
+        }
+
+        assert_eq!(inner.local_tail.get(), 2);
+        assert_eq!(
+            inner.pending_refills.borrow().as_slices().0,
+            &[Refill {
+                offset: inner.area_token | 128,
+                len: 32,
+            }]
+        );
+
+        // Safety: the test mapping owns this validated shared-head pointer.
+        unsafe { inner.head.as_ref().store(1, Ordering::Release) };
+        inner.flush_refills();
+
+        assert_eq!(inner.local_tail.get(), 3);
+        assert!(inner.pending_refills.borrow().is_empty());
+        // Tail 2 wraps to slot 0 after the kernel consumes the first entry.
+        let rqe = unsafe { inner.rqes.as_ptr().read() };
+        assert_eq!(rqe.off, inner.area_token | 128);
+        assert_eq!(rqe.len, 32);
+    }
+
+    #[test]
+    fn kernel_returned_rq_entries_may_clamp_the_request() {
+        assert_eq!(validate_registered_rq_entries(128, 64).unwrap(), 64);
+        for invalid in [0, 3, 256] {
+            assert_eq!(
+                validate_registered_rq_entries(128, invalid)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+    }
+
+    #[test]
+    fn anonymous_mmap_is_unmapped_when_madvise_fails() {
+        let len = page_size().unwrap();
+        let drop_result = Rc::new(Cell::new(None));
+        let result = AnonymousMmap::new_with_madvise_and_drop_result(
+            len,
+            Rc::clone(&drop_result),
+            |ptr, len| {
+                let mut residency = 0;
+                let result = unsafe { libc::mincore(ptr.as_ptr().cast(), len, &mut residency) };
+                assert_eq!(result, 0, "mapping must be live while madvise runs");
+
+                Err(io::Error::from_raw_os_error(libc::EINVAL))
+            },
+        );
+        let Err(err) = result else {
+            panic!("injected madvise failure unexpectedly succeeded");
+        };
+        assert_eq!(err.raw_os_error(), Some(libc::EINVAL));
+        assert_eq!(drop_result.get(), Some(0));
     }
 
     #[test]
@@ -509,9 +732,7 @@ mod tests {
             inner: Rc::clone(&inner),
             handle: driver.handle(),
         };
-        let more = (0..=u32::MAX)
-            .find(|flags| io_uring::cqueue::more(*flags))
-            .unwrap();
+        let more = more_flag();
 
         let missing = ifq
             .parse_completion(64, CQEResult::new(Ok(32), more))
@@ -548,5 +769,11 @@ mod tests {
             ifq.parse_completion(64, overlength).unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
+    }
+
+    fn more_flag() -> u32 {
+        (0..=u32::MAX)
+            .find(|flags| io_uring::cqueue::more(*flags))
+            .unwrap()
     }
 }

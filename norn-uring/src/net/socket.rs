@@ -1076,9 +1076,7 @@ unsafe impl Operation for RecvZc {
     }
 
     fn cleanup(&mut self, result: crate::operation::CQEResult) {
-        if let Ok(buf) = self.to_item(result) {
-            drop(buf);
-        }
+        self.ifq.recycle_completion(self.len, result);
     }
 }
 

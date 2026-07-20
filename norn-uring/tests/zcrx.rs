@@ -11,7 +11,7 @@ use norn_uring::zcrx::ZcRxIfqConfig;
 mod util;
 
 #[test]
-#[ignore = "requires Linux 6.15+, a ZCRX-capable NIC queue, and CAP_NET_ADMIN"]
+#[ignore = "requires Linux 6.15+, a ZCRX-capable NIC queue, and CAP_NET_ADMIN; loopback may copy"]
 fn recv_zc_multi_smoke() -> Result<(), Box<dyn std::error::Error>> {
     let Some(if_index) = env_u32("NORN_ZCRX_IFINDEX")? else {
         eprintln!("NORN_ZCRX_IFINDEX is unset; skipping ZCRX smoke test");
@@ -49,6 +49,9 @@ fn recv_zc_multi_smoke() -> Result<(), Box<dyn std::error::Error>> {
         let (server, _) = listener.accept().await?;
         let client = client_task.await??;
 
+        // Loopback validates registration and API plumbing, but the kernel may
+        // use its copy fallback. Verifying hardware zero-copy requires traffic
+        // arriving on the configured physical NIC queue.
         let payload = b"norn-zcrx-smoke".to_vec();
         let (sent, payload) = client.send(payload).await;
         assert_eq!(sent?, payload.len());
