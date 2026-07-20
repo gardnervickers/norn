@@ -160,8 +160,9 @@ impl TimeoutControl {
     /// Cancel the timeout.
     ///
     /// The returned request resolves to `Ok(true)` when this call canceled a
-    /// prepared or active timeout. It resolves to `Ok(false)` when the timeout
-    /// had already completed or its completion was already in progress.
+    /// prepared or active timeout. It resolves to `Ok(false)` when no matching
+    /// timeout could be removed, including when it had already completed or its
+    /// completion was already in progress.
     ///
     /// Canceling before the [`Timeout`] is first polled is handled locally; the
     /// timeout will never be submitted later.
@@ -172,8 +173,9 @@ impl TimeoutControl {
     /// Reset the timeout to expire after `duration` from the update.
     ///
     /// The returned request resolves to `Ok(true)` when the new duration was
-    /// applied. It resolves to `Ok(false)` when the timeout had already
-    /// completed or its completion was already in progress.
+    /// applied. It resolves to `Ok(false)` when no matching timeout could be
+    /// updated, including when it had already completed or its completion was
+    /// already in progress.
     ///
     /// Resetting before the [`Timeout`] is first polled updates its initial
     /// duration locally and does not submit an unnecessary control request.
@@ -204,8 +206,9 @@ impl LinkedTimeoutControl {
     /// Reset the linked timeout to expire after `duration` from the update.
     ///
     /// The returned request resolves to `Ok(true)` when the new duration was
-    /// applied and `Ok(false)` when the linked timeout had already completed or
-    /// its completion was already in progress.
+    /// applied and `Ok(false)` when no matching linked timeout could be updated,
+    /// including when it had already completed or its completion was already in
+    /// progress.
     pub fn reset(&self, duration: Duration) -> TimeoutUpdate {
         TimeoutUpdate::new(self.target.clone(), duration)
     }
@@ -1057,7 +1060,14 @@ impl Singleshot for TimeoutUpdateOp {
 fn control_result(action: &'static str, result: CQEResult) -> io::Result<bool> {
     match result.into_result() {
         Ok(0) => Ok(true),
-        Err(err) if matches!(err.raw_os_error(), Some(libc::ENOENT | libc::EBUSY)) => Ok(false),
+        Err(err)
+            if matches!(
+                err.raw_os_error(),
+                Some(libc::ENOENT | libc::EALREADY | libc::EBUSY)
+            ) =>
+        {
+            Ok(false)
+        }
         Err(err) => Err(err),
         Ok(result) => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1466,5 +1476,58 @@ mod tests {
                 .unwrap(),
             TimeoutOutcome::Expired
         );
+    }
+
+    #[test]
+    fn concurrent_timeout_control_completion_is_not_an_error() {
+        for errno in [libc::ENOENT, libc::EALREADY, libc::EBUSY] {
+            let result = CQEResult::synthetic(Err(io::Error::from_raw_os_error(errno)));
+            assert!(!control_result("timeout control", result).unwrap());
+        }
+    }
+
+    #[test]
+    fn shutdown_cancels_a_live_timeout_and_completes_its_controls() {
+        let mut driver = crate::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let handle = driver.handle();
+        let timeout = handle.timeout(Duration::from_secs(60));
+        let control = timeout.control();
+        let mut timeout = std::pin::pin!(timeout);
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(Future::poll(timeout.as_mut(), &mut cx).is_pending());
+        driver.park(ParkMode::NoPark).unwrap();
+        Park::shutdown(&mut driver);
+
+        assert_eq!(
+            poll_ready(timeout.as_mut()).unwrap(),
+            TimeoutOutcome::Canceled
+        );
+        let mut cancel = std::pin::pin!(control.cancel());
+        let mut reset = std::pin::pin!(control.reset(Duration::from_secs(1)));
+        assert!(!poll_ready(cancel.as_mut()).unwrap());
+        assert!(!poll_ready(reset.as_mut()).unwrap());
+    }
+
+    #[test]
+    fn dropping_a_submitted_timeout_is_reclaimed_during_shutdown() {
+        let mut driver = crate::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let handle = driver.handle();
+        let timeout = handle.timeout(Duration::from_secs(60));
+        let control = timeout.control();
+        let mut timeout = Box::pin(timeout);
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(Future::poll(timeout.as_mut(), &mut cx).is_pending());
+        driver.park(ParkMode::NoPark).unwrap();
+        drop(timeout);
+        Park::shutdown(&mut driver);
+
+        let mut cancel = std::pin::pin!(control.cancel());
+        let mut reset = std::pin::pin!(control.reset(Duration::from_secs(1)));
+        assert!(!poll_ready(cancel.as_mut()).unwrap());
+        assert!(!poll_ready(reset.as_mut()).unwrap());
     }
 }
