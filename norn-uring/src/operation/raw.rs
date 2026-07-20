@@ -111,11 +111,34 @@ where
 pub struct CQEResult {
     pub(crate) result: io::Result<u32>,
     pub(crate) flags: u32,
+    source: CompletionSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompletionSource {
+    Kernel,
+    Synthetic,
 }
 
 impl CQEResult {
     pub(crate) fn new(result: io::Result<u32>, flags: u32) -> Self {
-        Self { result, flags }
+        Self {
+            result,
+            flags,
+            source: CompletionSource::Kernel,
+        }
+    }
+
+    pub(crate) fn synthetic(result: io::Result<u32>) -> Self {
+        Self {
+            result,
+            flags: 0,
+            source: CompletionSource::Synthetic,
+        }
+    }
+
+    pub(crate) fn is_synthetic(&self) -> bool {
+        self.source == CompletionSource::Synthetic
     }
 
     /// Consume the completion and return its result value.

@@ -198,10 +198,9 @@ where
                 mut error,
             } => {
                 let handle = handle.take().expect("handle missing");
-                handle.untyped().complete(CQEResult::new(
-                    Err(error.take().expect("configuration error missing")),
-                    0,
-                ));
+                handle.untyped().complete(CQEResult::synthetic(Err(error
+                    .take()
+                    .expect("configuration error missing"))));
                 *self = State::Submitted {
                     inner: SubmittedOp { inner: handle },
                 };
@@ -252,10 +251,11 @@ where
                 return false;
             }
         };
-        handle.untyped().complete(CQEResult::new(
-            Err(io::Error::from_raw_os_error(libc::ECANCELED)),
-            0,
-        ));
+        handle
+            .untyped()
+            .complete(CQEResult::synthetic(Err(io::Error::from_raw_os_error(
+                libc::ECANCELED,
+            ))));
         *self = State::Submitted {
             inner: SubmittedOp { inner: handle },
         };
@@ -281,7 +281,7 @@ where
                 let handle = handle.take().expect("handle missing");
                 handle
                     .untyped()
-                    .complete(CQEResult::new(Err(err.to_io_error()), 0));
+                    .complete(CQEResult::synthetic(Err(err.to_io_error())));
                 State::Submitted {
                     inner: SubmittedOp { inner: handle },
                 }
@@ -806,10 +806,11 @@ mod tests {
         }
 
         impl Singleshot for SubmitFailureOp {
-            type Output = io::Result<()>;
+            type Output = (bool, io::Result<()>);
 
             fn complete(self, result: CQEResult) -> Self::Output {
-                result.result.map(drop)
+                let synthetic = result.is_synthetic();
+                (synthetic, result.result.map(drop))
             }
         }
 
@@ -827,7 +828,7 @@ mod tests {
         .expect("poll should not panic");
 
         match poll_result {
-            Poll::Ready(Err(_)) => {}
+            Poll::Ready((true, Err(_))) => {}
             other => panic!("expected ready error, got: {other:?}"),
         }
     }
@@ -846,10 +847,11 @@ mod tests {
         }
 
         impl Singleshot for ConfigurationFailureOp {
-            type Output = io::Result<()>;
+            type Output = (bool, io::Result<()>);
 
             fn complete(self, result: CQEResult) -> Self::Output {
-                result.result.map(drop)
+                let synthetic = result.is_synthetic();
+                (synthetic, result.result.map(drop))
             }
         }
 
@@ -859,9 +861,10 @@ mod tests {
         let waker = futures_test::task::noop_waker();
         let mut cx = std::task::Context::from_waker(&waker);
 
-        let Poll::Ready(Err(err)) = Future::poll(op.as_mut(), &mut cx) else {
+        let Poll::Ready((synthetic, Err(err))) = Future::poll(op.as_mut(), &mut cx) else {
             panic!("configuration failure should complete immediately")
         };
+        assert!(synthetic);
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
