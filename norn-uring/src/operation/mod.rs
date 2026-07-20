@@ -215,9 +215,25 @@ where
     }
 
     fn start_submit(&mut self) -> Option<ConfiguredEntry> {
-        let mut batch = SmallVec::new();
-        self.prepare_batch(&mut batch);
-        batch.pop()
+        // Keep ordinary submissions on the direct path. Linked requests use
+        // `prepare_batch`, which carries the configuration-failure semantics.
+        let state = mem::replace(self, State::Done);
+        match state {
+            State::Prepared {
+                mut handle,
+                mut entry,
+            } => {
+                let entry = entry.take().expect("entry missing");
+                *self = State::Waiting {
+                    handle: Some(handle.take().expect("handle missing")),
+                };
+                Some(entry)
+            }
+            state => {
+                *self = state;
+                None
+            }
+        }
     }
 
     fn cancel_unsubmitted(&mut self) -> bool {
@@ -287,17 +303,7 @@ where
 
         let entry = match T::configure(data) {
             Ok(entry) => entry,
-            Err(err) => {
-                return Self {
-                    submit: None,
-                    state: State::ConfigureFailed {
-                        handle: Some(handle),
-                        error: Some(err),
-                    },
-                    reactor,
-                    completed: false,
-                };
-            }
+            Err(err) => return Self::configure_failed(handle, err, reactor),
         };
         let entry = ConfiguredEntry::new(handle.untyped(), entry);
 
@@ -306,6 +312,20 @@ where
             state: State::Prepared {
                 handle: Some(handle),
                 entry: Some(entry),
+            },
+            reactor,
+            completed: false,
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn configure_failed(handle: TypedHandle<T>, error: io::Error, reactor: crate::Handle) -> Self {
+        Self {
+            submit: None,
+            state: State::ConfigureFailed {
+                handle: Some(handle),
+                error: Some(error),
             },
             reactor,
             completed: false,
