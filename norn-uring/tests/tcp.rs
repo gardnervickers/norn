@@ -54,6 +54,76 @@ fn single_accept_connection() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn close_rejects_unpolled_operation_without_invalidating_it(
+) -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let (server, client) = connected_pair().await?;
+
+        let recv = server.recv(BytesMut::with_capacity(16));
+        let err = server.close().await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+
+        let payload = b"still-open".to_vec();
+        client.send(payload).await.0?;
+        let (res, buf) = recv.await;
+        let len = res?;
+        assert_eq!(&buf[..len], b"still-open");
+
+        client.close().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn close_rejects_queued_operation_without_invalidating_it() -> Result<(), Box<dyn std::error::Error>>
+{
+    util::with_test_env(|| async {
+        let (server, client) = connected_pair().await?;
+
+        let mut recv = pin!(server.recv(BytesMut::with_capacity(16)));
+        assert!(futures_util::poll!(&mut recv).is_pending());
+
+        let err = server.close().await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+
+        let payload = b"still-open".to_vec();
+        client.send(payload).await.0?;
+        let (res, buf) = recv.await;
+        let len = res?;
+        assert_eq!(&buf[..len], b"still-open");
+
+        client.close().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn close_rejects_submitted_operation_without_invalidating_it(
+) -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let (server, client) = connected_pair().await?;
+
+        let recv = server.recv(BytesMut::with_capacity(16));
+        let recv_task = spawn(recv);
+
+        // Completing a separate ring round trip ensures the receive was submitted
+        // to the kernel before explicit close checks descriptor ownership.
+        norn_uring::noop().await;
+        let err = server.close().await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+
+        let payload = b"still-open".to_vec();
+        client.send(payload).await.0?;
+        let (res, buf) = recv_task.await?;
+        let len = res?;
+        assert_eq!(&buf[..len], b"still-open");
+
+        client.close().await?;
+        Ok(())
+    })
+}
+
+#[test]
 fn echo() -> Result<(), Box<dyn std::error::Error>> {
     util::with_test_env(|| async {
         let server = EchoServer::new().await?;
@@ -216,7 +286,7 @@ impl EchoServer {
             socket.set_recv_buffer_size(64).await?;
             socket.set_send_buffer_size(64).await?;
             spawn(async move {
-                let (mut reader, mut writer) = socket.into_stream().owned_split();
+                let (reader, writer) = socket.into_stream().owned_split();
                 let mut reader = pin!(reader);
                 let mut writer = pin!(writer);
                 if let Err(err) = tokio::io::copy(&mut reader, &mut writer).await {

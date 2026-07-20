@@ -99,6 +99,12 @@ impl TcpListener {
     }
 
     /// Closes the listener.
+    ///
+    /// Returns [`io::ErrorKind::WouldBlock`] if another owner or operation still
+    /// retains the descriptor. Prepared operations are not submitted or cancelled
+    /// by this call; queued, submitted, and completed-but-unconsumed operations
+    /// continue retaining the descriptor until they are dropped or consumed. If
+    /// close is rejected, dropping the last owner still closes the descriptor.
     pub async fn close(self) -> io::Result<()> {
         self.socket.close().await
     }
@@ -308,6 +314,12 @@ impl TcpSocket {
     }
 
     /// Close the socket.
+    ///
+    /// Returns [`io::ErrorKind::WouldBlock`] if another owner or operation still
+    /// retains the descriptor. Prepared operations are not submitted or cancelled
+    /// by this call; queued, submitted, and completed-but-unconsumed operations
+    /// continue retaining the descriptor until they are dropped or consumed. If
+    /// close is rejected, dropping the last owner still closes the descriptor.
     pub async fn close(self) -> io::Result<()> {
         self.socket.close().await
     }

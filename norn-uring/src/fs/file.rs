@@ -338,6 +338,12 @@ impl File {
     }
 
     /// Close the file.
+    ///
+    /// Returns [`io::ErrorKind::WouldBlock`] if another owner or operation still
+    /// retains the descriptor. Prepared operations are not submitted or cancelled
+    /// by this call; queued, submitted, and completed-but-unconsumed operations
+    /// continue retaining the descriptor until they are dropped or consumed. If
+    /// close is rejected, dropping the last owner still closes the descriptor.
     pub async fn close(self) -> io::Result<()> {
         self.fd.close().await
     }
@@ -370,6 +376,12 @@ impl PipeReader {
     }
 
     /// Close the pipe read end.
+    ///
+    /// Returns [`io::ErrorKind::WouldBlock`] if another owner or operation still
+    /// retains the descriptor. Prepared operations are not submitted or cancelled
+    /// by this call; queued, submitted, and completed-but-unconsumed operations
+    /// continue retaining the descriptor until they are dropped or consumed. If
+    /// close is rejected, dropping the last owner still closes the descriptor.
     pub async fn close(self) -> io::Result<()> {
         self.fd.close().await
     }
@@ -396,6 +408,12 @@ impl PipeWriter {
     }
 
     /// Close the pipe write end.
+    ///
+    /// Returns [`io::ErrorKind::WouldBlock`] if another owner or operation still
+    /// retains the descriptor. Prepared operations are not submitted or cancelled
+    /// by this call; queued, submitted, and completed-but-unconsumed operations
+    /// continue retaining the descriptor until they are dropped or consumed. If
+    /// close is rejected, dropping the last owner still closes the descriptor.
     pub async fn close(self) -> io::Result<()> {
         self.fd.close().await
     }
