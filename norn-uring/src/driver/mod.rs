@@ -118,6 +118,8 @@ struct Shared {
     cancel_all_error: Cell<Option<i32>>,
     #[cfg(test)]
     submit_failures: RefCell<std::collections::VecDeque<i32>>,
+    #[cfg(test)]
+    submit_limits: RefCell<std::collections::VecDeque<usize>>,
     // This field must be declared after `ring`: fields are dropped in declaration
     // order, so retained registered storage is released only after the ring.
     registered_buffers: RegisteredBuffers,
@@ -141,8 +143,12 @@ pub(super) enum Status {
     Running,
     /// The driver is closing and will not accept new requests.
     Closing,
-    /// The driver has queued its drain barrier and is waiting for completion.
-    Draining,
+    /// The driver is waiting for all admitted operations to become terminal.
+    DrainingOperations,
+    /// Operation completions have been reaped and cleanup-generated work is being flushed.
+    ClosingResources,
+    /// The driver is waiting for cleanup-generated work to become terminal.
+    DrainingResources,
     /// The driver has shutdown and will not accept new requests.
     Shutdown,
 }
@@ -407,8 +413,8 @@ impl Handle {
 }
 
 impl Driver {
-    /// [Driver::DRAIN_TOKEN] is a special token which is used to signal the driver has drained all requests.
-    const DRAIN_TOKEN: usize = 0x01;
+    /// Signals that all operations admitted before shutdown are terminal.
+    const OPERATIONS_DRAIN_TOKEN: usize = 0x01;
 
     /// [Driver::UNPARKER_WAKE_TOKEN] is a special token which is used to signal unparker wake events.
     const UNPARKER_WAKE_TOKEN: usize = 0x02;
@@ -418,6 +424,9 @@ impl Driver {
 
     /// [Driver::CLOSE_FD_TOKEN] is a special token which is used to signal close fd events.
     const CLOSE_FD_TOKEN: usize = 0x04;
+
+    /// Signals that all work generated while reaping operation completions is terminal.
+    const RESOURCES_DRAIN_TOKEN: usize = 0x05;
 
     /// Create a new [`Driver`] with the provided size from the provided [`io_uring::Builder`].
     ///
@@ -446,6 +455,8 @@ impl Driver {
                 cancel_all_error: Cell::new(None),
                 #[cfg(test)]
                 submit_failures: RefCell::new(std::collections::VecDeque::new()),
+                #[cfg(test)]
+                submit_limits: RefCell::new(std::collections::VecDeque::new()),
                 registered_buffers: RegisteredBuffers::new(),
             }),
             unparker: Arc::new(unpark::Unparker::new()?),
@@ -538,8 +549,15 @@ impl Driver {
             let nr_drained = entries.len();
             for cqe in entries {
                 let user_data = cqe.user_data() as usize;
-                if user_data == Self::DRAIN_TOKEN {
-                    trace!(target: LOG, "drain.token");
+                if user_data == Self::OPERATIONS_DRAIN_TOKEN {
+                    trace!(target: LOG, "drain.operations.token");
+                    debug_assert_eq!(self.shared.status(), Status::DrainingOperations);
+                    self.shared.set_status(Status::ClosingResources);
+                    continue;
+                }
+                if user_data == Self::RESOURCES_DRAIN_TOKEN {
+                    trace!(target: LOG, "drain.resources.token");
+                    debug_assert_eq!(self.shared.status(), Status::DrainingResources);
                     self.shared.finish_shutdown(ShutdownOutcome::CleanDrained);
                     continue;
                 }
@@ -690,7 +708,7 @@ impl Driver {
                 Status::Running => self.shared.set_status(Status::Closing),
                 Status::Closing => {
                     self.unparker.wake();
-                    if let Err(err) = self.shared.submit(ParkMode::NoPark) {
+                    if let Err(err) = self.shared.submit_all_pending() {
                         self.retry_shutdown("submit", &err);
                         continue;
                     }
@@ -705,22 +723,50 @@ impl Driver {
                     let opcode = io_uring::opcode::Nop::new()
                         .build()
                         .flags(io_uring::squeue::Flags::IO_DRAIN)
-                        .user_data(Self::DRAIN_TOKEN as u64);
+                        .user_data(Self::OPERATIONS_DRAIN_TOKEN as u64);
                     if unsafe { self.shared.try_push_raw(&opcode) }.is_ok() {
-                        self.shared.set_status(Status::Draining);
+                        self.shared.set_status(Status::DrainingOperations);
                     } else {
                         let drained = self.drain_exhaustive();
-                        trace!(target: LOG, "shutdown.push_drain.retry drained={drained}");
+                        trace!(target: LOG, "shutdown.push_operations_drain.retry drained={drained}");
                         if drained == 0 {
                             std::thread::sleep(Duration::from_millis(1));
                         }
                     }
                 }
-                Status::Draining => {
+                Status::DrainingOperations => {
                     if let Err(err) =
                         self.park_with_completion_budget(ParkMode::NextCompletion, None)
                     {
                         self.retry_shutdown("park", &err);
+                    }
+                }
+                Status::ClosingResources => {
+                    // Reaping the first barrier can destroy RawOps. Their destructors may
+                    // enqueue close SQEs or other cleanup work after that barrier, so flush
+                    // the complete userspace SQ before ordering a final drain behind it.
+                    if let Err(err) = self.shared.submit_all_pending() {
+                        self.retry_shutdown("submit_cleanup", &err);
+                        continue;
+                    }
+
+                    let opcode = io_uring::opcode::Nop::new()
+                        .build()
+                        .flags(io_uring::squeue::Flags::IO_DRAIN)
+                        .user_data(Self::RESOURCES_DRAIN_TOKEN as u64);
+                    if unsafe { self.shared.try_push_raw(&opcode) }.is_ok() {
+                        self.shared.set_status(Status::DrainingResources);
+                    } else {
+                        let drained = self.drain::<32>(usize::MAX);
+                        trace!(target: LOG, "shutdown.push_resources_drain.retry drained={drained}");
+                        if drained == 0 {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                    }
+                }
+                Status::DrainingResources => {
+                    if let Err(err) = self.park(ParkMode::NextCompletion) {
+                        self.retry_shutdown("park_cleanup", &err);
                     }
                 }
             }
@@ -860,6 +906,27 @@ impl Shared {
             return Err(io::Error::from_raw_os_error(errno));
         }
 
+        #[cfg(test)]
+        if let Some(limit) = self.submit_limits.borrow_mut().pop_front() {
+            assert_eq!(mode, ParkMode::NoPark);
+            let mut ring = self.ring.borrow_mut();
+            let pending = {
+                let mut sq = ring.submission();
+                sq.sync();
+                sq.len()
+            };
+            if pending == 0 {
+                return Ok(0);
+            }
+            let to_submit = pending.min(limit);
+            // Safety: this is the same io_uring_enter operation used by Submitter::submit,
+            // deliberately capped to emulate a successful partial kernel consumption.
+            return unsafe {
+                ring.submitter()
+                    .enter::<libc::sigset_t>(to_submit as u32, 0, 0, None)
+            };
+        }
+
         let mut ring = self.ring.borrow_mut();
         Ok(match mode {
             ParkMode::Timeout(duration) => {
@@ -922,6 +989,42 @@ impl Shared {
                 }
             }
         }
+    }
+
+    /// Submit every SQE currently visible in the userspace submission queue.
+    ///
+    /// A successful `io_uring_enter` may consume fewer entries than requested. Shutdown
+    /// must drive that remainder into the kernel before synchronous cancellation, or the
+    /// cancel registration cannot observe all admitted operations.
+    fn submit_all_pending(&self) -> io::Result<usize> {
+        let mut total_submitted = 0;
+        loop {
+            let pending_before = self.pending_submissions();
+            if pending_before == 0 {
+                return Ok(total_submitted);
+            }
+
+            let submitted = self.submit(ParkMode::NoPark)?;
+            total_submitted += submitted;
+
+            let pending_after = self.pending_submissions();
+            if pending_after == 0 {
+                return Ok(total_submitted);
+            }
+            if pending_after >= pending_before {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "submission queue made no progress",
+                ));
+            }
+        }
+    }
+
+    fn pending_submissions(&self) -> usize {
+        let mut ring = self.ring.borrow_mut();
+        let mut sq = ring.submission();
+        sq.sync();
+        sq.len()
     }
 
     /// Cancel a specific request synchronously.
@@ -999,6 +1102,12 @@ impl Shared {
     #[cfg(test)]
     fn fail_next_submit(&self, errno: i32) {
         self.submit_failures.borrow_mut().push_back(errno);
+    }
+
+    #[cfg(test)]
+    fn limit_next_submit(&self, limit: usize) {
+        assert!(limit > 0);
+        self.submit_limits.borrow_mut().push_back(limit);
     }
 
     fn needs_park(&self, completion_drain_is_bounded: bool) -> bool {
@@ -1509,6 +1618,160 @@ mod tests {
             "shutdown must break the operation/descriptor/driver ownership cycle"
         );
         assert_eq!(pool.unregister().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn shutdown_waits_for_cleanup_generated_close_before_returning() {
+        #[derive(Debug)]
+        struct PendingFdOp {
+            _fd: fd::NornFd,
+            timeout: Timespec,
+            shared: Weak<Shared>,
+        }
+
+        impl Drop for PendingFdOp {
+            fn drop(&mut self) {
+                // Force the NornFd field's subsequent close submission to remain in
+                // userspace until the shutdown finalization pass retries it.
+                self.shared
+                    .upgrade()
+                    .expect("driver shared state dropped before operation cleanup")
+                    .fail_next_submit(libc::EIO);
+            }
+        }
+
+        // Safety: RawOp keeps the timeout storage stable until the terminal CQE.
+        unsafe impl Operation for PendingFdOp {
+            fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+                Ok(opcode::Timeout::new(&self.timeout).build())
+            }
+
+            fn cleanup(&mut self, _: CQEResult) {}
+        }
+
+        impl Singleshot for PendingFdOp {
+            type Output = io::Result<()>;
+
+            fn complete(self, result: CQEResult) -> Self::Output {
+                result.result.map(drop)
+            }
+        }
+
+        fn assert_open(raw_fd: libc::c_int) {
+            assert_ne!(unsafe { libc::fcntl(raw_fd, libc::F_GETFD) }, -1);
+        }
+
+        fn assert_closed(raw_fd: libc::c_int) {
+            assert_eq!(unsafe { libc::fcntl(raw_fd, libc::F_GETFD) }, -1);
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+        }
+
+        let mut pipe_fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
+        let owned_fd = pipe_fds[0];
+        let write_fd = pipe_fds[1];
+        let duplicate_fd = unsafe { libc::dup(owned_fd) };
+        assert!(duplicate_fd >= 0);
+
+        let mut driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let weak_shared = Rc::downgrade(&driver.shared);
+        let guard = driver.enter();
+        let handle = driver.handle();
+        let mut op = Box::pin(handle.submit(PendingFdOp {
+            _fd: fd::NornFd::from_fd(owned_fd),
+            timeout: Timespec::new().sec(3_600),
+            shared: weak_shared,
+        }));
+        let waker = futures_test::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+
+        assert!(Future::poll(op.as_mut(), &mut cx).is_pending());
+        driver.shared.submit(ParkMode::NoPark).unwrap();
+        drop(op);
+        drop(handle);
+        drop(guard);
+
+        Park::shutdown(&mut driver);
+
+        assert!(driver.shared.submit_failures.borrow().is_empty());
+        assert_closed(owned_fd);
+        assert_open(duplicate_fd);
+
+        // Reuse the exact integer descriptor before destroying the ring. A close SQE
+        // left behind the first drain would close this unrelated replacement later.
+        assert_eq!(unsafe { libc::dup2(duplicate_fd, owned_fd) }, owned_fd);
+        assert_open(owned_fd);
+        drop(driver);
+        assert_open(owned_fd);
+
+        unsafe {
+            libc::close(owned_fd);
+            libc::close(duplicate_fd);
+            libc::close(write_fd);
+        }
+    }
+
+    #[test]
+    fn shutdown_submits_partial_success_remainder_before_cancel_all() {
+        let (tx, rx) = mpsc::channel();
+
+        std::thread::spawn(move || {
+            #[derive(Debug)]
+            struct NopOp;
+
+            unsafe impl Operation for NopOp {
+                fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+                    Ok(opcode::Nop::new().build())
+                }
+
+                fn cleanup(&mut self, _: CQEResult) {}
+            }
+
+            impl Singleshot for NopOp {
+                type Output = io::Result<()>;
+
+                fn complete(self, result: CQEResult) -> Self::Output {
+                    result.result.map(drop)
+                }
+            }
+
+            let (reader, writer) = UnixStream::pair().unwrap();
+            let dropped = Arc::new(AtomicBool::new(false));
+            let mut driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+            let handle = driver.handle();
+            let mut nop = Box::pin(handle.submit(NopOp));
+            let mut long_lived = Box::pin(handle.submit(LongLivedOp {
+                io: LongLivedIo::Read {
+                    reader,
+                    _writer: writer,
+                    buf: Box::new([0; 8]),
+                },
+                _driver: handle.clone(),
+                dropped: Arc::clone(&dropped),
+            }));
+            let waker = futures_test::task::noop_waker();
+            let mut cx = std::task::Context::from_waker(&waker);
+
+            assert!(Future::poll(nop.as_mut(), &mut cx).is_pending());
+            assert!(Future::poll(long_lived.as_mut(), &mut cx).is_pending());
+            assert_eq!(driver.shared.pending_submissions(), 2);
+            driver.shared.limit_next_submit(1);
+            drop(nop);
+            drop(long_lived);
+            drop(handle);
+
+            let outcome = driver.shutdown_with_outcome();
+            tx.send((outcome, dropped.load(Ordering::Acquire))).unwrap();
+        });
+
+        let (outcome, dropped) = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("shutdown stranded the long-lived userspace SQ remainder");
+        assert_eq!(outcome, ShutdownOutcome::CleanDrained);
+        assert!(
+            dropped,
+            "the partially submitted operation must be reclaimed"
+        );
     }
 
     #[test]
