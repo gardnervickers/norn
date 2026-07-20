@@ -11,7 +11,7 @@ use std::mem::{ManuallyDrop, MaybeUninit};
 use std::net::SocketAddr;
 use std::os::fd::FromRawFd;
 
-use crate::buf::{StableBuf, StableBufMut};
+use crate::buf::{set_init_checked, StableBuf, StableBufMut};
 use crate::bufring::{BufRing, BufRingBuf, BufRingBufBundle};
 use crate::fd::NornFd;
 use crate::operation::{Multishot, Op, Operation, Singleshot};
@@ -58,15 +58,10 @@ where
     } else if flags & libc::MSG_TRUNC as u32 != 0 {
         submitted_len
     } else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "receive completion exceeded the submitted buffer length",
-        ));
+        reported_len
     };
 
-    // Safety: the completed receive initialized `init_len` bytes, and the
-    // calculation above keeps that length within the submitted writable region.
-    unsafe { buf.set_init(init_len) };
+    set_init_checked(buf, submitted_len, init_len, "receive")?;
     Ok(reported_len)
 }
 
@@ -2002,44 +1997,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(target_pointer_width = "64")]
-    #[derive(Debug)]
-    struct FakeBuf {
-        len: usize,
-    }
-
-    #[cfg(target_pointer_width = "64")]
-    unsafe impl StableBuf for FakeBuf {
-        fn stable_ptr(&self) -> *const u8 {
-            std::ptr::NonNull::<u8>::dangling().as_ptr()
-        }
-
-        fn bytes_init(&self) -> usize {
-            self.len
-        }
-    }
-
-    #[cfg(target_pointer_width = "64")]
-    unsafe impl StableBufMut for FakeBuf {
-        fn stable_ptr_mut(&mut self) -> *mut u8 {
-            std::ptr::NonNull::<u8>::dangling().as_ptr()
-        }
-
-        fn bytes_remaining(&self) -> usize {
-            self.len
-        }
-
-        unsafe fn set_init(&mut self, _: usize) {}
-    }
-
-    #[cfg(target_pointer_width = "64")]
-    fn test_fd() -> NornFd {
-        use std::os::fd::IntoRawFd;
-
-        let file = std::fs::File::open("/dev/null").unwrap();
-        NornFd::from_fd(file.into_raw_fd())
-    }
-
     fn more_flag() -> u32 {
         (0..=u32::MAX)
             .find(|flags| io_uring::cqueue::more(*flags))
@@ -2083,28 +2040,10 @@ mod tests {
     #[cfg(target_pointer_width = "64")]
     #[test]
     fn connected_scalar_io_rejects_lengths_above_u32_max() {
-        let fd = test_fd();
-        let mut recv = Recv::new(
-            fd.clone(),
-            FakeBuf {
-                len: u32::MAX as usize + 1,
-            },
-            0,
-        );
-        let mut send = Send::new(
-            fd,
-            FakeBuf {
-                len: u32::MAX as usize + 1,
-            },
-            0,
-        );
-
         assert_eq!(
-            recv.configure().unwrap_err().kind(),
-            io::ErrorKind::InvalidInput
-        );
-        assert_eq!(
-            send.configure().unwrap_err().kind(),
+            checked_scalar_len(u32::MAX as usize + 1, "test buffer")
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::InvalidInput
         );
     }
@@ -2112,23 +2051,9 @@ mod tests {
     #[cfg(target_pointer_width = "64")]
     #[test]
     fn connected_scalar_io_preserves_u32_max_length() {
-        let fd = test_fd();
-        let mut recv = Recv::new(
-            fd.clone(),
-            FakeBuf {
-                len: u32::MAX as usize,
-            },
-            0,
+        assert_eq!(
+            checked_scalar_len(u32::MAX as usize, "test buffer").unwrap(),
+            u32::MAX
         );
-        let mut send = Send::new(
-            fd,
-            FakeBuf {
-                len: u32::MAX as usize,
-            },
-            0,
-        );
-
-        assert!(recv.configure().is_ok());
-        assert!(send.configure().is_ok());
     }
 }

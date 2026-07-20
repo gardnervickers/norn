@@ -701,6 +701,9 @@ mod block {
             }
         }
 
+        // Safety: the allocation is separately owned, does not move with this
+        // wrapper, and cannot be accessed through another handle while the
+        // operation owns `AlignedBuf`.
         unsafe impl StableBufMut for AlignedBuf {
             fn stable_ptr_mut(&mut self) -> *mut u8 {
                 self.ptr.as_ptr()
@@ -710,7 +713,9 @@ mod block {
                 self.len
             }
 
-            unsafe fn set_init(&mut self, _: usize) {}
+            unsafe fn set_init(&mut self, init_len: usize) {
+                assert!(init_len <= self.len);
+            }
         }
     }
 

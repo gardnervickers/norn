@@ -9,7 +9,7 @@ mod opts;
 
 use std::io;
 
-use crate::buf::StableBufMut;
+use crate::buf::{set_init_checked, StableBufMut};
 
 pub use dir::{
     create_dir, get_xattr, hard_link, metadata, remove_dir, remove_file, rename, set_xattr, statx,
@@ -31,16 +31,7 @@ where
         return Ok(result);
     }
 
-    if result > submitted_len {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "getxattr completion exceeded the submitted buffer length",
-        ));
-    }
-
-    // Safety: the kernel has completed the operation after initializing
-    // `result` bytes, and the bound above keeps it within the submitted region.
-    unsafe { buf.set_init(result) };
+    set_init_checked(buf, submitted_len, result, "getxattr")?;
     Ok(result)
 }
 
