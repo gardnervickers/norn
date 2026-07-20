@@ -119,7 +119,7 @@ struct Shared {
     #[cfg(test)]
     submit_failures: RefCell<std::collections::VecDeque<i32>>,
     #[cfg(test)]
-    submit_limits: RefCell<std::collections::VecDeque<usize>>,
+    submit_limits: RefCell<std::collections::VecDeque<(usize, usize)>>,
     // This field must be declared after `ring`: fields are dropped in declaration
     // order, so retained registered storage is released only after the ring.
     registered_buffers: RegisteredBuffers,
@@ -907,7 +907,7 @@ impl Shared {
         }
 
         #[cfg(test)]
-        if let Some(limit) = self.submit_limits.borrow_mut().pop_front() {
+        if let Some((limit, expected_remaining)) = self.submit_limits.borrow_mut().pop_front() {
             assert_eq!(mode, ParkMode::NoPark);
             let mut ring = self.ring.borrow_mut();
             let pending = {
@@ -921,10 +921,20 @@ impl Shared {
             let to_submit = pending.min(limit);
             // Safety: this is the same io_uring_enter operation used by Submitter::submit,
             // deliberately capped to emulate a successful partial kernel consumption.
-            return unsafe {
+            let submitted = unsafe {
                 ring.submitter()
                     .enter::<libc::sigset_t>(to_submit as u32, 0, 0, None)
+            }?;
+            let remaining = {
+                let mut sq = ring.submission();
+                sq.sync();
+                sq.len()
             };
+            assert_eq!(
+                remaining, expected_remaining,
+                "capped shutdown submit did not leave the expected userspace SQ remainder"
+            );
+            return Ok(submitted);
         }
 
         let mut ring = self.ring.borrow_mut();
@@ -1105,9 +1115,11 @@ impl Shared {
     }
 
     #[cfg(test)]
-    fn limit_next_submit(&self, limit: usize) {
+    fn limit_next_submit(&self, limit: usize, expected_remaining: usize) {
         assert!(limit > 0);
-        self.submit_limits.borrow_mut().push_back(limit);
+        self.submit_limits
+            .borrow_mut()
+            .push_back((limit, expected_remaining));
     }
 
     fn needs_park(&self, completion_drain_is_bounded: bool) -> bool {
@@ -1755,12 +1767,19 @@ mod tests {
             assert!(Future::poll(nop.as_mut(), &mut cx).is_pending());
             assert!(Future::poll(long_lived.as_mut(), &mut cx).is_pending());
             assert_eq!(driver.shared.pending_submissions(), 2);
-            driver.shared.limit_next_submit(1);
+            // The test hook asserts inside the capped io_uring_enter path, before
+            // submit_all_pending can loop and before cancel_all can run, that one
+            // long-lived operation still remains in the userspace SQ.
+            driver.shared.limit_next_submit(1, 1);
+
+            let outcome = driver.shutdown_with_outcome();
+            assert!(
+                !dropped.load(Ordering::Acquire),
+                "operation future must remain alive throughout shutdown"
+            );
             drop(nop);
             drop(long_lived);
             drop(handle);
-
-            let outcome = driver.shutdown_with_outcome();
             tx.send((outcome, dropped.load(Ordering::Acquire))).unwrap();
         });
 
