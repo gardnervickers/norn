@@ -46,5 +46,8 @@ pub mod net;
 
 pub use driver::{Driver, DriverOptions, Handle};
 pub use operation::{CQEResult, Multishot, Op, Operation, Singleshot};
-pub use request::{Map, Request, Then, ThenAux, WithTimeout};
+pub use request::{
+    LinkedTimeoutControl, Map, Request, Then, ThenAux, Timeout, TimeoutControl, TimeoutOutcome,
+    TimeoutRemove, TimeoutUpdate, WithTimeout,
+};
 pub use util::noop;

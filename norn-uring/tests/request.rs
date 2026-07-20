@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use norn_uring::fs;
 use norn_uring::net::{TcpListener, TcpSocket};
-use norn_uring::Request;
+use norn_uring::{Request, TimeoutOutcome};
 
 mod util;
 
@@ -151,6 +151,77 @@ fn linked_timeout_cancels_blocked_recv() -> Result<(), Box<dyn std::error::Error
 
         assert_eq!(recv_res.unwrap_err().raw_os_error(), Some(libc::ECANCELED));
         assert_eq!(buf.len(), 1);
+
+        client.close().await?;
+        let server = server_task.await??;
+        server.close().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn standalone_timeout_expires_normally() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let outcome = norn_uring::Handle::current()
+            .timeout(Duration::from_millis(5))
+            .await?;
+        assert_eq!(outcome, TimeoutOutcome::Expired);
+        Ok(())
+    })
+}
+
+#[test]
+fn standalone_timeout_can_be_canceled_after_submission() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let timeout = norn_uring::Handle::current().timeout(Duration::from_secs(30));
+        let control = timeout.control();
+        let waiter = norn_executor::spawn(timeout);
+
+        norn_uring::noop().await;
+        assert!(control.cancel().await?);
+        assert_eq!(waiter.await??, TimeoutOutcome::Canceled);
+        assert!(!control.cancel().await?);
+        Ok(())
+    })
+}
+
+#[test]
+fn standalone_timeout_can_be_reset_after_submission() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let timeout = norn_uring::Handle::current().timeout(Duration::from_secs(30));
+        let control = timeout.control();
+        let waiter = norn_executor::spawn(timeout);
+
+        norn_uring::noop().await;
+        assert!(control.reset(Duration::from_millis(5)).await?);
+        assert_eq!(waiter.await??, TimeoutOutcome::Expired);
+        assert!(!control.reset(Duration::from_secs(1)).await?);
+        Ok(())
+    })
+}
+
+#[test]
+fn linked_timeout_can_be_reset_after_submission() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let listener = TcpListener::bind("127.0.0.1:0".parse()?, 32).await?;
+        let addr = listener.local_addr()?;
+
+        let server_task = norn_executor::spawn(async move {
+            let (server, _) = listener.accept().await?;
+            Ok::<_, Box<dyn std::error::Error>>(server)
+        });
+
+        let client = TcpSocket::connect(addr).await?;
+        let request = client.recv(vec![0; 1]).timeout(Duration::from_secs(30));
+        let control = request.control();
+        let waiter = norn_executor::spawn(request);
+
+        norn_uring::noop().await;
+        assert!(control.reset(Duration::from_millis(5)).await?);
+        let (recv_res, buf) = waiter.await?;
+        assert_eq!(recv_res.unwrap_err().raw_os_error(), Some(libc::ECANCELED));
+        assert_eq!(buf.len(), 1);
+        assert!(!control.reset(Duration::from_secs(1)).await?);
 
         client.close().await?;
         let server = server_task.await??;
