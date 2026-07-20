@@ -1,4 +1,4 @@
-use std::cell::UnsafeCell;
+use std::cell::{Cell, UnsafeCell};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::rc::Rc;
@@ -15,9 +15,28 @@ use crate::{JoinHandle, Runnable, Schedule, TaskSet};
 ///     runnable.run();
 /// }
 /// ```
-#[derive(Clone)]
+///
+/// Cloning a queue creates another external owner. Dropping the final external
+/// owner shuts down the queue, even though pending tasks retain strong scheduler
+/// references internally. A queue clone captured by one of its tasks still
+/// counts as an external owner; call [`TaskQueue::shutdown`] explicitly when
+/// the queue must be cancelled while such captured handles remain alive.
 pub struct TaskQueue {
     shared: Rc<Shared>,
+}
+
+impl Clone for TaskQueue {
+    fn clone(&self) -> Self {
+        let external_handles = self.shared.external_handles.get();
+        self.shared.external_handles.set(
+            external_handles
+                .checked_add(1)
+                .expect("TaskQueue handle count overflow"),
+        );
+        Self {
+            shared: Rc::clone(&self.shared),
+        }
+    }
 }
 
 impl Default for TaskQueue {
@@ -35,6 +54,7 @@ impl std::fmt::Debug for TaskQueue {
 struct Shared {
     runqueue: UnsafeCell<VecDeque<Runnable>>,
     taskset: TaskSet,
+    external_handles: Cell<usize>,
 }
 
 impl TaskQueue {
@@ -43,6 +63,7 @@ impl TaskQueue {
         let shared = Shared {
             runqueue: UnsafeCell::new(VecDeque::with_capacity(1024)),
             taskset: TaskSet::default(),
+            external_handles: Cell::new(1),
         };
         Self {
             shared: Rc::new(shared),
@@ -87,8 +108,20 @@ impl TaskQueue {
     ///
     /// Cancels all tasks and drops their [`Future`]s.
     pub fn shutdown(&self) {
-        self.shared.taskset.shutdown();
-        self.shared.clear_runqueue();
+        self.shared.shutdown();
+    }
+}
+
+impl Drop for TaskQueue {
+    fn drop(&mut self) {
+        let external_handles = self.shared.external_handles.get();
+        let remaining_handles = external_handles
+            .checked_sub(1)
+            .expect("TaskQueue handle count underflow");
+        self.shared.external_handles.set(remaining_handles);
+        if remaining_handles == 0 {
+            self.shared.shutdown();
+        }
     }
 }
 
@@ -104,6 +137,12 @@ impl Schedule for Rc<Shared> {
 }
 
 impl Shared {
+    /// Shutdown all tasks and release their queued runnable references.
+    fn shutdown(&self) {
+        self.taskset.shutdown();
+        self.clear_runqueue();
+    }
+
     /// Push a runnable into the queue.
     ///
     /// # Safety
@@ -146,5 +185,144 @@ impl Shared {
         while let Some(runnable) = self.pop_runnable() {
             drop(runnable);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::{Cell, RefCell};
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::rc::Rc;
+    use std::task::{Context, Poll};
+
+    use super::TaskQueue;
+    use crate::JoinHandle;
+
+    struct CountDrop(Rc<Cell<usize>>);
+
+    impl Drop for CountDrop {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    struct SelfWoken {
+        _guard: CountDrop,
+    }
+
+    impl Future for SelfWoken {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+
+    #[test]
+    fn dropping_final_queue_destroys_queued_detached_task() {
+        let queue = TaskQueue::new();
+        let shared = Rc::downgrade(&queue.shared);
+        let drops = Rc::new(Cell::new(0));
+        let guard = CountDrop(Rc::clone(&drops));
+        queue
+            .spawn(async move {
+                let _guard = guard;
+                std::future::pending::<()>().await;
+            })
+            .detach();
+
+        assert_eq!(queue.runnable(), 1);
+        drop(queue);
+
+        assert_eq!(drops.get(), 1);
+        assert!(shared.upgrade().is_none());
+    }
+
+    #[test]
+    fn dropping_final_queue_destroys_pending_task() {
+        let queue = TaskQueue::new();
+        let shared = Rc::downgrade(&queue.shared);
+        let drops = Rc::new(Cell::new(0));
+        let guard = CountDrop(Rc::clone(&drops));
+        queue
+            .spawn(async move {
+                let _guard = guard;
+                std::future::pending::<()>().await;
+            })
+            .detach();
+        queue.next().unwrap().run();
+
+        assert_eq!(queue.runnable(), 0);
+        drop(queue);
+
+        assert_eq!(drops.get(), 1);
+        assert!(shared.upgrade().is_none());
+    }
+
+    #[test]
+    fn dropping_final_queue_destroys_self_woken_task() {
+        let queue = TaskQueue::new();
+        let shared = Rc::downgrade(&queue.shared);
+        let drops = Rc::new(Cell::new(0));
+        queue
+            .spawn(SelfWoken {
+                _guard: CountDrop(Rc::clone(&drops)),
+            })
+            .detach();
+        queue.next().unwrap().run();
+
+        assert_eq!(queue.runnable(), 1);
+        drop(queue);
+
+        assert_eq!(drops.get(), 1);
+        assert!(shared.upgrade().is_none());
+    }
+
+    #[test]
+    fn dropping_final_queue_breaks_task_join_handle_cycle() {
+        let queue = TaskQueue::new();
+        let shared = Rc::downgrade(&queue.shared);
+        let drops = Rc::new(Cell::new(0));
+        let join = Rc::new(RefCell::new(None));
+        let task_join = Rc::clone(&join);
+        let guard = CountDrop(Rc::clone(&drops));
+
+        let handle: JoinHandle<()> = queue.spawn(async move {
+            let _guard = guard;
+            let _task_join = task_join;
+            std::future::pending::<()>().await;
+        });
+        join.borrow_mut().replace(handle);
+        drop(join);
+        drop(queue);
+
+        assert_eq!(drops.get(), 1);
+        assert!(shared.upgrade().is_none());
+    }
+
+    #[test]
+    fn running_task_can_drop_final_external_queue_handle() {
+        let queue = TaskQueue::new();
+        let shared = Rc::downgrade(&queue.shared);
+        let drops = Rc::new(Cell::new(0));
+        let task_queue = queue.clone();
+        let guard = CountDrop(Rc::clone(&drops));
+        queue
+            .spawn(async move {
+                let _guard = guard;
+                drop(task_queue);
+                std::future::pending::<()>().await;
+            })
+            .detach();
+        let runnable = queue.next().unwrap();
+        drop(queue);
+
+        assert!(shared.upgrade().is_some());
+        runnable.run();
+
+        assert_eq!(drops.get(), 1);
+        assert!(shared.upgrade().is_none());
     }
 }
