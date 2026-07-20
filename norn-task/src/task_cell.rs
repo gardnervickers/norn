@@ -190,6 +190,16 @@ where
                 let future_cell = this.as_ref().future_cell();
 
                 if future_cell.poll(cx).is_ready() {
+                    if matches!(
+                        this.as_ref()
+                            .state()
+                            .update(state::State::complete_ready_poll),
+                        state::CompleteReadyPollResult::Cancelled
+                    ) {
+                        // Queue shutdown wins over a value produced by the poll
+                        // that requested shutdown.
+                        future_cell.cancel();
+                    }
                     PollResult::Complete
                 } else {
                     match this
@@ -281,8 +291,13 @@ where
             state::ShutdownResult::AlreadyCompleted => {
                 // Nothing to do!
             }
+            state::ShutdownResult::Deferred => {
+                // The future is currently borrowed by its own poll. The poll
+                // completion path observes cancellation and destroys it safely.
+            }
             state::ShutdownResult::NotCompleted => {
                 this.as_ref().future_cell().cancel();
+                this.as_ref().header().notify_join_handle();
             }
         }
     }
