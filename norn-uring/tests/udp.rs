@@ -1,13 +1,14 @@
 #![cfg(target_os = "linux")]
 
 use std::future::Future;
+use std::io;
 use std::pin::pin;
 use std::task::Poll;
 
 use bytes::{Bytes, BytesMut};
 use futures_util::future::poll_fn;
 use futures_util::StreamExt;
-use norn_uring::bufring::{BufRingBufBundle, RecvBufRing};
+use norn_uring::bufring::{BufRing, BufRingBufBundle, SendBundleBatch};
 use norn_uring::net::UdpSocket;
 
 mod util;
@@ -20,6 +21,13 @@ fn flatten_bundle(bundle: &BufRingBufBundle) -> Vec<u8> {
 }
 
 const TRUNC_PAYLOAD: &[u8] = b"a datagram much larger than the receive buffer";
+
+fn stage_bundle_segment(batch: &SendBundleBatch, payload: &[u8]) -> io::Result<()> {
+    let mut buf = batch.checkout()?;
+    buf.as_mut_slice()[..payload.len()].copy_from_slice(payload);
+    buf.set_len(payload.len())?;
+    buf.commit()
+}
 
 #[test]
 fn send_recv() -> Result<(), Box<dyn std::error::Error>> {
@@ -274,10 +282,7 @@ fn msg_trunc_connected_recv_caps_vec_and_bytes_mut_initialization(
 #[test]
 fn send_recv_ring() -> Result<(), Box<dyn std::error::Error>> {
     util::with_test_env(|| async {
-        let ring = RecvBufRing::builder(1)
-            .buf_cnt(32)
-            .buf_len(1024 * 16)
-            .build()?;
+        let ring = BufRing::builder(1).buf_cnt(32).buf_len(1024 * 16).build()?;
         let s1 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
         let s2 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
 
@@ -300,8 +305,8 @@ fn send_recv_ring() -> Result<(), Box<dyn std::error::Error>> {
 fn duplicate_bgid_failure_keeps_original_ring_registered() -> Result<(), Box<dyn std::error::Error>>
 {
     util::with_test_env(|| async {
-        let ring = RecvBufRing::builder(10).buf_cnt(1).buf_len(128).build()?;
-        let err = RecvBufRing::builder(10)
+        let ring = BufRing::builder(10).buf_cnt(1).buf_len(128).build()?;
+        let err = BufRing::builder(10)
             .buf_cnt(1)
             .buf_len(128)
             .build()
@@ -335,7 +340,7 @@ fn duplicate_bgid_failure_keeps_original_ring_registered() -> Result<(), Box<dyn
 #[test]
 fn send_recv_ring_multi_msg() -> Result<(), Box<dyn std::error::Error>> {
     util::with_test_env(|| async {
-        let ring = RecvBufRing::builder(4).buf_cnt(32).buf_len(2048).build()?;
+        let ring = BufRing::builder(4).buf_cnt(32).buf_len(2048).build()?;
         let s1 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
         let s2 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
         let sender = s1.local_addr()?;
@@ -357,7 +362,7 @@ fn send_recv_ring_multi_msg() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn recv_msg_ring_buf_can_be_sent_directly() -> Result<(), Box<dyn std::error::Error>> {
     util::with_test_env(|| async {
-        let ring = RecvBufRing::builder(9).buf_cnt(32).buf_len(2048).build()?;
+        let ring = BufRing::builder(9).buf_cnt(32).buf_len(2048).build()?;
         let client = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
         let server = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
 
@@ -386,7 +391,7 @@ fn recv_msg_ring_buf_can_be_sent_directly() -> Result<(), Box<dyn std::error::Er
 #[test]
 fn connected_send_recv_ring_multi() -> Result<(), Box<dyn std::error::Error>> {
     util::with_test_env(|| async {
-        let ring = RecvBufRing::builder(5).buf_cnt(32).buf_len(2048).build()?;
+        let ring = BufRing::builder(5).buf_cnt(32).buf_len(2048).build()?;
         let s1 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
         let s2 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
         s1.connect(s2.local_addr()?).await?;
@@ -407,7 +412,7 @@ fn connected_send_recv_ring_multi() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn connected_send_recv_from_ring_multi() -> Result<(), Box<dyn std::error::Error>> {
     util::with_test_env(|| async {
-        let ring = RecvBufRing::builder(8).buf_cnt(32).buf_len(2048).build()?;
+        let ring = BufRing::builder(8).buf_cnt(32).buf_len(2048).build()?;
         let s1 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
         let s2 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
         s1.connect(s2.local_addr()?).await?;
@@ -427,7 +432,7 @@ fn connected_send_recv_from_ring_multi() -> Result<(), Box<dyn std::error::Error
 #[test]
 fn connected_send_recv_bundle() -> Result<(), Box<dyn std::error::Error>> {
     util::with_test_env(|| async {
-        let ring = RecvBufRing::builder(6).buf_cnt(64).buf_len(2048).build()?;
+        let ring = BufRing::builder(6).buf_cnt(64).buf_len(2048).build()?;
         let s1 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
         let s2 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
         s1.connect(s2.local_addr()?).await?;
@@ -451,7 +456,7 @@ fn connected_send_recv_bundle() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn connected_send_recv_bundle_multi() -> Result<(), Box<dyn std::error::Error>> {
     util::with_test_env(|| async {
-        let ring = RecvBufRing::builder(7).buf_cnt(64).buf_len(2048).build()?;
+        let ring = BufRing::builder(7).buf_cnt(64).buf_len(2048).build()?;
         let s1 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
         let s2 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
         s1.connect(s2.local_addr()?).await?;
@@ -473,6 +478,137 @@ fn connected_send_recv_bundle_multi() -> Result<(), Box<dyn std::error::Error>> 
     })
 }
 
+#[test]
+fn connected_send_bundle_segments() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let ring = BufRing::builder(9).buf_cnt(8).buf_len(256).build_send()?;
+        let s1 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let s2 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        s1.connect(s2.local_addr()?).await?;
+        s2.connect(s1.local_addr()?).await?;
+        let batch = ring.batch()?;
+
+        let messages: [&[u8]; 3] = [b"send-bundle-a", b"send-bundle-b", b"send-bundle-c"];
+        let total: usize = messages.iter().map(|msg| msg.len()).sum();
+        for message in messages {
+            stage_bundle_segment(&batch, message)?;
+        }
+        assert_eq!(batch.queued_buffers(), 3);
+        assert_eq!(batch.queued_len(), total);
+
+        let sent = match s1.send_bundle(batch).await {
+            Ok(sent) => sent,
+            Err(err) if util::send_bundle_unsupported(&err) => return Ok(()),
+            Err(err) => return Err(err.into()),
+        };
+        assert_eq!(sent, total);
+        assert_eq!(ring.available_buffers(), 8);
+
+        let (res, buf) = s2.recv(BytesMut::with_capacity(64)).await;
+        let n = res?;
+        let expected: Vec<u8> = messages
+            .iter()
+            .flat_map(|msg| msg.iter().copied())
+            .collect();
+        assert_eq!(&buf[..n], expected.as_slice());
+
+        Ok(())
+    })
+}
+
+#[test]
+fn connected_send_bundle_with_flags_smoke() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let ring = BufRing::builder(10).buf_cnt(4).buf_len(256).build_send()?;
+        let s1 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let s2 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        s1.connect(s2.local_addr()?).await?;
+        s2.connect(s1.local_addr()?).await?;
+        let batch = ring.batch()?;
+
+        stage_bundle_segment(&batch, b"send-bundle-flags")?;
+
+        let sent = match s1.send_bundle_with_flags(batch, libc::MSG_DONTWAIT).await {
+            Ok(sent) => sent,
+            Err(err) if util::send_bundle_unsupported(&err) => return Ok(()),
+            Err(err) => return Err(err.into()),
+        };
+        assert_eq!(sent, b"send-bundle-flags".len());
+
+        let (res, buf) = s2.recv(BytesMut::with_capacity(64)).await;
+        let n = res?;
+        assert_eq!(&buf[..n], b"send-bundle-flags");
+
+        Ok(())
+    })
+}
+
+#[test]
+fn connected_send_bundle_reuses_ring_after_send() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let ring = BufRing::builder(11).buf_cnt(4).buf_len(256).build_send()?;
+        let s1 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let s2 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        s1.connect(s2.local_addr()?).await?;
+        s2.connect(s1.local_addr()?).await?;
+
+        let batch = ring.batch()?;
+        stage_bundle_segment(&batch, b"reuse-1")?;
+        stage_bundle_segment(&batch, b"reuse-2")?;
+        match s1.send_bundle(batch).await {
+            Ok(sent) => assert_eq!(sent, b"reuse-1".len() + b"reuse-2".len()),
+            Err(err) if util::send_bundle_unsupported(&err) => return Ok(()),
+            Err(err) => return Err(err.into()),
+        }
+        let (res, buf) = s2.recv(BytesMut::with_capacity(64)).await;
+        let n = res?;
+        assert_eq!(&buf[..n], b"reuse-1reuse-2");
+        assert_eq!(ring.available_buffers(), 4);
+
+        let batch = ring.batch()?;
+        stage_bundle_segment(&batch, b"reuse-3")?;
+        let sent = s1.send_bundle(batch).await?;
+        assert_eq!(sent, b"reuse-3".len());
+        let (res, buf) = s2.recv(BytesMut::with_capacity(64)).await;
+        let n = res?;
+        assert_eq!(&buf[..n], b"reuse-3");
+        assert_eq!(ring.available_buffers(), 4);
+
+        Ok(())
+    })
+}
+
+#[test]
+fn duplicate_send_bgid_failure_keeps_original_ring_registered(
+) -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let ring = BufRing::builder(12).buf_cnt(2).buf_len(128).build_send()?;
+        let err = BufRing::builder(12)
+            .buf_cnt(2)
+            .buf_len(128)
+            .build_send()
+            .unwrap_err();
+        assert!(err.to_string().contains("already registered"));
+
+        let sender = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let receiver = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        sender.connect(receiver.local_addr()?).await?;
+
+        let batch = ring.batch()?;
+        stage_bundle_segment(&batch, b"original-send-ring")?;
+        match sender.send_bundle(batch).await {
+            Ok(sent) => assert_eq!(sent, b"original-send-ring".len()),
+            Err(err) if util::send_bundle_unsupported(&err) => return Ok(()),
+            Err(err) => return Err(err.into()),
+        }
+
+        let (res, buf) = receiver.recv(BytesMut::with_capacity(64)).await;
+        let n = res?;
+        assert_eq!(&buf[..n], b"original-send-ring");
+        Ok(())
+    })
+}
+
 struct UdpEchoServer {
     socket: UdpSocket,
 }
@@ -488,7 +624,7 @@ impl UdpEchoServer {
     }
 
     async fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let bufring = RecvBufRing::builder(1)
+        let bufring = BufRing::builder(1)
             .buf_cnt(32)
             .buf_len(u16::MAX as usize)
             .build()?;
@@ -537,7 +673,7 @@ fn buffer_exhaustion() -> Result<(), Box<dyn std::error::Error>> {
         .detach();
 
         // Create a bufring of 2 buffers of 64k each.
-        let bufring = RecvBufRing::builder(2)
+        let bufring = BufRing::builder(2)
             .buf_cnt(2)
             .buf_len(u16::MAX as usize)
             .build()?;
@@ -596,7 +732,7 @@ fn poll_readiness_smoke() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn drop_bufring_outside_runtime() -> Result<(), Box<dyn std::error::Error>> {
     let ring = util::with_test_env(|| async {
-        let ring = RecvBufRing::builder(3).buf_cnt(8).buf_len(1024).build()?;
+        let ring = BufRing::builder(3).buf_cnt(8).buf_len(1024).build()?;
         Ok(ring)
     })?;
 

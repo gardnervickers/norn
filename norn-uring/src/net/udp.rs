@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use socket2::{Domain, Type};
 
 use crate::buf::{StableBuf, StableBufMut};
-use crate::bufring::{BufRingBuf, RecvBufRing};
+use crate::bufring::{BufRing, BufRingBuf, SendBundleBatch};
 use crate::net::socket;
 use crate::operation::Op;
 
@@ -93,6 +93,32 @@ impl UdpSocket {
         B: StableBuf + 'static,
     {
         self.inner.send_with_flags(buf, flags).await
+    }
+
+    /// Sends one datagram assembled from one or more committed buffers in a send bundle batch on a
+    /// connected socket.
+    ///
+    /// The batch must have at least one committed buffer queued.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the batch's send ring was registered with another driver.
+    pub async fn send_bundle(&self, batch: SendBundleBatch) -> io::Result<usize> {
+        self.inner.send_bundle_udp(batch).await
+    }
+
+    /// Sends one datagram assembled from one or more committed buffers in a send bundle batch on a
+    /// connected socket with the provided send flags.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the batch's send ring was registered with another driver.
+    pub async fn send_bundle_with_flags(
+        &self,
+        batch: SendBundleBatch,
+        flags: i32,
+    ) -> io::Result<usize> {
+        self.inner.send_bundle_udp_with_flags(batch, flags).await
     }
 
     /// Sends a single datagram on a connected socket using io_uring zerocopy send.
@@ -214,7 +240,7 @@ impl UdpSocket {
     /// # Panics
     ///
     /// Panics when the buffer ring was registered with another driver.
-    pub async fn recv_from_ring(&self, ring: &RecvBufRing) -> io::Result<(BufRingBuf, SocketAddr)> {
+    pub async fn recv_from_ring(&self, ring: &BufRing) -> io::Result<(BufRingBuf, SocketAddr)> {
         self.inner.recv_from_ring(ring).await
     }
 
@@ -234,7 +260,7 @@ impl UdpSocket {
     /// # Panics
     ///
     /// Panics when the buffer ring was registered with another driver.
-    pub fn recv_from_ring_multi(&self, ring: &RecvBufRing) -> Op<socket::RecvFromRingMulti> {
+    pub fn recv_from_ring_multi(&self, ring: &BufRing) -> Op<socket::RecvFromRingMulti> {
         self.inner.recv_from_ring_multi(ring)
     }
 
@@ -244,7 +270,7 @@ impl UdpSocket {
     /// # Panics
     ///
     /// Panics when the buffer ring was registered with another driver.
-    pub fn recv_ring_multi(&self, ring: &RecvBufRing) -> Op<socket::RecvRingMulti> {
+    pub fn recv_ring_multi(&self, ring: &BufRing) -> Op<socket::RecvRingMulti> {
         self.inner.recv_ring_multi(ring)
     }
 
@@ -253,7 +279,7 @@ impl UdpSocket {
     /// # Panics
     ///
     /// Panics when the buffer ring was registered with another driver.
-    pub fn recv_bundle(&self, ring: &RecvBufRing) -> Op<socket::RecvRingBundle> {
+    pub fn recv_bundle(&self, ring: &BufRing) -> Op<socket::RecvRingBundle> {
         self.inner.recv_ring_bundle(ring)
     }
 
@@ -262,11 +288,7 @@ impl UdpSocket {
     /// # Panics
     ///
     /// Panics when the buffer ring was registered with another driver.
-    pub fn recv_bundle_with_flags(
-        &self,
-        ring: &RecvBufRing,
-        flags: i32,
-    ) -> Op<socket::RecvRingBundle> {
+    pub fn recv_bundle_with_flags(&self, ring: &BufRing, flags: i32) -> Op<socket::RecvRingBundle> {
         self.inner.recv_ring_bundle_with_flags(ring, flags)
     }
 
@@ -275,7 +297,7 @@ impl UdpSocket {
     /// # Panics
     ///
     /// Panics when the buffer ring was registered with another driver.
-    pub fn recv_bundle_multi(&self, ring: &RecvBufRing) -> Op<socket::RecvRingBundleMulti> {
+    pub fn recv_bundle_multi(&self, ring: &BufRing) -> Op<socket::RecvRingBundleMulti> {
         self.inner.recv_ring_bundle_multi(ring)
     }
 
@@ -286,7 +308,7 @@ impl UdpSocket {
     /// Panics when the buffer ring was registered with another driver.
     pub fn recv_bundle_multi_with_flags(
         &self,
-        ring: &RecvBufRing,
+        ring: &BufRing,
         flags: i32,
     ) -> Op<socket::RecvRingBundleMulti> {
         self.inner.recv_ring_bundle_multi_with_flags(ring, flags)

@@ -118,3 +118,16 @@ pub fn xattr_unsupported(err: &io::Error) -> bool {
     err.kind() == io::ErrorKind::Unsupported
         || XATTR_UNSUPPORTED_ERRNOS.contains(&err.raw_os_error().unwrap_or_default())
 }
+
+#[allow(dead_code)]
+pub fn send_bundle_unsupported(err: &io::Error) -> bool {
+    const BUNDLE_UNSUPPORTED_ERRNOS: [c_int; 5] = [
+        libc::ENOSYS,
+        libc::EOPNOTSUPP,
+        libc::ENOTSUP,
+        libc::EINVAL,
+        libc::ENOPROTOOPT,
+    ];
+    err.kind() == io::ErrorKind::Unsupported
+        || BUNDLE_UNSUPPORTED_ERRNOS.contains(&err.raw_os_error().unwrap_or_default())
+}
