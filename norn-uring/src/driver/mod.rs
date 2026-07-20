@@ -7,7 +7,7 @@ use std::{io, mem};
 
 use io_uring::squeue::{Flags, PushError};
 use io_uring::types::{self, CancelBuilder, SubmitArgs, Timespec};
-use io_uring::{cqueue, opcode, IoUring, Submitter};
+use io_uring::{cqueue, opcode, squeue, IoUring, Submitter};
 use log::{debug, error, trace, warn};
 use norn_executor::park::{Park, ParkMode};
 use smallvec::SmallVec;
@@ -85,16 +85,150 @@ pub struct Handle {
 }
 
 struct Shared {
-    ring: RefCell<IoUring>,
+    ring: RefCell<RingInner>,
     backpressure: Notify,
     status: Cell<Status>,
     submit_error: RefCell<Option<(io::ErrorKind, String)>>,
     shutdown_outcome: Cell<Option<ShutdownOutcome>>,
     #[cfg(test)]
     cancel_all_error: Cell<Option<i32>>,
-    // This field must be declared after `ring`: fields are dropped in declaration
+    // These fields must be declared after `ring`: fields are dropped in declaration
     // order, so retained registered storage is released only after the ring.
     registered_buffers: RegisteredBuffers,
+    zcrx_ifqs: RefCell<Vec<crate::zcrx::Registration>>,
+}
+
+pub(crate) enum RingInner {
+    Base(IoUring<squeue::Entry, cqueue::Entry>),
+    Cqe32(IoUring<squeue::Entry, cqueue::Entry32>),
+}
+
+#[derive(Clone, Copy)]
+struct RawCompletion {
+    user_data: u64,
+    result: i32,
+    flags: u32,
+    extra: Option<[u64; 2]>,
+}
+
+impl RingInner {
+    fn is_cqe32(&self) -> bool {
+        matches!(self, Self::Cqe32(_))
+    }
+
+    pub(crate) fn with_submitter<U>(&self, f: impl FnOnce(&Submitter<'_>) -> U) -> U {
+        match self {
+            Self::Base(ring) => f(&ring.submitter()),
+            Self::Cqe32(ring) => f(&ring.submitter()),
+        }
+    }
+
+    fn with_submission<U>(
+        &mut self,
+        f: impl FnOnce(&mut squeue::SubmissionQueue<'_, squeue::Entry>) -> U,
+    ) -> U {
+        match self {
+            Self::Base(ring) => f(&mut ring.submission()),
+            Self::Cqe32(ring) => f(&mut ring.submission()),
+        }
+    }
+
+    fn submit_once(&mut self, mode: ParkMode) -> io::Result<usize> {
+        match self {
+            Self::Base(ring) => submit_ring_once(ring, mode),
+            Self::Cqe32(ring) => submit_ring_once(ring, mode),
+        }
+    }
+
+    fn queues_full(&mut self) -> bool {
+        match self {
+            Self::Base(ring) => {
+                let (_, sq, cq) = ring.split();
+                sq.is_full() || cq.is_full()
+            }
+            Self::Cqe32(ring) => {
+                let (_, sq, cq) = ring.split();
+                sq.is_full() || cq.is_full()
+            }
+        }
+    }
+
+    fn drain_fill<'a, const N: usize>(
+        &mut self,
+        entries: &'a mut [mem::MaybeUninit<RawCompletion>; N],
+    ) -> (&'a mut [RawCompletion], bool) {
+        let (filled, has_more) = match self {
+            Self::Base(ring) => {
+                let mut cq = ring.completion();
+                let has_more = cq.len() > entries.len();
+                let mut filled = 0;
+                for cqe in cq.by_ref().take(entries.len()) {
+                    entries[filled].write(RawCompletion {
+                        user_data: cqe.user_data(),
+                        result: cqe.result(),
+                        flags: cqe.flags(),
+                        extra: None,
+                    });
+                    filled += 1;
+                }
+                (filled, has_more)
+            }
+            Self::Cqe32(ring) => {
+                let mut cq = ring.completion();
+                let has_more = cq.len() > entries.len();
+                let mut filled = 0;
+                for cqe in cq.by_ref().take(entries.len()) {
+                    entries[filled].write(RawCompletion {
+                        user_data: cqe.user_data(),
+                        result: cqe.result(),
+                        flags: cqe.flags(),
+                        extra: Some(*cqe.big_cqe()),
+                    });
+                    filled += 1;
+                }
+                (filled, has_more)
+            }
+        };
+
+        // Safety: both match arms initialized exactly `filled` consecutive entries.
+        let entries = unsafe {
+            std::slice::from_raw_parts_mut(entries.as_mut_ptr().cast::<RawCompletion>(), filled)
+        };
+        (entries, has_more)
+    }
+
+    #[cfg(test)]
+    fn submission_len(&mut self) -> usize {
+        self.with_submission(|sq| sq.len())
+    }
+}
+
+fn submit_ring_once<C>(ring: &mut IoUring<squeue::Entry, C>, mode: ParkMode) -> io::Result<usize>
+where
+    C: cqueue::EntryMarker,
+{
+    Ok(match mode {
+        ParkMode::Timeout(duration) => {
+            let ts = Timespec::new()
+                .sec(duration.as_secs())
+                .nsec(duration.subsec_nanos());
+            let args = SubmitArgs::new().timespec(&ts);
+            ring.submitter().submit_with_args(1, &args)?
+        }
+        ParkMode::NextCompletion => {
+            let args = SubmitArgs::new();
+            ring.submitter().submit_with_args(1, &args)?
+        }
+        ParkMode::NoPark => {
+            let sq = ring.submission();
+            if sq.is_empty() {
+                0
+            } else {
+                drop(sq);
+                ring.submitter().submit()?
+            }
+        }
+    })
 }
 
 pub(crate) struct FixedBufReservation {
@@ -394,6 +528,25 @@ impl Driver {
     /// Create a new [`Driver`] with the provided size from the provided [`io_uring::Builder`].
     pub fn new(mut builder: io_uring::Builder, size: u32) -> io::Result<Self> {
         let ring = builder.dontfork().build(size)?;
+        Self::from_ring(RingInner::Base(ring))
+    }
+
+    /// Create a new [`Driver`] configured for 32-byte completion queue entries.
+    ///
+    /// This is required for operations such as zero-copy receive that return an
+    /// operation-specific payload after the base CQE fields. [`Driver::new`]
+    /// continues to create the existing 16-byte CQE ring. Callers intending to
+    /// register a zero-copy receive IFQ must also configure the builder with
+    /// `setup_single_issuer` and `setup_defer_taskrun`, as required by the kernel.
+    pub fn new_cqe32(
+        mut builder: io_uring::Builder<squeue::Entry, cqueue::Entry32>,
+        size: u32,
+    ) -> io::Result<Self> {
+        let ring = builder.dontfork().build(size)?;
+        Self::from_ring(RingInner::Cqe32(ring))
+    }
+
+    fn from_ring(ring: RingInner) -> io::Result<Self> {
         Ok(Self {
             shared: Rc::new(Shared {
                 ring: RefCell::new(ring),
@@ -404,10 +557,42 @@ impl Driver {
                 #[cfg(test)]
                 cancel_all_error: Cell::new(None),
                 registered_buffers: RegisteredBuffers::new(),
+                zcrx_ifqs: RefCell::new(Vec::new()),
             }),
             unparker: Arc::new(unpark::Unparker::new()?),
             unparker_buf: mem::ManuallyDrop::new(UnparkerBuffer::new()),
         })
+    }
+
+    /// Register a network receive queue for io_uring zero-copy receive.
+    ///
+    /// Registration is explicit and is supported only by a driver created with
+    /// [`Driver::new_cqe32`] whose builder enabled `setup_single_issuer` and
+    /// `setup_defer_taskrun`. The driver retains the registered memory until the
+    /// ring is destroyed.
+    pub fn register_zcrx_ifq(
+        &mut self,
+        config: crate::zcrx::ZcRxIfqConfig,
+    ) -> io::Result<crate::zcrx::ZcRxIfq> {
+        if self.shared.status() != Status::Running {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "zero-copy receive IFQ registration requires a running driver",
+            ));
+        }
+        if !self.shared.ring.borrow().is_cqe32() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "zero-copy receive IFQ registration requires Driver::new_cqe32",
+            ));
+        }
+
+        let registration = self
+            .shared
+            .with_submitter(|submitter| crate::zcrx::Registration::new(submitter, config))?;
+        let ifq = registration.handle(self.handle());
+        self.shared.zcrx_ifqs.borrow_mut().push(registration);
+        Ok(ifq)
     }
 
     /// Returns a handle to the driver.
@@ -481,14 +666,14 @@ impl Driver {
     /// `N` is the number of entries to drain at a time. This is used to allocate
     /// storage for copying the entries out of the ring. This should be a small value.
     fn drain<const N: usize>(&self, max: usize) -> usize {
-        let mut entries: [mem::MaybeUninit<cqueue::Entry>; N] =
+        let mut entries: [mem::MaybeUninit<RawCompletion>; N] =
             unsafe { mem::MaybeUninit::uninit().assume_init() };
         let mut total_drained = 0;
         loop {
             let (entries, has_more) = self.shared.drain_fill(&mut entries);
             let nr_drained = entries.len();
             for cqe in entries {
-                let user_data = cqe.user_data() as usize;
+                let user_data = cqe.user_data as usize;
                 if user_data == Self::DRAIN_TOKEN {
                     trace!(target: LOG, "drain.token");
                     self.shared.finish_shutdown(ShutdownOutcome::CleanDrained);
@@ -511,7 +696,7 @@ impl Driver {
                 }
 
                 if user_data <= 1024 {
-                    let result = cqe.result();
+                    let result = cqe.result;
                     let result = if result >= 0 {
                         Ok(result as u32)
                     } else {
@@ -524,7 +709,7 @@ impl Driver {
                 }
                 // Safety: This is being called on a completion queue entry which has been generated
                 // by a prior submission.
-                unsafe { complete_operation(cqe) }
+                unsafe { complete_operation(cqe.user_data, cqe.result, cqe.flags, cqe.extra) }
             }
             total_drained += nr_drained;
             if !has_more || total_drained >= max {
@@ -653,8 +838,7 @@ impl Shared {
             return Ok(());
         }
         let mut ring = self.ring.borrow_mut();
-        let sq = ring.submission();
-        let capacity = sq.capacity();
+        let capacity = ring.with_submission(|sq| sq.capacity());
         if batch_len > capacity {
             return Err(SubmitError::batch_too_large(batch_len, capacity));
         }
@@ -714,14 +898,15 @@ impl Shared {
     /// If the submission queue is full, this returns the original entry.
     fn try_push(&self, entry: ConfiguredEntry) -> Result<(), ConfiguredEntry> {
         let mut ring = self.ring.borrow_mut();
-        let mut sq = ring.submission();
-        if sq.is_full() {
-            Err(entry)
-        } else {
-            let entry = entry.into_entry_with_flags(Flags::empty());
-            unsafe { sq.push(&entry) }.unwrap();
-            Ok(())
-        }
+        ring.with_submission(|sq| {
+            if sq.is_full() {
+                Err(entry)
+            } else {
+                let entry = entry.into_entry_with_flags(Flags::empty());
+                unsafe { sq.push(&entry) }.unwrap();
+                Ok(())
+            }
+        })
     }
 
     /// Attempt to push a batch of entries into the submission queue.
@@ -733,30 +918,31 @@ impl Shared {
         mut entries: SmallVec<[ConfiguredEntry; 4]>,
     ) -> Result<(), SmallVec<[ConfiguredEntry; 4]>> {
         let mut ring = self.ring.borrow_mut();
-        let mut sq = ring.submission();
-        if sq.capacity() - sq.len() < entries.len() {
-            return Err(entries);
-        }
+        ring.with_submission(|sq| {
+            if sq.capacity() - sq.len() < entries.len() {
+                return Err(entries);
+            }
 
-        if entries.len() == 1 {
-            let entry = entries.pop().expect("singleton batch missing entry");
-            let entry = entry.into_entry_with_flags(Flags::empty());
-            unsafe { sq.push(&entry) }.unwrap();
-            return Ok(());
-        }
+            if entries.len() == 1 {
+                let entry = entries.pop().expect("singleton batch missing entry");
+                let entry = entry.into_entry_with_flags(Flags::empty());
+                unsafe { sq.push(&entry) }.unwrap();
+                return Ok(());
+            }
 
-        let len = entries.len();
-        let mut raw_entries = SmallVec::<[io_uring::squeue::Entry; 4]>::with_capacity(len);
-        for (idx, entry) in entries.into_iter().enumerate() {
-            let flags = if idx + 1 == len {
-                Flags::empty()
-            } else {
-                Flags::IO_LINK
-            };
-            raw_entries.push(entry.into_entry_with_flags(flags));
-        }
-        unsafe { sq.push_multiple(raw_entries.as_slice()) }.unwrap();
-        Ok(())
+            let len = entries.len();
+            let mut raw_entries = SmallVec::<[io_uring::squeue::Entry; 4]>::with_capacity(len);
+            for (idx, entry) in entries.into_iter().enumerate() {
+                let flags = if idx + 1 == len {
+                    Flags::empty()
+                } else {
+                    Flags::IO_LINK
+                };
+                raw_entries.push(entry.into_entry_with_flags(flags));
+            }
+            unsafe { sq.push_multiple(raw_entries.as_slice()) }.unwrap();
+            Ok(())
+        })
     }
 
     /// Attempt to push a new raw entry into the submission queue.
@@ -764,40 +950,17 @@ impl Shared {
     /// If the submission queue is full, this will return an error.
     unsafe fn try_push_raw(&self, entry: &io_uring::squeue::Entry) -> Result<(), PushError> {
         let mut ring = self.ring.borrow_mut();
-        let mut sq = ring.submission();
-        sq.push(entry)
+        ring.with_submission(|sq| sq.push(entry))
     }
 
     fn with_submitter<U>(&self, f: impl FnOnce(&Submitter<'_>) -> U) -> U {
         let ring = self.ring.borrow();
-        let sq = ring.submitter();
-        f(&sq)
+        ring.with_submitter(f)
     }
 
     fn submit_once(&self, mode: ParkMode) -> io::Result<usize> {
         let mut ring = self.ring.borrow_mut();
-        Ok(match mode {
-            ParkMode::Timeout(duration) => {
-                let ts = Timespec::new()
-                    .sec(duration.as_secs())
-                    .nsec(duration.subsec_nanos());
-                let args = SubmitArgs::new().timespec(&ts);
-                ring.submitter().submit_with_args(1, &args)?
-            }
-            ParkMode::NextCompletion => {
-                let args = SubmitArgs::new();
-                ring.submitter().submit_with_args(1, &args)?
-            }
-            ParkMode::NoPark => {
-                let sq = ring.submission();
-                if sq.is_empty() {
-                    0
-                } else {
-                    drop(sq);
-                    ring.submitter().submit()?
-                }
-            }
-        })
+        ring.submit_once(mode)
     }
 
     /// Submit all entries in the submission queue.
@@ -848,19 +1011,27 @@ impl Shared {
 
         // First try to submit an async cancel request, this avoids a syscall.
         let mut ring = self.ring.borrow_mut();
+        let mut criteria = Some(criteria);
         if !sync {
-            let mut sq = ring.submission();
-            if !sq.is_full() {
-                let cancel = opcode::AsyncCancel2::new(criteria)
-                    .build()
-                    .flags(Flags::SKIP_SUCCESS)
-                    .user_data(Driver::CANCELLATION_TOKEN as u64);
+            let queued = ring.with_submission(|sq| {
+                if sq.is_full() {
+                    return false;
+                }
+                let cancel = opcode::AsyncCancel2::new(
+                    criteria.take().expect("cancel criteria already consumed"),
+                )
+                .build()
+                .flags(Flags::SKIP_SUCCESS)
+                .user_data(Driver::CANCELLATION_TOKEN as u64);
                 unsafe { sq.push(&cancel) }.unwrap();
+                true
+            });
+            if queued {
                 return Ok(());
             }
         }
-        let submitter = ring.submitter();
-        submitter.register_sync_cancel(None, criteria)?;
+        let criteria = criteria.expect("queued async cancellation returned early");
+        ring.with_submitter(|submitter| submitter.register_sync_cancel(None, criteria))?;
         Ok(())
     }
 
@@ -897,12 +1068,10 @@ impl Shared {
             return Err(io::Error::from_raw_os_error(errno));
         }
 
-        let ring = self.ring.borrow();
         let criteria = CancelBuilder::any();
         let timeout = Timespec::from(SHUTDOWN_CANCEL_TIMEOUT);
-        match ring
-            .submitter()
-            .register_sync_cancel(Some(timeout), criteria)
+        match self
+            .with_submitter(|submitter| submitter.register_sync_cancel(Some(timeout), criteria))
         {
             Ok(()) => Ok(()),
             // No matching requests means there is nothing left to cancel.
@@ -919,8 +1088,7 @@ impl Shared {
         }
         if NEEDS_PARK_CHECK_RINGS {
             let mut ring = self.ring.borrow_mut();
-            let (_, sq, cq) = ring.split();
-            sq.is_full() || cq.is_full()
+            ring.queues_full()
         } else {
             false
         }
@@ -932,12 +1100,10 @@ impl Shared {
     /// this buffer.
     fn drain_fill<'a, const N: usize>(
         &'a self,
-        entries: &'a mut [mem::MaybeUninit<cqueue::Entry>; N],
-    ) -> (&'a mut [cqueue::Entry], bool) {
+        entries: &'a mut [mem::MaybeUninit<RawCompletion>; N],
+    ) -> (&'a mut [RawCompletion], bool) {
         let mut ring = self.ring.borrow_mut();
-        let mut cq = ring.completion();
-        let has_more = cq.len() > entries.len();
-        (cq.fill(entries), has_more)
+        ring.drain_fill(entries)
     }
 }
 
@@ -1115,6 +1281,56 @@ mod tests {
     }
 
     #[test]
+    fn cqe32_driver_preserves_extra_completion_payload() {
+        #[derive(Debug)]
+        struct InspectNop;
+
+        unsafe impl Operation for InspectNop {
+            fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+                Ok(opcode::Nop::new().build())
+            }
+
+            fn cleanup(&mut self, _: CQEResult) {}
+        }
+
+        impl Singleshot for InspectNop {
+            type Output = Option<[u64; 2]>;
+
+            fn complete(self, result: CQEResult) -> Self::Output {
+                result.big_cqe().copied()
+            }
+        }
+
+        fn run(driver: Driver) -> Option<[u64; 2]> {
+            let handle = driver.handle();
+            let mut executor = norn_executor::LocalExecutor::new(driver);
+            executor.block_on(handle.submit(InspectNop))
+        }
+
+        assert_eq!(
+            run(Driver::new(io_uring::IoUring::builder(), 8).unwrap()),
+            None
+        );
+        assert_eq!(
+            run(Driver::new_cqe32(
+                io_uring::IoUring::<squeue::Entry, cqueue::Entry32>::builder(),
+                8,
+            )
+            .unwrap()),
+            Some([0, 0])
+        );
+    }
+
+    #[test]
+    fn base_driver_rejects_zcrx_registration() {
+        let mut driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let err = driver
+            .register_zcrx_ifq(crate::zcrx::ZcRxIfqConfig::default())
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+    }
+
+    #[test]
     fn clean_shutdown_releases_unparker_buffer_once() {
         let mut driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
         let unparker_buf_drops = Arc::new(AtomicUsize::new(0));
@@ -1147,7 +1363,7 @@ mod tests {
         assert!(!driver.unparker.state().is_parked());
         {
             let mut ring = driver.shared.ring.borrow_mut();
-            assert_eq!(ring.submission().len(), 0);
+            assert_eq!(ring.submission_len(), 0);
         }
 
         assert!(driver.prepare_park());
@@ -1155,7 +1371,7 @@ mod tests {
         assert!(!driver.unparker.state().woken());
         {
             let mut ring = driver.shared.ring.borrow_mut();
-            assert_eq!(ring.submission().len(), 1);
+            assert_eq!(ring.submission_len(), 1);
         }
     }
 
@@ -1266,8 +1482,11 @@ mod tests {
         let _op = driver.handle().submit(NopOp);
 
         let mut ring = driver.shared.ring.borrow_mut();
-        let sq = ring.submission();
-        assert_eq!(sq.len(), 0, "request construction must not enqueue");
+        assert_eq!(
+            ring.submission_len(),
+            0,
+            "request construction must not enqueue"
+        );
     }
 
     #[test]
@@ -1312,8 +1531,11 @@ mod tests {
         assert_eq!(batch.len(), 2);
 
         let mut ring = driver.shared.ring.borrow_mut();
-        let sq = ring.submission();
-        assert_eq!(sq.len(), 1, "failed batch enqueue must not partially push");
+        assert_eq!(
+            ring.submission_len(),
+            1,
+            "failed batch enqueue must not partially push"
+        );
     }
 
     #[test]

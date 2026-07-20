@@ -536,23 +536,31 @@ where
     }
 }
 
-/// Complete an operations.
+/// Complete an operation.
 ///
 /// ### Safety
 ///
 /// This should only be called by the reactor when it reaps a completion. It should not
-/// be called multiple times for the same completion.
+/// be called multiple times for the same completion. `user_data` must be the raw
+/// operation reference installed by this runtime.
 #[inline]
-pub(crate) unsafe fn complete_operation(entry: &io_uring::cqueue::Entry) {
-    assert!(entry.user_data() > 1024);
-    let handle = RawOpRef::from_raw_usize(entry.user_data() as usize);
-    let result = entry.result();
+pub(crate) unsafe fn complete_operation(
+    user_data: u64,
+    result: i32,
+    flags: u32,
+    extra: Option<[u64; 2]>,
+) {
+    assert!(user_data > 1024);
+    let handle = RawOpRef::from_raw_usize(user_data as usize);
     let result = if result >= 0 {
         Ok(result as u32)
     } else {
         Err(io::Error::from_raw_os_error(-result))
     };
-    let result = CQEResult::new(result, entry.flags());
+    let result = match extra {
+        Some(extra) => CQEResult::new_big(result, flags, extra),
+        None => CQEResult::new(result, flags),
+    };
     handle.complete(result);
 }
 

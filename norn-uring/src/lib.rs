@@ -12,6 +12,7 @@
 //! - `fixedbuf`: caller-owned buffers registered for fixed I/O.
 //! - `fs`: asynchronous filesystem operations.
 //! - `net`: asynchronous TCP and UDP networking.
+//! - `zcrx`: zero-copy receive queue registration and buffers.
 //!
 //! [`Park`]: norn_executor::park::Park
 //! [io_uring]: https://kernel.dk/io_uring.pdf
@@ -41,6 +42,8 @@ pub mod fixedbuf;
 pub mod fs;
 /// Asynchronous TCP and UDP networking.
 pub mod net;
+/// Zero-copy receive interface-queue support.
+pub mod zcrx;
 
 pub use driver::{Driver, Handle};
 pub use operation::{CQEResult, Multishot, Op, Operation, Singleshot};

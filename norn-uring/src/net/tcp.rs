@@ -258,6 +258,16 @@ impl TcpSocket {
         self.socket.recv_ring_multi(ring)
     }
 
+    /// Receive TCP data as a multishot zero-copy stream.
+    ///
+    /// The IFQ must be registered with the same CQE32 driver as this socket.
+    /// This method does not fall back to buffered receive when zero-copy
+    /// receive is unavailable. A second active stream for the same IFQ yields
+    /// [`io::ErrorKind::WouldBlock`].
+    pub fn recv_zc_multi(&self, len: u32, ifq: &crate::zcrx::ZcRxIfq) -> Op<socket::RecvZc> {
+        self.socket.recv_zc_multi(len, ifq)
+    }
+
     /// Receive data using a single-shot recv bundle operation and a provided buffer ring.
     ///
     /// # Panics

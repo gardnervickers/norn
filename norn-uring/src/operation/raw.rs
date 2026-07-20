@@ -111,6 +111,7 @@ where
 pub struct CQEResult {
     pub(crate) result: io::Result<u32>,
     pub(crate) flags: u32,
+    extra: Option<[u64; 2]>,
     source: CompletionSource,
 }
 
@@ -125,6 +126,16 @@ impl CQEResult {
         Self {
             result,
             flags,
+            extra: None,
+            source: CompletionSource::Kernel,
+        }
+    }
+
+    pub(crate) fn new_big(result: io::Result<u32>, flags: u32, extra: [u64; 2]) -> Self {
+        Self {
+            result,
+            flags,
+            extra: Some(extra),
             source: CompletionSource::Kernel,
         }
     }
@@ -133,6 +144,7 @@ impl CQEResult {
         Self {
             result,
             flags: 0,
+            extra: None,
             source: CompletionSource::Synthetic,
         }
     }
@@ -168,6 +180,10 @@ impl CQEResult {
 
     pub(crate) fn notif(&self) -> bool {
         io_uring::cqueue::notif(self.flags)
+    }
+
+    pub(crate) fn big_cqe(&self) -> Option<&[u64; 2]> {
+        self.extra.as_ref()
     }
 }
 
@@ -280,5 +296,17 @@ impl Clone for RawOpRef {
         let header = self.header();
         unsafe { (header.vtable.clone_ref)(self.inner) }
         RawOpRef { inner: self.inner }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CQEResult;
+
+    #[test]
+    fn cqe32_result_preserves_extra_payload() {
+        let result = CQEResult::new_big(Ok(7), 9, [11, 13]);
+        assert_eq!(result.big_cqe(), Some(&[11, 13]));
+        assert_eq!(result.flags(), 9);
     }
 }

@@ -6,6 +6,7 @@ use std::{io, os::raw::c_int};
 
 use futures_core::Future;
 
+#[allow(dead_code)]
 pub fn with_test_env<U, F>(f: impl FnOnce() -> F) -> Result<U, Box<dyn std::error::Error>>
 where
     F: Future<Output = Result<U, Box<dyn std::error::Error>>>,
@@ -103,6 +104,20 @@ pub fn recv_bundle_unsupported(err: &io::Error) -> bool {
     ];
     err.kind() == io::ErrorKind::Unsupported
         || BUNDLE_UNSUPPORTED_ERRNOS.contains(&err.raw_os_error().unwrap_or_default())
+}
+
+#[allow(dead_code)]
+pub fn zcrx_unsupported(err: &io::Error) -> bool {
+    const ZCRX_UNSUPPORTED_ERRNOS: [c_int; 6] = [
+        libc::ENOSYS,
+        libc::EOPNOTSUPP,
+        libc::ENOTSUP,
+        libc::EINVAL,
+        libc::EPERM,
+        libc::EACCES,
+    ];
+    err.kind() == io::ErrorKind::Unsupported
+        || ZCRX_UNSUPPORTED_ERRNOS.contains(&err.raw_os_error().unwrap_or_default())
 }
 
 #[allow(dead_code)]

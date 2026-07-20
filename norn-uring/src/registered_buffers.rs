@@ -4,8 +4,9 @@ use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::{io, mem};
 
-use io_uring::IoUring;
 use log::warn;
+
+use crate::driver::RingInner;
 
 const LOG: &str = "norn_uring::registered_buffers";
 
@@ -68,7 +69,7 @@ impl Registry {
     }
 
     /// Reserve the ring's fixed-buffer table for a registration attempt.
-    pub(crate) fn reserve(&self, ring: &RefCell<IoUring>) -> Result<Generation, ReserveError> {
+    pub(crate) fn reserve(&self, ring: &RefCell<RingInner>) -> Result<Generation, ReserveError> {
         self.try_release_retained(ring);
         let retained_storage = self
             .retained
@@ -123,7 +124,7 @@ impl Registry {
 
     pub(crate) fn unregister(
         &self,
-        ring: &RefCell<IoUring>,
+        ring: &RefCell<RingInner>,
         generation: Generation,
     ) -> Result<Release, ReleaseError> {
         let state = self.state.get();
@@ -138,7 +139,7 @@ impl Registry {
             let ring = ring
                 .try_borrow()
                 .map_err(|_| ReleaseError::DriverBorrowed)?;
-            match ring.submitter().unregister_buffers() {
+            match ring.with_submitter(|submitter| submitter.unregister_buffers()) {
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
                 result => break result,
             }
@@ -174,7 +175,7 @@ impl Registry {
     }
 
     /// Retry a best-effort pool-drop release before rejecting a new table.
-    fn try_release_retained(&self, ring: &RefCell<IoUring>) {
+    fn try_release_retained(&self, ring: &RefCell<RingInner>) {
         let retained_generation = match self.retained.try_borrow() {
             Ok(retained) if retained.is_empty() => return,
             Ok(retained) => {
@@ -207,7 +208,7 @@ impl Registry {
                         return;
                     };
                     loop {
-                        match ring.submitter().unregister_buffers() {
+                        match ring.with_submitter(|submitter| submitter.unregister_buffers()) {
                             Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
                             result => break result,
                         }
@@ -296,7 +297,7 @@ mod tests {
     #[test]
     fn retained_storage_cannot_unregister_a_different_generation() -> io::Result<()> {
         let registry = Registry::new();
-        let ring = RefCell::new(IoUring::builder().build(8)?);
+        let ring = RefCell::new(RingInner::Base(io_uring::IoUring::builder().build(8)?));
 
         let first = registry
             .reserve(&ring)
@@ -314,7 +315,10 @@ mod tests {
         registry.arm_kernel_call(second);
         // Safety: `registered` remains alive and fixed in its box through the
         // successful unregistration below.
-        unsafe { ring.borrow().submitter().register_buffers(&[iovec])? };
+        unsafe {
+            ring.borrow()
+                .with_submitter(|submitter| submitter.register_buffers(&[iovec]))?
+        };
         registry.commit(second);
 
         assert!(matches!(

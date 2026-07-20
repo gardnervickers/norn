@@ -180,6 +180,11 @@ impl Socket {
         self.handle.submit(op)
     }
 
+    pub(crate) fn recv_zc_multi(&self, len: u32, ifq: &crate::zcrx::ZcRxIfq) -> Op<RecvZc> {
+        let op = RecvZc::new(self.fd.clone(), self.handle.clone(), ifq.clone(), len);
+        self.handle.submit(op)
+    }
+
     pub(crate) fn recv_ring_bundle(&self, ring: &BufRing) -> Op<RecvRingBundle> {
         self.assert_bufring_driver(ring);
         let op = RecvRingBundle::new(self.fd.clone(), ring.clone(), 0);
@@ -1014,6 +1019,82 @@ impl Multishot for RecvRingMulti {
 
     fn complete(self, result: crate::operation::CQEResult) -> Option<Self::Item> {
         Some(self.to_item(result))
+    }
+}
+
+/// A multishot zero-copy receive operation.
+#[derive(Debug)]
+pub struct RecvZc {
+    fd: NornFd,
+    handle: crate::Handle,
+    ifq: crate::zcrx::ZcRxIfq,
+    len: u32,
+    acquired: bool,
+}
+
+impl RecvZc {
+    fn new(fd: NornFd, handle: crate::Handle, ifq: crate::zcrx::ZcRxIfq, len: u32) -> Self {
+        Self {
+            fd,
+            handle,
+            ifq,
+            len,
+            acquired: false,
+        }
+    }
+
+    fn to_item(&self, result: crate::operation::CQEResult) -> io::Result<crate::zcrx::ZcRecvBuf> {
+        self.ifq.parse_completion(self.len, result)
+    }
+}
+
+impl Drop for RecvZc {
+    fn drop(&mut self) {
+        if self.acquired {
+            self.ifq.release();
+            self.acquired = false;
+        }
+    }
+}
+
+// Safety: `fd` retains the socket, `ifq` retains the registered memory,
+// registration is tied to the same driver, and the stream guard prevents a
+// second userspace consumer from racing the refill queue.
+unsafe impl Operation for RecvZc {
+    fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+        self.ifq.acquire(&self.handle)?;
+        self.acquired = true;
+
+        Ok(match self.fd.kind() {
+            crate::fd::FdKind::Fd(fd) => opcode::RecvZc::new(types::Fd(fd.0), self.len)
+                .ifq(self.ifq.id())
+                .build(),
+            crate::fd::FdKind::Fixed(fd) => opcode::RecvZc::new(types::Fixed(fd.0), self.len)
+                .ifq(self.ifq.id())
+                .build(),
+        })
+    }
+
+    fn cleanup(&mut self, result: crate::operation::CQEResult) {
+        if let Ok(buf) = self.to_item(result) {
+            drop(buf);
+        }
+    }
+}
+
+impl Multishot for RecvZc {
+    type Item = io::Result<crate::zcrx::ZcRecvBuf>;
+
+    fn update(&mut self, result: crate::operation::CQEResult) -> Self::Item {
+        self.to_item(result)
+    }
+
+    fn complete(self, result: crate::operation::CQEResult) -> Option<Self::Item> {
+        if matches!(&result.result, Ok(0)) {
+            None
+        } else {
+            Some(self.to_item(result))
+        }
     }
 }
 
