@@ -19,7 +19,6 @@ use log::warn;
 
 use crate::driver::CloseFdError;
 use crate::operation::{Operation, Singleshot};
-use crate::util::notify::Notify;
 use crate::Handle;
 
 /// [`NornFd`] is a reference counted file descriptor.
@@ -32,7 +31,6 @@ pub(crate) struct NornFd {
 struct Inner {
     kind: FdKind,
     handle: Option<Handle>,
-    notify: Notify,
     closed: Cell<bool>,
 }
 
@@ -61,7 +59,6 @@ impl NornFd {
         let inner = Inner {
             kind,
             handle,
-            notify: Notify::default(),
             closed: Cell::new(false),
         };
         let inner = Rc::new(inner);
@@ -73,31 +70,25 @@ impl NornFd {
     }
 
     pub(crate) async fn close(&self) -> io::Result<()> {
-        loop {
-            if self.inner.closed.get() {
-                return Ok(());
-            }
-            if Rc::strong_count(&self.inner) == 1 {
-                if let Some(handle) = &self.inner.handle {
-                    let result = handle
-                        .submit(CloseFd {
-                            fd: self.inner.kind,
-                        })
-                        .await;
-                    return self.inner.finish_tracked_close(result);
-                } else {
-                    return self.inner.close_direct_and_invalidate();
-                }
-            } else {
-                self.inner.notify.wait().await;
-            }
+        if self.inner.closed.get() {
+            return Ok(());
         }
-    }
-}
-
-impl Drop for NornFd {
-    fn drop(&mut self) {
-        self.inner.notify.notify(usize::MAX);
+        if Rc::strong_count(&self.inner) != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "explicit close requires sole descriptor ownership",
+            ));
+        }
+        if let Some(handle) = &self.inner.handle {
+            let result = handle
+                .submit(CloseFd {
+                    fd: self.inner.kind,
+                })
+                .await;
+            self.inner.finish_tracked_close(result)
+        } else {
+            self.inner.close_direct_and_invalidate()
+        }
     }
 }
 
