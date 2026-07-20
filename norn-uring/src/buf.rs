@@ -7,7 +7,7 @@
 //! Some buffer types, such as `Bytes` or `Vec<u8>`, can move due
 //! to reallocation. To avoid this, we use the StableBuf trait
 //! which restricts the buffer to a stable pointer into memory.
-use std::cmp;
+use std::{cmp, io};
 
 use bytes::{Bytes, BytesMut};
 
@@ -57,24 +57,125 @@ pub unsafe trait StableBuf: Unpin + 'static {
     }
 }
 
-/// [`StableBufMut`] is a trait for types which expose a
-/// stable pointer into memory.
+/// A buffer that exposes a stable, exclusively writable memory region to an
+/// I/O operation.
 ///
-/// ### Safety
-/// Implementors of this trait must ensure that the pointer returned by
-/// stable_ptr_mut is valid.
+/// # Safety
+///
+/// Implementing this trait allows safe Norn APIs to give a raw pointer to the
+/// kernel. Implementors must uphold all of the following requirements:
+///
+/// - [`StableBufMut::stable_ptr_mut`] returns a non-null, properly aligned
+///   pointer. The pointer must be valid for writes of at least
+///   [`StableBufMut::bytes_remaining`] consecutive bytes. This non-null and
+///   alignment requirement also applies when `bytes_remaining()` is zero.
+/// - The pointer, allocation, and writable length reported for an operation
+///   remain unchanged from operation configuration until its terminal
+///   completion or cleanup. Moving the owning buffer value during that interval
+///   must not move, free, or shrink the exposed region.
+/// - While an operation owns the buffer, no independent alias may read from or
+///   write to the exposed region. In particular, an implementation backed by
+///   shared or interior-mutable storage must prevent access through every other
+///   handle while the kernel may write to the region.
+/// - Every `init_len` accepted by [`StableBufMut::set_init`] must be within the
+///   region previously reported by `bytes_remaining()`. The method must make at
+///   least `0..init_len` observable as initialized without reading any bytes
+///   that the caller did not report as initialized. It may retain a longer
+///   initialized prefix that existed before the operation.
+///
+/// Norn does not access the buffer through Rust references while the kernel may
+/// use the pointer and calls `set_init` only after terminal completion. Norn
+/// also checks successful completion lengths against the exact writable length
+/// submitted to the kernel before calling `set_init`.
+///
+/// # Example
+///
+/// A custom implementation can use separately allocated, exclusively owned
+/// storage so moving the wrapper does not move the exposed region:
+///
+/// ```
+/// use norn_uring::buf::StableBufMut;
+///
+/// struct CustomBuf {
+///     storage: Box<[u8]>,
+///     initialized: usize,
+/// }
+///
+/// // Safety: the box keeps its allocation stable when `CustomBuf` moves. The
+/// // wrapper is not cloneable, so ownership of it provides exclusive access to
+/// // the entire writable allocation.
+/// unsafe impl StableBufMut for CustomBuf {
+///     fn stable_ptr_mut(&mut self) -> *mut u8 {
+///         self.storage.as_mut_ptr()
+///     }
+///
+///     fn bytes_remaining(&self) -> usize {
+///         self.storage.len()
+///     }
+///
+///     unsafe fn set_init(&mut self, init_len: usize) {
+///         assert!(init_len <= self.storage.len());
+///         self.initialized = self.initialized.max(init_len);
+///     }
+/// }
+///
+/// let mut buf = CustomBuf {
+///     storage: vec![0; 16].into_boxed_slice(),
+///     initialized: 0,
+/// };
+/// let ptr = buf.stable_ptr_mut();
+/// // Model a completed kernel write of one byte.
+/// unsafe {
+///     ptr.write(42);
+///     buf.set_init(1);
+/// }
+/// assert_eq!(buf.initialized, 1);
+/// assert_eq!(buf.storage[0], 42);
+/// ```
 pub unsafe trait StableBufMut: Unpin + 'static {
-    /// Returns a mutable pointer to the stable memory location.
+    /// Return the start of the stable writable region.
+    ///
+    /// The returned pointer and the length from [`Self::bytes_remaining`] form
+    /// one coherent region and must satisfy the trait's safety contract.
     fn stable_ptr_mut(&mut self) -> *mut u8;
 
-    /// Returns the capacity of the buffer.
+    /// Return the number of consecutive bytes writable through
+    /// [`Self::stable_ptr_mut`].
+    ///
+    /// The value must not exceed the allocation available from the returned
+    /// pointer and must remain valid for the complete operation lifetime.
     fn bytes_remaining(&self) -> usize;
 
-    /// Set the number of initialized bytes.
+    /// Record that the kernel initialized the first `init_len` bytes.
     ///
-    /// ### Safety
-    /// Callers should ensure that all bytes from 0..init_len are initialized.
+    /// # Safety
+    ///
+    /// The caller must ensure that kernel access to the buffer has ended, that
+    /// every byte in `0..init_len` is initialized, and that `init_len` is no
+    /// greater than the writable length submitted for the completed operation.
     unsafe fn set_init(&mut self, init_len: usize);
+}
+
+pub(crate) fn set_init_checked<B>(
+    buf: &mut B,
+    submitted_len: usize,
+    initialized_len: usize,
+    operation: &'static str,
+) -> io::Result<()>
+where
+    B: StableBufMut,
+{
+    if initialized_len > submitted_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{operation} completion exceeded the submitted buffer length"),
+        ));
+    }
+
+    // Safety: callers invoke this helper only after terminal completion. The
+    // bound above proves that the initialized prefix fits the submitted region.
+    unsafe { buf.set_init(initialized_len) };
+    Ok(())
 }
 
 /// A fully initialized, writable memory region suitable for long-lived kernel
@@ -167,6 +268,8 @@ unsafe impl StableBuf for Vec<u8> {
     }
 }
 
+// Safety: moving a `Vec` does not move its allocation. Exclusive ownership of
+// the vector prevents aliases, and no method here reallocates its storage.
 unsafe impl StableBufMut for Vec<u8> {
     fn stable_ptr_mut(&mut self) -> *mut u8 {
         self.as_mut_ptr()
@@ -177,6 +280,10 @@ unsafe impl StableBufMut for Vec<u8> {
     }
 
     unsafe fn set_init(&mut self, init_len: usize) {
+        assert!(
+            init_len <= self.capacity(),
+            "initialized length exceeds capacity"
+        );
         self.set_len(init_len);
     }
 }
@@ -191,6 +298,8 @@ unsafe impl StableBuf for Box<[u8]> {
     }
 }
 
+// Safety: a boxed slice has a fixed allocation and length, and exclusive
+// ownership of the box provides exclusive access to every element.
 unsafe impl StableBufMut for Box<[u8]> {
     fn stable_ptr_mut(&mut self) -> *mut u8 {
         self.as_mut_ptr()
@@ -200,7 +309,12 @@ unsafe impl StableBufMut for Box<[u8]> {
         self.len()
     }
 
-    unsafe fn set_init(&mut self, _: usize) {}
+    unsafe fn set_init(&mut self, init_len: usize) {
+        assert!(
+            init_len <= self.len(),
+            "initialized length exceeds capacity"
+        );
+    }
 }
 
 unsafe impl StableBuf for &'static [u8] {
@@ -243,6 +357,8 @@ unsafe impl StableBuf for BytesMut {
     }
 }
 
+// Safety: moving `BytesMut` does not move its backing allocation. Operation
+// ownership prevents aliases, and these methods do not resize the allocation.
 unsafe impl StableBufMut for BytesMut {
     fn stable_ptr_mut(&mut self) -> *mut u8 {
         self.as_mut_ptr()
@@ -253,6 +369,10 @@ unsafe impl StableBufMut for BytesMut {
     }
 
     unsafe fn set_init(&mut self, init_len: usize) {
+        assert!(
+            init_len <= self.capacity(),
+            "initialized length exceeds capacity"
+        );
         if self.len() < init_len {
             self.set_len(init_len)
         }
@@ -338,7 +458,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{BufCursor, StableBuf};
+    use super::{set_init_checked, BufCursor, StableBuf};
 
     #[test]
     fn cursor_consume_saturates_remaining_len() {
@@ -355,5 +475,13 @@ mod tests {
         cursor.consume(usize::MAX);
         assert_eq!(cursor.bytes_init(), 0);
         assert!(cursor.as_slice().is_empty());
+    }
+
+    #[test]
+    fn checked_init_rejects_oversized_completions() {
+        let mut buf = Vec::with_capacity(1);
+        let err = set_init_checked(&mut buf, 1, 2, "test I/O").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(buf.is_empty());
     }
 }

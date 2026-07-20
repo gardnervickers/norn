@@ -4,7 +4,7 @@ use std::io;
 use std::os::fd::RawFd;
 use std::path::Path;
 
-use crate::buf::{StableBuf, StableBufMut};
+use crate::buf::{set_init_checked, StableBuf, StableBufMut};
 use crate::fd::{FdKind, NornFd};
 use crate::fixedbuf::FixedBuf;
 use crate::fs::opts;
@@ -478,11 +478,21 @@ struct ReadAt<B> {
     fd: NornFd,
     buf: B,
     offset: u64,
+    submitted_len: usize,
 }
 
-impl<B> ReadAt<B> {
+impl<B> ReadAt<B>
+where
+    B: StableBufMut,
+{
     fn new(fd: NornFd, buf: B, offset: u64) -> Self {
-        Self { fd, buf, offset }
+        let submitted_len = buf.bytes_remaining();
+        Self {
+            fd,
+            buf,
+            offset,
+            submitted_len,
+        }
     }
 }
 
@@ -493,7 +503,7 @@ where
     B: StableBufMut,
 {
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
-        let len = usize_to_u32(self.buf.bytes_remaining(), "read buffer length")?;
+        let len = usize_to_u32(self.submitted_len, "read buffer length")?;
         let buf = self.buf.stable_ptr_mut();
         Ok(match self.fd.kind() {
             FdKind::Fd(fd) => opcode::Read::new(*fd, buf, len),
@@ -516,10 +526,9 @@ where
         match result.result {
             Ok(n) => {
                 let n = n as usize;
-                unsafe {
-                    self.buf.set_init(n);
-                }
-                (Ok(n), self.buf)
+                let result =
+                    set_init_checked(&mut self.buf, self.submitted_len, n, "read").map(|()| n);
+                (result, self.buf)
             }
             Err(err) => {
                 let buf = self.buf;
@@ -723,10 +732,24 @@ where
         match result.result {
             Ok(n) => {
                 let mut remaining = n as usize;
-                for buf in &mut self.bufs {
-                    let init = remaining.min(buf.bytes_remaining());
-                    unsafe {
-                        buf.set_init(init);
+                let submitted_len = self
+                    .iovecs
+                    .iter()
+                    .fold(0usize, |total, iovec| total.saturating_add(iovec.iov_len));
+                if remaining > submitted_len {
+                    return (
+                        Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "vectored read completion exceeded the submitted buffer length",
+                        )),
+                        self.bufs,
+                    );
+                }
+
+                for (buf, iovec) in self.bufs.iter_mut().zip(&self.iovecs) {
+                    let init = remaining.min(iovec.iov_len);
+                    if let Err(err) = set_init_checked(buf, iovec.iov_len, init, "vectored read") {
+                        return (Err(err), self.bufs);
                     }
                     remaining = remaining.saturating_sub(init);
                     if remaining == 0 {
@@ -1225,33 +1248,6 @@ mod layout_tests {
     use super::*;
     use std::os::fd::IntoRawFd;
 
-    #[derive(Debug)]
-    struct FakeBuf {
-        len: usize,
-    }
-
-    unsafe impl StableBuf for FakeBuf {
-        fn stable_ptr(&self) -> *const u8 {
-            std::ptr::NonNull::<u8>::dangling().as_ptr()
-        }
-
-        fn bytes_init(&self) -> usize {
-            self.len
-        }
-    }
-
-    unsafe impl StableBufMut for FakeBuf {
-        fn stable_ptr_mut(&mut self) -> *mut u8 {
-            std::ptr::NonNull::<u8>::dangling().as_ptr()
-        }
-
-        fn bytes_remaining(&self) -> usize {
-            self.len
-        }
-
-        unsafe fn set_init(&mut self, _: usize) {}
-    }
-
     fn test_fd() -> NornFd {
         let file = std::fs::File::open("/dev/null").unwrap();
         NornFd::from_fd(file.into_raw_fd())
@@ -1259,7 +1255,7 @@ mod layout_tests {
 
     #[test]
     fn fixed_operation_payloads_stay_within_the_expected_size_class() {
-        assert_eq!(std::mem::size_of::<ReadAt<usize>>(), 24);
+        assert_eq!(std::mem::size_of::<ReadAt<usize>>(), 32);
         assert_eq!(std::mem::size_of::<WriteAt<usize>>(), 24);
         assert_eq!(std::mem::size_of::<ReadFixedAt<[u8; 1]>>(), 48);
         assert_eq!(std::mem::size_of::<WriteFixedAt<[u8; 1]>>(), 48);
@@ -1267,51 +1263,40 @@ mod layout_tests {
 
     #[test]
     fn scalar_file_io_rejects_lengths_above_u32_max() {
-        let fd = test_fd();
-        let mut read = ReadAt::new(
-            fd.clone(),
-            FakeBuf {
-                len: u32::MAX as usize + 1,
-            },
-            0,
-        );
-        let mut write = WriteAt::new(
-            fd,
-            FakeBuf {
-                len: u32::MAX as usize + 1,
-            },
-            0,
-        );
-
         assert_eq!(
-            read.configure().unwrap_err().kind(),
-            io::ErrorKind::InvalidInput
-        );
-        assert_eq!(
-            write.configure().unwrap_err().kind(),
+            usize_to_u32(u32::MAX as usize + 1, "test buffer")
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::InvalidInput
         );
     }
 
     #[test]
     fn scalar_file_io_preserves_u32_max_length() {
-        let fd = test_fd();
-        let mut read = ReadAt::new(
-            fd.clone(),
-            FakeBuf {
-                len: u32::MAX as usize,
-            },
-            0,
+        assert_eq!(
+            usize_to_u32(u32::MAX as usize, "test buffer").unwrap(),
+            u32::MAX
         );
-        let mut write = WriteAt::new(
-            fd,
-            FakeBuf {
-                len: u32::MAX as usize,
-            },
-            0,
-        );
+    }
 
-        assert!(read.configure().is_ok());
-        assert!(write.configure().is_ok());
+    #[test]
+    fn scalar_read_rejects_completion_above_submitted_length() {
+        let fd = test_fd();
+        let read = ReadAt::new(fd, Vec::with_capacity(1), 0);
+        let (result, buf) = read.complete(CQEResult::new(Ok(2), 0));
+
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn vectored_read_rejects_completion_above_submitted_length() {
+        let fd = test_fd();
+        let mut read = ReadVectoredAt::new(fd, vec![Vec::with_capacity(1)], 0);
+        read.configure().unwrap();
+        let (result, bufs) = read.complete(CQEResult::new(Ok(2), 0));
+
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert!(bufs[0].is_empty());
     }
 }
