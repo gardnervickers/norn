@@ -94,6 +94,29 @@ pub(crate) enum TryPush {
     Failed(SubmitError),
 }
 
+#[derive(Debug)]
+pub(crate) enum CloseFdError {
+    NeverQueued(io::Error),
+    Queued(io::Error),
+}
+
+impl std::fmt::Display for CloseFdError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NeverQueued(err) => write!(f, "close SQE was never queued: {err}"),
+            Self::Queued(err) => write!(f, "close SQE was queued before submit failed: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for CloseFdError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::NeverQueued(err) | Self::Queued(err) => Some(err),
+        }
+    }
+}
+
 impl std::fmt::Debug for Handle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Handle").finish()
@@ -241,7 +264,7 @@ impl Handle {
         PushFuture::new_batch(Rc::clone(&self.shared), entries)
     }
 
-    pub(crate) fn close_fd(&self, kind: &fd::FdKind) -> io::Result<()> {
+    pub(crate) fn close_fd(&self, kind: &fd::FdKind) -> Result<(), CloseFdError> {
         self.shared.close_fd(kind)
     }
 
@@ -649,26 +672,6 @@ impl Shared {
         sq.push(entry)
     }
 
-    /// Attempt to push a new raw entry into the submission queue.
-    ///
-    /// If the submission queue is full, this will attempt to submit
-    /// once and then try again. If the submission fails, this will
-    /// return an error.
-    unsafe fn try_push_raw_submit(&self, entry: &io_uring::squeue::Entry) -> io::Result<()> {
-        if self.try_push_raw(entry).is_err() {
-            // Try to make space.
-            self.submit(ParkMode::NoPark)?;
-        }
-        // Try again.
-        self.try_push_raw(entry).map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("failed to push entry: {:?}", err),
-            )
-        })?;
-        Ok(())
-    }
-
     fn with_submitter<U>(&self, f: impl FnOnce(&Submitter<'_>) -> U) -> U {
         let ring = self.ring.borrow();
         let sq = ring.submitter();
@@ -765,16 +768,29 @@ impl Shared {
         Ok(())
     }
 
-    fn close_fd(&self, kind: &fd::FdKind) -> io::Result<()> {
+    fn close_fd(&self, kind: &fd::FdKind) -> Result<(), CloseFdError> {
         let entry = match kind {
             fd::FdKind::Fd(fd) => opcode::Close::new(types::Fd(fd.0)).build(),
             fd::FdKind::Fixed(fd) => opcode::Close::new(types::Fixed(fd.0)).build(),
         }
         .flags(Flags::SKIP_SUCCESS)
         .user_data(Driver::CLOSE_FD_TOKEN as u64);
-        unsafe { self.try_push_raw_submit(&entry) }?;
+
+        if unsafe { self.try_push_raw(&entry) }.is_err() {
+            // The close entry is still caller-owned, so a submit failure here proves
+            // that the kernel has never seen it.
+            self.submit(ParkMode::NoPark)
+                .map_err(CloseFdError::NeverQueued)?;
+            unsafe { self.try_push_raw(&entry) }.map_err(|err| {
+                CloseFdError::NeverQueued(io::Error::other(format!(
+                    "failed to push close entry: {err:?}"
+                )))
+            })?;
+        }
+
         // Ensure close requests are not stranded in SQ if no further park cycle happens.
-        self.submit(ParkMode::NoPark)?;
+        self.submit(ParkMode::NoPark)
+            .map_err(CloseFdError::Queued)?;
         Ok(())
     }
 

@@ -17,6 +17,7 @@ use std::rc::Rc;
 use io_uring::{opcode, types};
 use log::warn;
 
+use crate::driver::CloseFdError;
 use crate::operation::{Operation, Singleshot};
 use crate::util::notify::Notify;
 use crate::Handle;
@@ -78,21 +79,15 @@ impl NornFd {
             }
             if Rc::strong_count(&self.inner) == 1 {
                 if let Some(handle) = &self.inner.handle {
-                    if let Err(_err) = handle
+                    let result = handle
                         .submit(CloseFd {
                             fd: self.inner.kind,
                         })
-                        .await
-                    {
-                        // Fall back to best-effort direct close if the reactor is shutting down.
-                        self.inner.close_direct()?;
-                        self.inner.closed.set(true);
-                        return Ok(());
-                    }
+                        .await;
+                    return self.inner.finish_tracked_close(result);
                 } else {
-                    self.inner.close_direct()?;
+                    return self.inner.close_direct_and_invalidate();
                 }
-                self.inner.closed.set(true);
             } else {
                 self.inner.notify.wait().await;
             }
@@ -110,21 +105,63 @@ impl Drop for Inner {
     fn drop(&mut self) {
         if !self.closed.get() {
             // Best-effort close on drop. Errors are logged because drop cannot report them.
-            let reactor_res = self
-                .handle
-                .as_ref()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no driver handle"))
-                .and_then(|handle| handle.close_fd(&self.kind));
-            if let Err(err) = reactor_res {
-                if let Err(direct_err) = self.close_direct() {
-                    warn!(target: "norn_uring::fd", "close_fd.failed: {}; direct_close.failed: {}", err, direct_err);
-                }
+            if let Some(handle) = &self.handle {
+                self.finish_drop_close(handle.close_fd(&self.kind));
+            } else if let Err(err) = self.close_direct_and_invalidate() {
+                warn!(target: "norn_uring::fd", "direct_close.failed: {err}");
             }
         }
     }
 }
 
+enum CloseResult {
+    Closed,
+    NeverSubmitted(io::Error),
+    KernelError(io::Error),
+}
+
 impl Inner {
+    fn finish_tracked_close(&self, result: CloseResult) -> io::Result<()> {
+        match result {
+            CloseResult::Closed => {
+                self.closed.set(true);
+                Ok(())
+            }
+            CloseResult::NeverSubmitted(_submit_err) => self.close_direct_and_invalidate(),
+            CloseResult::KernelError(err) => {
+                // Linux invalidates the descriptor when processing Close even if it reports a
+                // later error. Retrying by integer fd could close an unrelated reused fd.
+                self.closed.set(true);
+                Err(err)
+            }
+        }
+    }
+
+    fn finish_drop_close(&self, result: Result<(), CloseFdError>) {
+        match result {
+            Ok(()) => {}
+            Err(CloseFdError::NeverQueued(err)) => {
+                if let Err(direct_err) = self.close_direct_and_invalidate() {
+                    warn!(target: "norn_uring::fd", "close_fd.failed: {err}; direct_close.failed: {direct_err}");
+                }
+            }
+            Err(CloseFdError::Queued(err)) => {
+                // The SQE remains owned by the ring and may still be submitted. Direct close is
+                // unsafe because the descriptor number can be reused before that happens.
+                warn!(target: "norn_uring::fd", "close_fd.failed: {err}; direct_close.skipped: close SQE was already queued");
+            }
+        }
+    }
+
+    fn close_direct_and_invalidate(&self) -> io::Result<()> {
+        let result = self.close_direct();
+        if matches!(self.kind, FdKind::Fd(_)) {
+            // On Linux a close error does not preserve ownership of the descriptor number.
+            self.closed.set(true);
+        }
+        result
+    }
+
     fn close_direct(&self) -> io::Result<()> {
         match self.kind {
             FdKind::Fd(fd) => {
@@ -162,11 +199,15 @@ unsafe impl Operation for CloseFd {
 }
 
 impl Singleshot for CloseFd {
-    type Output = io::Result<()>;
+    type Output = CloseResult;
 
     fn complete(self, result: crate::operation::CQEResult) -> Self::Output {
-        result.result?;
-        Ok(())
+        let synthetic = result.is_synthetic();
+        match result.into_result() {
+            Ok(_) => CloseResult::Closed,
+            Err(err) if synthetic => CloseResult::NeverSubmitted(err),
+            Err(err) => CloseResult::KernelError(err),
+        }
     }
 }
 
@@ -174,12 +215,25 @@ impl Singleshot for CloseFd {
 mod tests {
     use super::*;
 
-    #[test]
-    fn drop_fd_without_runtime_context_closes_descriptor() {
+    fn pipe() -> [RawFd; 2] {
         let mut fds = [0; 2];
         let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
         assert_eq!(rc, 0);
+        fds
+    }
 
+    fn assert_open(fd: RawFd) {
+        assert_ne!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+    }
+
+    fn assert_closed(fd: RawFd) {
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+    }
+
+    #[test]
+    fn drop_fd_without_runtime_context_closes_descriptor() {
+        let fds = pipe();
         let read_end = fds[0];
         let write_end = fds[1];
         let fd = NornFd::from_fd(read_end);
@@ -187,12 +241,112 @@ mod tests {
         drop(fd);
 
         // Pipe read-end should be closed by NornFd drop fallback.
-        let check = unsafe { libc::fcntl(read_end, libc::F_GETFD) };
-        assert_eq!(check, -1);
-        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+        assert_closed(read_end);
 
         unsafe {
             libc::close(write_end);
         }
+    }
+
+    #[test]
+    fn close_completion_distinguishes_submission_from_kernel_errors() {
+        let synthetic = CloseFd {
+            fd: FdKind::Fd(types::Fd(-1)),
+        }
+        .complete(crate::operation::CQEResult::synthetic(Err(
+            io::Error::from_raw_os_error(libc::EIO),
+        )));
+        assert!(matches!(
+            synthetic,
+            CloseResult::NeverSubmitted(err) if err.raw_os_error() == Some(libc::EIO)
+        ));
+
+        let kernel = CloseFd {
+            fd: FdKind::Fd(types::Fd(-1)),
+        }
+        .complete(crate::operation::CQEResult::new(
+            Err(io::Error::from_raw_os_error(libc::EIO)),
+            0,
+        ));
+        assert!(matches!(
+            kernel,
+            CloseResult::KernelError(err) if err.raw_os_error() == Some(libc::EIO)
+        ));
+    }
+
+    #[test]
+    fn never_submitted_close_uses_direct_fallback() {
+        let [read_end, write_end] = pipe();
+        let fd = NornFd::from_fd(read_end);
+
+        fd.inner
+            .finish_tracked_close(CloseResult::NeverSubmitted(io::Error::from_raw_os_error(
+                libc::EIO,
+            )))
+            .unwrap();
+
+        assert_closed(read_end);
+        drop(fd);
+        unsafe { libc::close(write_end) };
+    }
+
+    #[test]
+    fn terminal_close_error_does_not_close_reused_descriptor() {
+        let [read_end, write_end] = pipe();
+        let fd = NornFd::from_fd(read_end);
+
+        // Model the kernel invalidating the original descriptor before returning a late error,
+        // then another thread reusing the same integer descriptor.
+        assert_eq!(unsafe { libc::close(read_end) }, 0);
+        assert_eq!(unsafe { libc::dup2(write_end, read_end) }, read_end);
+
+        let err = fd
+            .inner
+            .finish_tracked_close(CloseResult::KernelError(io::Error::from_raw_os_error(
+                libc::EIO,
+            )))
+            .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EIO));
+        assert_open(read_end);
+
+        drop(fd);
+        unsafe {
+            libc::close(read_end);
+            libc::close(write_end);
+        }
+    }
+
+    #[test]
+    fn queued_drop_close_failure_skips_direct_fallback() {
+        let [read_end, write_end] = pipe();
+        let fd = NornFd::from_fd(read_end);
+
+        fd.inner
+            .finish_drop_close(Err(CloseFdError::Queued(io::Error::from_raw_os_error(
+                libc::EIO,
+            ))));
+        assert_open(read_end);
+
+        // The test owns the descriptor because there is no real queued SQE to close it.
+        fd.inner.closed.set(true);
+        drop(fd);
+        unsafe {
+            libc::close(read_end);
+            libc::close(write_end);
+        }
+    }
+
+    #[test]
+    fn never_queued_drop_close_failure_uses_direct_fallback() {
+        let [read_end, write_end] = pipe();
+        let fd = NornFd::from_fd(read_end);
+
+        fd.inner.finish_drop_close(Err(CloseFdError::NeverQueued(
+            io::Error::from_raw_os_error(libc::EIO),
+        )));
+        assert_closed(read_end);
+
+        drop(fd);
+        unsafe { libc::close(write_end) };
     }
 }
