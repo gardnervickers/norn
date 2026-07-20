@@ -53,7 +53,28 @@ const SHUTDOWN_CANCEL_TIMEOUT: Duration = Duration::from_millis(100);
 pub struct Driver {
     shared: Rc<Shared>,
     unparker: Arc<unpark::Unparker>,
-    unparker_buf: mem::ManuallyDrop<Box<UnsafeCell<[u8; 8]>>>,
+    /// Storage passed to the kernel for the eventfd read.
+    ///
+    /// The buffer is manually dropped because an abandoned ring may still hold
+    /// its address. [`Driver::drop`] releases it only after the drain sentinel
+    /// proves every earlier request, including the eventfd read, is terminal.
+    unparker_buf: mem::ManuallyDrop<UnparkerBuffer>,
+}
+
+struct UnparkerBuffer {
+    storage: Box<UnsafeCell<[u8; 8]>>,
+    #[cfg(test)]
+    drop_probe: Option<DropProbe>,
+}
+
+#[cfg(test)]
+struct DropProbe(Arc<std::sync::atomic::AtomicUsize>);
+
+#[cfg(test)]
+impl Drop for DropProbe {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
 }
 
 /// [`Handle`] is used to interact with the [`Driver`] and
@@ -145,6 +166,25 @@ impl std::fmt::Debug for Handle {
 impl std::fmt::Debug for Driver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Driver").finish()
+    }
+}
+
+impl UnparkerBuffer {
+    fn new() -> Self {
+        Self {
+            storage: Box::new(UnsafeCell::new([0; 8])),
+            #[cfg(test)]
+            drop_probe: None,
+        }
+    }
+
+    fn get(&self) -> *mut [u8; 8] {
+        self.storage.get()
+    }
+
+    #[cfg(test)]
+    fn track_drop(&mut self, counter: Arc<std::sync::atomic::AtomicUsize>) {
+        self.drop_probe = Some(DropProbe(counter));
     }
 }
 
@@ -366,7 +406,7 @@ impl Driver {
                 registered_buffers: RegisteredBuffers::new(),
             }),
             unparker: Arc::new(unpark::Unparker::new()?),
-            unparker_buf: mem::ManuallyDrop::new(Box::new(UnsafeCell::new([0; 8]))),
+            unparker_buf: mem::ManuallyDrop::new(UnparkerBuffer::new()),
         })
     }
 
@@ -903,7 +943,14 @@ impl Shared {
 
 impl Drop for Driver {
     fn drop(&mut self) {
-        Park::shutdown(self);
+        let outcome = self.shutdown_with_outcome();
+        if outcome == ShutdownOutcome::CleanDrained {
+            // Safety: observing the IO_DRAIN sentinel proves the kernel has
+            // finished every earlier SQE. In particular, no eventfd read can
+            // still reference this buffer. Driver is dropping, so this is the
+            // buffer's only explicit release.
+            unsafe { mem::ManuallyDrop::drop(&mut self.unparker_buf) };
+        }
     }
 }
 
@@ -913,7 +960,7 @@ mod tests {
     use std::net::TcpListener;
     use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixStream;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc};
     use std::task::Poll;
     use std::time::Duration;
@@ -982,10 +1029,13 @@ mod tests {
 
     fn assert_cancel_failure_abandons(op: LongLivedOp) {
         let dropped = Arc::clone(&op.dropped);
+        let unparker_buf_drops = Arc::new(AtomicUsize::new(0));
+        let thread_unparker_buf_drops = Arc::clone(&unparker_buf_drops);
         let (tx, rx) = mpsc::channel();
 
         std::thread::spawn(move || {
             let mut driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+            driver.unparker_buf.track_drop(thread_unparker_buf_drops);
             let handle = driver.handle();
             let mut op = Box::pin(handle.submit(op));
             let waker = futures_test::task::noop_waker();
@@ -995,6 +1045,11 @@ mod tests {
             driver
                 .park(ParkMode::NoPark)
                 .expect("long-lived operation submission failed");
+            assert!(driver.prepare_park(), "eventfd read should be queued");
+            driver
+                .shared
+                .submit(ParkMode::NoPark)
+                .expect("eventfd read submission failed");
 
             driver.shared.cancel_all_error.set(Some(libc::EIO));
             let outcome = driver.shutdown_with_outcome();
@@ -1017,6 +1072,11 @@ mod tests {
         assert!(
             !dropped.load(Ordering::Acquire),
             "kernel-referenced operation storage was released before ring destruction"
+        );
+        assert_eq!(
+            unparker_buf_drops.load(Ordering::Acquire),
+            0,
+            "abandoned shutdown must quarantine the kernel-referenced unparker buffer"
         );
     }
 
@@ -1047,10 +1107,33 @@ mod tests {
     #[test]
     fn shutdown_without_pending_requests_is_clean_drained() {
         let mut driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+
         assert_eq!(
             driver.shutdown_with_outcome(),
             ShutdownOutcome::CleanDrained
         );
+    }
+
+    #[test]
+    fn clean_shutdown_releases_unparker_buffer_once() {
+        let mut driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let unparker_buf_drops = Arc::new(AtomicUsize::new(0));
+        driver
+            .unparker_buf
+            .track_drop(Arc::clone(&unparker_buf_drops));
+
+        assert!(driver.prepare_park(), "eventfd read should be queued");
+        assert_eq!(
+            driver.shutdown_with_outcome(),
+            ShutdownOutcome::CleanDrained
+        );
+        assert_eq!(unparker_buf_drops.load(Ordering::Acquire), 0);
+
+        Park::shutdown(&mut driver);
+        assert_eq!(unparker_buf_drops.load(Ordering::Acquire), 0);
+
+        drop(driver);
+        assert_eq!(unparker_buf_drops.load(Ordering::Acquire), 1);
     }
 
     #[test]
