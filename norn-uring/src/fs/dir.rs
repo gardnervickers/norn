@@ -1,6 +1,6 @@
 use io_uring::{opcode, types};
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::operation::{Operation, Singleshot};
 use crate::Handle;
@@ -79,14 +79,6 @@ pub async fn statx<P: AsRef<Path>>(path: P, flags: i32, mask: u32) -> io::Result
 /// Read file metadata with `STATX_BASIC_STATS`.
 pub async fn metadata<P: AsRef<Path>>(path: P) -> io::Result<libc::statx> {
     statx(path, libc::AT_STATX_SYNC_AS_STAT, libc::STATX_BASIC_STATS).await
-}
-
-/// Read a symbolic link target.
-///
-/// Note: `io_uring` does not currently expose a `readlinkat` opcode in this version of the
-/// dependency, so this uses `std::fs::read_link` directly.
-pub async fn read_link<P: AsRef<Path>>(path: P) -> io::Result<PathBuf> {
-    std::fs::read_link(path)
 }
 
 /// Read an extended attribute from a path into the provided buffer.
