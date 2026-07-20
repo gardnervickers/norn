@@ -164,8 +164,12 @@ impl SendBundleBatch {
         self.rc.ring.rc.validate_send(self.rc.id)
     }
 
-    pub(crate) fn on_submit(&self) {
-        self.rc.on_submit();
+    pub(crate) fn on_submit(&self) -> io::Result<()> {
+        self.rc.on_submit()
+    }
+
+    pub(crate) fn on_submit_rollback(&self) {
+        self.rc.on_submit_rollback();
     }
 
     pub(crate) fn finish_send(&self, result: crate::operation::CQEResult) -> io::Result<usize> {
@@ -173,7 +177,9 @@ impl SendBundleBatch {
             self.rc.ring.rc.abandon_batch(self.rc.id);
             return result.result.map(|bytes| bytes as usize);
         }
-        self.rc.ring.rc.finish_send(self.rc.id, result)
+        let out = self.rc.ring.rc.finish_send(self.rc.id, result);
+        self.rc.publish_start_tail.set(None);
+        out
     }
 }
 
@@ -522,6 +528,7 @@ struct InnerSendBundleBatch {
     ring: SendBufRing,
     id: u64,
     submitted: Cell<bool>,
+    publish_start_tail: Cell<Option<u16>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -981,12 +988,16 @@ impl SendQueueState {
         Ok(())
     }
 
-    fn mark_submitted(&mut self, batch_id: u64) {
-        debug_assert!(!self.poisoned);
-        debug_assert_eq!(self.active_batch, Some(batch_id));
-        debug_assert!(!self.inflight);
-        debug_assert!(!self.queued.is_empty());
+    fn mark_submitted(&mut self, batch_id: u64) -> io::Result<()> {
+        self.validate_send(batch_id)?;
         self.inflight = true;
+        Ok(())
+    }
+
+    fn rollback_submit(&mut self, batch_id: u64) {
+        if self.active_batch == Some(batch_id) {
+            self.inflight = false;
+        }
     }
 
     fn finish_send(
@@ -1200,16 +1211,26 @@ impl InnerSendBufRing {
         self.state.borrow().validate_send(batch_id)
     }
 
-    fn publish_for_send(&self, batch_id: u64) {
-        let queued: Vec<_> = {
+    fn publish_for_send(&self, batch_id: u64) -> io::Result<()> {
+        {
             let mut state = self.state.borrow_mut();
-            state.mark_submitted(batch_id);
-            state.queued.iter().copied().collect()
-        };
-        for segment in queued {
-            self.buf_ring_push_with_len(segment.bid, segment.len);
+            state.mark_submitted(batch_id)?;
+            for segment in state.queued.iter().copied() {
+                self.buf_ring_push_with_len(segment.bid, segment.len);
+            }
         }
         self.buf_ring_sync();
+        Ok(())
+    }
+
+    fn rollback_publish(&self, batch_id: u64, start_tail: u16) {
+        // The driver invokes this only while the matching SQE is still hidden behind the SQ tail.
+        // A send ring has one active batch, so no kernel request can have consumed these entries.
+        self.local_tail.set(start_tail);
+        unsafe {
+            (*self.shared_tail).store(start_tail, atomic::Ordering::Release);
+        }
+        self.state.borrow_mut().rollback_submit(batch_id);
     }
 
     fn finish_send(&self, batch_id: u64, result: crate::operation::CQEResult) -> io::Result<usize> {
@@ -1260,14 +1281,30 @@ impl InnerSendBundleBatch {
             ring,
             id,
             submitted: Cell::new(false),
+            publish_start_tail: Cell::new(None),
         }
     }
 
-    fn on_submit(&self) {
-        if self.submitted.replace(true) {
-            return;
+    fn on_submit(&self) -> io::Result<()> {
+        if self.submitted.get() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "send bundle submission hook ran more than once",
+            ));
         }
-        self.ring.rc.publish_for_send(self.id);
+        let start_tail = self.ring.rc.local_tail.get();
+        self.publish_start_tail.set(Some(start_tail));
+        self.ring.rc.publish_for_send(self.id)?;
+        self.submitted.set(true);
+        Ok(())
+    }
+
+    fn on_submit_rollback(&self) {
+        let Some(start_tail) = self.publish_start_tail.take() else {
+            return;
+        };
+        self.ring.rc.rollback_publish(self.id, start_tail);
+        self.submitted.set(false);
     }
 }
 
@@ -1373,8 +1410,9 @@ impl ops::Deref for BufRingBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{selected_bid_from_flags, SendQueueState};
+    use super::{selected_bid_from_flags, InnerSendBufRing, SendBufRing, SendQueueState};
     use std::io;
+    use std::sync::atomic;
 
     fn selected_bid_flag(bid: u16) -> u32 {
         const IORING_CQE_F_BUFFER: u32 = 1;
@@ -1410,7 +1448,7 @@ mod tests {
         state.commit_datagram(batch, first, 3).unwrap();
         state.commit_datagram(batch, second, 5).unwrap();
         state.validate_send(batch).unwrap();
-        state.mark_submitted(batch);
+        state.mark_submitted(batch).unwrap();
 
         let sent = state
             .complete_udp_send(8, selected_bid_flag(first))
@@ -1429,7 +1467,7 @@ mod tests {
         state.commit_datagram(batch, first, 3).unwrap();
         state.commit_datagram(batch, second, 5).unwrap();
         state.validate_send(batch).unwrap();
-        state.mark_submitted(batch);
+        state.mark_submitted(batch).unwrap();
 
         let err = state
             .complete_udp_send(3, selected_bid_flag(first))
@@ -1447,7 +1485,7 @@ mod tests {
         let first = state.checkout_bid(batch).unwrap();
         state.commit_datagram(batch, first, 4).unwrap();
         state.validate_send(batch).unwrap();
-        state.mark_submitted(batch);
+        state.mark_submitted(batch).unwrap();
 
         let err = state
             .complete_udp_send(2, selected_bid_flag(first))
@@ -1465,7 +1503,7 @@ mod tests {
         state.commit_datagram(batch, first, 4).unwrap();
         state.commit_datagram(batch, second, 4).unwrap();
         state.validate_send(batch).unwrap();
-        state.mark_submitted(batch);
+        state.mark_submitted(batch).unwrap();
 
         let err = state
             .complete_udp_send(4, selected_bid_flag(second))
@@ -1481,7 +1519,7 @@ mod tests {
         let bid = state.checkout_bid(batch).unwrap();
         state.commit_datagram(batch, bid, 4).unwrap();
         state.validate_send(batch).unwrap();
-        state.mark_submitted(batch);
+        state.mark_submitted(batch).unwrap();
 
         state.abandon_batch(batch);
 
@@ -1508,7 +1546,7 @@ mod tests {
         let stale_bid = state.checkout_bid(first_batch).unwrap();
         let sent_bid = state.checkout_bid(first_batch).unwrap();
         state.commit_datagram(first_batch, sent_bid, 4).unwrap();
-        state.mark_submitted(first_batch);
+        state.mark_submitted(first_batch).unwrap();
         state
             .finish_send(
                 first_batch,
@@ -1534,7 +1572,7 @@ mod tests {
         let stale_bid = state.checkout_bid(first_batch).unwrap();
         let sent_bid = state.checkout_bid(first_batch).unwrap();
         state.commit_datagram(first_batch, sent_bid, 4).unwrap();
-        state.mark_submitted(first_batch);
+        state.mark_submitted(first_batch).unwrap();
         state
             .finish_send(
                 first_batch,
@@ -1561,7 +1599,7 @@ mod tests {
         let batch = state.begin_batch().unwrap();
         let bid = state.checkout_bid(batch).unwrap();
         state.commit_datagram(batch, bid, 4).unwrap();
-        state.mark_submitted(batch);
+        state.mark_submitted(batch).unwrap();
 
         let err = state
             .finish_send(
@@ -1580,12 +1618,46 @@ mod tests {
     }
 
     #[test]
+    fn submit_hook_rollback_restores_send_ring_publication() {
+        let driver = crate::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let ring = SendBufRing::new(InnerSendBufRing::new(33, 2, 2, 64, driver.handle()).unwrap());
+        let batch = ring.batch().unwrap();
+        let mut buf = batch.checkout().unwrap();
+        buf.as_mut_slice()[..4].copy_from_slice(b"test");
+        buf.set_len(4).unwrap();
+        buf.commit().unwrap();
+        let start_tail = ring.rc.local_tail.get();
+
+        batch.on_submit().unwrap();
+        assert!(batch.rc.submitted.get());
+        assert_eq!(ring.rc.local_tail.get(), start_tail.wrapping_add(1));
+        assert_eq!(
+            unsafe { (*ring.rc.shared_tail).load(atomic::Ordering::Acquire) },
+            start_tail.wrapping_add(1)
+        );
+
+        batch.on_submit_rollback();
+        assert!(!batch.rc.submitted.get());
+        assert_eq!(ring.rc.local_tail.get(), start_tail);
+        assert_eq!(
+            unsafe { (*ring.rc.shared_tail).load(atomic::Ordering::Acquire) },
+            start_tail
+        );
+        batch.validate_send().unwrap();
+
+        batch.on_submit().unwrap();
+        batch.on_submit_rollback();
+        drop(batch);
+        assert_eq!(ring.available_buffers(), 2);
+    }
+
+    #[test]
     fn missing_selected_bid_poisons_published_send_ring() {
         let mut state = SendQueueState::new(1);
         let batch = state.begin_batch().unwrap();
         let bid = state.checkout_bid(batch).unwrap();
         state.commit_datagram(batch, bid, 4).unwrap();
-        state.mark_submitted(batch);
+        state.mark_submitted(batch).unwrap();
 
         let err = state
             .finish_send(batch, crate::operation::CQEResult::new(Ok(4), 0))

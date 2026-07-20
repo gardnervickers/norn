@@ -579,6 +579,46 @@ fn connected_send_bundle_reuses_ring_after_send() -> Result<(), Box<dyn std::err
 }
 
 #[test]
+fn connected_send_bundle_sqpoll_publishes_buffers_before_sqe_visibility(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut builder = io_uring::IoUring::builder();
+    builder.setup_sqpoll(1_000);
+    let driver = match norn_uring::Driver::new(builder, 32) {
+        Ok(driver) => driver,
+        Err(err) if util::sqpoll_unsupported(&err) => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+    let mut ex = norn_executor::LocalExecutor::new(driver);
+    ex.block_on(async {
+        let ring = BufRing::builder(13).buf_cnt(4).buf_len(64).build_send()?;
+        let sender = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let receiver = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        sender.connect(receiver.local_addr()?).await?;
+
+        for sequence in 0..64u8 {
+            let batch = ring.batch()?;
+            stage_bundle_segment(&batch, b"sqpoll-")?;
+            stage_bundle_segment(&batch, &[sequence])?;
+            match sender.send_bundle(batch).await {
+                Ok(sent) => assert_eq!(sent, 8),
+                Err(err) if util::send_bundle_unsupported(&err) => return Ok(()),
+                Err(err) => return Err(err.into()),
+            }
+
+            let (res, buf) = receiver.recv(BytesMut::with_capacity(16)).await;
+            let n = res?;
+            assert_eq!(
+                &buf[..n],
+                &[b's', b'q', b'p', b'o', b'l', b'l', b'-', sequence]
+            );
+            assert_eq!(ring.available_buffers(), 4);
+        }
+
+        Ok(())
+    })
+}
+
+#[test]
 fn duplicate_send_bgid_failure_keeps_original_ring_registered(
 ) -> Result<(), Box<dyn std::error::Error>> {
     util::with_test_env(|| async {

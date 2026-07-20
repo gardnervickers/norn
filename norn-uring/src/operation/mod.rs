@@ -54,11 +54,27 @@ pub unsafe trait Operation {
     /// invalidate the pointed-to storage during that period.
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry>;
 
-    /// Called after the SQE has been queued for submission.
+    /// Called after the SQE has been written into the submission queue but before the queue tail
+    /// is published to the kernel.
     ///
     /// This is the point where operations may safely publish userspace state that must only
-    /// become visible once the SQE exists in the submission queue.
-    fn on_submit(&mut self) {}
+    /// become visible once the SQE exists in the submission queue. Returning an error prevents
+    /// the SQE from becoming visible and routes the error through the normal synthetic completion
+    /// path.
+    ///
+    /// The hook runs while the driver holds its submission queue, so it must not re-enter that
+    /// driver or attempt to submit another operation through it.
+    fn on_submit(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// Roll back state changed by [`Operation::on_submit`] when the submission queue tail will not
+    /// be published.
+    ///
+    /// This is called after an `on_submit` error or panic, including for earlier entries in a
+    /// linked batch when a later entry fails. Implementations whose hook mutates state must make
+    /// this method idempotent and safe after a partially completed or panicking hook.
+    fn on_submit_rollback(&mut self) {}
 
     /// Release resources represented by an unconsumed completion.
     ///
@@ -115,10 +131,24 @@ pub(crate) struct ConfiguredEntry {
 }
 
 impl ConfiguredEntry {
-    pub(crate) fn into_entry_with_flags(self, flags: Flags) -> io_uring::squeue::Entry {
+    pub(crate) fn entry_with_flags(&self, flags: Flags) -> io_uring::squeue::Entry {
         self.entry
+            .clone()
             .flags(flags)
-            .user_data(self.handle.into_raw_usize() as u64)
+            .user_data(self.handle.as_raw_usize() as u64)
+    }
+
+    pub(crate) fn on_submit(&self) -> io::Result<()> {
+        self.handle.on_submit()
+    }
+
+    pub(crate) fn rollback_submit(&self) {
+        self.handle.rollback_submit();
+    }
+
+    pub(crate) fn commit_kernel_ref(self) {
+        let Self { entry: _, handle } = self;
+        mem::forget(handle);
     }
 
     pub(crate) fn new(handle: RawOpRef, entry: io_uring::squeue::Entry) -> Self {
@@ -279,19 +309,6 @@ where
                 inner: handle.take().expect("handle missing"),
             },
         };
-        let State::Submitted { inner } = self else {
-            unreachable!("operation did not transition to submitted")
-        };
-        // Safety: queueing succeeded, the operation remains pinned in RawOp, and this is the
-        // only mutable access before the kernel completion path. Transitioning the state first
-        // ensures a panicking hook still leaves Drop able to cancel the queued operation.
-        unsafe {
-            inner
-                .inner
-                .data_mut()
-                .expect("operation data missing after submission")
-                .on_submit();
-        }
     }
 
     fn fail_submit(&mut self, err: &SubmitError) {
@@ -945,7 +962,7 @@ mod tests {
     }
 
     #[test]
-    fn on_submit_runs_only_after_sqe_is_queued() {
+    fn finish_submit_only_transitions_operation_state() {
         #[derive(Debug)]
         struct SubmitHookOp(Rc<Cell<bool>>);
 
@@ -954,8 +971,9 @@ mod tests {
                 Ok(io_uring::opcode::Nop::new().build())
             }
 
-            fn on_submit(&mut self) {
+            fn on_submit(&mut self) -> io::Result<()> {
                 self.0.set(true);
+                Ok(())
             }
 
             fn cleanup(&mut self, _: CQEResult) {}
@@ -970,7 +988,7 @@ mod tests {
 
         state.finish_submit();
 
-        assert!(submitted.get());
+        assert!(!submitted.get());
         assert!(matches!(state, State::Submitted { .. }));
     }
 

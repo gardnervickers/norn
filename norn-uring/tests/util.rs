@@ -131,3 +131,18 @@ pub fn send_bundle_unsupported(err: &io::Error) -> bool {
     err.kind() == io::ErrorKind::Unsupported
         || BUNDLE_UNSUPPORTED_ERRNOS.contains(&err.raw_os_error().unwrap_or_default())
 }
+
+#[allow(dead_code)]
+pub fn sqpoll_unsupported(err: &io::Error) -> bool {
+    const SQPOLL_UNSUPPORTED_ERRNOS: [c_int; 6] = [
+        libc::ENOSYS,
+        libc::EOPNOTSUPP,
+        libc::ENOTSUP,
+        libc::EINVAL,
+        libc::EPERM,
+        libc::EACCES,
+    ];
+    err.kind() == io::ErrorKind::Unsupported
+        || err.kind() == io::ErrorKind::PermissionDenied
+        || SQPOLL_UNSUPPORTED_ERRNOS.contains(&err.raw_os_error().unwrap_or_default())
+}

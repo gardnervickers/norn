@@ -22,6 +22,8 @@ where
     const VTABLE: VTable = VTable {
         drop_ref: Self::drop_ref,
         clone_ref: Self::clone_ref,
+        on_submit: Self::on_submit,
+        rollback_submit: Self::rollback_submit,
         complete: Self::complete,
     };
 
@@ -76,6 +78,24 @@ where
     unsafe fn clone_ref(ptr: NonNull<Header>) {
         let this = Self::from_raw_header(ptr);
         this.as_ref().header.inc_refcount();
+    }
+
+    unsafe fn on_submit(ptr: NonNull<Header>) -> io::Result<()> {
+        let mut this = Self::from_raw_header(ptr);
+        this.as_mut()
+            .data_mut()
+            .as_mut()
+            .expect("operation data missing before submission")
+            .on_submit()
+    }
+
+    unsafe fn rollback_submit(ptr: NonNull<Header>) {
+        let mut this = Self::from_raw_header(ptr);
+        this.as_mut()
+            .data_mut()
+            .as_mut()
+            .expect("operation data missing during submission rollback")
+            .on_submit_rollback();
     }
 
     unsafe fn complete(ptr: NonNull<Header>, result: CQEResult) -> bool {
@@ -210,6 +230,16 @@ impl RawOpRef {
         unsafe { (header.vtable.complete)(inner, result) }
     }
 
+    pub(crate) fn on_submit(&self) -> io::Result<()> {
+        let header = self.header();
+        unsafe { (header.vtable.on_submit)(self.inner) }
+    }
+
+    pub(crate) fn rollback_submit(&self) {
+        let header = self.header();
+        unsafe { (header.vtable.rollback_submit)(self.inner) }
+    }
+
     fn as_raw(&self) -> *const () {
         self.inner.as_ptr() as *const ()
     }
@@ -218,15 +248,16 @@ impl RawOpRef {
         sptr::Strict::expose_addr(self.as_raw())
     }
 
-    /// Returns the inner pointer.
-    ///
-    /// This will **not** decrement the reference count. It is the callers responsibility
-    /// to ensure that the returned pointer is passed to Handle::from_raw later.
-    #[inline]
+    #[cfg(test)]
     pub(crate) fn into_raw(self) -> *const () {
         let raw = self.inner.as_ptr();
         mem::forget(self);
         raw as *const ()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn into_raw_usize(self) -> usize {
+        sptr::Strict::expose_addr(self.into_raw())
     }
 
     /// Creates a new [Handle] from a raw pointer.
@@ -239,14 +270,6 @@ impl RawOpRef {
     unsafe fn from_raw(ptr: *const ()) -> Self {
         let inner = NonNull::new_unchecked(ptr as *mut Header);
         RawOpRef { inner }
-    }
-
-    /// Returns a usize representing the raw pointer for the operation.
-    ///
-    /// This consumes the [Handle] and does not decrement the reference count.
-    #[inline]
-    pub(crate) fn into_raw_usize(self) -> usize {
-        sptr::Strict::expose_addr(self.into_raw())
     }
 
     /// Creates a new [Handle] from a usize representing a raw pointer.

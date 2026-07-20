@@ -5,7 +5,7 @@ use std::task::{ready, Context, Poll};
 
 use smallvec::SmallVec;
 
-use crate::driver::{Shared, Status};
+use crate::driver::{QueuePushError, Shared, Status};
 use crate::error::SubmitError;
 use crate::operation::ConfiguredEntry;
 use crate::util::notify::Notified;
@@ -88,27 +88,33 @@ impl Future for PushFutureInner<'_> {
 
             match &mut *this.pending {
                 PendingSubmission::Single(entry) => {
-                    if let Err(returned_entry) = this
+                    match this
                         .shared
                         .try_push(entry.take().expect("entry already submitted"))
                     {
-                        *entry = Some(returned_entry);
-                        log::trace!(target: LOG, "ring.push.full");
-                        Pin::set(&mut this.notify, Some(this.shared.backpressure.wait()));
-                        continue;
+                        Ok(()) => {}
+                        Err(QueuePushError::Full(returned_entry)) => {
+                            *entry = Some(returned_entry);
+                            log::trace!(target: LOG, "ring.push.full");
+                            Pin::set(&mut this.notify, Some(this.shared.backpressure.wait()));
+                            continue;
+                        }
+                        Err(QueuePushError::SubmitHook(err)) => return Poll::Ready(Err(err)),
                     }
                 }
                 PendingSubmission::Batch(entries) => {
                     if let Err(err) = this.shared.validate_batch_len(entries.len()) {
                         return Poll::Ready(Err(err));
                     }
-                    if let Err(returned_entries) =
-                        this.shared.try_push_batch(std::mem::take(entries))
-                    {
-                        *entries = returned_entries;
-                        log::trace!(target: LOG, "ring.push.full");
-                        Pin::set(&mut this.notify, Some(this.shared.backpressure.wait()));
-                        continue;
+                    match this.shared.try_push_batch(std::mem::take(entries)) {
+                        Ok(()) => {}
+                        Err(QueuePushError::Full(returned_entries)) => {
+                            *entries = returned_entries;
+                            log::trace!(target: LOG, "ring.push.full");
+                            Pin::set(&mut this.notify, Some(this.shared.backpressure.wait()));
+                            continue;
+                        }
+                        Err(QueuePushError::SubmitHook(err)) => return Poll::Ready(Err(err)),
                     }
                 }
             }

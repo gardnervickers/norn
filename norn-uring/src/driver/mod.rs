@@ -1,5 +1,6 @@
 use std::any::Any;
 use std::cell::{Cell, RefCell, UnsafeCell};
+use std::panic::{self, AssertUnwindSafe};
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::time::Duration;
@@ -92,6 +93,8 @@ struct Shared {
     shutdown_outcome: Cell<Option<ShutdownOutcome>>,
     #[cfg(test)]
     cancel_all_error: Cell<Option<i32>>,
+    #[cfg(test)]
+    submission_stages: RefCell<Vec<SubmissionStage>>,
     // This field must be declared after `ring`: fields are dropped in declaration
     // order, so retained registered storage is released only after the ring.
     registered_buffers: RegisteredBuffers,
@@ -132,6 +135,19 @@ pub(crate) enum TryPush {
     Submitted,
     Full(ConfiguredEntry),
     Failed(SubmitError),
+}
+
+enum QueuePushError<T> {
+    Full(T),
+    SubmitHook(SubmitError),
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubmissionStage {
+    SqeWritten,
+    HookComplete,
+    TailPublished,
 }
 
 #[derive(Debug)]
@@ -311,7 +327,8 @@ impl Handle {
         }
         match self.shared.try_push(entry) {
             Ok(()) => TryPush::Submitted,
-            Err(entry) => TryPush::Full(entry),
+            Err(QueuePushError::Full(entry)) => TryPush::Full(entry),
+            Err(QueuePushError::SubmitHook(err)) => TryPush::Failed(err),
         }
     }
 
@@ -403,6 +420,8 @@ impl Driver {
                 shutdown_outcome: Cell::new(None),
                 #[cfg(test)]
                 cancel_all_error: Cell::new(None),
+                #[cfg(test)]
+                submission_stages: RefCell::new(Vec::new()),
                 registered_buffers: RegisteredBuffers::new(),
             }),
             unparker: Arc::new(unpark::Unparker::new()?),
@@ -648,6 +667,52 @@ impl Driver {
 }
 
 impl Shared {
+    #[cfg(test)]
+    fn record_submission_stage(&self, stage: SubmissionStage) {
+        if let Ok(mut stages) = self.submission_stages.try_borrow_mut() {
+            stages.push(stage);
+        }
+    }
+
+    fn run_submit_hooks(&self, entries: &[ConfiguredEntry]) -> Result<(), SubmitError> {
+        let mut invoked = 0;
+        let result = panic::catch_unwind(AssertUnwindSafe(|| -> io::Result<()> {
+            for entry in entries {
+                invoked += 1;
+                entry.on_submit()?;
+                #[cfg(test)]
+                self.record_submission_stage(SubmissionStage::HookComplete);
+            }
+            Ok(())
+        }));
+
+        if matches!(&result, Ok(Ok(()))) {
+            return Ok(());
+        }
+
+        let mut rollback_panic = None;
+        for entry in entries[..invoked].iter().rev() {
+            if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| entry.rollback_submit()))
+            {
+                rollback_panic.get_or_insert(payload);
+            }
+        }
+
+        match result {
+            Err(payload) => {
+                drop(rollback_panic);
+                panic::resume_unwind(payload)
+            }
+            Ok(Err(err)) => {
+                if let Some(payload) = rollback_panic {
+                    panic::resume_unwind(payload);
+                }
+                Err(SubmitError::submit_hook(err))
+            }
+            Ok(Ok(())) => unreachable!("successful hooks returned before rollback"),
+        }
+    }
+
     fn validate_batch_len(&self, batch_len: usize) -> Result<(), SubmitError> {
         if batch_len <= 1 {
             return Ok(());
@@ -712,16 +777,33 @@ impl Shared {
     /// Attempt to push a single entry into the submission queue.
     ///
     /// If the submission queue is full, this returns the original entry.
-    fn try_push(&self, entry: ConfiguredEntry) -> Result<(), ConfiguredEntry> {
+    fn try_push(&self, entry: ConfiguredEntry) -> Result<(), QueuePushError<ConfiguredEntry>> {
         let mut ring = self.ring.borrow_mut();
-        let mut sq = ring.submission();
+        let sq = ring.submission();
         if sq.is_full() {
-            Err(entry)
-        } else {
-            let entry = entry.into_entry_with_flags(Flags::empty());
-            unsafe { sq.push(&entry) }.unwrap();
-            Ok(())
+            return Err(QueuePushError::Full(entry));
         }
+
+        // `SubmissionQueue::drop` release-stores its local tail. Keep it suppressed until every
+        // operation has published the userspace state its SQE depends on. This also lets hook
+        // failures abandon the written-but-hidden SQE without exposing it to an SQPOLL thread.
+        let mut sq = mem::ManuallyDrop::new(sq);
+        let raw_entry = entry.entry_with_flags(Flags::empty());
+        unsafe { sq.push(&raw_entry) }.unwrap();
+        #[cfg(test)]
+        self.record_submission_stage(SubmissionStage::SqeWritten);
+
+        if let Err(err) = self.run_submit_hooks(std::slice::from_ref(&entry)) {
+            return Err(QueuePushError::SubmitHook(err));
+        }
+
+        entry.commit_kernel_ref();
+        #[cfg(test)]
+        self.record_submission_stage(SubmissionStage::TailPublished);
+        // Safety: `sq` has not been dropped yet, and the successful hook transferred the retained
+        // operation reference to the written SQE. Dropping exactly once publishes that SQE.
+        unsafe { mem::ManuallyDrop::drop(&mut sq) };
+        Ok(())
     }
 
     /// Attempt to push a batch of entries into the submission queue.
@@ -730,32 +812,42 @@ impl Shared {
     /// batch, the original entries are returned unchanged.
     fn try_push_batch(
         &self,
-        mut entries: SmallVec<[ConfiguredEntry; 4]>,
-    ) -> Result<(), SmallVec<[ConfiguredEntry; 4]>> {
+        entries: SmallVec<[ConfiguredEntry; 4]>,
+    ) -> Result<(), QueuePushError<SmallVec<[ConfiguredEntry; 4]>>> {
         let mut ring = self.ring.borrow_mut();
-        let mut sq = ring.submission();
+        let sq = ring.submission();
         if sq.capacity() - sq.len() < entries.len() {
-            return Err(entries);
+            return Err(QueuePushError::Full(entries));
         }
 
-        if entries.len() == 1 {
-            let entry = entries.pop().expect("singleton batch missing entry");
-            let entry = entry.into_entry_with_flags(Flags::empty());
-            unsafe { sq.push(&entry) }.unwrap();
-            return Ok(());
-        }
-
+        let mut sq = mem::ManuallyDrop::new(sq);
         let len = entries.len();
         let mut raw_entries = SmallVec::<[io_uring::squeue::Entry; 4]>::with_capacity(len);
-        for (idx, entry) in entries.into_iter().enumerate() {
+        for (idx, entry) in entries.iter().enumerate() {
             let flags = if idx + 1 == len {
                 Flags::empty()
             } else {
                 Flags::IO_LINK
             };
-            raw_entries.push(entry.into_entry_with_flags(flags));
+            raw_entries.push(entry.entry_with_flags(flags));
         }
         unsafe { sq.push_multiple(raw_entries.as_slice()) }.unwrap();
+        #[cfg(test)]
+        self.record_submission_stage(SubmissionStage::SqeWritten);
+
+        if let Err(err) = self.run_submit_hooks(entries.as_slice()) {
+            return Err(QueuePushError::SubmitHook(err));
+        }
+
+        for entry in entries {
+            entry.commit_kernel_ref();
+        }
+        #[cfg(test)]
+        self.record_submission_stage(SubmissionStage::TailPublished);
+        // Safety: `sq` has not been dropped yet, and every successful hook transferred its
+        // retained operation reference to the corresponding written SQE. Dropping exactly once
+        // publishes the complete linked batch.
+        unsafe { mem::ManuallyDrop::drop(&mut sq) };
         Ok(())
     }
 
@@ -983,6 +1075,63 @@ mod tests {
     struct LongLivedOp {
         io: LongLivedIo,
         dropped: Arc<AtomicBool>,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum SubmitHookBehavior {
+        Succeed,
+        Error,
+        Panic,
+    }
+
+    #[derive(Debug)]
+    struct SubmitHookOp {
+        behavior: SubmitHookBehavior,
+        called: Rc<Cell<usize>>,
+        rolled_back: Rc<Cell<usize>>,
+    }
+
+    impl SubmitHookOp {
+        fn new(
+            behavior: SubmitHookBehavior,
+            called: Rc<Cell<usize>>,
+            rolled_back: Rc<Cell<usize>>,
+        ) -> Self {
+            Self {
+                behavior,
+                called,
+                rolled_back,
+            }
+        }
+    }
+
+    unsafe impl Operation for SubmitHookOp {
+        fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+            Ok(io_uring::opcode::Nop::new().build())
+        }
+
+        fn on_submit(&mut self) -> io::Result<()> {
+            self.called.set(self.called.get() + 1);
+            match self.behavior {
+                SubmitHookBehavior::Succeed => Ok(()),
+                SubmitHookBehavior::Error => Err(io::Error::other("test submit hook failed")),
+                SubmitHookBehavior::Panic => panic!("test submit hook panicked"),
+            }
+        }
+
+        fn on_submit_rollback(&mut self) {
+            self.rolled_back.set(self.rolled_back.get() + 1);
+        }
+
+        fn cleanup(&mut self, _: CQEResult) {}
+    }
+
+    impl Singleshot for SubmitHookOp {
+        type Output = io::Result<()>;
+
+        fn complete(self, result: CQEResult) -> Self::Output {
+            result.result.map(drop)
+        }
     }
 
     impl Drop for LongLivedOp {
@@ -1271,6 +1420,120 @@ mod tests {
     }
 
     #[test]
+    fn submit_hook_runs_between_sqe_write_and_tail_publication() {
+        let driver = Driver::new(io_uring::IoUring::builder(), 2).unwrap();
+        let called = Rc::new(Cell::new(0));
+        let rolled_back = Rc::new(Cell::new(0));
+        let mut op = std::pin::pin!(driver.handle().submit(SubmitHookOp::new(
+            SubmitHookBehavior::Succeed,
+            Rc::clone(&called),
+            Rc::clone(&rolled_back),
+        )));
+        let waker = futures_test::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+
+        assert!(Future::poll(op.as_mut(), &mut cx).is_pending());
+
+        assert_eq!(called.get(), 1);
+        assert_eq!(rolled_back.get(), 0);
+        assert_eq!(
+            driver.shared.submission_stages.borrow().as_slice(),
+            [
+                SubmissionStage::SqeWritten,
+                SubmissionStage::HookComplete,
+                SubmissionStage::TailPublished,
+            ]
+        );
+    }
+
+    #[test]
+    fn submit_hook_error_rolls_back_without_publishing_tail() {
+        let driver = Driver::new(io_uring::IoUring::builder(), 2).unwrap();
+        let called = Rc::new(Cell::new(0));
+        let rolled_back = Rc::new(Cell::new(0));
+        let mut op = std::pin::pin!(driver.handle().submit(SubmitHookOp::new(
+            SubmitHookBehavior::Error,
+            Rc::clone(&called),
+            Rc::clone(&rolled_back),
+        )));
+        let waker = futures_test::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+
+        let Poll::Ready(Err(err)) = Future::poll(op.as_mut(), &mut cx) else {
+            panic!("submit hook error did not complete the operation")
+        };
+        assert!(err.to_string().contains("operation submission hook failed"));
+        assert_eq!(called.get(), 1);
+        assert_eq!(rolled_back.get(), 1);
+        assert_eq!(
+            driver.shared.submission_stages.borrow().as_slice(),
+            [SubmissionStage::SqeWritten]
+        );
+        assert_eq!(driver.shared.ring.borrow_mut().submission().len(), 0);
+    }
+
+    #[test]
+    fn panicking_submit_hook_rolls_back_without_publishing_tail() {
+        let driver = Driver::new(io_uring::IoUring::builder(), 2).unwrap();
+        let called = Rc::new(Cell::new(0));
+        let rolled_back = Rc::new(Cell::new(0));
+        let mut op = std::pin::pin!(driver.handle().submit(SubmitHookOp::new(
+            SubmitHookBehavior::Panic,
+            Rc::clone(&called),
+            Rc::clone(&rolled_back),
+        )));
+        let waker = futures_test::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+
+        let panic = panic::catch_unwind(AssertUnwindSafe(|| {
+            let _ = Future::poll(op.as_mut(), &mut cx);
+        }));
+
+        assert!(panic.is_err());
+        assert_eq!(called.get(), 1);
+        assert_eq!(rolled_back.get(), 1);
+        assert_eq!(
+            driver.shared.submission_stages.borrow().as_slice(),
+            [SubmissionStage::SqeWritten]
+        );
+        assert_eq!(driver.shared.ring.borrow_mut().submission().len(), 0);
+    }
+
+    #[test]
+    fn later_batch_hook_error_rolls_back_earlier_hooks() {
+        let driver = Driver::new(io_uring::IoUring::builder(), 2).unwrap();
+        let handle = driver.handle();
+        let first_called = Rc::new(Cell::new(0));
+        let first_rolled_back = Rc::new(Cell::new(0));
+        let second_called = Rc::new(Cell::new(0));
+        let second_rolled_back = Rc::new(Cell::new(0));
+        let mut first = std::pin::pin!(handle.submit(SubmitHookOp::new(
+            SubmitHookBehavior::Succeed,
+            Rc::clone(&first_called),
+            Rc::clone(&first_rolled_back),
+        )));
+        let mut second = std::pin::pin!(handle.submit(SubmitHookOp::new(
+            SubmitHookBehavior::Error,
+            Rc::clone(&second_called),
+            Rc::clone(&second_rolled_back),
+        )));
+        let mut entries = SmallVec::new();
+        assert!(first.as_mut().prepare_batch(&mut entries));
+        assert!(second.as_mut().prepare_batch(&mut entries));
+
+        let err = driver
+            .shared
+            .try_push_batch(entries)
+            .expect_err("later hook should fail the entire batch");
+        assert!(matches!(err, QueuePushError::SubmitHook(_)));
+        assert_eq!(first_called.get(), 1);
+        assert_eq!(second_called.get(), 1);
+        assert_eq!(first_rolled_back.get(), 1);
+        assert_eq!(second_rolled_back.get(), 1);
+        assert_eq!(driver.shared.ring.borrow_mut().submission().len(), 0);
+    }
+
+    #[test]
     fn try_push_batch_needs_full_capacity() {
         #[derive(Debug)]
         struct NopOp;
@@ -1305,10 +1568,13 @@ mod tests {
         second.as_mut().prepare_batch(&mut batch);
         third.as_mut().prepare_batch(&mut batch);
 
-        let batch = driver
+        let err = driver
             .shared
             .try_push_batch(batch)
             .expect_err("batch should wait for full capacity");
+        let QueuePushError::Full(batch) = err else {
+            panic!("full queue unexpectedly failed its submission hook")
+        };
         assert_eq!(batch.len(), 2);
 
         let mut ring = driver.shared.ring.borrow_mut();

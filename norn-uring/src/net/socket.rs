@@ -1620,8 +1620,12 @@ unsafe impl Operation for SendBundleUdp {
         .build())
     }
 
-    fn on_submit(&mut self) {
-        self.batch.on_submit();
+    fn on_submit(&mut self) -> io::Result<()> {
+        self.batch.on_submit()
+    }
+
+    fn on_submit_rollback(&mut self) {
+        self.batch.on_submit_rollback();
     }
 
     fn cleanup(&mut self, result: crate::operation::CQEResult) {
