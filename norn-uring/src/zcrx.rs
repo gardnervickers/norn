@@ -127,10 +127,10 @@ impl ZcRxIfq {
     }
 
     pub(crate) fn recycle_completion(&self, submitted_len: u32, result: CQEResult) {
-        // Only positive multishot data CQEs name an area region. The terminal
-        // CQE may be Ok(0) with zeroed extra fields and must not publish a
-        // duplicate offset-zero refill.
-        let is_data = result.more() && matches!(&result.result, Ok(len) if *len > 0);
+        // Every positive data CQE names an area region, including a positive
+        // terminal CQE. Zero-length and error completions do not name a
+        // region and must not publish a duplicate or fabricated refill.
+        let is_data = matches!(&result.result, Ok(len) if *len > 0);
         if is_data {
             if let Ok(buf) = self.parse_completion(submitted_len, result) {
                 drop(buf);
@@ -599,37 +599,104 @@ mod tests {
     }
 
     #[test]
-    fn terminal_cleanup_does_not_recycle_a_live_offset_zero_buffer() {
+    fn positive_terminal_cleanup_recycles_data() {
         let driver = crate::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
         let inner = test_inner(4096, 8);
         let ifq = ZcRxIfq {
             inner: Rc::clone(&inner),
             handle: driver.handle(),
         };
-        let held = inner.recv_buf(0, 64, inner.area_token).unwrap();
 
-        ifq.recycle_completion(0, CQEResult::new_big(Ok(0), 0, [inner.area_token, 0]));
         ifq.recycle_completion(
             64,
             CQEResult::new_big(Ok(32), 0, [inner.area_token | 128, 0]),
         );
-        assert_eq!(inner.local_tail.get(), 0);
-        assert!(inner.pending_refills.borrow().is_empty());
 
-        drop(held);
         assert_eq!(inner.local_tail.get(), 1);
+        assert!(inner.pending_refills.borrow().is_empty());
         let rqe = unsafe { inner.rqes.as_ptr().read() };
-        assert_eq!(rqe.off, inner.area_token);
-        assert_eq!(rqe.len, 64);
+        assert_eq!(rqe.off, inner.area_token | 128);
+        assert_eq!(rqe.len, 32);
+    }
+
+    #[test]
+    fn more_cleanup_recycles_data() {
+        let driver = crate::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let inner = test_inner(4096, 8);
+        let ifq = ZcRxIfq {
+            inner: Rc::clone(&inner),
+            handle: driver.handle(),
+        };
 
         ifq.recycle_completion(
             64,
             CQEResult::new_big(Ok(32), more_flag(), [inner.area_token | 256, 0]),
         );
-        assert_eq!(inner.local_tail.get(), 2);
-        let rqe = unsafe { inner.rqes.as_ptr().add(1).read() };
+
+        assert_eq!(inner.local_tail.get(), 1);
+        assert!(inner.pending_refills.borrow().is_empty());
+        let rqe = unsafe { inner.rqes.as_ptr().read() };
         assert_eq!(rqe.off, inner.area_token | 256);
         assert_eq!(rqe.len, 32);
+    }
+
+    #[test]
+    fn cleanup_ignores_zero_length_and_error_completions() {
+        let driver = crate::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let inner = test_inner(4096, 8);
+        let ifq = ZcRxIfq {
+            inner: Rc::clone(&inner),
+            handle: driver.handle(),
+        };
+
+        ifq.recycle_completion(0, CQEResult::new_big(Ok(0), 0, [inner.area_token, 0]));
+        ifq.recycle_completion(
+            64,
+            CQEResult::new_big(
+                Err(io::Error::from_raw_os_error(libc::ECANCELED)),
+                0,
+                [inner.area_token | 128, 0],
+            ),
+        );
+        ifq.recycle_completion(
+            64,
+            CQEResult::new_big(
+                Err(io::Error::from_raw_os_error(libc::EIO)),
+                more_flag(),
+                [inner.area_token | 256, 0],
+            ),
+        );
+
+        assert_eq!(inner.local_tail.get(), 0);
+        assert!(inner.pending_refills.borrow().is_empty());
+    }
+
+    #[test]
+    fn cleanup_recycles_each_data_completion_exactly_once() {
+        let driver = crate::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let inner = test_inner(4096, 8);
+        let ifq = ZcRxIfq {
+            inner: Rc::clone(&inner),
+            handle: driver.handle(),
+        };
+
+        ifq.recycle_completion(
+            64,
+            CQEResult::new_big(Ok(16), more_flag(), [inner.area_token | 128, 0]),
+        );
+        ifq.recycle_completion(
+            64,
+            CQEResult::new_big(Ok(32), 0, [inner.area_token | 256, 0]),
+        );
+
+        assert_eq!(inner.local_tail.get(), 2);
+        assert!(inner.pending_refills.borrow().is_empty());
+        let rqe = unsafe { inner.rqes.as_ptr().read() };
+        assert_eq!(rqe.off, inner.area_token | 128);
+        assert_eq!(rqe.len, 16);
+        let next_rqe = unsafe { inner.rqes.as_ptr().add(1).read() };
+        assert_eq!(next_rqe.off, inner.area_token | 256);
+        assert_eq!(next_rqe.len, 32);
     }
 
     #[test]
