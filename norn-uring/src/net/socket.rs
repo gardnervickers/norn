@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 use std::os::fd::FromRawFd;
 
 use crate::buf::{set_init_checked, StableBuf, StableBufMut};
-use crate::bufring::{BufRingBuf, BufRingBufBundle, RecvBufRing};
+use crate::bufring::{BufRingBuf, BufRingBufBundle, RecvBufRing, SendBundleBatch};
 use crate::fd::NornFd;
 use crate::operation::{Multishot, Op, Operation, Singleshot};
 
@@ -162,6 +162,14 @@ impl Socket {
         );
     }
 
+    #[track_caller]
+    fn assert_sendbufring_driver(&self, batch: &SendBundleBatch) {
+        assert!(
+            batch.same_driver(&self.handle),
+            "buffer ring and socket must target the same driver"
+        );
+    }
+
     pub(crate) fn recv_from_ring(&self, ring: &RecvBufRing) -> Op<RecvFromRing> {
         self.assert_bufring_driver(ring);
         let op = RecvFromRing::new(self.fd.clone(), ring.clone());
@@ -264,6 +272,21 @@ impl Socket {
             return (result, buf);
         }
         let op = SendTo::new(self.fd.clone(), buf, Some(addr), flags as u32);
+        self.handle.submit(op).await
+    }
+
+    pub(crate) async fn send_bundle_udp(&self, batch: SendBundleBatch) -> io::Result<usize> {
+        self.send_bundle_udp_with_flags(batch, 0).await
+    }
+
+    pub(crate) async fn send_bundle_udp_with_flags(
+        &self,
+        batch: SendBundleBatch,
+        flags: i32,
+    ) -> io::Result<usize> {
+        self.assert_sendbufring_driver(&batch);
+        batch.validate_send()?;
+        let op = SendBundleUdp::new(self.fd.clone(), batch, flags);
         self.handle.submit(op).await
     }
 
@@ -1567,6 +1590,113 @@ fn checked_scalar_len(len: usize, what: &'static str) -> io::Result<u32> {
     })
 }
 
+/// Accumulates the per-CQE byte counts from one send bundle submission.
+///
+/// Send bundle operations may produce multiple CQEs. The operation-specific batch reconciler runs
+/// before each result is recorded here.
+#[derive(Debug, Default)]
+pub(crate) struct SendBundleCompletion {
+    total_bytes: usize,
+    error: Option<io::Error>,
+}
+
+impl SendBundleCompletion {
+    pub(crate) fn record(&mut self, result: io::Result<usize>) {
+        if self.error.is_some() {
+            return;
+        }
+        match result {
+            Ok(bytes) => match self.total_bytes.checked_add(bytes) {
+                Some(total) => self.total_bytes = total,
+                None => {
+                    self.error = Some(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "send bundle completion byte count overflowed usize",
+                    ));
+                }
+            },
+            Err(err) => self.error = Some(err),
+        }
+    }
+
+    pub(crate) fn finish(mut self, result: io::Result<usize>) -> io::Result<usize> {
+        self.record(result);
+        match self.error {
+            Some(err) => Err(err),
+            None => Ok(self.total_bytes),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SendBundleUdp {
+    fd: NornFd,
+    batch: SendBundleBatch,
+    flags: i32,
+    completion: SendBundleCompletion,
+}
+
+impl SendBundleUdp {
+    fn new(fd: NornFd, batch: SendBundleBatch, flags: i32) -> Self {
+        Self {
+            fd,
+            batch,
+            flags,
+            completion: SendBundleCompletion::default(),
+        }
+    }
+
+    fn record_completion(&mut self, result: crate::operation::CQEResult) {
+        let result = self.batch.complete_send(result);
+        self.completion.record(result);
+    }
+}
+
+// Safety: `NornFd` retains the connected socket and `SendBundleBatch` retains all
+// provided buffers through the terminal completion.
+unsafe impl Operation for SendBundleUdp {
+    fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+        Ok(match self.fd.kind() {
+            crate::fd::FdKind::Fd(fd) => {
+                opcode::SendBundle::new(types::Fd(fd.0), self.batch.bgid())
+            }
+            crate::fd::FdKind::Fixed(fd) => {
+                opcode::SendBundle::new(types::Fixed(fd.0), self.batch.bgid())
+            }
+        }
+        .flags(self.flags)
+        .len(0)
+        .build())
+    }
+
+    fn on_submit(&mut self) -> io::Result<()> {
+        self.batch.on_submit()
+    }
+
+    fn on_submit_rollback(&mut self) {
+        self.batch.on_submit_rollback();
+    }
+
+    fn cleanup(&mut self, result: crate::operation::CQEResult) {
+        self.record_completion(result);
+    }
+}
+
+impl Singleshot for SendBundleUdp {
+    type Output = io::Result<usize>;
+
+    fn update(&mut self, result: crate::operation::CQEResult) {
+        debug_assert!(result.more());
+        self.record_completion(result);
+    }
+
+    fn complete(self, result: crate::operation::CQEResult) -> Self::Output {
+        debug_assert!(!result.more());
+        let result = self.batch.complete_send(result);
+        self.completion.finish(result)
+    }
+}
+
 fn update_send_zc_primary(
     primary_result: &mut Option<io::Result<usize>>,
     result: crate::operation::CQEResult,
@@ -1847,6 +1977,7 @@ mod tests {
     use norn_executor::LocalExecutor;
 
     use super::*;
+    use crate::bufring::SendBufRing;
 
     fn assert_accept_flags(fd: &NornFd) {
         let crate::fd::FdKind::Fd(fd) = fd.kind() else {
@@ -1931,6 +2062,11 @@ mod tests {
         RecvBufRing::builder(bgid).buf_cnt(8).buf_len(1024).build()
     }
 
+    fn build_test_send_ring(driver: &crate::Driver, bgid: u16) -> io::Result<SendBufRing> {
+        let _guard = norn_executor::park::Park::enter(driver);
+        SendBufRing::builder(bgid).buf_cnt(8).buf_len(1024).build()
+    }
+
     fn test_socket(handle: crate::Handle) -> io::Result<Socket> {
         let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
         if fd < 0 {
@@ -1997,6 +2133,23 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn send_bundle_rejects_same_bgid_from_another_driver() -> io::Result<()> {
+        let first_driver = crate::Driver::new(io_uring::IoUring::builder(), 8)?;
+        let first_ring = build_test_send_ring(&first_driver, 32)?;
+        let batch = first_ring.batch()?;
+        let mut buf = batch.checkout()?;
+        buf.as_mut_slice()[0] = 1;
+        buf.set_len(1)?;
+        buf.commit()?;
+
+        let second_driver = crate::Driver::new(io_uring::IoUring::builder(), 8)?;
+        let socket = test_socket(second_driver.handle())?;
+
+        assert_driver_mismatch(|| socket.assert_sendbufring_driver(&batch));
+        Ok(())
+    }
+
     fn more_flag() -> u32 {
         (0..=u32::MAX)
             .find(|flags| io_uring::cqueue::more(*flags))
@@ -2007,6 +2160,29 @@ mod tests {
         (0..=u32::MAX)
             .find(|flags| io_uring::cqueue::notif(*flags))
             .expect("missing CQE notif flag")
+    }
+
+    #[test]
+    fn send_bundle_completion_accumulates_updates_and_terminal_result() {
+        let mut completion = SendBundleCompletion::default();
+        completion.record(Ok(256));
+
+        assert_eq!(completion.finish(Ok(1)).unwrap(), 257);
+    }
+
+    #[test]
+    fn send_bundle_completion_preserves_first_reconciliation_error() {
+        let mut completion = SendBundleCompletion::default();
+        completion.record(Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "intermediate completion mismatch",
+        )));
+
+        let err = completion
+            .finish(Err(io::Error::from_raw_os_error(libc::ECANCELED)))
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "intermediate completion mismatch");
     }
 
     #[test]

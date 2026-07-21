@@ -54,6 +54,28 @@ pub unsafe trait Operation {
     /// invalidate the pointed-to storage during that period.
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry>;
 
+    /// Called after the SQE has been written into the submission queue but before the queue tail
+    /// is published to the kernel.
+    ///
+    /// This is the point where operations may safely publish userspace state that must only
+    /// become visible once the SQE exists in the submission queue. Returning an error prevents
+    /// the SQE from becoming visible and routes the error through the normal synthetic completion
+    /// path.
+    ///
+    /// The hook runs while the driver holds its submission queue, so it must not re-enter that
+    /// driver or attempt to submit another operation through it.
+    fn on_submit(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// Roll back state changed by [`Operation::on_submit`] when the submission queue tail will not
+    /// be published.
+    ///
+    /// This is called after an `on_submit` error or panic, including for earlier entries in a
+    /// linked batch when a later entry fails. Implementations whose hook mutates state must make
+    /// this method idempotent and safe after a partially completed or panicking hook.
+    fn on_submit_rollback(&mut self) {}
+
     /// Release resources represented by an unconsumed completion.
     ///
     /// When an application drops a submitted operation, the runtime continues reaping its
@@ -109,10 +131,24 @@ pub(crate) struct ConfiguredEntry {
 }
 
 impl ConfiguredEntry {
-    pub(crate) fn into_entry_with_flags(self, flags: Flags) -> io_uring::squeue::Entry {
+    pub(crate) fn entry_with_flags(&self, flags: Flags) -> io_uring::squeue::Entry {
         self.entry
+            .clone()
             .flags(flags)
-            .user_data(self.handle.into_raw_usize() as u64)
+            .user_data(self.handle.as_raw_usize() as u64)
+    }
+
+    pub(crate) fn on_submit(&self) -> io::Result<()> {
+        self.handle.on_submit()
+    }
+
+    pub(crate) fn rollback_submit(&self) {
+        self.handle.rollback_submit();
+    }
+
+    pub(crate) fn commit_kernel_ref(self) {
+        let Self { entry: _, handle } = self;
+        mem::forget(handle);
     }
 
     pub(crate) fn new(handle: RawOpRef, entry: io_uring::squeue::Entry) -> Self {
@@ -264,13 +300,14 @@ where
 
     fn finish_submit(&mut self) {
         let state = mem::replace(self, State::Done);
-        *self = match state {
-            State::Waiting { mut handle } => State::Submitted {
-                inner: SubmittedOp {
-                    inner: handle.take().expect("handle missing"),
-                },
+        let State::Waiting { mut handle } = state else {
+            *self = state;
+            return;
+        };
+        *self = State::Submitted {
+            inner: SubmittedOp {
+                inner: handle.take().expect("handle missing"),
             },
-            state => state,
         };
     }
 
@@ -899,6 +936,37 @@ mod tests {
         let op = op.as_ref().get_ref();
         assert!(op.submit.is_none());
         assert!(matches!(op.state, State::Submitted { .. }));
+    }
+
+    #[test]
+    fn finish_submit_only_transitions_operation_state() {
+        #[derive(Debug)]
+        struct SubmitHookOp(Rc<Cell<bool>>);
+
+        unsafe impl Operation for SubmitHookOp {
+            fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+                Ok(io_uring::opcode::Nop::new().build())
+            }
+
+            fn on_submit(&mut self) -> io::Result<()> {
+                self.0.set(true);
+                Ok(())
+            }
+
+            fn cleanup(&mut self, _: CQEResult) {}
+        }
+
+        let submitted = Rc::new(Cell::new(false));
+        let handle = TypedHandle::new(SubmitHookOp(Rc::clone(&submitted)));
+        let mut state = State::Waiting {
+            handle: Some(handle),
+        };
+        assert!(!submitted.get());
+
+        state.finish_submit();
+
+        assert!(!submitted.get());
+        assert!(matches!(state, State::Submitted { .. }));
     }
 
     #[test]

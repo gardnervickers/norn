@@ -43,6 +43,18 @@ pub(crate) struct VTable {
     /// to a valid [`Header`].
     pub(crate) clone_ref: unsafe fn(NonNull<Header>),
 
+    /// Called after the SQE has been written but before the submission tail is published.
+    ///
+    /// # Safety
+    /// Callers must ensure exclusive access to the operation data.
+    pub(crate) on_submit: unsafe fn(NonNull<Header>) -> std::io::Result<()>,
+
+    /// Roll back state changed by `on_submit` when the submission tail will not be published.
+    ///
+    /// # Safety
+    /// Callers must ensure exclusive access to the operation data.
+    pub(crate) rollback_submit: unsafe fn(NonNull<Header>),
+
     /// Called when a completion is received for the operation.
     ///
     /// Note that an operation may receive multiple completions.

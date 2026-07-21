@@ -28,6 +28,12 @@ impl SubmitError {
         }
     }
 
+    pub(crate) fn submit_hook(err: io::Error) -> Self {
+        Self {
+            kind: SubmitErrorKind::SubmitHook(err),
+        }
+    }
+
     pub(crate) fn to_io_error(&self) -> io::Error {
         match &self.kind {
             SubmitErrorKind::ShuttingDown => {
@@ -36,6 +42,10 @@ impl SubmitError {
             SubmitErrorKind::Broken(err) => {
                 io::Error::new(err.kind(), format!("reactor submit path failed: {err}"))
             }
+            SubmitErrorKind::SubmitHook(err) => io::Error::new(
+                err.kind(),
+                format!("operation submission hook failed: {err}"),
+            ),
             SubmitErrorKind::BatchTooLarge {
                 batch_len,
                 capacity,
@@ -55,6 +65,8 @@ enum SubmitErrorKind {
     ShuttingDown,
     #[error("reactor submit path failed: {0}")]
     Broken(#[source] io::Error),
+    #[error("operation submission hook failed: {0}")]
+    SubmitHook(#[source] io::Error),
     #[error("request batch of {batch_len} SQEs exceeds submission queue capacity {capacity}")]
     BatchTooLarge { batch_len: usize, capacity: usize },
 }
@@ -66,6 +78,10 @@ impl From<SubmitError> for io::Error {
             SubmitErrorKind::Broken(err) => {
                 io::Error::new(err.kind(), format!("reactor submit path failed: {err}"))
             }
+            SubmitErrorKind::SubmitHook(err) => io::Error::new(
+                err.kind(),
+                format!("operation submission hook failed: {err}"),
+            ),
             SubmitErrorKind::BatchTooLarge {
                 batch_len,
                 capacity,
