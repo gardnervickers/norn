@@ -8,7 +8,7 @@ use futures_core::Stream;
 use socket2::{Domain, Type};
 
 use crate::buf::{StableBuf, StableBufMut};
-use crate::bufring::RecvBufRing;
+use crate::bufring::{RecvBufRing, SendStreamBatch};
 use crate::net::socket;
 use crate::operation::Op;
 
@@ -200,6 +200,35 @@ impl TcpSocket {
     /// Send data from the given buffer with send flags.
     pub fn send_with_flags<B: StableBuf>(&self, buf: B, flags: i32) -> Op<socket::Send<B>> {
         self.socket.send_with_flags(buf, flags)
+    }
+
+    /// Sends queued stream data from a send stream batch.
+    ///
+    /// This waits through short kernel sends until the batch drains, and returns the total
+    /// number of bytes sent.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the batch's send ring was registered with another driver.
+    pub async fn send_bundle(&self, batch: &SendStreamBatch) -> io::Result<usize> {
+        self.socket.send_bundle_tcp(batch).await
+    }
+
+    /// Sends queued stream data from a send stream batch with the provided send flags.
+    ///
+    /// Without `MSG_DONTWAIT`, this waits through short kernel sends until the batch drains.
+    /// With `MSG_DONTWAIT`, a short send trims the queued prefix from the batch; call this
+    /// method again until [`SendStreamBatch::is_empty`] returns `true`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the batch's send ring was registered with another driver.
+    pub async fn send_bundle_with_flags(
+        &self,
+        batch: &SendStreamBatch,
+        flags: i32,
+    ) -> io::Result<usize> {
+        self.socket.send_bundle_tcp_with_flags(batch, flags).await
     }
 
     /// Send data from the given buffer using io_uring zerocopy send.

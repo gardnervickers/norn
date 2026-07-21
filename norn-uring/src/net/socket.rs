@@ -12,7 +12,10 @@ use std::net::SocketAddr;
 use std::os::fd::FromRawFd;
 
 use crate::buf::{set_init_checked, StableBuf, StableBufMut};
-use crate::bufring::{BufRingBuf, BufRingBufBundle, RecvBufRing, SendBundleBatch};
+use crate::bufring::{
+    BufRingBuf, BufRingBufBundle, RecvBufRing, SendBundleBatch, SendStreamBatch,
+    SendStreamSubmission,
+};
 use crate::fd::NornFd;
 use crate::operation::{Multishot, Op, Operation, Singleshot};
 
@@ -170,6 +173,14 @@ impl Socket {
         );
     }
 
+    #[track_caller]
+    fn assert_sendstreambufring_driver(&self, batch: &SendStreamBatch) {
+        assert!(
+            batch.same_driver(&self.handle),
+            "buffer ring and socket must target the same driver"
+        );
+    }
+
     pub(crate) fn recv_from_ring(&self, ring: &RecvBufRing) -> Op<RecvFromRing> {
         self.assert_bufring_driver(ring);
         let op = RecvFromRing::new(self.fd.clone(), ring.clone());
@@ -288,6 +299,28 @@ impl Socket {
         batch.validate_send()?;
         let op = SendBundleUdp::new(self.fd.clone(), batch, flags);
         self.handle.submit(op).await
+    }
+
+    pub(crate) async fn send_bundle_tcp(&self, batch: &SendStreamBatch) -> io::Result<usize> {
+        self.send_bundle_tcp_with_flags(batch, 0).await
+    }
+
+    pub(crate) async fn send_bundle_tcp_with_flags(
+        &self,
+        batch: &SendStreamBatch,
+        flags: i32,
+    ) -> io::Result<usize> {
+        self.assert_sendstreambufring_driver(batch);
+        batch.validate_send()?;
+        let drain = flags & libc::MSG_DONTWAIT == 0;
+        let mut total = 0;
+        loop {
+            let op = SendBundleTcp::new(self.fd.clone(), batch, flags);
+            total += self.handle.submit(op).await?;
+            if batch.is_empty() || !drain {
+                return Ok(total);
+            }
+        }
     }
 
     pub(crate) fn recv<B>(&self, buf: B) -> Op<Recv<B>>
@@ -1697,6 +1730,75 @@ impl Singleshot for SendBundleUdp {
     }
 }
 
+#[derive(Debug)]
+struct SendBundleTcp {
+    fd: NornFd,
+    submission: SendStreamSubmission,
+    flags: i32,
+    completion: SendBundleCompletion,
+}
+
+impl SendBundleTcp {
+    fn new(fd: NornFd, batch: &SendStreamBatch, flags: i32) -> Self {
+        Self {
+            fd,
+            submission: batch.submission(),
+            flags,
+            completion: SendBundleCompletion::default(),
+        }
+    }
+
+    fn record_completion(&mut self, result: crate::operation::CQEResult) {
+        let result = self.submission.complete_send(result);
+        self.completion.record(result);
+    }
+}
+
+// Safety: `NornFd` retains the connected socket and `SendStreamBatch` retains all
+// queued provided buffers through the terminal completion.
+unsafe impl Operation for SendBundleTcp {
+    fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+        Ok(match self.fd.kind() {
+            crate::fd::FdKind::Fd(fd) => {
+                opcode::SendBundle::new(types::Fd(fd.0), self.submission.bgid())
+            }
+            crate::fd::FdKind::Fixed(fd) => {
+                opcode::SendBundle::new(types::Fixed(fd.0), self.submission.bgid())
+            }
+        }
+        .flags(self.flags)
+        .len(0)
+        .build())
+    }
+
+    fn on_submit(&mut self) -> io::Result<()> {
+        self.submission.on_submit()
+    }
+
+    fn on_submit_rollback(&mut self) {
+        self.submission.on_submit_rollback();
+    }
+
+    fn cleanup(&mut self, result: crate::operation::CQEResult) {
+        self.record_completion(result);
+    }
+}
+
+impl Singleshot for SendBundleTcp {
+    type Output = io::Result<usize>;
+
+    fn update(&mut self, result: crate::operation::CQEResult) {
+        debug_assert!(result.more());
+        self.record_completion(result);
+    }
+
+    fn complete(mut self, result: crate::operation::CQEResult) -> Self::Output {
+        debug_assert!(!result.more());
+        let result = self.submission.complete_send(result);
+        self.completion.finish(result)
+    }
+}
+
 fn update_send_zc_primary(
     primary_result: &mut Option<io::Result<usize>>,
     result: crate::operation::CQEResult,
@@ -2147,6 +2249,10 @@ mod tests {
         let socket = test_socket(second_driver.handle())?;
 
         assert_driver_mismatch(|| socket.assert_sendbufring_driver(&batch));
+        drop(batch);
+
+        let stream_batch = first_ring.stream_batch()?;
+        assert_driver_mismatch(|| socket.assert_sendstreambufring_driver(&stream_batch));
         Ok(())
     }
 
