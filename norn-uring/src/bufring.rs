@@ -14,18 +14,37 @@ use log::warn;
 
 use crate::Handle;
 
-/// [`BufRing`] is a reference counted buffer ring which can be registered
+/// [`RecvBufRing`] is a reference counted buffer ring which can be registered
 /// with io_uring to provide buffers for read operations.
+///
+/// # Example
+///
+/// ```no_run
+/// use norn_uring::bufring::RecvBufRing;
+/// use norn_uring::net::UdpSocket;
+///
+/// # async fn receive() -> std::io::Result<()> {
+/// let ring = RecvBufRing::builder(7)
+///     .buf_cnt(32)
+///     .buf_len(2048)
+///     .build()?;
+/// let socket = UdpSocket::bind("127.0.0.1:8080".parse().unwrap()).await?;
+///
+/// let (buffer, peer) = socket.recv_from_ring(&ring).await?;
+/// println!("received {} bytes from {peer}", buffer.len());
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Clone)]
-pub struct BufRing {
-    // The BufRing is reference counted because each buffer handed out has a reference back to its
-    // buffer group, or in this case, to its buffer ring.
+pub struct RecvBufRing {
+    // The RecvBufRing is reference counted because each buffer handed out has a reference back to
+    // its buffer group, or in this case, to its buffer ring.
     rc: Rc<InnerBufRing>,
 }
 
-impl fmt::Debug for BufRing {
+impl fmt::Debug for RecvBufRing {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BufRing")
+        f.debug_struct("RecvBufRing")
             .field("bgid", &self.rc.bgid())
             .field("ring_entries", &self.rc.ring_entries())
             .field("buf_cnt", &self.rc.buf_cnt)
@@ -34,9 +53,9 @@ impl fmt::Debug for BufRing {
     }
 }
 
-impl BufRing {
+impl RecvBufRing {
     fn new(buf_ring: InnerBufRing) -> Self {
-        BufRing {
+        RecvBufRing {
             rc: Rc::new(buf_ring),
         }
     }
@@ -79,7 +98,7 @@ impl BufRing {
 /// Users should be careful to drop the buffer as soon as possible to avoid
 /// exhausting the buffer ring.
 pub struct BufRingBuf {
-    bufgroup: BufRing,
+    bufgroup: RecvBufRing,
     len: usize,
     bid: Bid,
 }
@@ -137,7 +156,7 @@ impl fmt::Debug for BufRingBuf {
 }
 
 impl BufRingBuf {
-    fn new(bufgroup: BufRing, bid: Bid, len: usize) -> Self {
+    fn new(bufgroup: RecvBufRing, bid: Bid, len: usize) -> Self {
         assert!(len <= bufgroup.rc.buf_len);
 
         Self { bufgroup, len, bid }
@@ -189,7 +208,7 @@ fn selected_bid_from_flags(flags: u32) -> io::Result<Bid> {
     })
 }
 
-/// [`Builder`] is used to create a new [`BufRing`].
+/// [`Builder`] is used to create a new [`RecvBufRing`].
 #[derive(Copy, Clone, Debug)]
 pub struct Builder {
     bgid: Bgid,
@@ -236,8 +255,8 @@ impl Builder {
         self
     }
 
-    /// Return a BufRing.
-    pub fn build(&self) -> io::Result<BufRing> {
+    /// Return a [`RecvBufRing`].
+    pub fn build(&self) -> io::Result<RecvBufRing> {
         let mut b: Builder = *self;
 
         // Two cases where both buf_cnt and ring_entries are set to the max of the two.
@@ -266,7 +285,7 @@ impl Builder {
         let inner =
             InnerBufRing::new(b.bgid, b.ring_entries, b.buf_cnt, b.buf_len, handle.clone())?;
         handle.with_submitter(|s| inner.register(s))?;
-        Ok(BufRing::new(inner))
+        Ok(RecvBufRing::new(inner))
     }
 }
 
@@ -444,9 +463,9 @@ impl InnerBufRing {
 
     // Returns the buffer the uring interface picked from the buf_ring for the completion result
     // represented by the res and flags.
-    fn get_buf(&self, buf_ring: BufRing, res: u32, flags: u32) -> io::Result<BufRingBuf> {
-        // This fn does the odd thing of having self as the BufRing and taking an argument that is
-        // the same BufRing but wrapped in Rc<_> so the wrapped buf_ring can be passed to the
+    fn get_buf(&self, buf_ring: RecvBufRing, res: u32, flags: u32) -> io::Result<BufRingBuf> {
+        // This fn does the odd thing of having self as the RecvBufRing and taking an argument that
+        // is the same RecvBufRing but wrapped in Rc<_> so the wrapped buf_ring can be passed to the
         // outgoing GBuf.
         let bid = selected_bid_from_flags(flags)?;
         if bid >= self.buf_cnt {
@@ -474,7 +493,7 @@ impl InnerBufRing {
 
     fn get_buf_bundle(
         &self,
-        buf_ring: BufRing,
+        buf_ring: RecvBufRing,
         res: u32,
         flags: u32,
     ) -> io::Result<BufRingBufBundle> {

@@ -7,7 +7,7 @@ use std::pin::pin;
 use bytes::BytesMut;
 use futures_util::StreamExt;
 use norn_executor::spawn;
-use norn_uring::bufring::BufRing;
+use norn_uring::bufring::RecvBufRing;
 use norn_uring::net::{TcpListener, TcpSocket};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -163,7 +163,7 @@ fn recv_ring_stream_socket_reports_peer() -> Result<(), Box<dyn std::error::Erro
         let (server, peer_addr) = listener.accept().await?;
         let client = client_task.await??;
 
-        let ring = BufRing::builder(7).buf_cnt(16).buf_len(1024).build()?;
+        let ring = RecvBufRing::builder(7).buf_cnt(16).buf_len(1024).build()?;
         let payload = b"hello".to_vec();
         let (send_res, payload) = client.send(payload).await;
         assert_eq!(send_res?, payload.len());

@@ -73,7 +73,7 @@ The project is intentionally not general-purpose today; APIs are still in flux i
 ### FD and buffer lifetime constraints
 
 - `NornFd` is refcounted and waits for `strong_count == 1` before close submission.
-- `NornFd::Inner::drop` and `BufRing::drop` call `Handle::current()`; dropping outside driver context is unsafe/panic-prone.
+- `NornFd::Inner::drop` and `RecvBufRing::drop` call `Handle::current()`; dropping outside driver context is unsafe/panic-prone.
 - I/O buffers must implement `StableBuf`/`StableBufMut` (stable pointer guarantees).
 - Bufring uses registered kernel buffer rings and returns buffers to ring on `BufRingBuf::drop`.
 
