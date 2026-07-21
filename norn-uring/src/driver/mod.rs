@@ -72,8 +72,10 @@ pub struct DriverOptions {
 ///
 /// Shutdown stops accepting new requests, cancels outstanding work, and waits
 /// for every kernel-owned operation to reach a terminal completion. Teardown
-/// retries transient and fatal submission errors indefinitely; consequently,
-/// dropping a driver can block forever if its ring can no longer make progress.
+/// retries unclassified cancellation errors and submission errors indefinitely.
+/// Kernels without synchronous cancellation proceed directly to the drain
+/// barriers, which can still block forever behind an operation that cannot
+/// complete without cancellation.
 pub struct Driver {
     options: DriverOptions,
     shared: Rc<Shared>,
@@ -115,7 +117,15 @@ struct Shared {
     submit_error: RefCell<Option<(io::ErrorKind, String)>>,
     shutdown_outcome: Cell<Option<ShutdownOutcome>>,
     #[cfg(test)]
-    cancel_all_error: Cell<Option<i32>>,
+    cancel_all_failures: RefCell<std::collections::VecDeque<i32>>,
+    #[cfg(test)]
+    cancel_all_attempts: Cell<usize>,
+    #[cfg(test)]
+    drain_failures: RefCell<std::collections::VecDeque<usize>>,
+    #[cfg(test)]
+    operations_drain_attempts: Cell<usize>,
+    #[cfg(test)]
+    resources_drain_attempts: Cell<usize>,
     #[cfg(test)]
     submit_failures: RefCell<std::collections::VecDeque<i32>>,
     #[cfg(test)]
@@ -452,7 +462,15 @@ impl Driver {
                 submit_error: RefCell::new(None),
                 shutdown_outcome: Cell::new(None),
                 #[cfg(test)]
-                cancel_all_error: Cell::new(None),
+                cancel_all_failures: RefCell::new(std::collections::VecDeque::new()),
+                #[cfg(test)]
+                cancel_all_attempts: Cell::new(0),
+                #[cfg(test)]
+                drain_failures: RefCell::new(std::collections::VecDeque::new()),
+                #[cfg(test)]
+                operations_drain_attempts: Cell::new(0),
+                #[cfg(test)]
+                resources_drain_attempts: Cell::new(0),
                 #[cfg(test)]
                 submit_failures: RefCell::new(std::collections::VecDeque::new()),
                 #[cfg(test)]
@@ -550,15 +568,27 @@ impl Driver {
             for cqe in entries {
                 let user_data = cqe.user_data() as usize;
                 if user_data == Self::OPERATIONS_DRAIN_TOKEN {
-                    trace!(target: LOG, "drain.operations.token");
                     debug_assert_eq!(self.shared.status(), Status::DrainingOperations);
-                    self.shared.set_status(Status::ClosingResources);
+                    if cqe.result() < 0 {
+                        let err = io::Error::from_raw_os_error(-cqe.result());
+                        warn!(target: LOG, "drain.operations.failed {err:?}");
+                        self.shared.set_status(Status::Closing);
+                    } else {
+                        trace!(target: LOG, "drain.operations.token");
+                        self.shared.set_status(Status::ClosingResources);
+                    }
                     continue;
                 }
                 if user_data == Self::RESOURCES_DRAIN_TOKEN {
-                    trace!(target: LOG, "drain.resources.token");
                     debug_assert_eq!(self.shared.status(), Status::DrainingResources);
-                    self.shared.finish_shutdown(ShutdownOutcome::CleanDrained);
+                    if cqe.result() < 0 {
+                        let err = io::Error::from_raw_os_error(-cqe.result());
+                        warn!(target: LOG, "drain.resources.failed {err:?}");
+                        self.shared.set_status(Status::ClosingResources);
+                    } else {
+                        trace!(target: LOG, "drain.resources.token");
+                        self.shared.finish_shutdown(ShutdownOutcome::CleanDrained);
+                    }
                     continue;
                 }
                 if user_data == Self::UNPARKER_WAKE_TOKEN {
@@ -608,6 +638,21 @@ impl Driver {
         if self.shared.status() != Status::Shutdown {
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    fn drain_sentinel(&self, token: usize) -> io_uring::squeue::Entry {
+        #[cfg(test)]
+        let opcode = if self.shared.fail_drain_sentinel(token) {
+            opcode::Close::new(types::Fd(-1)).build()
+        } else {
+            opcode::Nop::new().build()
+        };
+        #[cfg(not(test))]
+        let opcode = opcode::Nop::new().build();
+
+        opcode
+            .flags(io_uring::squeue::Flags::IO_DRAIN)
+            .user_data(token as u64)
     }
 
     fn drain_normal(&self, remaining: &mut Option<usize>) -> usize {
@@ -696,9 +741,10 @@ impl Driver {
 
         // Once an SQE may have reached the kernel, returning before its terminal CQE
         // is unsafe: the operation can retain buffers, descriptors, and this driver.
-        // Teardown therefore retries indefinitely. A permanently broken ring can
-        // make shutdown block forever, but it cannot make shutdown abandon memory
-        // still owned by the kernel.
+        // Teardown therefore retries every cancellation error that does not prove
+        // the operation unsupported. If synchronous cancellation is unsupported,
+        // the drain barrier itself becomes the proof; it can block forever, but
+        // shutdown cannot abandon memory still owned by the kernel.
         loop {
             if let Some(outcome) = self.shared.shutdown_outcome() {
                 return outcome;
@@ -714,16 +760,18 @@ impl Driver {
                     }
 
                     if let Err(err) = self.shared.cancel_all() {
-                        if err.raw_os_error() != Some(libc::ENOENT) {
+                        if Self::sync_cancel_unsupported(&err) {
+                            // The drain barrier remains the reclamation proof. Without
+                            // synchronous cancellation it completes immediately for an
+                            // idle ring, but safely waits behind any outstanding operation.
+                            warn!(target: LOG, "shutdown.cancel_all.unsupported {err:?}");
+                        } else if err.raw_os_error() != Some(libc::ENOENT) {
                             self.retry_shutdown("cancel_all", &err);
                             continue;
                         }
                     }
 
-                    let opcode = io_uring::opcode::Nop::new()
-                        .build()
-                        .flags(io_uring::squeue::Flags::IO_DRAIN)
-                        .user_data(Self::OPERATIONS_DRAIN_TOKEN as u64);
+                    let opcode = self.drain_sentinel(Self::OPERATIONS_DRAIN_TOKEN);
                     if unsafe { self.shared.try_push_raw(&opcode) }.is_ok() {
                         self.shared.set_status(Status::DrainingOperations);
                     } else {
@@ -750,10 +798,7 @@ impl Driver {
                         continue;
                     }
 
-                    let opcode = io_uring::opcode::Nop::new()
-                        .build()
-                        .flags(io_uring::squeue::Flags::IO_DRAIN)
-                        .user_data(Self::RESOURCES_DRAIN_TOKEN as u64);
+                    let opcode = self.drain_sentinel(Self::RESOURCES_DRAIN_TOKEN);
                     if unsafe { self.shared.try_push_raw(&opcode) }.is_ok() {
                         self.shared.set_status(Status::DrainingResources);
                     } else {
@@ -771,6 +816,13 @@ impl Driver {
                 }
             }
         }
+    }
+
+    fn sync_cancel_unsupported(err: &io::Error) -> bool {
+        matches!(
+            err.raw_os_error(),
+            Some(libc::EINVAL) | Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS)
+        )
     }
 }
 
@@ -1051,7 +1103,6 @@ impl Shared {
             if !sq.is_full() {
                 let cancel = opcode::AsyncCancel2::new(criteria)
                     .build()
-                    .flags(Flags::SKIP_SUCCESS)
                     .user_data(Driver::CANCELLATION_TOKEN as u64);
                 unsafe { sq.push(&cancel) }.unwrap();
                 return Ok(());
@@ -1067,7 +1118,6 @@ impl Shared {
             fd::FdKind::Fd(fd) => opcode::Close::new(types::Fd(fd.0)).build(),
             fd::FdKind::Fixed(fd) => opcode::Close::new(types::Fixed(fd.0)).build(),
         }
-        .flags(Flags::SKIP_SUCCESS)
         .user_data(Driver::CLOSE_FD_TOKEN as u64);
 
         if unsafe { self.try_push_raw(&entry) }.is_err() {
@@ -1091,8 +1141,12 @@ impl Shared {
     /// Cancel all outstanding requests synchronously.
     pub(crate) fn cancel_all(&self) -> io::Result<()> {
         #[cfg(test)]
-        if let Some(errno) = self.cancel_all_error.take() {
-            return Err(io::Error::from_raw_os_error(errno));
+        {
+            self.cancel_all_attempts
+                .set(self.cancel_all_attempts.get() + 1);
+            if let Some(errno) = self.cancel_all_failures.borrow_mut().pop_front() {
+                return Err(io::Error::from_raw_os_error(errno));
+            }
         }
 
         let ring = self.ring.borrow();
@@ -1106,6 +1160,38 @@ impl Shared {
             // No matching requests means there is nothing left to cancel.
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(err) => Err(err),
+        }
+    }
+
+    #[cfg(test)]
+    fn fail_next_cancel_all(&self, errno: i32) {
+        self.cancel_all_failures.borrow_mut().push_back(errno);
+    }
+
+    #[cfg(test)]
+    fn fail_next_drain_sentinel(&self, token: usize) {
+        assert!(matches!(
+            token,
+            Driver::OPERATIONS_DRAIN_TOKEN | Driver::RESOURCES_DRAIN_TOKEN
+        ));
+        self.drain_failures.borrow_mut().push_back(token);
+    }
+
+    #[cfg(test)]
+    fn fail_drain_sentinel(&self, token: usize) -> bool {
+        let attempts = match token {
+            Driver::OPERATIONS_DRAIN_TOKEN => &self.operations_drain_attempts,
+            Driver::RESOURCES_DRAIN_TOKEN => &self.resources_drain_attempts,
+            _ => unreachable!("unknown drain sentinel token"),
+        };
+        attempts.set(attempts.get() + 1);
+
+        let should_fail = self.drain_failures.borrow().front() == Some(&token);
+        if should_fail {
+            self.drain_failures.borrow_mut().pop_front();
+            true
+        } else {
+            false
         }
     }
 
@@ -1294,17 +1380,45 @@ mod tests {
 
             drop(op);
             drop(handle);
-            driver.shared.cancel_all_error.set(Some(libc::EIO));
+            driver.shared.fail_next_cancel_all(libc::EIO);
             let outcome = driver.shutdown_with_outcome();
+            let cancel_all_attempts = driver.shared.cancel_all_attempts.get();
+            let operations_drain_attempts = driver.shared.operations_drain_attempts.get();
+            let resources_drain_attempts = driver.shared.resources_drain_attempts.get();
             let shared_refs = Rc::strong_count(&driver.shared);
             drop(driver);
-            tx.send((outcome, shared_refs)).unwrap();
+            tx.send((
+                outcome,
+                cancel_all_attempts,
+                operations_drain_attempts,
+                resources_drain_attempts,
+                shared_refs,
+            ))
+            .unwrap();
         });
 
-        let (outcome, shared_refs) = rx
+        let (
+            outcome,
+            cancel_all_attempts,
+            operations_drain_attempts,
+            resources_drain_attempts,
+            shared_refs,
+        ) = rx
             .recv_timeout(Duration::from_secs(2))
             .expect("shutdown did not recover from the injected cancellation failure");
         assert_eq!(outcome, ShutdownOutcome::CleanDrained);
+        assert_eq!(
+            cancel_all_attempts, 2,
+            "a transient cancellation failure must be retried before draining"
+        );
+        assert_eq!(
+            operations_drain_attempts, 1,
+            "the dropped-operation async cancel must be compatible with IO_DRAIN"
+        );
+        assert_eq!(
+            resources_drain_attempts, 1,
+            "the cleanup drain barrier must succeed on its first attempt"
+        );
         assert_eq!(
             shared_refs, 1,
             "clean drain must release the operation-owned driver reference"
@@ -1339,6 +1453,90 @@ mod tests {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
         let dropped = Arc::new(AtomicBool::new(false));
         assert_cancel_failure_retries(LongLivedIo::Accept(listener), dropped);
+    }
+
+    fn shutdown_with_cancel_all_failures(errors: &[i32]) -> (ShutdownOutcome, usize) {
+        let errors = errors.to_vec();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+            for errno in errors {
+                driver.shared.fail_next_cancel_all(errno);
+            }
+            let outcome = driver.shutdown_with_outcome();
+            tx.send((outcome, driver.shared.cancel_all_attempts.get()))
+                .unwrap();
+        });
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("shutdown did not reach the drain barriers")
+    }
+
+    #[test]
+    fn unsupported_sync_cancel_reaches_idle_drain_barriers() {
+        let (outcome, attempts) = shutdown_with_cancel_all_failures(&[libc::EINVAL]);
+
+        assert_eq!(outcome, ShutdownOutcome::CleanDrained);
+        assert_eq!(
+            attempts, 1,
+            "a permanent unsupported error must not be retried"
+        );
+    }
+
+    #[test]
+    fn transient_sync_cancel_error_retries_before_draining() {
+        let (outcome, attempts) = shutdown_with_cancel_all_failures(&[libc::EIO, libc::ENOENT]);
+
+        assert_eq!(outcome, ShutdownOutcome::CleanDrained);
+        assert_eq!(attempts, 2, "a transient error must retry cancellation");
+    }
+
+    #[test]
+    fn sync_cancel_unsupported_error_classification() {
+        for errno in [libc::EINVAL, libc::EOPNOTSUPP, libc::ENOSYS] {
+            assert!(Driver::sync_cancel_unsupported(
+                &io::Error::from_raw_os_error(errno)
+            ));
+        }
+        for errno in [libc::EIO, libc::EBUSY, libc::EINTR] {
+            assert!(!Driver::sync_cancel_unsupported(
+                &io::Error::from_raw_os_error(errno)
+            ));
+        }
+    }
+
+    #[test]
+    fn failed_drain_sentinels_retry_without_advancing_shutdown() {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+            driver
+                .shared
+                .fail_next_drain_sentinel(Driver::OPERATIONS_DRAIN_TOKEN);
+            driver
+                .shared
+                .fail_next_drain_sentinel(Driver::RESOURCES_DRAIN_TOKEN);
+
+            let outcome = driver.shutdown_with_outcome();
+            tx.send((
+                outcome,
+                driver.shared.operations_drain_attempts.get(),
+                driver.shared.resources_drain_attempts.get(),
+            ))
+            .unwrap();
+        });
+
+        let (outcome, operations_attempts, resources_attempts) = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("shutdown did not retry failed drain sentinels");
+        assert_eq!(outcome, ShutdownOutcome::CleanDrained);
+        assert_eq!(
+            operations_attempts, 2,
+            "a failed operations barrier must be retried"
+        );
+        assert_eq!(
+            resources_attempts, 2,
+            "a failed resources barrier must be retried"
+        );
     }
 
     #[test]
@@ -1706,6 +1904,16 @@ mod tests {
         Park::shutdown(&mut driver);
 
         assert!(driver.shared.submit_failures.borrow().is_empty());
+        assert_eq!(
+            driver.shared.operations_drain_attempts.get(),
+            1,
+            "the operations drain barrier must succeed on its first attempt"
+        );
+        assert_eq!(
+            driver.shared.resources_drain_attempts.get(),
+            1,
+            "the cleanup-generated close must be compatible with IO_DRAIN"
+        );
         assert_closed(owned_fd);
         assert_open(duplicate_fd);
 
