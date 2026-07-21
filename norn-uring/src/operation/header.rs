@@ -1,12 +1,132 @@
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
+use std::mem;
 use std::ptr::NonNull;
 use std::task::Waker;
 
-use smallvec::SmallVec;
-
 use super::CQEResult;
 
-pub(crate) type CompletionQueue = SmallVec<[CQEResult; 1]>;
+/// A FIFO completion queue with an allocation-free common path.
+///
+/// Singleshot operations and multishot operations whose consumer keeps pace
+/// store their sole pending completion inline. Once an operation has observed
+/// a backlog, the deque retains its high-water capacity so a steady producer
+/// and consumer do not repeatedly allocate.
+pub(crate) struct CompletionQueue {
+    storage: CompletionStorage,
+}
+
+enum CompletionStorage {
+    Empty,
+    One(CQEResult),
+    Many(VecDeque<CQEResult>),
+}
+
+impl CompletionQueue {
+    #[inline]
+    pub(crate) fn new() -> Self {
+        Self {
+            storage: CompletionStorage::Empty,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn push(&mut self, result: CQEResult) {
+        match &mut self.storage {
+            CompletionStorage::Empty => self.storage = CompletionStorage::One(result),
+            CompletionStorage::One(_) => {
+                let CompletionStorage::One(first) =
+                    mem::replace(&mut self.storage, CompletionStorage::Empty)
+                else {
+                    unreachable!()
+                };
+                let mut overflow = VecDeque::with_capacity(2);
+                overflow.push_back(first);
+                overflow.push_back(result);
+                self.storage = CompletionStorage::Many(overflow);
+            }
+            CompletionStorage::Many(overflow) => overflow.push_back(result),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn pop_front(&mut self) -> Option<CQEResult> {
+        match &mut self.storage {
+            CompletionStorage::Empty => None,
+            CompletionStorage::One(_) => {
+                let CompletionStorage::One(result) =
+                    mem::replace(&mut self.storage, CompletionStorage::Empty)
+                else {
+                    unreachable!()
+                };
+                Some(result)
+            }
+            CompletionStorage::Many(overflow) => overflow.pop_front(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        match &self.storage {
+            CompletionStorage::Empty => 0,
+            CompletionStorage::One(_) => 1,
+            CompletionStorage::Many(overflow) => overflow.len(),
+        }
+    }
+}
+
+impl Default for CompletionQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub(crate) enum CompletionQueueIntoIter {
+    Inline(std::option::IntoIter<CQEResult>),
+    Overflow(std::collections::vec_deque::IntoIter<CQEResult>),
+}
+
+impl Iterator for CompletionQueueIntoIter {
+    type Item = CQEResult;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Inline(iter) => iter.next(),
+            Self::Overflow(iter) => iter.next(),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            Self::Inline(iter) => iter.size_hint(),
+            Self::Overflow(iter) => iter.size_hint(),
+        }
+    }
+}
+
+impl ExactSizeIterator for CompletionQueueIntoIter {}
+
+impl IntoIterator for CompletionQueue {
+    type Item = CQEResult;
+    type IntoIter = CompletionQueueIntoIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        match self.storage {
+            CompletionStorage::Empty => CompletionQueueIntoIter::Inline(None.into_iter()),
+            CompletionStorage::One(result) => {
+                CompletionQueueIntoIter::Inline(Some(result).into_iter())
+            }
+            CompletionStorage::Many(overflow) => {
+                CompletionQueueIntoIter::Overflow(overflow.into_iter())
+            }
+        }
+    }
+}
 
 /// Header is the first field in every operation. It is the handle
 /// through which the reactor completes operations.
@@ -66,7 +186,7 @@ impl Header {
         Self {
             refcount: Cell::new(1),
             waker: Default::default(),
-            completions: RefCell::new(SmallVec::new()),
+            completions: RefCell::new(CompletionQueue::new()),
             complete: Cell::new(false),
             vtable,
         }
@@ -127,5 +247,47 @@ impl Header {
     /// Existing wakers will be overwritten.
     pub(crate) fn set_waker(&self, waker: &Waker) {
         *self.waker.borrow_mut() = Some(waker.clone());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn completion(value: u32) -> CQEResult {
+        CQEResult::new(Ok(value), 0)
+    }
+
+    #[test]
+    fn one_completion_stays_inline() {
+        let mut queue = CompletionQueue::new();
+        queue.push(completion(7));
+        assert!(matches!(queue.storage, CompletionStorage::One(_)));
+        assert_eq!(queue.pop_front().unwrap().into_result().unwrap(), 7);
+        assert!(matches!(queue.storage, CompletionStorage::Empty));
+    }
+
+    #[test]
+    fn overflow_is_fifo_and_retains_high_water_storage() {
+        let mut queue = CompletionQueue::new();
+        for value in 0..128 {
+            queue.push(completion(value));
+        }
+        let capacity = match &queue.storage {
+            CompletionStorage::Many(overflow) => overflow.capacity(),
+            _ => panic!("completion backlog did not use overflow storage"),
+        };
+
+        for expected in 0..128 {
+            assert_eq!(queue.pop_front().unwrap().into_result().unwrap(), expected);
+        }
+        assert!(queue.is_empty());
+        assert_eq!(
+            match &queue.storage {
+                CompletionStorage::Many(overflow) => overflow.capacity(),
+                _ => panic!("completion queue discarded overflow storage"),
+            },
+            capacity
+        );
     }
 }

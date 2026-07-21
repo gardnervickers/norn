@@ -833,7 +833,10 @@ async fn norn_tcp_echo_connection_bufring_multi(
             send_buf = norn_tcp_send_all(&socket, send_buf).await?;
         }
     }
-    socket.close().await
+    // Dropping a submitted multishot receive requests cancellation, but its
+    // operation still owns the descriptor until the terminal CQE is reaped.
+    // Let the socket's in-context drop close it once that ownership releases.
+    Ok(())
 }
 
 async fn norn_tcp_echo_connection_bufring_bundle_multi(
@@ -843,7 +846,7 @@ async fn norn_tcp_echo_connection_bufring_bundle_multi(
     payload_len: usize,
 ) -> io::Result<()> {
     let mut send_buf = vec![0x5A; payload_len];
-    // Drop the multishot op before closing; it owns an fd reference.
+    // Drop the multishot op before returning the socket to in-context drop.
     {
         let mut recv = pin!(socket.recv_bundle_multi(&ring));
         for _ in 0..requests {
@@ -851,7 +854,9 @@ async fn norn_tcp_echo_connection_bufring_bundle_multi(
             send_buf = norn_tcp_send_all(&socket, send_buf).await?;
         }
     }
-    socket.close().await
+    // Explicit close has the same terminal-cancellation ownership race as the
+    // non-bundled multishot path above.
+    Ok(())
 }
 
 async fn norn_tcp_request_response_clients(
@@ -948,7 +953,8 @@ async fn norn_tcp_request_response_client_bufring(
             }
         }
         TcpRecvMode::BufRingMulti => {
-            // Drop the multishot op before closing; it owns an fd reference.
+            // Drop the multishot op before returning the socket to in-context
+            // drop; explicit close cannot consume its outstanding fd owner.
             {
                 let mut recv = pin!(socket.recv_ring_multi(&ring));
                 for _ in 0..requests {
@@ -956,9 +962,11 @@ async fn norn_tcp_request_response_client_bufring(
                     norn_tcp_recv_exact_ring_multi(recv.as_mut(), 0x5A, payload_len).await?;
                 }
             }
+            return Ok(());
         }
         TcpRecvMode::BufRingBundleMulti => {
-            // Drop the multishot op before closing; it owns an fd reference.
+            // Drop the multishot op before returning the socket to in-context
+            // drop; explicit close cannot consume its outstanding fd owner.
             {
                 let mut recv = pin!(socket.recv_bundle_multi(&ring));
                 for _ in 0..requests {
@@ -966,6 +974,7 @@ async fn norn_tcp_request_response_client_bufring(
                     norn_tcp_recv_exact_bundle_multi(recv.as_mut(), 0x5A, payload_len).await?;
                 }
             }
+            return Ok(());
         }
         TcpRecvMode::Normal => unreachable!(),
     }

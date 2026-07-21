@@ -217,9 +217,14 @@ mod tests {
         assert_ne!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
     }
 
-    fn assert_closed(fd: RawFd) {
-        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
-        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+    fn assert_pipe_reader_closed(write_end: RawFd) {
+        let mut pollfd = libc::pollfd {
+            fd: write_end,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut pollfd, 1, 0) }, 1);
+        assert_ne!(pollfd.revents & libc::POLLERR, 0);
     }
 
     #[test]
@@ -232,7 +237,7 @@ mod tests {
         drop(fd);
 
         // Pipe read-end should be closed by NornFd drop fallback.
-        assert_closed(read_end);
+        assert_pipe_reader_closed(write_end);
 
         unsafe {
             libc::close(write_end);
@@ -276,7 +281,7 @@ mod tests {
             )))
             .unwrap();
 
-        assert_closed(read_end);
+        assert_pipe_reader_closed(write_end);
         drop(fd);
         unsafe { libc::close(write_end) };
     }
@@ -335,7 +340,7 @@ mod tests {
         fd.inner.finish_drop_close(Err(CloseFdError::NeverQueued(
             io::Error::from_raw_os_error(libc::EIO),
         )));
-        assert_closed(read_end);
+        assert_pipe_reader_closed(write_end);
 
         drop(fd);
         unsafe { libc::close(write_end) };

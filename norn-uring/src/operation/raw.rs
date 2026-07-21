@@ -58,7 +58,7 @@ where
 
         if let Some(mut data) = this.data_mut().take() {
             let completions = this.header.completions_mut().get_mut();
-            for result in completions.drain(..) {
+            for result in mem::take(completions) {
                 data.cleanup(result);
             }
         } else if !this.header.completions().borrow().is_empty() {

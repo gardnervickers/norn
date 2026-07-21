@@ -953,3 +953,290 @@ NORN_FIXEDBUF_RESULT_DIR=/tmp/norn-fixedbuf-2026-07-15 \
 
 After execution, preserve all raw pairs and add medians, paired deltas, noise
 assessment, ordinary regression cross-checks, and the final disposition here.
+
+## 2026-07-20: Multishot completion backlog storage
+
+Issue: [#56](https://github.com/gardnervickers/norn/issues/56).
+
+### Approved contract and environment
+
+- Machine: local Linux workstation, NixOS kernel `6.18.38`, AMD Ryzen 9
+  5950X (16 cores/32 threads), 62 GiB RAM, no swap.
+- Toolchain: `rustc 1.97.0 (2d8144b78 2026-07-07)`, Cargo 1.97.0,
+  Nix 2.34.8.
+- Source baseline: exact remote `master`
+  `3a80a12800abbbd431de0fe2e91731916ce816e7` (tree
+  `cf8aef02120c7af2d95b35f4e7f7a8f70113cc36`) plus measurement-only
+  harness scaffolding. No driver or completion-queue behavior changed before
+  baseline capture.
+- Affinity: benchmark process pinned to CPU 15, whose governor was already
+  `performance`; SMT sibling CPU 31 remained idle. No host power setting was
+  changed.
+- Initial quiet-window evidence: load average `0.15 0.09 0.04`; the process
+  snapshot contained only the sandbox shell and inspection commands at 0% CPU.
+- Primary command:
+
+  ```text
+  nix develop -c taskset -c 15 \
+    cargo bench -p benches --bench uring_completion_backlog
+  ```
+
+- Existing-workload guard:
+
+  ```text
+  nix develop -c taskset -c 15 cargo bench -p benches \
+    --bench uring_realworld -- \
+    bench_tcp_request_response/runtime=norn/recv=bufring_multi/connections=8/requests_per_connection=512/payload=64
+  ```
+
+### Workloads and integrity gates
+
+- Real-path throughput covers sequential connected-UDP multishot receives,
+  fixed-count kernel multishot bursts of 64, 1,024, and 4,096 completions, and
+  a deliberately lagged consumer with 16,384 real timeout CQEs. The lagged
+  case submits an `IO_DRAIN` fence after the multishot request and awaits the
+  fence without polling the stream, which proves the terminal CQE has been
+  reaped before backlog consumption is timed. All completion counts, timeout
+  results, datagram lengths, and payload sequence values are checked.
+- Synthetic queue scaling is reported separately at depths 1, 64, and 1,024.
+  The 16,384-entry consumption case prepares the backlog outside the timed
+  region, performs three warmups, accumulates at least 250 ms of consumption
+  work, and rejects a sample whose wall time exceeds three seconds.
+- A million-cycle depth-64 probe verifies storage capacity is unchanged after
+  reaching its high-water mark. A separate probe consumes 127 of 1,024 CQEs,
+  drops the operation, and verifies the 897-entry FIFO suffix is cleaned up
+  exactly once.
+- Candidate comparisons used seven process-isolated pairs with alternating
+  baseline/candidate order. The measurement runner rejected mismatched harness
+  blobs and recorded provenance, governor, load, CPU topology, and process
+  snapshots.
+
+Retention gates:
+
+- at least 5% improvement at queue depths 1,024 and 16,384;
+- no more than 2% regression for the depth-one/common completion path;
+- no more than 3% regression in real steady-state throughput or the existing
+  `uring_realworld` guard; use 11 pairs if a 2-5% effect overlaps noise.
+
+The attainable storage invariant is honest rather than absolute: generic
+multishot operations currently have no cancellation/rearm producer-backpressure
+protocol. The candidate must remain `O(high-water pending backlog)` and
+preserve FIFO exactly-once delivery and cleanup.
+
+### Baseline
+
+The unchanged runtime baseline used measurement commit
+`0731405d069dfaf8d048f4b3b0e28ec5719ccadb` (tree
+`dcaa201110ea7c248f783c050b7b5283ecc76fdb`, harness blob
+`f6b93d0d4f67eed1e1eece5d175591d4714b3694`). Three process-isolated full
+matrices are preserved under
+`/tmp/norn-completion-baseline-2026-07-20-0731405/`.
+
+| workload | raw runs | median |
+| --- | --- | ---: |
+| synthetic queue, 1 | 40, 40, 40 ns | 40 ns |
+| synthetic queue, 64 | 1,231, 1,214, 1,231 ns | 1,231 ns |
+| synthetic queue, 1,024 | 98,392, 98,940, 98,508 ns | 98,508 ns |
+| fixed-work consume, 16,384 | 35.521, 34.735, 38.615 ms/backlog | 35.521 ms |
+| constant depth 64, 1M cycles | 19.882, 16.620, 19.941 ms | 19.882 ms |
+| drop 897-entry FIFO suffix | 30,314, 30,280, 30,279 ns | 30,280 ns |
+| real multishot burst, 64 | 336.376, 337.303, 332.242 us | 336.376 us |
+| real multishot burst, 1,024 | 5.346, 5.434, 5.301 ms | 5.346 ms |
+| real multishot burst, 4,096 | 21.818, 21.880, 21.899 ms | 21.880 ms |
+| connected UDP steady, 4,096 | 18.145, 18.204, 18.210 ms | 18.204 ms |
+
+The depth-one result was exact at the harness's integer-nanosecond resolution.
+The 1,024 central value was stable despite one wide Bencher dispersion report.
+The fixed-work 16K range was about 11%; candidate disposition therefore uses
+paired process isolation, not this three-run range alone. Every invariant probe
+passed: constant-depth capacity stayed `128 -> 128`, and the full 897-entry
+suffix was cleaned in FIFO order exactly once.
+
+Every raw baseline, trial, rejected variant, and final paired result will be
+appended below rather than reconstructed later.
+
+Before recording the existing TCP guard, its multishot variants failed
+deterministically with `WouldBlock` from explicit `close()`: dropping the
+multishot operation queues asynchronous cancellation, so the descriptor still
+has an operation owner at the immediately following close call. Multishot
+benchmark variants therefore rely on in-context socket drop, which submits the
+close after terminal completion releases the operation's descriptor ownership.
+
+Three clean process-isolated guard runs after that benchmark-only correction
+were `40.608`, `40.539`, and `40.453 ms` (median `40.539 ms`). The successful
+logs are `guard-fixed-run-{1,2,3}.log` in the baseline result directory; the two
+earlier deterministic failures remain there as `guard-run-{1,2}.log` so the
+measurement correction is auditable.
+
+### Completion-storage trial
+
+The first production trial replaced front-removal from the inline
+`SmallVec<[CQEResult; 1]>` with an inline-one representation that promotes to a
+`VecDeque` when a second completion arrives. Overflow capacity is retained for
+the lifetime of that operation, so memory remains proportional to the
+operation's high-water pending backlog while steady producer/consumer cycles do
+not reallocate.
+
+The initial implementation called `is_empty()` before its new `pop_front()`
+path. Its first full matrix improved depth 1,024 from the `98.508 us` baseline
+to `12.251 us` and fixed-work depth 16,384 from `35.521 ms` to `83.067 us`, but
+regressed depth one from `40 ns` to `45 ns` (+12.5%). It was rejected as written
+because that exceeded the 2% common-path gate. Replacing the redundant two-step
+probe with one direct optional pop recovered the common path without changing
+the storage representation.
+
+| workload | optimized raw runs | optimized median | delta from baseline |
+| --- | --- | ---: | ---: |
+| synthetic queue, 1 | 39, 39, 40 ns | 39 ns | -2.5% |
+| synthetic queue, 1,024 | 10,076, 10,070, 10,083 ns | 10,076 ns | -89.8% |
+| fixed-work consume, 16,384 | 55,570, 55,383, 55,317 ns/backlog | 55,383 ns | -99.84% |
+
+The optimized million-cycle depth-64 invariant again held capacity at
+`128 -> 128`, and the 897-entry drop-suffix probe again verified exact FIFO
+cleanup. This trial clears both backlog retention gates by a wide margin and
+does not regress the allocation-free depth-one path, so the representation is
+retained. Raw trial logs are under
+`/tmp/norn-completion-queue-trial-2026-07-20/`.
+
+### Final paired results
+
+The frozen baseline is commit `f2dfe081db1b7c6e6d0402915b433afe6fa90c00`
+(tree `dd8560552e2126cc4a57d4dc6bc2e1add68187ea`). The queue candidate is
+`4c3d48b4c4f4389085afe400b6130571e494fe8e` (tree
+`b07ea29570d9a0778ddd146b40916ad4d4a8fdf9`). Both use benchmark-harness blob
+`a59fd673de2f8e1fdeb34658f71fc0e2bcd8cb35`.
+
+Results are paired median deltas across seven alternating, process-isolated
+baseline/candidate pairs. Negative values are faster. MAD is the median
+absolute deviation of the seven paired percentage deltas.
+
+| workload | baseline median | candidate median | paired delta | paired MAD |
+| --- | ---: | ---: | ---: | ---: |
+| queue depth 1 | 41 ns | 40 ns | -2.439% | 0.000% |
+| queue depth 1,024 | 100.562 us | 10.740 us | -89.318% | 0.007% |
+| fixed-work consume, 16,384 | 34.624 ms | 57.581 us | -99.834% | 0.001% |
+| constant depth 64, 1M cycles | 19.632 ms | 7.428 ms | -62.163% | 0.034% |
+| drop 897-entry FIFO suffix | 30.579 us | 10.293 us | -66.320% | 0.044% |
+| connected UDP steady, 4,096 | 18.299 ms | 18.189 ms | -0.603% | 0.048% |
+| real multishot burst, 1,024 | 5.308 ms | 5.297 ms | -0.090% | 0.254% |
+| real multishot burst, 4,096 | 21.542 ms | 21.531 ms | +0.327% | 0.162% |
+| TCP real-world guard | 40.696 ms | 40.760 ms | +0.169% | 0.110% |
+
+The queue representation clears both backlog improvement gates, preserves the
+allocation-free depth-one path, and is neutral on the ordinary real-driver and
+TCP guards. Capacity stayed `128 -> 128` through one million constant-depth
+cycles, and dropping a partially consumed backlog cleaned its 897-entry FIFO
+suffix exactly once.
+
+An earlier repeated multishot latency cohort was excluded because awaiting one
+NOP after dropping a multishot operation did not prove its terminal cancellation
+CQE had been reaped before the next sample. The invalid workload was removed and
+none of its latency or p99 results are used here.
+
+The synthetic injection fixture used to isolate queue consumption was also
+removed before merge rather than exposing operation internals through a
+benchmark-only library API. The checked-in benchmark retains only public-API
+workloads: connected UDP multishot receive and a benchmark-local custom
+multishot timeout `Operation`. The frozen commit, tree, and harness blob IDs
+above identify the exact synthetic measurement artifacts used for these
+historical results.
+
+### Existing-benchmark cross-check after fixture removal
+
+After removing the synthetic fixture and benchmark-only library API, the
+pre-existing `uring_realworld` multishot cases were checked against current
+`master` `9ec88c1cb1a2d5eb663f82926636239a121a3041`. Both sides used the exact
+same `uring_realworld.rs` blob
+`d47dc8b94655b112d3d53d426f7d2c2547a0e1f2`, ran on CPU 15 with the
+`performance` governor, and alternated order across five pairs:
+
+```text
+taskset -c 15 cargo bench -p benches --bench uring_realworld -- \
+  'bench_udp_request_response/runtime=norn/recv=multi/window=64/total_requests=8192/payload=64'
+```
+
+| pair | order | master | candidate | candidate delta |
+| ---: | --- | ---: | ---: | ---: |
+| 1 | master, candidate | 65.208 ms | 65.083 ms | -0.192% |
+| 2 | candidate, master | 65.455 ms | 65.558 ms | +0.157% |
+| 3 | master, candidate | 63.008 ms | 64.973 ms | +3.119% |
+| 4 | candidate, master | 65.216 ms | 65.026 ms | -0.291% |
+| 5 | master, candidate | 65.316 ms | 65.359 ms | +0.067% |
+
+The master and candidate medians were 65.216 ms and 65.083 ms. The paired
+median delta was `+0.067%` with `0.259%` MAD, so the change has no measurable
+effect on this existing multishot workload.
+
+The existing TCP multishot cases originally failed during teardown with
+`WouldBlock` because explicit close requires sole descriptor ownership while
+the dropped multishot operation is still awaiting its terminal cancellation
+completion. Their benchmark-local teardown now uses in-context socket drop;
+the results below validate that repaired harness.
+
+The repaired cases completed successfully:
+
+- TCP `bufring_multi`, 8 connections x 512 requests x 64-byte payload:
+  `41.105 ms`;
+- TCP `bufring_bundle_multi`, the same shape: `41.231 ms`.
+
+A temporary high-water diagnostic was then added to `CompletionQueue::push`,
+run once per workload, and removed before commit. It observed the maximum
+number of pending CQEs for any one operation:
+
+| workload | maximum pending completions |
+| --- | ---: |
+| UDP multi, window 64 | 64 |
+| TCP `bufring_multi` | 1 |
+| TCP `bufring_bundle_multi` | 1 |
+| multishot timeout burst, 4,096 completions | 1 |
+| lagged multishot timeout, 16,384 completions | 16,384 |
+
+### Public-API lagged-consumer cross-check
+
+The checked-in benchmark now includes a public-API-only case for the regime the
+ordinary workloads do not reach:
+
+```text
+taskset -c 15 cargo bench -p benches --bench uring_completion_backlog -- \
+  'real_multishot/lagged/messages=16384/consume'
+```
+
+It submits the benchmark-local multishot timeout `Operation`, then submits and
+awaits an `IO_DRAIN` NOP without polling the multishot stream. Because the drain
+cannot complete until the earlier multishot request has produced its terminal
+CQE, all 16,384 real CQEs are already in the operation-local queue before the
+timed consume-only iteration begins. A temporary diagnostic confirmed the
+pending high-water mark was exactly 16,384 and was removed before commit.
+
+Five process-isolated pairs alternated exact `master` and candidate order on
+CPU 15 with the `performance` governor:
+
+| pair | order | master | candidate | candidate delta |
+| ---: | --- | ---: | ---: | ---: |
+| 1 | master, candidate | 35.008 ms | 90.358 us | -99.742% |
+| 2 | candidate, master | 35.121 ms | 93.364 us | -99.734% |
+| 3 | master, candidate | 34.389 ms | 90.052 us | -99.738% |
+| 4 | candidate, master | 35.189 ms | 90.047 us | -99.744% |
+| 5 | master, candidate | 34.693 ms | 90.148 us | -99.740% |
+
+The master and candidate medians were `35.008 ms` and `90.148 us`. The paired
+median delta was `-99.740%` with `0.002%` MAD, or about 385x faster by the
+paired median speedup.
+
+Both sides used benchmark blob
+`93efb9dbbe25c003445bfffac5f108efd542080a`; the production baseline was exact
+`master` `9ec88c1cb1a2d5eb663f82926636239a121a3041` (tree
+`fd54953bd1c4b2a075e191f203220f48447e633d`) and the candidate production tree
+was `2ae3572b2372101fb16bc7b3c532e16710151123`. Raw logs and provenance are
+under `/tmp/norn-completion-lagged-consume-5pairs/`.
+
+The ordinary benchmarks exercise real multishot paths and show why the queue
+representation has no measurable effect while consumers keep pace. TCP and the
+ordinary timeout burst consume each completion before another becomes pending;
+the deliberately windowed UDP case reaches only 64, where queue manipulation is
+a tiny fraction of the full socket workload. The `IO_DRAIN`-fenced timeout case
+then isolates the opposite, valid regime using only public APIs: a multishot
+producer finishes while its consumer is not polled. Its 16,384 CQEs take a
+median `35.008 ms` to consume on `master` and `90.148 us` with the candidate, a
+paired `-99.740%` change. This is a defensive lagging-consumer win, not a claim
+that current steady consumers commonly build large backlogs.
