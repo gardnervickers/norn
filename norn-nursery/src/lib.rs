@@ -107,10 +107,13 @@ macro_rules! scope {
 pub struct Scope<'scope, 'env, R> {
     shared: Rc<Shared>,
     terminated: RefCell<Option<R>>,
-    _marker: PhantomData<&'scope &'env ()>,
+    _marker: PhantomData<(&'scope &'env (), &'env mut &'env ())>,
 }
 
-impl<'scope, R> Scope<'scope, '_, R> {
+impl<'scope, 'env, R> Scope<'scope, 'env, R>
+where
+    'env: 'scope,
+{
     fn new() -> Self {
         Self {
             shared: Rc::new(Shared::default()),
@@ -124,9 +127,10 @@ impl<'scope, R> Scope<'scope, '_, R> {
     /// The scope will not complete until all spawned child tasks have either
     /// finished or the scope has been terminated.
     ///
-    /// Borrowed futures must use [`Scope::spawn_scoped`].
+    /// Futures may borrow values from the environment surrounding the scope.
+    /// They may not borrow values owned by the scope body or another child.
     ///
-    /// ```compile_fail
+    /// ```rust
     /// let value = String::from("borrowed");
     /// let value_ref = &value;
     /// let _scope = norn_nursery::scope!(|scope| {
@@ -134,12 +138,21 @@ impl<'scope, R> Scope<'scope, '_, R> {
     ///     child.await.unwrap()
     /// });
     /// ```
+    ///
+    /// ```compile_fail
+    /// let _scope = norn_nursery::scope!(|scope| {
+    ///     let value = String::from("body local");
+    ///     let child = scope.spawn(async { value.len() });
+    ///     child.await.unwrap()
+    /// });
+    /// ```
     pub fn spawn<F>(&'scope self, future: F) -> JoinHandle<F::Output>
     where
-        F: Future + 'static,
-        F::Output: 'static,
+        F: Future + 'env,
+        F::Output: 'env,
     {
-        // Safety: neither the future nor its output contains borrowed data.
+        // Safety: neither the future nor its output can borrow values whose
+        // lifetime is shorter than the environment surrounding the scope.
         unsafe { self.spawn_scoped(future) }
     }
 
@@ -436,7 +449,7 @@ mod tests {
             let value = String::from("borrowed");
             let value_ref = &value;
             crate::scope!(|scope| {
-                let child = unsafe { scope.spawn_scoped(async move { value_ref.len() }) };
+                let child = scope.spawn(async move { value_ref.len() });
                 child.await.unwrap()
             })
             .await
