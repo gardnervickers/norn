@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use socket2::{Domain, Type};
 
 use crate::buf::{StableBuf, StableBufMut};
-use crate::bufring::{BufRing, BufRingBuf};
+use crate::bufring::{BufRingBuf, RecvBufRing};
 use crate::net::socket;
 use crate::operation::Op;
 
@@ -214,7 +214,7 @@ impl UdpSocket {
     /// # Panics
     ///
     /// Panics when the buffer ring was registered with another driver.
-    pub async fn recv_from_ring(&self, ring: &BufRing) -> io::Result<(BufRingBuf, SocketAddr)> {
+    pub async fn recv_from_ring(&self, ring: &RecvBufRing) -> io::Result<(BufRingBuf, SocketAddr)> {
         self.inner.recv_from_ring(ring).await
     }
 
@@ -234,7 +234,7 @@ impl UdpSocket {
     /// # Panics
     ///
     /// Panics when the buffer ring was registered with another driver.
-    pub fn recv_from_ring_multi(&self, ring: &BufRing) -> Op<socket::RecvFromRingMulti> {
+    pub fn recv_from_ring_multi(&self, ring: &RecvBufRing) -> Op<socket::RecvFromRingMulti> {
         self.inner.recv_from_ring_multi(ring)
     }
 
@@ -244,7 +244,7 @@ impl UdpSocket {
     /// # Panics
     ///
     /// Panics when the buffer ring was registered with another driver.
-    pub fn recv_ring_multi(&self, ring: &BufRing) -> Op<socket::RecvRingMulti> {
+    pub fn recv_ring_multi(&self, ring: &RecvBufRing) -> Op<socket::RecvRingMulti> {
         self.inner.recv_ring_multi(ring)
     }
 
@@ -253,7 +253,7 @@ impl UdpSocket {
     /// # Panics
     ///
     /// Panics when the buffer ring was registered with another driver.
-    pub fn recv_bundle(&self, ring: &BufRing) -> Op<socket::RecvRingBundle> {
+    pub fn recv_bundle(&self, ring: &RecvBufRing) -> Op<socket::RecvRingBundle> {
         self.inner.recv_ring_bundle(ring)
     }
 
@@ -262,7 +262,11 @@ impl UdpSocket {
     /// # Panics
     ///
     /// Panics when the buffer ring was registered with another driver.
-    pub fn recv_bundle_with_flags(&self, ring: &BufRing, flags: i32) -> Op<socket::RecvRingBundle> {
+    pub fn recv_bundle_with_flags(
+        &self,
+        ring: &RecvBufRing,
+        flags: i32,
+    ) -> Op<socket::RecvRingBundle> {
         self.inner.recv_ring_bundle_with_flags(ring, flags)
     }
 
@@ -271,7 +275,7 @@ impl UdpSocket {
     /// # Panics
     ///
     /// Panics when the buffer ring was registered with another driver.
-    pub fn recv_bundle_multi(&self, ring: &BufRing) -> Op<socket::RecvRingBundleMulti> {
+    pub fn recv_bundle_multi(&self, ring: &RecvBufRing) -> Op<socket::RecvRingBundleMulti> {
         self.inner.recv_ring_bundle_multi(ring)
     }
 
@@ -282,7 +286,7 @@ impl UdpSocket {
     /// Panics when the buffer ring was registered with another driver.
     pub fn recv_bundle_multi_with_flags(
         &self,
-        ring: &BufRing,
+        ring: &RecvBufRing,
         flags: i32,
     ) -> Op<socket::RecvRingBundleMulti> {
         self.inner.recv_ring_bundle_multi_with_flags(ring, flags)

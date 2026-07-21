@@ -16,7 +16,7 @@ use futures::stream::{FuturesUnordered, Stream, StreamExt};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use norn_uring::buf::{BufCursor, StableBuf};
-use norn_uring::bufring::{BufRing, BufRingBuf, BufRingBufBundle};
+use norn_uring::bufring::{BufRingBuf, BufRingBufBundle, RecvBufRing};
 use norn_uring::fs;
 use norn_uring::net::UdpSocket as NornUdpSocket;
 use norn_uring::net::{TcpListener as NornTcpListener, TcpSocket as NornTcpSocket};
@@ -70,7 +70,7 @@ impl Drop for BenchDir {
 
 async fn norn_udp_echo_server_multi(
     socket: &NornUdpSocket,
-    recv_ring: &BufRing,
+    recv_ring: &RecvBufRing,
     payload_len: usize,
     total_requests: usize,
 ) -> io::Result<()> {
@@ -90,7 +90,7 @@ async fn norn_udp_echo_server_multi(
 async fn norn_udp_request_response_worker(
     sockets: &[NornUdpSocket],
     recv_mode: UdpRecvMode,
-    recv_rings: &[BufRing],
+    recv_rings: &[RecvBufRing],
     payload_len: usize,
     total_requests: usize,
 ) -> io::Result<()> {
@@ -150,7 +150,7 @@ async fn norn_udp_request_response_lane_single(
 
 async fn norn_udp_request_response_lane_multi(
     socket: &NornUdpSocket,
-    recv_ring: &BufRing,
+    recv_ring: &RecvBufRing,
     payload_len: usize,
     requests: usize,
 ) -> io::Result<()> {
@@ -361,7 +361,7 @@ impl UdpRequestResponseBench {
                     let ring_buf_len = cmp::max(2048, self.payload_len * 2);
                     for lane in 0..lane_count {
                         rings.push(
-                            BufRing::builder((100 + lane) as u16)
+                            RecvBufRing::builder((100 + lane) as u16)
                                 .buf_cnt(64)
                                 .buf_len(ring_buf_len)
                                 .build()
@@ -369,7 +369,7 @@ impl UdpRequestResponseBench {
                         );
                     }
                 }
-                let server_ring = BufRing::builder(99)
+                let server_ring = RecvBufRing::builder(99)
                     .buf_cnt(256)
                     .buf_len(cmp::max(2048, self.payload_len * 2))
                     .build()
@@ -590,7 +590,7 @@ async fn norn_tcp_send_all(socket: &NornTcpSocket, buf: Vec<u8>) -> io::Result<V
 
 async fn norn_tcp_recv_exact_ring(
     socket: &NornTcpSocket,
-    ring: &BufRing,
+    ring: &RecvBufRing,
     expected_byte: u8,
     payload_len: usize,
 ) -> io::Result<()> {
@@ -787,7 +787,7 @@ async fn norn_tcp_echo_connection_normal(
 
 async fn norn_tcp_echo_connection_bufring(
     socket: NornTcpSocket,
-    ring: BufRing,
+    ring: RecvBufRing,
     requests: usize,
     payload_len: usize,
 ) -> io::Result<()> {
@@ -801,7 +801,7 @@ async fn norn_tcp_echo_connection_bufring(
 
 async fn norn_tcp_echo_connection_bufring_linked(
     socket: NornTcpSocket,
-    ring: BufRing,
+    ring: RecvBufRing,
     requests: usize,
     payload_len: usize,
 ) -> io::Result<()> {
@@ -820,7 +820,7 @@ async fn norn_tcp_echo_connection_bufring_linked(
 
 async fn norn_tcp_echo_connection_bufring_multi(
     socket: NornTcpSocket,
-    ring: BufRing,
+    ring: RecvBufRing,
     requests: usize,
     payload_len: usize,
 ) -> io::Result<()> {
@@ -838,7 +838,7 @@ async fn norn_tcp_echo_connection_bufring_multi(
 
 async fn norn_tcp_echo_connection_bufring_bundle_multi(
     socket: NornTcpSocket,
-    ring: BufRing,
+    ring: RecvBufRing,
     requests: usize,
     payload_len: usize,
 ) -> io::Result<()> {
@@ -1053,8 +1053,8 @@ async fn tokio_tcp_request_response_client(
     Ok(())
 }
 
-fn tcp_bufring(base: u16, connection: usize, payload_len: usize) -> io::Result<BufRing> {
-    BufRing::builder(base + connection as u16)
+fn tcp_bufring(base: u16, connection: usize, payload_len: usize) -> io::Result<RecvBufRing> {
+    RecvBufRing::builder(base + connection as u16)
         .buf_cnt(64)
         .buf_len(cmp::max(payload_len, 1))
         .build()

@@ -7,7 +7,7 @@ use std::task::Poll;
 use bytes::{Bytes, BytesMut};
 use futures_util::future::poll_fn;
 use futures_util::StreamExt;
-use norn_uring::bufring::{BufRing, BufRingBufBundle};
+use norn_uring::bufring::{BufRingBufBundle, RecvBufRing};
 use norn_uring::net::UdpSocket;
 
 mod util;
@@ -274,7 +274,10 @@ fn msg_trunc_connected_recv_caps_vec_and_bytes_mut_initialization(
 #[test]
 fn send_recv_ring() -> Result<(), Box<dyn std::error::Error>> {
     util::with_test_env(|| async {
-        let ring = BufRing::builder(1).buf_cnt(32).buf_len(1024 * 16).build()?;
+        let ring = RecvBufRing::builder(1)
+            .buf_cnt(32)
+            .buf_len(1024 * 16)
+            .build()?;
         let s1 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
         let s2 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
 
@@ -297,8 +300,8 @@ fn send_recv_ring() -> Result<(), Box<dyn std::error::Error>> {
 fn duplicate_bgid_failure_keeps_original_ring_registered() -> Result<(), Box<dyn std::error::Error>>
 {
     util::with_test_env(|| async {
-        let ring = BufRing::builder(10).buf_cnt(1).buf_len(128).build()?;
-        let err = BufRing::builder(10)
+        let ring = RecvBufRing::builder(10).buf_cnt(1).buf_len(128).build()?;
+        let err = RecvBufRing::builder(10)
             .buf_cnt(1)
             .buf_len(128)
             .build()
@@ -332,7 +335,7 @@ fn duplicate_bgid_failure_keeps_original_ring_registered() -> Result<(), Box<dyn
 #[test]
 fn send_recv_ring_multi_msg() -> Result<(), Box<dyn std::error::Error>> {
     util::with_test_env(|| async {
-        let ring = BufRing::builder(4).buf_cnt(32).buf_len(2048).build()?;
+        let ring = RecvBufRing::builder(4).buf_cnt(32).buf_len(2048).build()?;
         let s1 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
         let s2 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
         let sender = s1.local_addr()?;
@@ -354,7 +357,7 @@ fn send_recv_ring_multi_msg() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn recv_msg_ring_buf_can_be_sent_directly() -> Result<(), Box<dyn std::error::Error>> {
     util::with_test_env(|| async {
-        let ring = BufRing::builder(9).buf_cnt(32).buf_len(2048).build()?;
+        let ring = RecvBufRing::builder(9).buf_cnt(32).buf_len(2048).build()?;
         let client = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
         let server = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
 
@@ -383,7 +386,7 @@ fn recv_msg_ring_buf_can_be_sent_directly() -> Result<(), Box<dyn std::error::Er
 #[test]
 fn connected_send_recv_ring_multi() -> Result<(), Box<dyn std::error::Error>> {
     util::with_test_env(|| async {
-        let ring = BufRing::builder(5).buf_cnt(32).buf_len(2048).build()?;
+        let ring = RecvBufRing::builder(5).buf_cnt(32).buf_len(2048).build()?;
         let s1 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
         let s2 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
         s1.connect(s2.local_addr()?).await?;
@@ -404,7 +407,7 @@ fn connected_send_recv_ring_multi() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn connected_send_recv_from_ring_multi() -> Result<(), Box<dyn std::error::Error>> {
     util::with_test_env(|| async {
-        let ring = BufRing::builder(8).buf_cnt(32).buf_len(2048).build()?;
+        let ring = RecvBufRing::builder(8).buf_cnt(32).buf_len(2048).build()?;
         let s1 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
         let s2 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
         s1.connect(s2.local_addr()?).await?;
@@ -424,7 +427,7 @@ fn connected_send_recv_from_ring_multi() -> Result<(), Box<dyn std::error::Error
 #[test]
 fn connected_send_recv_bundle() -> Result<(), Box<dyn std::error::Error>> {
     util::with_test_env(|| async {
-        let ring = BufRing::builder(6).buf_cnt(64).buf_len(2048).build()?;
+        let ring = RecvBufRing::builder(6).buf_cnt(64).buf_len(2048).build()?;
         let s1 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
         let s2 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
         s1.connect(s2.local_addr()?).await?;
@@ -448,7 +451,7 @@ fn connected_send_recv_bundle() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn connected_send_recv_bundle_multi() -> Result<(), Box<dyn std::error::Error>> {
     util::with_test_env(|| async {
-        let ring = BufRing::builder(7).buf_cnt(64).buf_len(2048).build()?;
+        let ring = RecvBufRing::builder(7).buf_cnt(64).buf_len(2048).build()?;
         let s1 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
         let s2 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
         s1.connect(s2.local_addr()?).await?;
@@ -485,7 +488,7 @@ impl UdpEchoServer {
     }
 
     async fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let bufring = BufRing::builder(1)
+        let bufring = RecvBufRing::builder(1)
             .buf_cnt(32)
             .buf_len(u16::MAX as usize)
             .build()?;
@@ -534,7 +537,7 @@ fn buffer_exhaustion() -> Result<(), Box<dyn std::error::Error>> {
         .detach();
 
         // Create a bufring of 2 buffers of 64k each.
-        let bufring = BufRing::builder(2)
+        let bufring = RecvBufRing::builder(2)
             .buf_cnt(2)
             .buf_len(u16::MAX as usize)
             .build()?;
@@ -593,7 +596,7 @@ fn poll_readiness_smoke() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn drop_bufring_outside_runtime() -> Result<(), Box<dyn std::error::Error>> {
     let ring = util::with_test_env(|| async {
-        let ring = BufRing::builder(3).buf_cnt(8).buf_len(1024).build()?;
+        let ring = RecvBufRing::builder(3).buf_cnt(8).buf_len(1024).build()?;
         Ok(ring)
     })?;
 

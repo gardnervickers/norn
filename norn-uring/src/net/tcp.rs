@@ -8,7 +8,7 @@ use futures_core::Stream;
 use socket2::{Domain, Type};
 
 use crate::buf::{StableBuf, StableBufMut};
-use crate::bufring::BufRing;
+use crate::bufring::RecvBufRing;
 use crate::net::socket;
 use crate::operation::Op;
 
@@ -245,7 +245,7 @@ impl TcpSocket {
     /// # Panics
     ///
     /// Panics when the buffer ring was registered with another driver.
-    pub fn recv_ring(&self, ring: &BufRing) -> Op<socket::RecvFromRing> {
+    pub fn recv_ring(&self, ring: &RecvBufRing) -> Op<socket::RecvFromRing> {
         self.socket.recv_from_ring(ring)
     }
 
@@ -254,7 +254,7 @@ impl TcpSocket {
     /// # Panics
     ///
     /// Panics when the buffer ring was registered with another driver.
-    pub fn recv_ring_multi(&self, ring: &BufRing) -> Op<socket::RecvRingMulti> {
+    pub fn recv_ring_multi(&self, ring: &RecvBufRing) -> Op<socket::RecvRingMulti> {
         self.socket.recv_ring_multi(ring)
     }
 
@@ -263,7 +263,7 @@ impl TcpSocket {
     /// # Panics
     ///
     /// Panics when the buffer ring was registered with another driver.
-    pub fn recv_bundle(&self, ring: &BufRing) -> Op<socket::RecvRingBundle> {
+    pub fn recv_bundle(&self, ring: &RecvBufRing) -> Op<socket::RecvRingBundle> {
         self.socket.recv_ring_bundle(ring)
     }
 
@@ -272,7 +272,11 @@ impl TcpSocket {
     /// # Panics
     ///
     /// Panics when the buffer ring was registered with another driver.
-    pub fn recv_bundle_with_flags(&self, ring: &BufRing, flags: i32) -> Op<socket::RecvRingBundle> {
+    pub fn recv_bundle_with_flags(
+        &self,
+        ring: &RecvBufRing,
+        flags: i32,
+    ) -> Op<socket::RecvRingBundle> {
         self.socket.recv_ring_bundle_with_flags(ring, flags)
     }
 
@@ -281,7 +285,7 @@ impl TcpSocket {
     /// # Panics
     ///
     /// Panics when the buffer ring was registered with another driver.
-    pub fn recv_bundle_multi(&self, ring: &BufRing) -> Op<socket::RecvRingBundleMulti> {
+    pub fn recv_bundle_multi(&self, ring: &RecvBufRing) -> Op<socket::RecvRingBundleMulti> {
         self.socket.recv_ring_bundle_multi(ring)
     }
 
@@ -292,7 +296,7 @@ impl TcpSocket {
     /// Panics when the buffer ring was registered with another driver.
     pub fn recv_bundle_multi_with_flags(
         &self,
-        ring: &BufRing,
+        ring: &RecvBufRing,
         flags: i32,
     ) -> Op<socket::RecvRingBundleMulti> {
         self.socket.recv_ring_bundle_multi_with_flags(ring, flags)
