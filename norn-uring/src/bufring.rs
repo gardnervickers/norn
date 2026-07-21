@@ -3,7 +3,7 @@
 //! Copied from the test code here
 //! https://github.com/tokio-rs/io-uring/blob/master/io-uring-test/src/tests/register_buf_ring.rs
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::atomic::{self, AtomicU16};
@@ -526,7 +526,9 @@ struct InnerSendBufRing {
     buf_cnt: u16,
     buf_len: usize,
     ring_start: AnonymousMmap,
-    buf_list: Vec<Vec<u8>>,
+    // Each BID is handed out exclusively by `SendQueueState`. The cell makes that
+    // per-BID interior mutability explicit while the ring is shared through `Rc`.
+    buf_list: Vec<UnsafeCell<Vec<u8>>>,
     local_tail: Cell<u16>,
     shared_tail: *const AtomicU16,
     state: RefCell<SendQueueState>,
@@ -1132,7 +1134,7 @@ impl InnerSendBufRing {
 
         let mut buf_list = Vec::with_capacity(buf_cnt as usize);
         for _ in 0..buf_cnt {
-            buf_list.push(vec![0; buf_len]);
+            buf_list.push(UnsafeCell::new(vec![0; buf_len]));
         }
 
         let shared_tail =
@@ -1288,7 +1290,12 @@ impl InnerSendBufRing {
     }
 
     fn stable_ptr_mut(&self, bid: Bid) -> *mut u8 {
-        self.buf_list[bid as usize].as_ptr() as *mut u8
+        // Safety: `SendQueueState` removes a BID from `free_bids` before creating
+        // its sole, non-cloneable `SendBuf`. Committing consumes that `SendBuf`,
+        // and the BID is not made free again until the kernel completion is
+        // reconciled. The vectors are never resized after construction, so their
+        // allocations remain stable for registration and in-flight I/O.
+        unsafe { (*self.buf_list[bid as usize].get()).as_mut_ptr() }
     }
 
     fn ring_entries(&self) -> u16 {
@@ -1502,6 +1509,31 @@ mod tests {
         assert_eq!(state.available_buffers(), 1);
         assert_eq!(state.queued_buffers(batch), 1);
         assert_eq!(state.queued_len(batch), 4);
+    }
+
+    #[test]
+    fn send_buf_checkout_preserves_exclusive_bid_storage() {
+        let driver = crate::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let ring = SendBufRing::new(InnerSendBufRing::new(32, 2, 2, 64, driver.handle()).unwrap());
+        let batch = ring.batch().unwrap();
+
+        let mut committed = batch.checkout().unwrap();
+        let committed_ptr = committed.as_mut_slice().as_mut_ptr();
+        committed.set_len(1).unwrap();
+        committed.commit().unwrap();
+
+        let mut checkout = batch.checkout().unwrap();
+        let checkout_ptr = checkout.as_mut_slice().as_mut_ptr();
+        assert_ne!(checkout_ptr, committed_ptr);
+        assert_eq!(
+            batch.checkout().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+
+        drop(checkout);
+        let mut replacement = batch.checkout().unwrap();
+        assert_eq!(replacement.as_mut_slice().as_mut_ptr(), checkout_ptr);
+        assert_ne!(replacement.as_mut_slice().as_mut_ptr(), committed_ptr);
     }
 
     #[test]
