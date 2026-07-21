@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 use std::os::fd::FromRawFd;
 
 use crate::buf::{set_init_checked, StableBuf, StableBufMut};
-use crate::bufring::{BufRing, BufRingBuf, BufRingBufBundle, SendBundleBatch};
+use crate::bufring::{BufRingBuf, BufRingBufBundle, RecvBufRing, SendBundleBatch};
 use crate::fd::NornFd;
 use crate::operation::{Multishot, Op, Operation, Singleshot};
 
@@ -155,7 +155,7 @@ impl Socket {
     }
 
     #[track_caller]
-    fn assert_bufring_driver(&self, ring: &BufRing) {
+    fn assert_bufring_driver(&self, ring: &RecvBufRing) {
         assert!(
             ring.same_driver(&self.handle),
             "buffer ring and socket must target the same driver"
@@ -170,25 +170,25 @@ impl Socket {
         );
     }
 
-    pub(crate) fn recv_from_ring(&self, ring: &BufRing) -> Op<RecvFromRing> {
+    pub(crate) fn recv_from_ring(&self, ring: &RecvBufRing) -> Op<RecvFromRing> {
         self.assert_bufring_driver(ring);
         let op = RecvFromRing::new(self.fd.clone(), ring.clone());
         self.handle.submit(op)
     }
 
-    pub(crate) fn recv_from_ring_multi(&self, ring: &BufRing) -> Op<RecvFromRingMulti> {
+    pub(crate) fn recv_from_ring_multi(&self, ring: &RecvBufRing) -> Op<RecvFromRingMulti> {
         self.assert_bufring_driver(ring);
         let op = RecvFromRingMulti::new(self.fd.clone(), ring.clone());
         self.handle.submit(op)
     }
 
-    pub(crate) fn recv_ring_multi(&self, ring: &BufRing) -> Op<RecvRingMulti> {
+    pub(crate) fn recv_ring_multi(&self, ring: &RecvBufRing) -> Op<RecvRingMulti> {
         self.assert_bufring_driver(ring);
         let op = RecvRingMulti::new(self.fd.clone(), ring.clone(), 0);
         self.handle.submit(op)
     }
 
-    pub(crate) fn recv_ring_bundle(&self, ring: &BufRing) -> Op<RecvRingBundle> {
+    pub(crate) fn recv_ring_bundle(&self, ring: &RecvBufRing) -> Op<RecvRingBundle> {
         self.assert_bufring_driver(ring);
         let op = RecvRingBundle::new(self.fd.clone(), ring.clone(), 0);
         self.handle.submit(op)
@@ -196,7 +196,7 @@ impl Socket {
 
     pub(crate) fn recv_ring_bundle_with_flags(
         &self,
-        ring: &BufRing,
+        ring: &RecvBufRing,
         flags: i32,
     ) -> Op<RecvRingBundle> {
         self.assert_bufring_driver(ring);
@@ -204,7 +204,7 @@ impl Socket {
         self.handle.submit(op)
     }
 
-    pub(crate) fn recv_ring_bundle_multi(&self, ring: &BufRing) -> Op<RecvRingBundleMulti> {
+    pub(crate) fn recv_ring_bundle_multi(&self, ring: &RecvBufRing) -> Op<RecvRingBundleMulti> {
         self.assert_bufring_driver(ring);
         let op = RecvRingBundleMulti::new(self.fd.clone(), ring.clone(), 0);
         self.handle.submit(op)
@@ -212,7 +212,7 @@ impl Socket {
 
     pub(crate) fn recv_ring_bundle_multi_with_flags(
         &self,
-        ring: &BufRing,
+        ring: &RecvBufRing,
         flags: i32,
     ) -> Op<RecvRingBundleMulti> {
         self.assert_bufring_driver(ring);
@@ -784,13 +784,13 @@ where
 #[derive(Debug)]
 pub struct RecvFromRing {
     fd: NornFd,
-    ring: BufRing,
+    ring: RecvBufRing,
     addr: SockAddr,
     msghdr: MaybeUninit<libc::msghdr>,
 }
 
 impl RecvFromRing {
-    pub(crate) fn new(fd: NornFd, ring: BufRing) -> Self {
+    pub(crate) fn new(fd: NornFd, ring: RecvBufRing) -> Self {
         // Safety: We won't read from the socket addr until it's initialized.
         let addr = unsafe { SockAddr::try_init(|_, _| Ok(())) }.unwrap().1;
         Self {
@@ -802,7 +802,7 @@ impl RecvFromRing {
     }
 }
 
-// Safety: `NornFd` and `BufRing` retain the socket and registered buffer group;
+// Safety: `NornFd` and `RecvBufRing` retain the socket and registered buffer group;
 // inline recvmsg metadata remains pinned, and cleanup returns selected buffers.
 unsafe impl Operation for RecvFromRing {
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
@@ -899,13 +899,13 @@ unsafe impl StableBuf for RecvMsgRingBuf {
 #[derive(Debug)]
 pub struct RecvFromRingMulti {
     fd: NornFd,
-    ring: BufRing,
+    ring: RecvBufRing,
     addr: SockAddr,
     msghdr: MaybeUninit<libc::msghdr>,
 }
 
 impl RecvFromRingMulti {
-    pub(crate) fn new(fd: NornFd, ring: BufRing) -> Self {
+    pub(crate) fn new(fd: NornFd, ring: RecvBufRing) -> Self {
         // Safety: We won't read from the socket addr until it's initialized by the kernel.
         let addr = unsafe { SockAddr::try_init(|_, _| Ok(())) }.unwrap().1;
         Self {
@@ -942,7 +942,7 @@ impl RecvFromRingMulti {
     }
 }
 
-// Safety: `NornFd` and `BufRing` retain all referenced resources through the
+// Safety: `NornFd` and `RecvBufRing` retain all referenced resources through the
 // multishot terminal CQE; each selected buffer is either yielded or cleaned up.
 unsafe impl Operation for RecvFromRingMulti {
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
@@ -989,12 +989,12 @@ impl Multishot for RecvFromRingMulti {
 #[derive(Debug)]
 pub struct RecvRingMulti {
     fd: NornFd,
-    ring: BufRing,
+    ring: RecvBufRing,
     flags: i32,
 }
 
 impl RecvRingMulti {
-    pub(crate) fn new(fd: NornFd, ring: BufRing, flags: i32) -> Self {
+    pub(crate) fn new(fd: NornFd, ring: RecvBufRing, flags: i32) -> Self {
         Self { fd, ring, flags }
     }
 
@@ -1004,7 +1004,7 @@ impl RecvRingMulti {
     }
 }
 
-// Safety: `NornFd` and `BufRing` retain all referenced resources through the
+// Safety: `NornFd` and `RecvBufRing` retain all referenced resources through the
 // multishot terminal CQE; each selected buffer is either yielded or cleaned up.
 unsafe impl Operation for RecvRingMulti {
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
@@ -1043,17 +1043,17 @@ impl Multishot for RecvRingMulti {
 #[derive(Debug)]
 pub struct RecvRingBundle {
     fd: NornFd,
-    ring: BufRing,
+    ring: RecvBufRing,
     flags: i32,
 }
 
 impl RecvRingBundle {
-    pub(crate) fn new(fd: NornFd, ring: BufRing, flags: i32) -> Self {
+    pub(crate) fn new(fd: NornFd, ring: RecvBufRing, flags: i32) -> Self {
         Self { fd, ring, flags }
     }
 }
 
-// Safety: `NornFd` and `BufRing` retain the descriptor and registered group;
+// Safety: `NornFd` and `RecvBufRing` retain the descriptor and registered group;
 // completion ownership accounts for every selected buffer in the bundle.
 unsafe impl Operation for RecvRingBundle {
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
@@ -1089,12 +1089,12 @@ impl Singleshot for RecvRingBundle {
 #[derive(Debug)]
 pub struct RecvRingBundleMulti {
     fd: NornFd,
-    ring: BufRing,
+    ring: RecvBufRing,
     flags: i32,
 }
 
 impl RecvRingBundleMulti {
-    pub(crate) fn new(fd: NornFd, ring: BufRing, flags: i32) -> Self {
+    pub(crate) fn new(fd: NornFd, ring: RecvBufRing, flags: i32) -> Self {
         Self { fd, ring, flags }
     }
 
@@ -1104,7 +1104,7 @@ impl RecvRingBundleMulti {
     }
 }
 
-// Safety: `NornFd` and `BufRing` retain resources through the multishot
+// Safety: `NornFd` and `RecvBufRing` retain resources through the multishot
 // terminal CQE; yielded and unconsumed bundles are returned by completion logic.
 unsafe impl Operation for RecvRingBundleMulti {
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
@@ -2057,14 +2057,14 @@ mod tests {
         assert_eq!(buf.len(), 1);
     }
 
-    fn build_test_ring(driver: &crate::Driver, bgid: u16) -> io::Result<BufRing> {
+    fn build_test_ring(driver: &crate::Driver, bgid: u16) -> io::Result<RecvBufRing> {
         let _guard = norn_executor::park::Park::enter(driver);
-        BufRing::builder(bgid).buf_cnt(8).buf_len(1024).build()
+        RecvBufRing::builder(bgid).buf_cnt(8).buf_len(1024).build()
     }
 
     fn build_test_send_ring(driver: &crate::Driver, bgid: u16) -> io::Result<SendBufRing> {
         let _guard = norn_executor::park::Park::enter(driver);
-        BufRing::builder(bgid).buf_cnt(8).buf_len(1024).build_send()
+        SendBufRing::builder(bgid).buf_cnt(8).buf_len(1024).build()
     }
 
     fn test_socket(handle: crate::Handle) -> io::Result<Socket> {
@@ -2090,7 +2090,7 @@ mod tests {
         );
     }
 
-    fn prepare_all_ring_receives(socket: &Socket, ring: &BufRing) {
+    fn prepare_all_ring_receives(socket: &Socket, ring: &RecvBufRing) {
         drop(socket.recv_from_ring(ring));
         drop(socket.recv_from_ring_multi(ring));
         drop(socket.recv_ring_multi(ring));

@@ -7,7 +7,7 @@ use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::atomic::{self, AtomicU16};
-use std::{fmt, io, ops, ptr};
+use std::{fmt, io, marker::PhantomData, ops, ptr};
 
 use io_uring::types::{self, BufRingEntry};
 use io_uring::Submitter;
@@ -15,12 +15,12 @@ use log::warn;
 
 use crate::Handle;
 
-/// [`BufRing`] is a reference counted buffer ring which can be registered
+/// [`RecvBufRing`] is a reference counted buffer ring which can be registered
 /// with io_uring to provide buffers for read operations.
 #[derive(Clone)]
-pub struct BufRing {
-    // The BufRing is reference counted because each buffer handed out has a reference back to its
-    // buffer group, or in this case, to its buffer ring.
+pub struct RecvBufRing {
+    // The RecvBufRing is reference counted because each buffer handed out has a reference back to
+    // its buffer group, or in this case, to its buffer ring.
     rc: Rc<InnerBufRing>,
 }
 
@@ -38,9 +38,9 @@ pub struct SendBundleBatch {
     rc: Rc<InnerSendBundleBatch>,
 }
 
-impl fmt::Debug for BufRing {
+impl fmt::Debug for RecvBufRing {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BufRing")
+        f.debug_struct("RecvBufRing")
             .field("bgid", &self.rc.bgid())
             .field("ring_entries", &self.rc.ring_entries())
             .field("buf_cnt", &self.rc.buf_cnt)
@@ -49,15 +49,15 @@ impl fmt::Debug for BufRing {
     }
 }
 
-impl BufRing {
+impl RecvBufRing {
     fn new(buf_ring: InnerBufRing) -> Self {
-        BufRing {
+        RecvBufRing {
             rc: Rc::new(buf_ring),
         }
     }
 
     /// Create a new Builder with the given buffer group ID.
-    pub fn builder(id: Bgid) -> Builder {
+    pub fn builder(id: Bgid) -> Builder<Self> {
         Builder::new(id)
     }
 
@@ -104,6 +104,11 @@ impl SendBufRing {
         Self {
             rc: Rc::new(buf_ring),
         }
+    }
+
+    /// Create a new Builder with the given buffer group ID.
+    pub fn builder(id: Bgid) -> Builder<Self> {
+        Builder::new(id)
     }
 
     /// Start a new bundle batch on this send ring.
@@ -201,7 +206,7 @@ impl SendBundleBatch {
 /// Users should be careful to drop the buffer as soon as possible to avoid
 /// exhausting the buffer ring.
 pub struct BufRingBuf {
-    bufgroup: BufRing,
+    bufgroup: RecvBufRing,
     len: usize,
     bid: Bid,
 }
@@ -279,7 +284,7 @@ impl fmt::Debug for BufRingBuf {
 }
 
 impl BufRingBuf {
-    fn new(bufgroup: BufRing, bid: Bid, len: usize) -> Self {
+    fn new(bufgroup: RecvBufRing, bid: Bid, len: usize) -> Self {
         assert!(len <= bufgroup.rc.buf_len);
 
         Self { bufgroup, len, bid }
@@ -390,16 +395,25 @@ fn selected_bid_from_flags(flags: u32) -> io::Result<Bid> {
     })
 }
 
-/// [`Builder`] is used to create a new [`BufRing`].
+/// [`Builder`] is used to create a new receive or send buffer ring.
+#[derive(Clone, Debug)]
+pub struct Builder<T> {
+    bgid: Bgid,
+    ring_entries: u16,
+    buf_cnt: u16,
+    buf_len: usize,
+    target: PhantomData<fn() -> T>,
+}
+
 #[derive(Copy, Clone, Debug)]
-pub struct Builder {
+struct NormalizedBuilder {
     bgid: Bgid,
     ring_entries: u16,
     buf_cnt: u16,
     buf_len: usize,
 }
 
-impl Builder {
+impl<T> Builder<T> {
     // Create a new Builder with the given buffer group ID and defaults.
     //
     // The buffer group ID, `bgid`, is the id the kernel uses to identify the buffer group to use
@@ -407,12 +421,13 @@ impl Builder {
     //
     // The caller is responsible for picking a bgid that does not conflict with other buffer
     // groups that have been registered with the same uring interface.
-    fn new(bgid: Bgid) -> Builder {
+    fn new(bgid: Bgid) -> Self {
         Builder {
             bgid,
             ring_entries: 128,
             buf_cnt: 0, // 0 indicates buf_cnt is taken from ring_entries
             buf_len: 4096,
+            target: PhantomData,
         }
     }
 
@@ -420,25 +435,30 @@ impl Builder {
     ///
     /// The number will be made a power of 2, and will be the maximum of the ring_entries setting
     /// and the buf_cnt setting. The interface will enforce a maximum of 2^15 (32768).
-    pub fn ring_entries(mut self, ring_entries: u16) -> Builder {
+    pub fn ring_entries(mut self, ring_entries: u16) -> Self {
         self.ring_entries = ring_entries;
         self
     }
 
     /// The number of buffers to allocate. If left zero, the ring_entries value will be used.
-    pub fn buf_cnt(mut self, buf_cnt: u16) -> Builder {
+    pub fn buf_cnt(mut self, buf_cnt: u16) -> Self {
         self.buf_cnt = buf_cnt;
         self
     }
 
     /// The length to be preallocated for each buffer.
-    pub fn buf_len(mut self, buf_len: usize) -> Builder {
+    pub fn buf_len(mut self, buf_len: usize) -> Self {
         self.buf_len = buf_len;
         self
     }
 
-    fn normalized(&self) -> io::Result<Builder> {
-        let mut b: Builder = *self;
+    fn normalized(&self) -> io::Result<NormalizedBuilder> {
+        let mut b = NormalizedBuilder {
+            bgid: self.bgid,
+            ring_entries: self.ring_entries,
+            buf_cnt: self.buf_cnt,
+            buf_len: self.buf_len,
+        };
 
         if b.buf_cnt == 0 || b.ring_entries < b.buf_cnt {
             let max = std::cmp::max(b.ring_entries, b.buf_cnt);
@@ -456,20 +476,24 @@ impl Builder {
         b.ring_entries = b.ring_entries.next_power_of_two();
         Ok(b)
     }
+}
 
-    /// Return a BufRing.
-    pub fn build(&self) -> io::Result<BufRing> {
+impl Builder<RecvBufRing> {
+    /// Return a RecvBufRing.
+    pub fn build(&self) -> io::Result<RecvBufRing> {
         let b = self.normalized()?;
 
         let handle = crate::Handle::current();
         let inner =
             InnerBufRing::new(b.bgid, b.ring_entries, b.buf_cnt, b.buf_len, handle.clone())?;
         handle.with_submitter(|s| inner.register(s))?;
-        Ok(BufRing::new(inner))
+        Ok(RecvBufRing::new(inner))
     }
+}
 
+impl Builder<SendBufRing> {
     /// Return a send-side buffer ring used to stage outbound buffers for `SendBundle`.
-    pub fn build_send(&self) -> io::Result<SendBufRing> {
+    pub fn build(&self) -> io::Result<SendBufRing> {
         let b = self.normalized()?;
 
         let handle = crate::Handle::current();
@@ -695,9 +719,9 @@ impl InnerBufRing {
 
     // Returns the buffer the uring interface picked from the buf_ring for the completion result
     // represented by the res and flags.
-    fn get_buf(&self, buf_ring: BufRing, res: u32, flags: u32) -> io::Result<BufRingBuf> {
-        // This fn does the odd thing of having self as the BufRing and taking an argument that is
-        // the same BufRing but wrapped in Rc<_> so the wrapped buf_ring can be passed to the
+    fn get_buf(&self, buf_ring: RecvBufRing, res: u32, flags: u32) -> io::Result<BufRingBuf> {
+        // This fn does the odd thing of having self as the RecvBufRing and taking an argument that
+        // is the same RecvBufRing but wrapped in Rc<_> so the wrapped buf_ring can be passed to the
         // outgoing GBuf.
         let bid = selected_bid_from_flags(flags)?;
         if bid >= self.buf_cnt {
@@ -725,7 +749,7 @@ impl InnerBufRing {
 
     fn get_buf_bundle(
         &self,
-        buf_ring: BufRing,
+        buf_ring: RecvBufRing,
         res: u32,
         flags: u32,
     ) -> io::Result<BufRingBufBundle> {
