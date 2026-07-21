@@ -492,11 +492,7 @@ where
 
     fn pop_completion(&self) -> Option<CQEResult> {
         let mut completions = self.inner.header().completions().borrow_mut();
-        if completions.is_empty() {
-            None
-        } else {
-            Some(completions.remove(0))
-        }
+        completions.pop_front()
     }
 
     /// Returns true if this operation is complete.
@@ -737,6 +733,33 @@ mod tests {
         assert_eq!(submitted.try_next(), Some(30));
         assert_eq!(submitted.try_next(), None);
         assert!(submitted.inner.is_complete());
+    }
+
+    #[test]
+    fn dropped_multishot_cleans_pending_completions_once_in_fifo_order() {
+        #[derive(Debug)]
+        struct CleanupMultishot(Rc<RefCell<Vec<u32>>>);
+
+        unsafe impl Operation for CleanupMultishot {
+            fn cleanup(&mut self, result: CQEResult) {
+                self.0.borrow_mut().push(result.into_result().unwrap());
+            }
+
+            fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+                unimplemented!()
+            }
+        }
+
+        let cleaned = Rc::new(RefCell::new(Vec::new()));
+        let typed = TypedHandle::new(CleanupMultishot(Rc::clone(&cleaned)));
+        let kernel_ref = typed.untyped().into_raw_usize();
+        for (value, flags) in [(10, more_flag()), (20, more_flag()), (30, 0)] {
+            let handle = unsafe { RawOpRef::from_raw_usize(kernel_ref) };
+            handle.complete(CQEResult::new(Ok(value), flags));
+        }
+
+        drop(typed);
+        assert_eq!(&*cleaned.borrow(), &[10, 20, 30]);
     }
 
     #[test]

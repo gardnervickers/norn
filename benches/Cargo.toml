@@ -96,3 +96,8 @@ harness = false
 name = "fixed_buffers"
 path = "fixed_buffers.rs"
 harness = false
+
+[[bench]]
+name = "uring_completion_backlog"
+path = "uring_completion_backlog.rs"
+harness = false
