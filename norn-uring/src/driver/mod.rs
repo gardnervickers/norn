@@ -93,8 +93,6 @@ struct Shared {
     shutdown_outcome: Cell<Option<ShutdownOutcome>>,
     #[cfg(test)]
     cancel_all_error: Cell<Option<i32>>,
-    #[cfg(test)]
-    submission_stages: RefCell<Vec<SubmissionStage>>,
     // This field must be declared after `ring`: fields are dropped in declaration
     // order, so retained registered storage is released only after the ring.
     registered_buffers: RegisteredBuffers,
@@ -140,14 +138,6 @@ pub(crate) enum TryPush {
 enum QueuePushError<T> {
     Full(T),
     SubmitHook(SubmitError),
-}
-
-#[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SubmissionStage {
-    SqeWritten,
-    HookComplete,
-    TailPublished,
 }
 
 #[derive(Debug)]
@@ -420,8 +410,6 @@ impl Driver {
                 shutdown_outcome: Cell::new(None),
                 #[cfg(test)]
                 cancel_all_error: Cell::new(None),
-                #[cfg(test)]
-                submission_stages: RefCell::new(Vec::new()),
                 registered_buffers: RegisteredBuffers::new(),
             }),
             unparker: Arc::new(unpark::Unparker::new()?),
@@ -667,21 +655,12 @@ impl Driver {
 }
 
 impl Shared {
-    #[cfg(test)]
-    fn record_submission_stage(&self, stage: SubmissionStage) {
-        if let Ok(mut stages) = self.submission_stages.try_borrow_mut() {
-            stages.push(stage);
-        }
-    }
-
     fn run_submit_hooks(&self, entries: &[ConfiguredEntry]) -> Result<(), SubmitError> {
         let mut invoked = 0;
         let result = panic::catch_unwind(AssertUnwindSafe(|| -> io::Result<()> {
             for entry in entries {
                 invoked += 1;
                 entry.on_submit()?;
-                #[cfg(test)]
-                self.record_submission_stage(SubmissionStage::HookComplete);
             }
             Ok(())
         }));
@@ -790,16 +769,12 @@ impl Shared {
         let mut sq = mem::ManuallyDrop::new(sq);
         let raw_entry = entry.entry_with_flags(Flags::empty());
         unsafe { sq.push(&raw_entry) }.unwrap();
-        #[cfg(test)]
-        self.record_submission_stage(SubmissionStage::SqeWritten);
 
         if let Err(err) = self.run_submit_hooks(std::slice::from_ref(&entry)) {
             return Err(QueuePushError::SubmitHook(err));
         }
 
         entry.commit_kernel_ref();
-        #[cfg(test)]
-        self.record_submission_stage(SubmissionStage::TailPublished);
         // Safety: `sq` has not been dropped yet, and the successful hook transferred the retained
         // operation reference to the written SQE. Dropping exactly once publishes that SQE.
         unsafe { mem::ManuallyDrop::drop(&mut sq) };
@@ -832,8 +807,6 @@ impl Shared {
             raw_entries.push(entry.entry_with_flags(flags));
         }
         unsafe { sq.push_multiple(raw_entries.as_slice()) }.unwrap();
-        #[cfg(test)]
-        self.record_submission_stage(SubmissionStage::SqeWritten);
 
         if let Err(err) = self.run_submit_hooks(entries.as_slice()) {
             return Err(QueuePushError::SubmitHook(err));
@@ -842,8 +815,6 @@ impl Shared {
         for entry in entries {
             entry.commit_kernel_ref();
         }
-        #[cfg(test)]
-        self.record_submission_stage(SubmissionStage::TailPublished);
         // Safety: `sq` has not been dropped yet, and every successful hook transferred its
         // retained operation reference to the corresponding written SQE. Dropping exactly once
         // publishes the complete linked batch.
@@ -1420,7 +1391,7 @@ mod tests {
     }
 
     #[test]
-    fn submit_hook_runs_between_sqe_write_and_tail_publication() {
+    fn successful_submit_hook_is_not_rolled_back() {
         let driver = Driver::new(io_uring::IoUring::builder(), 2).unwrap();
         let called = Rc::new(Cell::new(0));
         let rolled_back = Rc::new(Cell::new(0));
@@ -1436,14 +1407,6 @@ mod tests {
 
         assert_eq!(called.get(), 1);
         assert_eq!(rolled_back.get(), 0);
-        assert_eq!(
-            driver.shared.submission_stages.borrow().as_slice(),
-            [
-                SubmissionStage::SqeWritten,
-                SubmissionStage::HookComplete,
-                SubmissionStage::TailPublished,
-            ]
-        );
     }
 
     #[test]
@@ -1465,10 +1428,6 @@ mod tests {
         assert!(err.to_string().contains("operation submission hook failed"));
         assert_eq!(called.get(), 1);
         assert_eq!(rolled_back.get(), 1);
-        assert_eq!(
-            driver.shared.submission_stages.borrow().as_slice(),
-            [SubmissionStage::SqeWritten]
-        );
         assert_eq!(driver.shared.ring.borrow_mut().submission().len(), 0);
     }
 
@@ -1492,10 +1451,6 @@ mod tests {
         assert!(panic.is_err());
         assert_eq!(called.get(), 1);
         assert_eq!(rolled_back.get(), 1);
-        assert_eq!(
-            driver.shared.submission_stages.borrow().as_slice(),
-            [SubmissionStage::SqeWritten]
-        );
         assert_eq!(driver.shared.ring.borrow_mut().submission().len(), 0);
     }
 

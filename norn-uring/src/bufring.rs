@@ -17,6 +17,25 @@ use crate::Handle;
 
 /// [`RecvBufRing`] is a reference counted buffer ring which can be registered
 /// with io_uring to provide buffers for read operations.
+///
+/// # Example
+///
+/// ```no_run
+/// use norn_uring::bufring::RecvBufRing;
+/// use norn_uring::net::UdpSocket;
+///
+/// # async fn receive() -> std::io::Result<()> {
+/// let ring = RecvBufRing::builder(7)
+///     .buf_cnt(32)
+///     .buf_len(2048)
+///     .build()?;
+/// let socket = UdpSocket::bind("127.0.0.1:8080".parse().unwrap()).await?;
+///
+/// let (buffer, peer) = socket.recv_from_ring(&ring).await?;
+/// println!("received {} bytes from {peer}", buffer.len());
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Clone)]
 pub struct RecvBufRing {
     // The RecvBufRing is reference counted because each buffer handed out has a reference back to
