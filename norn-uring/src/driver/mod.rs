@@ -282,6 +282,14 @@ impl Handle {
         Op::new(op, self.clone())
     }
 
+    pub(crate) fn submit_with_terminal_guard<T, G>(&self, op: T, terminal_guard: G) -> Op<T>
+    where
+        T: Operation + 'static,
+        G: crate::operation::TerminalGuard,
+    {
+        Op::new_guarded(op, self.clone(), terminal_guard)
+    }
+
     /// Issue a cancellation request.
     ///
     /// Setting `sync` to true will cause the cancellation to

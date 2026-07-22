@@ -9,6 +9,7 @@ use socket2::{Domain, Type};
 
 use crate::buf::{StableBuf, StableBufMut};
 use crate::bufring::RecvBufRing;
+use crate::fd::Direction;
 use crate::net::socket;
 use crate::operation::Op;
 
@@ -445,6 +446,7 @@ impl tokio::io::AsyncRead for TcpStreamReader {
             cx,
             |sock| { unsafe { sock.recv(buf.unfilled_mut()) } },
             socket::READ_FLAGS as u32,
+            Direction::Read,
         ))?;
         unsafe {
             buf.assume_init(n);
@@ -461,18 +463,24 @@ impl tokio::io::AsyncWrite for TcpStreamWriter {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.project();
-        let n = ready!(this
-            .inner
-            .poll_op(cx, |sock| sock.send(buf), socket::WRITE_FLAGS as u32))?;
+        let n = ready!(this.inner.poll_op(
+            cx,
+            |sock| sock.send(buf),
+            socket::WRITE_FLAGS as u32,
+            Direction::Write,
+        ))?;
         Poll::Ready(Ok(n))
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
         use std::io::Write;
         let this = self.project();
-        ready!(this
-            .inner
-            .poll_op(cx, |mut sock| sock.flush(), socket::WRITE_FLAGS as u32))?;
+        ready!(this.inner.poll_op(
+            cx,
+            |mut sock| sock.flush(),
+            socket::WRITE_FLAGS as u32,
+            Direction::Write,
+        ))?;
         Poll::Ready(Ok(()))
     }
 
@@ -481,7 +489,8 @@ impl tokio::io::AsyncWrite for TcpStreamWriter {
         ready!(this.inner.poll_op(
             cx,
             |sock| sock.shutdown(std::net::Shutdown::Write),
-            socket::WRITE_FLAGS as u32
+            socket::WRITE_FLAGS as u32,
+            Direction::Write,
         ))?;
         Poll::Ready(Ok(()))
     }
@@ -495,7 +504,8 @@ impl tokio::io::AsyncWrite for TcpStreamWriter {
         let n = ready!(this.inner.poll_op(
             cx,
             |sock| sock.send_vectored(bufs),
-            socket::WRITE_FLAGS as u32
+            socket::WRITE_FLAGS as u32,
+            Direction::Write,
         ))?;
         Poll::Ready(Ok(n))
     }
@@ -528,12 +538,17 @@ impl ReadyStream {
         cx: &mut Context<'_>,
         mut f: impl FnMut(ManuallyDrop<socket2::Socket>) -> io::Result<U>,
         flags: u32,
+        direction: Direction,
     ) -> Poll<io::Result<U>> {
         loop {
             log::trace!(target: LOG, "poll_op");
             ready!(self.as_mut().poll_ready(cx, flags))?;
             log::trace!(target: LOG, "poll_op.ready");
             let this = self.as_mut().project();
+            let _permit = this
+                .inner
+                .acquire_ordinary(direction)
+                .expect("ordinary stream I/O polled while bundled mode is active");
             let sock = this.inner.as_socket()?;
             match f(sock) {
                 Ok(res) => {

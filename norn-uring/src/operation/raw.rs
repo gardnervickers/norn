@@ -15,9 +15,62 @@ pub(crate) struct RawOp<T> {
     data: UnsafeCell<Option<T>>,
 }
 
-impl<T> RawOp<T>
+#[repr(C)]
+struct RawOpStorage<T, G> {
+    // Keep this prefix first so typed handles can access operation data without
+    // knowing whether this allocation carries a terminal guard.
+    op: RawOp<T>,
+    terminal_guard: UnsafeCell<G>,
+}
+
+trait TerminalGuardSlot: 'static {
+    fn release(&mut self);
+}
+
+struct NoTerminalGuard;
+
+impl TerminalGuardSlot for NoTerminalGuard {
+    fn release(&mut self) {}
+}
+
+struct SomeTerminalGuard<G>(Option<G>);
+
+impl<G: 'static> TerminalGuardSlot for SomeTerminalGuard<G> {
+    fn release(&mut self) {
+        self.0.take();
+    }
+}
+
+pub(crate) fn allocate<T>(data: T) -> NonNull<Header>
 where
     T: Operation + 'static,
+{
+    RawOpStorage::<T, NoTerminalGuard>::allocate(data, NoTerminalGuard)
+}
+
+pub(crate) fn allocate_guarded<T, G>(data: T, terminal_guard: G) -> NonNull<Header>
+where
+    T: Operation + 'static,
+    G: 'static,
+{
+    RawOpStorage::<T, SomeTerminalGuard<G>>::allocate(data, SomeTerminalGuard(Some(terminal_guard)))
+}
+
+impl<T> RawOp<T> {
+    pub(crate) unsafe fn data_mut(&mut self) -> &mut Option<T> {
+        &mut *self.data.get()
+    }
+
+    #[inline]
+    pub(crate) unsafe fn from_raw_header(ptr: NonNull<Header>) -> NonNull<Self> {
+        ptr.cast()
+    }
+}
+
+impl<T, G> RawOpStorage<T, G>
+where
+    T: Operation + 'static,
+    G: TerminalGuardSlot,
 {
     const VTABLE: VTable = VTable {
         drop_ref: Self::drop_ref,
@@ -25,22 +78,25 @@ where
         complete: Self::complete,
     };
 
-    pub(crate) fn allocate(data: T) -> NonNull<Header> {
+    fn allocate(data: T, terminal_guard: G) -> NonNull<Header> {
         let header = Header::new(&Self::VTABLE);
-        let raw = RawOp {
-            header,
-            data: UnsafeCell::new(Some(data)),
+        let raw = Self {
+            op: RawOp {
+                header,
+                data: UnsafeCell::new(Some(data)),
+            },
+            terminal_guard: UnsafeCell::new(terminal_guard),
         };
         let ptr = Box::into_raw(Box::new(raw));
         // Safety: `ptr` is a valid pointer to a `Header`. RawOp is also
-        // repr(C), so the pointer to the header is the same as the pointer
-        // to the whole struct.
+        // repr(C), and both of its prefix fields are first, so the pointer to
+        // the header is the same as the pointer to the whole allocation.
         unsafe { NonNull::new_unchecked(ptr as *mut Header) }
     }
 
     unsafe fn drop_ref(ptr: NonNull<Header>) {
         let this = Self::from_raw_header(ptr);
-        if this.as_ref().header.dec_refcount() {
+        if this.as_ref().op.header.dec_refcount() {
             Self::destroy(ptr)
         }
     }
@@ -54,41 +110,41 @@ where
         // The refcount should be 0 now, so we are the only owner. We can
         // thus borrow mutably.
         let this = raw.as_mut();
-        debug_assert!(this.header.refcount() == 0);
+        debug_assert!(this.op.header.refcount() == 0);
 
-        if let Some(mut data) = this.data_mut().take() {
-            let completions = this.header.completions_mut().get_mut();
+        if let Some(mut data) = this.op.data_mut().take() {
+            let completions = this.op.header.completions_mut().get_mut();
             for result in mem::take(completions) {
                 data.cleanup(result);
             }
-        } else if !this.header.completions().borrow().is_empty() {
+        } else if !this.op.header.completions().borrow().is_empty() {
             panic!("operation state cone without waiting for all completions");
         }
-        // Safety: We can cast to Box<RawTask> because we allocated it with Box::new,
-        // and Header is the first field in RawTask (which is repr(C)).
+        // Safety: this pointer has the exact `RawOpStorage<T, G>` type used by
+        // `allocate`, and the reference count proves this is the last owner.
         drop(Box::from_raw(this as *mut Self));
-    }
-
-    pub(crate) unsafe fn data_mut(&mut self) -> &mut Option<T> {
-        &mut *self.data.get()
     }
 
     unsafe fn clone_ref(ptr: NonNull<Header>) {
         let this = Self::from_raw_header(ptr);
-        this.as_ref().header.inc_refcount();
+        this.as_ref().op.header.inc_refcount();
     }
 
     unsafe fn complete(ptr: NonNull<Header>, result: CQEResult) -> bool {
         let more = result.more();
         let this = Self::from_raw_header(ptr);
-        let header = &this.as_ref().header;
-        assert!(!header.is_complete());
+        let raw = this.as_ref();
+        assert!(!raw.op.header.is_complete());
+        let header = &raw.op.header;
         {
             let mut completions = header.completions().borrow_mut();
             completions.push(result);
         }
         if !more {
             header.set_complete();
+            // Safety: the single-threaded driver serializes completion, and
+            // this is the only early-release path for the terminal guard.
+            (*raw.terminal_guard.get()).release();
         }
         if let Some(waker) = header.take_waker() {
             waker.wake();
@@ -96,9 +152,25 @@ where
         true
     }
 
-    #[inline]
-    pub(crate) unsafe fn from_raw_header(ptr: NonNull<Header>) -> NonNull<Self> {
+    unsafe fn from_raw_header(ptr: NonNull<Header>) -> NonNull<Self> {
         ptr.cast()
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    #[test]
+    fn unguarded_operations_pay_no_terminal_guard_storage() {
+        assert_eq!(
+            std::mem::size_of::<RawOpStorage<(), NoTerminalGuard>>(),
+            std::mem::size_of::<RawOp<()>>()
+        );
+        assert!(
+            std::mem::size_of::<RawOpStorage<(), SomeTerminalGuard<[usize; 2]>>>()
+                > std::mem::size_of::<RawOpStorage<(), NoTerminalGuard>>()
+        );
     }
 }
 

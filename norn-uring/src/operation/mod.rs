@@ -10,6 +10,9 @@ use io_uring::types::CancelBuilder;
 pub use raw::CQEResult;
 pub(crate) use raw::RawOpRef;
 
+/// Resource whose drop ends a lifetime fence at an operation's terminal CQE.
+pub(crate) trait TerminalGuard: 'static {}
+
 use io_uring::squeue::Flags;
 use smallvec::SmallVec;
 
@@ -296,7 +299,17 @@ where
     T: Operation + 'static,
 {
     pub(crate) fn new(data: T, reactor: crate::Handle) -> Self {
-        let mut handle = TypedHandle::new(data);
+        Self::new_inner(TypedHandle::new(data), reactor)
+    }
+
+    pub(crate) fn new_guarded<G>(data: T, reactor: crate::Handle, terminal_guard: G) -> Self
+    where
+        G: TerminalGuard,
+    {
+        Self::new_inner(TypedHandle::new_guarded(data, terminal_guard), reactor)
+    }
+
+    fn new_inner(mut handle: TypedHandle<T>, reactor: crate::Handle) -> Self {
         // Safety: The handle was just created and no other references to its operation data
         // exist. `RawOp` keeps the data at a stable address until the operation completes.
         let data = unsafe { handle.data_mut().expect("operation already completed") };
@@ -469,7 +482,18 @@ where
     T: Operation + 'static,
 {
     pub(crate) fn new(data: T) -> Self {
-        let ptr = raw::RawOp::<T>::allocate(data);
+        let ptr = raw::allocate(data);
+        Self {
+            inner: RawOpRef::from(ptr),
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    fn new_guarded<G>(data: T, terminal_guard: G) -> Self
+    where
+        G: TerminalGuard,
+    {
+        let ptr = raw::allocate_guarded(data, terminal_guard);
         Self {
             inner: RawOpRef::from(ptr),
             _marker: std::marker::PhantomData,
@@ -606,6 +630,7 @@ mod tests {
     use std::task::{Poll, Wake, Waker};
 
     use super::*;
+    use crate::fd::{Direction, NornFd};
 
     #[derive(Debug, Default)]
     struct TestOp(Vec<CQEResult>);
@@ -680,6 +705,12 @@ mod tests {
         (0..=u32::MAX)
             .find(|flags| io_uring::cqueue::more(*flags))
             .expect("missing CQE more flag")
+    }
+
+    fn notif_flag() -> u32 {
+        (0..=u32::MAX)
+            .find(|flags| io_uring::cqueue::notif(*flags))
+            .expect("missing CQE notification flag")
     }
 
     thread_local! {
@@ -763,6 +794,95 @@ mod tests {
     }
 
     #[test]
+    fn terminal_guard_is_released_by_terminal_completion() {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let fd = NornFd::from_fd(fds[0]);
+        let permit = fd.acquire_ordinary(Direction::Read).unwrap();
+        let typed = TypedHandle::new_guarded(TestMultishot, permit);
+
+        assert!(fd.acquire_bundled(Direction::Read).is_err());
+        typed.untyped().complete(CQEResult::new(Ok(1), 0));
+        let bundled = fd.acquire_bundled(Direction::Read).unwrap();
+
+        drop(bundled);
+        drop(typed);
+        drop(fd);
+        unsafe { libc::close(fds[1]) };
+    }
+
+    #[test]
+    fn terminal_guard_survives_more_until_notification_completion() {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let fd = NornFd::from_fd(fds[0]);
+        let permit = fd.acquire_ordinary(Direction::Read).unwrap();
+        let typed = TypedHandle::new_guarded(TestMultishot, permit);
+        let kernel_ref = typed.untyped().into_raw_usize();
+
+        let more_ref = unsafe { RawOpRef::from_raw_usize(kernel_ref) };
+        more_ref.complete(CQEResult::new(Ok(1), more_flag()));
+        assert!(fd.acquire_bundled(Direction::Read).is_err());
+
+        let terminal_ref = unsafe { RawOpRef::from_raw_usize(kernel_ref) };
+        terminal_ref.complete(CQEResult::new(Ok(2), notif_flag()));
+        let bundled = fd.acquire_bundled(Direction::Read).unwrap();
+
+        drop(bundled);
+        drop(typed);
+        drop(fd);
+        unsafe { libc::close(fds[1]) };
+    }
+
+    #[test]
+    fn dropped_submitted_op_retains_guard_until_terminal_completion() {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let fd = NornFd::from_fd(fds[0]);
+        let permit = fd.acquire_ordinary(Direction::Write).unwrap();
+        let driver = crate::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let typed = TypedHandle::new_guarded(TestMultishot, permit);
+        let kernel_ref = typed.untyped().into_raw_usize();
+        let op = Op {
+            submit: None,
+            state: State::Submitted {
+                inner: SubmittedOp { inner: typed },
+            },
+            reactor: driver.handle(),
+            completed: false,
+        };
+
+        drop(op);
+        assert!(fd.acquire_bundled(Direction::Write).is_err());
+
+        let terminal_ref = unsafe { RawOpRef::from_raw_usize(kernel_ref) };
+        terminal_ref.complete(CQEResult::new(
+            Err(io::Error::from_raw_os_error(libc::ECANCELED)),
+            0,
+        ));
+        let bundled = fd.acquire_bundled(Direction::Write).unwrap();
+
+        drop(bundled);
+        drop(fd);
+        unsafe { libc::close(fds[1]) };
+    }
+
+    #[test]
+    fn dropping_unsubmitted_handle_releases_terminal_guard() {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let fd = NornFd::from_fd(fds[0]);
+        let permit = fd.acquire_ordinary(Direction::Write).unwrap();
+
+        drop(TypedHandle::new_guarded(TestOp::default(), permit));
+        let bundled = fd.acquire_bundled(Direction::Write).unwrap();
+
+        drop(bundled);
+        drop(fd);
+        unsafe { libc::close(fds[1]) };
+    }
+
+    #[test]
     fn multishot_more_completion_survives_panicking_waker() {
         let typed = TypedHandle::new(TestMultishot);
         let kernel_ref = typed.untyped().into_raw_usize();
@@ -840,8 +960,12 @@ mod tests {
         let mut driver = crate::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
         let handle = driver.handle();
         norn_executor::park::Park::shutdown(&mut driver);
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let fd = NornFd::from_fd(fds[0]);
+        let permit = fd.acquire_ordinary(Direction::Write).unwrap();
 
-        let mut op = std::pin::pin!(handle.submit(SubmitFailureOp));
+        let mut op = std::pin::pin!(Op::new_guarded(SubmitFailureOp, handle, permit));
         let waker = futures_test::task::noop_waker();
         let mut cx = std::task::Context::from_waker(&waker);
 
@@ -854,6 +978,10 @@ mod tests {
             Poll::Ready((true, Err(_))) => {}
             other => panic!("expected ready error, got: {other:?}"),
         }
+        let bundled = fd.acquire_bundled(Direction::Write).unwrap();
+        drop(bundled);
+        drop(fd);
+        unsafe { libc::close(fds[1]) };
     }
 
     #[test]
@@ -880,7 +1008,11 @@ mod tests {
 
         let driver = crate::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
         let handle = driver.handle();
-        let mut op = std::pin::pin!(handle.submit(ConfigurationFailureOp));
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let fd = NornFd::from_fd(fds[0]);
+        let permit = fd.acquire_ordinary(Direction::Read).unwrap();
+        let mut op = std::pin::pin!(Op::new_guarded(ConfigurationFailureOp, handle, permit));
         let waker = futures_test::task::noop_waker();
         let mut cx = std::task::Context::from_waker(&waker);
 
@@ -889,6 +1021,10 @@ mod tests {
         };
         assert!(synthetic);
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        let bundled = fd.acquire_bundled(Direction::Read).unwrap();
+        drop(bundled);
+        drop(fd);
+        unsafe { libc::close(fds[1]) };
     }
 
     #[test]

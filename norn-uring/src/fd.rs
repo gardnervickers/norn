@@ -14,6 +14,10 @@ use std::io;
 use std::os::fd::{AsRawFd, RawFd};
 use std::rc::Rc;
 
+mod mode;
+
+pub(crate) use mode::{BundledPermit, Direction, ModeConflict, OrdinaryPermit};
+
 use io_uring::{opcode, types};
 use log::warn;
 
@@ -32,6 +36,7 @@ struct Inner {
     kind: FdKind,
     handle: Option<Handle>,
     closed: Cell<bool>,
+    modes: Cell<mode::DirectionModes>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -60,6 +65,7 @@ impl NornFd {
             kind,
             handle,
             closed: Cell::new(false),
+            modes: Cell::new(mode::DirectionModes::default()),
         };
         let inner = Rc::new(inner);
         Self { inner }
@@ -67,6 +73,24 @@ impl NornFd {
 
     pub(crate) fn kind(&self) -> &'_ FdKind {
         &self.inner.kind
+    }
+
+    pub(crate) fn acquire_ordinary(
+        &self,
+        direction: Direction,
+    ) -> Result<OrdinaryPermit, ModeConflict> {
+        OrdinaryPermit::acquire(&self.inner, direction)
+    }
+
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "consumed by the next stacked bundle API PR")
+    )]
+    pub(crate) fn acquire_bundled(
+        &self,
+        direction: Direction,
+    ) -> Result<BundledPermit, ModeConflict> {
+        BundledPermit::acquire(&self.inner, direction)
     }
 
     pub(crate) async fn close(&self) -> io::Result<()> {
@@ -341,6 +365,117 @@ mod tests {
             io::Error::from_raw_os_error(libc::EIO),
         )));
         assert_pipe_reader_closed(write_end);
+
+        drop(fd);
+        unsafe { libc::close(write_end) };
+    }
+
+    #[test]
+    fn ordinary_and_bundled_modes_are_exclusive_per_direction() {
+        let [read_end, write_end] = pipe();
+        let fd = NornFd::from_fd(read_end);
+
+        let read = fd.acquire_ordinary(Direction::Read).unwrap();
+        assert_eq!(
+            fd.acquire_bundled(Direction::Read).unwrap_err().direction(),
+            Direction::Read
+        );
+        drop(read);
+
+        let bundled = fd.acquire_bundled(Direction::Read).unwrap();
+        assert_eq!(
+            fd.acquire_ordinary(Direction::Read)
+                .unwrap_err()
+                .direction(),
+            Direction::Read
+        );
+        drop(bundled);
+
+        assert!(fd.acquire_ordinary(Direction::Read).is_ok());
+        drop(fd);
+        unsafe { libc::close(write_end) };
+    }
+
+    #[test]
+    fn read_and_write_modes_are_independent() {
+        let [read_end, write_end] = pipe();
+        let fd = NornFd::from_fd(read_end);
+
+        let _read = fd.acquire_bundled(Direction::Read).unwrap();
+        let _write = fd.acquire_ordinary(Direction::Write).unwrap();
+
+        drop(fd);
+        unsafe { libc::close(write_end) };
+    }
+
+    #[test]
+    fn acquiring_both_directions_is_atomic() {
+        let [read_end, write_end] = pipe();
+        let fd = NornFd::from_fd(read_end);
+
+        let write = fd.acquire_bundled(Direction::Write).unwrap();
+        assert_eq!(
+            fd.acquire_ordinary(Direction::Both)
+                .unwrap_err()
+                .direction(),
+            Direction::Write
+        );
+        // The failed two-direction acquisition must not retain the read side.
+        let read = fd.acquire_bundled(Direction::Read).unwrap();
+        drop(read);
+        drop(write);
+
+        let write = fd.acquire_ordinary(Direction::Write).unwrap();
+        assert_eq!(
+            fd.acquire_bundled(Direction::Both).unwrap_err().direction(),
+            Direction::Write
+        );
+        // The failed two-direction acquisition must not mark the read side bundled.
+        let read = fd.acquire_ordinary(Direction::Read).unwrap();
+        drop(read);
+        drop(write);
+
+        drop(fd);
+        unsafe { libc::close(write_end) };
+    }
+
+    #[test]
+    fn bundled_mode_waits_for_every_ordinary_permit() {
+        let [read_end, write_end] = pipe();
+        let fd = NornFd::from_fd(read_end);
+
+        let first = fd.acquire_ordinary(Direction::Read).unwrap();
+        let second = fd.acquire_ordinary(Direction::Read).unwrap();
+        assert!(fd.acquire_bundled(Direction::Read).is_err());
+
+        drop(first);
+        assert!(fd.acquire_bundled(Direction::Read).is_err());
+
+        drop(second);
+        assert!(fd.acquire_bundled(Direction::Read).is_ok());
+
+        drop(fd);
+        unsafe { libc::close(write_end) };
+    }
+
+    #[test]
+    fn permits_release_on_their_last_owner() {
+        let [read_end, write_end] = pipe();
+        let fd = NornFd::from_fd(read_end);
+
+        let mut ordinary = fd.acquire_ordinary(Direction::Write).unwrap();
+        ordinary.release();
+        ordinary.release();
+        let bundled = fd.acquire_bundled(Direction::Write).unwrap();
+        drop(ordinary);
+        drop(bundled);
+
+        let bundled = fd.acquire_bundled(Direction::Write).unwrap();
+        let bundled_kernel_ref = bundled.clone();
+        drop(bundled);
+        assert!(fd.acquire_ordinary(Direction::Write).is_err());
+        drop(bundled_kernel_ref);
+        assert!(fd.acquire_ordinary(Direction::Write).is_ok());
 
         drop(fd);
         unsafe { libc::close(write_end) };

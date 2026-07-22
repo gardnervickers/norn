@@ -13,7 +13,7 @@ use std::os::fd::FromRawFd;
 
 use crate::buf::{set_init_checked, StableBuf, StableBufMut};
 use crate::bufring::{BufRingBuf, BufRingBufBundle, RecvBufRing};
-use crate::fd::NornFd;
+use crate::fd::{Direction, NornFd};
 use crate::operation::{Multishot, Op, Operation, Singleshot};
 
 fn invalid_socket_addr_error() -> io::Error {
@@ -162,28 +162,46 @@ impl Socket {
         );
     }
 
+    fn submit_io<T>(&self, op: T, direction: Direction) -> Op<T>
+    where
+        T: Operation + 'static,
+    {
+        let permit = self
+            .fd
+            .acquire_ordinary(direction)
+            .expect("ordinary socket operation constructed while bundled mode is active");
+        self.handle.submit_with_terminal_guard(op, permit)
+    }
+
+    pub(crate) fn acquire_ordinary(
+        &self,
+        direction: Direction,
+    ) -> Result<crate::fd::OrdinaryPermit, crate::fd::ModeConflict> {
+        self.fd.acquire_ordinary(direction)
+    }
+
     pub(crate) fn recv_from_ring(&self, ring: &RecvBufRing) -> Op<RecvFromRing> {
         self.assert_bufring_driver(ring);
         let op = RecvFromRing::new(self.fd.clone(), ring.clone());
-        self.handle.submit(op)
+        self.submit_io(op, Direction::Read)
     }
 
     pub(crate) fn recv_from_ring_multi(&self, ring: &RecvBufRing) -> Op<RecvFromRingMulti> {
         self.assert_bufring_driver(ring);
         let op = RecvFromRingMulti::new(self.fd.clone(), ring.clone());
-        self.handle.submit(op)
+        self.submit_io(op, Direction::Read)
     }
 
     pub(crate) fn recv_ring_multi(&self, ring: &RecvBufRing) -> Op<RecvRingMulti> {
         self.assert_bufring_driver(ring);
         let op = RecvRingMulti::new(self.fd.clone(), ring.clone(), 0);
-        self.handle.submit(op)
+        self.submit_io(op, Direction::Read)
     }
 
     pub(crate) fn recv_ring_bundle(&self, ring: &RecvBufRing) -> Op<RecvRingBundle> {
         self.assert_bufring_driver(ring);
         let op = RecvRingBundle::new(self.fd.clone(), ring.clone(), 0);
-        self.handle.submit(op)
+        self.submit_io(op, Direction::Read)
     }
 
     pub(crate) fn recv_ring_bundle_with_flags(
@@ -193,13 +211,13 @@ impl Socket {
     ) -> Op<RecvRingBundle> {
         self.assert_bufring_driver(ring);
         let op = RecvRingBundle::new(self.fd.clone(), ring.clone(), flags);
-        self.handle.submit(op)
+        self.submit_io(op, Direction::Read)
     }
 
     pub(crate) fn recv_ring_bundle_multi(&self, ring: &RecvBufRing) -> Op<RecvRingBundleMulti> {
         self.assert_bufring_driver(ring);
         let op = RecvRingBundleMulti::new(self.fd.clone(), ring.clone(), 0);
-        self.handle.submit(op)
+        self.submit_io(op, Direction::Read)
     }
 
     pub(crate) fn recv_ring_bundle_multi_with_flags(
@@ -209,30 +227,38 @@ impl Socket {
     ) -> Op<RecvRingBundleMulti> {
         self.assert_bufring_driver(ring);
         let op = RecvRingBundleMulti::new(self.fd.clone(), ring.clone(), flags);
-        self.handle.submit(op)
+        self.submit_io(op, Direction::Read)
     }
 
     pub(crate) async fn recv_from<B>(&self, buf: B) -> (io::Result<(usize, SocketAddr)>, B)
     where
         B: StableBufMut + 'static,
     {
+        let permit = self
+            .fd
+            .acquire_ordinary(Direction::Read)
+            .expect("ordinary receive started while bundled mode is active");
         let mut buf = buf;
         if let Some(result) = self.try_recv_from(&mut buf, 0) {
             return (result, buf);
         }
         let op = RecvFrom::new(self.fd.clone(), buf, 0);
-        self.handle.submit(op).await
+        self.handle.submit_with_terminal_guard(op, permit).await
     }
 
     pub(crate) async fn send_to<B>(&self, buf: B, addr: SocketAddr) -> (io::Result<usize>, B)
     where
         B: StableBuf + 'static,
     {
+        let permit = self
+            .fd
+            .acquire_ordinary(Direction::Write)
+            .expect("ordinary send started while bundled mode is active");
         if let Some(result) = self.try_send_to(&buf, Some(addr), 0) {
             return (result, buf);
         }
         let op = SendTo::new(self.fd.clone(), buf, Some(addr), 0);
-        self.handle.submit(op).await
+        self.handle.submit_with_terminal_guard(op, permit).await
     }
 
     pub(crate) async fn recv_from_with_flags<B>(
@@ -243,12 +269,16 @@ impl Socket {
     where
         B: StableBufMut + 'static,
     {
+        let permit = self
+            .fd
+            .acquire_ordinary(Direction::Read)
+            .expect("ordinary receive started while bundled mode is active");
         let mut buf = buf;
         if let Some(result) = self.try_recv_from(&mut buf, flags) {
             return (result, buf);
         }
         let op = RecvFrom::new(self.fd.clone(), buf, flags as u32);
-        self.handle.submit(op).await
+        self.handle.submit_with_terminal_guard(op, permit).await
     }
 
     pub(crate) async fn send_to_with_flags<B>(
@@ -260,11 +290,15 @@ impl Socket {
     where
         B: StableBuf + 'static,
     {
+        let permit = self
+            .fd
+            .acquire_ordinary(Direction::Write)
+            .expect("ordinary send started while bundled mode is active");
         if let Some(result) = self.try_send_to(&buf, Some(addr), flags) {
             return (result, buf);
         }
         let op = SendTo::new(self.fd.clone(), buf, Some(addr), flags as u32);
-        self.handle.submit(op).await
+        self.handle.submit_with_terminal_guard(op, permit).await
     }
 
     pub(crate) fn recv<B>(&self, buf: B) -> Op<Recv<B>>
@@ -272,7 +306,7 @@ impl Socket {
         B: StableBufMut + 'static,
     {
         let op = Recv::new(self.fd.clone(), buf, 0);
-        self.handle.submit(op)
+        self.submit_io(op, Direction::Read)
     }
 
     pub(crate) fn send<B>(&self, buf: B) -> Op<Send<B>>
@@ -280,7 +314,7 @@ impl Socket {
         B: StableBuf + 'static,
     {
         let op = Send::new(self.fd.clone(), buf, 0);
-        self.handle.submit(op)
+        self.submit_io(op, Direction::Write)
     }
 
     pub(crate) fn recv_with_flags<B>(&self, buf: B, flags: i32) -> Op<Recv<B>>
@@ -288,7 +322,7 @@ impl Socket {
         B: StableBufMut + 'static,
     {
         let op = Recv::new(self.fd.clone(), buf, flags);
-        self.handle.submit(op)
+        self.submit_io(op, Direction::Read)
     }
 
     pub(crate) fn send_with_flags<B>(&self, buf: B, flags: i32) -> Op<Send<B>>
@@ -296,7 +330,7 @@ impl Socket {
         B: StableBuf + 'static,
     {
         let op = Send::new(self.fd.clone(), buf, flags);
-        self.handle.submit(op)
+        self.submit_io(op, Direction::Write)
     }
 
     pub(crate) fn send_zc<B>(&self, buf: B) -> Op<SendZc<B>>
@@ -304,7 +338,7 @@ impl Socket {
         B: StableBuf + 'static,
     {
         let op = SendZc::new(self.fd.clone(), buf, 0);
-        self.handle.submit(op)
+        self.submit_io(op, Direction::Write)
     }
 
     pub(crate) fn send_zc_with_flags<B>(&self, buf: B, flags: i32) -> Op<SendZc<B>>
@@ -312,7 +346,7 @@ impl Socket {
         B: StableBuf + 'static,
     {
         let op = SendZc::new(self.fd.clone(), buf, flags);
-        self.handle.submit(op)
+        self.submit_io(op, Direction::Write)
     }
 
     pub(crate) fn send_msg_zc<B>(&self, buf: B, flags: i32) -> Op<SendMsgZc<B>>
@@ -320,17 +354,17 @@ impl Socket {
         B: StableBuf + 'static,
     {
         let op = SendMsgZc::new(self.fd.clone(), buf, flags);
-        self.handle.submit(op)
+        self.submit_io(op, Direction::Write)
     }
 
     pub(crate) async fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()> {
-        let how = match how {
-            std::net::Shutdown::Read => libc::SHUT_RD,
-            std::net::Shutdown::Write => libc::SHUT_WR,
-            std::net::Shutdown::Both => libc::SHUT_RDWR,
+        let (how, direction) = match how {
+            std::net::Shutdown::Read => (libc::SHUT_RD, Direction::Read),
+            std::net::Shutdown::Write => (libc::SHUT_WR, Direction::Write),
+            std::net::Shutdown::Both => (libc::SHUT_RDWR, Direction::Both),
         };
         let op = Shutdown::new(self.fd.clone(), how);
-        self.handle.submit(op).await
+        self.submit_io(op, direction).await
     }
 
     pub(crate) fn poll_readiness<const MULTI: bool>(&self, events: u32) -> Op<Poll<MULTI>> {
@@ -1840,8 +1874,10 @@ impl Event {
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
     use std::panic::{self, AssertUnwindSafe};
     use std::pin::pin;
+    use std::task::{Context, Waker};
 
     use futures_util::StreamExt;
     use norn_executor::LocalExecutor;
@@ -1940,6 +1976,41 @@ mod tests {
             fd: NornFd::from_fd(fd),
             handle,
         })
+    }
+
+    #[test]
+    fn unsubmitted_socket_operation_reserves_its_direction() -> io::Result<()> {
+        let driver = crate::Driver::new(io_uring::IoUring::builder(), 8)?;
+        let socket = test_socket(driver.handle())?;
+
+        let receive = socket.recv(Vec::with_capacity(1));
+        assert!(socket.fd.acquire_bundled(Direction::Read).is_err());
+        assert!(socket.fd.acquire_bundled(Direction::Write).is_ok());
+
+        drop(receive);
+        assert!(socket.fd.acquire_bundled(Direction::Read).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn sq_waiting_socket_operation_releases_its_direction_on_drop() -> io::Result<()> {
+        let driver = crate::Driver::new(io_uring::IoUring::builder(), 1)?;
+        let socket = test_socket(driver.handle())?;
+        let mut cx = Context::from_waker(Waker::noop());
+
+        let mut send = Box::pin(socket.send(vec![1]));
+        assert!(Future::poll(send.as_mut(), &mut cx).is_pending());
+
+        let mut receive = Box::pin(socket.recv(Vec::with_capacity(1)));
+        assert!(Future::poll(receive.as_mut(), &mut cx).is_pending());
+        assert!(socket.fd.acquire_bundled(Direction::Read).is_err());
+
+        drop(receive);
+        let bundled = socket.fd.acquire_bundled(Direction::Read).unwrap();
+
+        drop(bundled);
+        drop(send);
+        Ok(())
     }
 
     fn assert_driver_mismatch(f: impl FnOnce()) {
