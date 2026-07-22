@@ -9,10 +9,20 @@ use socket2::{Domain, Type};
 
 use crate::buf::{StableBuf, StableBufMut};
 use crate::bufring::RecvBufRing;
+use crate::fd::Direction;
 use crate::net::socket;
 use crate::operation::Op;
 
 use super::socket::Accept;
+
+mod bundled_recv;
+mod bundled_send;
+
+pub use bundled_recv::{AttachRecvRingError, AttachRecvRingErrorKind, TcpRecvBundles};
+pub use bundled_send::{
+    AttachSendRingError, AttachSendRingErrorKind, BundledTcpWriter, EnqueueError,
+    FinishSendRingOutcome, SendError,
+};
 
 const LOG: &str = "norn_uring::net::tcp";
 
@@ -445,6 +455,7 @@ impl tokio::io::AsyncRead for TcpStreamReader {
             cx,
             |sock| { unsafe { sock.recv(buf.unfilled_mut()) } },
             socket::READ_FLAGS as u32,
+            Direction::Read,
         ))?;
         unsafe {
             buf.assume_init(n);
@@ -461,18 +472,24 @@ impl tokio::io::AsyncWrite for TcpStreamWriter {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.project();
-        let n = ready!(this
-            .inner
-            .poll_op(cx, |sock| sock.send(buf), socket::WRITE_FLAGS as u32))?;
+        let n = ready!(this.inner.poll_op(
+            cx,
+            |sock| sock.send(buf),
+            socket::WRITE_FLAGS as u32,
+            Direction::Write,
+        ))?;
         Poll::Ready(Ok(n))
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
         use std::io::Write;
         let this = self.project();
-        ready!(this
-            .inner
-            .poll_op(cx, |mut sock| sock.flush(), socket::WRITE_FLAGS as u32))?;
+        ready!(this.inner.poll_op(
+            cx,
+            |mut sock| sock.flush(),
+            socket::WRITE_FLAGS as u32,
+            Direction::Write,
+        ))?;
         Poll::Ready(Ok(()))
     }
 
@@ -481,7 +498,8 @@ impl tokio::io::AsyncWrite for TcpStreamWriter {
         ready!(this.inner.poll_op(
             cx,
             |sock| sock.shutdown(std::net::Shutdown::Write),
-            socket::WRITE_FLAGS as u32
+            socket::WRITE_FLAGS as u32,
+            Direction::Write,
         ))?;
         Poll::Ready(Ok(()))
     }
@@ -495,7 +513,8 @@ impl tokio::io::AsyncWrite for TcpStreamWriter {
         let n = ready!(this.inner.poll_op(
             cx,
             |sock| sock.send_vectored(bufs),
-            socket::WRITE_FLAGS as u32
+            socket::WRITE_FLAGS as u32,
+            Direction::Write,
         ))?;
         Poll::Ready(Ok(n))
     }
@@ -508,8 +527,7 @@ impl tokio::io::AsyncWrite for TcpStreamWriter {
 pin_project_lite::pin_project! {
     struct ReadyStream {
         inner: socket::Socket,
-        #[pin]
-        armed: Option<Op<socket::Poll<true>>>,
+        armed: Option<Pin<Box<Op<socket::Poll<true>>>>>,
         notified: bool,
     }
 }
@@ -523,17 +541,28 @@ impl ReadyStream {
         }
     }
 
+    fn into_socket(self) -> socket::Socket {
+        let Self { inner, armed, .. } = self;
+        drop(armed);
+        inner
+    }
+
     fn poll_op<U>(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         mut f: impl FnMut(ManuallyDrop<socket2::Socket>) -> io::Result<U>,
         flags: u32,
+        direction: Direction,
     ) -> Poll<io::Result<U>> {
         loop {
             log::trace!(target: LOG, "poll_op");
             ready!(self.as_mut().poll_ready(cx, flags))?;
             log::trace!(target: LOG, "poll_op.ready");
             let this = self.as_mut().project();
+            let _permit = this
+                .inner
+                .acquire_ordinary(direction)
+                .expect("ordinary stream I/O polled while bundled mode is active");
             let sock = this.inner.as_socket()?;
             match f(sock) {
                 Ok(res) => {
@@ -557,24 +586,24 @@ impl ReadyStream {
 
 impl ReadyStream {
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>, flags: u32) -> Poll<io::Result<()>> {
-        let mut this = self.project();
+        let this = self.project();
         loop {
             if *this.notified {
                 // If the notified bit is set, return immediately.
                 return Poll::Ready(Ok(()));
             }
-            if let Some(armed) = this.armed.as_mut().as_pin_mut() {
-                if let Some(res) = ready!(armed.poll_next(cx)) {
+            if let Some(armed) = this.armed.as_mut() {
+                if let Some(res) = ready!(armed.as_mut().poll_next(cx)) {
                     log::trace!(target: LOG, "poll_op.ready.stream_notified");
                     let _ = res?;
                     *this.notified = true;
                 } else {
                     log::trace!(target: LOG, "poll_op.ready.stream_done");
-                    this.armed.set(None);
+                    *this.armed = None;
                 }
             } else {
                 log::trace!(target: LOG, "poll_op.ready.stream_arm");
-                this.armed.set(Some(this.inner.poll_readiness(flags)));
+                *this.armed = Some(Box::pin(this.inner.poll_readiness(flags)));
             }
         }
     }

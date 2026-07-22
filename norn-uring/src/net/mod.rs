@@ -7,5 +7,13 @@ mod tcp;
 mod udp;
 
 pub use socket::Event;
-pub use tcp::{TcpListener, TcpSocket, TcpStream, TcpStreamReader, TcpStreamWriter};
-pub use udp::UdpSocket;
+pub use tcp::{
+    AttachRecvRingError, AttachRecvRingErrorKind, AttachSendRingError, AttachSendRingErrorKind,
+    BundledTcpWriter, EnqueueError, FinishSendRingOutcome, SendError, TcpListener, TcpRecvBundles,
+    TcpSocket, TcpStream, TcpStreamReader, TcpStreamWriter,
+};
+pub use udp::{
+    AttachUdpSendRingError, AttachUdpSendRingErrorKind, BundledUdpSocket, DatagramCommitError,
+    DatagramPushError, FinishUdpSendRingOutcome, UdpDatagramBuilder, UdpSocket,
+    SEND_BUNDLE_MAX_SEGMENTS,
+};

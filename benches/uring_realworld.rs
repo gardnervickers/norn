@@ -16,7 +16,7 @@ use futures::stream::{FuturesUnordered, Stream, StreamExt};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use norn_uring::buf::{BufCursor, StableBuf};
-use norn_uring::bufring::{BufRingBuf, BufRingBufBundle, RecvBufRing};
+use norn_uring::bufring::{RecvBuf, RecvBufBundle, RecvBufRing};
 use norn_uring::fs;
 use norn_uring::net::UdpSocket as NornUdpSocket;
 use norn_uring::net::{TcpListener as NornTcpListener, TcpSocket as NornTcpSocket};
@@ -293,20 +293,20 @@ impl UdpRecvMode {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TcpRecvMode {
     Normal,
-    BufRing,
-    BufRingLinked,
-    BufRingMulti,
-    BufRingBundleMulti,
+    RecvBufRing,
+    RecvBufRingLinked,
+    RecvBufRingMulti,
+    RecvBufRingBundleMulti,
 }
 
 impl TcpRecvMode {
     fn as_str(self) -> &'static str {
         match self {
             Self::Normal => "normal",
-            Self::BufRing => "bufring",
-            Self::BufRingLinked => "bufring_linked",
-            Self::BufRingMulti => "bufring_multi",
-            Self::BufRingBundleMulti => "bufring_bundle_multi",
+            Self::RecvBufRing => "bufring",
+            Self::RecvBufRingLinked => "bufring_linked",
+            Self::RecvBufRingMulti => "bufring_multi",
+            Self::RecvBufRingBundleMulti => "bufring_bundle_multi",
         }
     }
 }
@@ -616,7 +616,7 @@ async fn norn_tcp_recv_exact_ring(
 }
 
 fn norn_tcp_validate_exact_ring_buf(
-    buf: BufRingBuf,
+    buf: RecvBuf,
     expected_byte: u8,
     payload_len: usize,
 ) -> io::Result<()> {
@@ -636,7 +636,7 @@ async fn norn_tcp_recv_exact_ring_multi<S>(
     payload_len: usize,
 ) -> io::Result<()>
 where
-    S: Stream<Item = io::Result<BufRingBuf>>,
+    S: Stream<Item = io::Result<RecvBuf>>,
 {
     let mut read = 0;
     while read < payload_len {
@@ -667,7 +667,7 @@ async fn norn_tcp_recv_exact_bundle_multi<S>(
     payload_len: usize,
 ) -> io::Result<()>
 where
-    S: Stream<Item = io::Result<BufRingBufBundle>>,
+    S: Stream<Item = io::Result<RecvBufBundle>>,
 {
     let mut read = 0;
     while read < payload_len {
@@ -718,19 +718,19 @@ async fn norn_tcp_echo_server(
                 requests_per_connection,
                 payload_len,
             )),
-            TcpRecvMode::BufRing
-            | TcpRecvMode::BufRingLinked
-            | TcpRecvMode::BufRingMulti
-            | TcpRecvMode::BufRingBundleMulti => {
+            TcpRecvMode::RecvBufRing
+            | TcpRecvMode::RecvBufRingLinked
+            | TcpRecvMode::RecvBufRingMulti
+            | TcpRecvMode::RecvBufRingBundleMulti => {
                 let ring = tcp_bufring(2_000, connection, payload_len)?;
                 match recv_mode {
-                    TcpRecvMode::BufRing => Box::pin(norn_tcp_echo_connection_bufring(
+                    TcpRecvMode::RecvBufRing => Box::pin(norn_tcp_echo_connection_bufring(
                         socket,
                         ring,
                         requests_per_connection,
                         payload_len,
                     )),
-                    TcpRecvMode::BufRingLinked => {
+                    TcpRecvMode::RecvBufRingLinked => {
                         Box::pin(norn_tcp_echo_connection_bufring_linked(
                             socket,
                             ring,
@@ -738,13 +738,15 @@ async fn norn_tcp_echo_server(
                             payload_len,
                         ))
                     }
-                    TcpRecvMode::BufRingMulti => Box::pin(norn_tcp_echo_connection_bufring_multi(
-                        socket,
-                        ring,
-                        requests_per_connection,
-                        payload_len,
-                    )),
-                    TcpRecvMode::BufRingBundleMulti => {
+                    TcpRecvMode::RecvBufRingMulti => {
+                        Box::pin(norn_tcp_echo_connection_bufring_multi(
+                            socket,
+                            ring,
+                            requests_per_connection,
+                            payload_len,
+                        ))
+                    }
+                    TcpRecvMode::RecvBufRingBundleMulti => {
                         Box::pin(norn_tcp_echo_connection_bufring_bundle_multi(
                             socket,
                             ring,
@@ -878,10 +880,10 @@ async fn norn_tcp_request_response_clients(
                 requests_per_connection,
                 payload_len,
             )),
-            TcpRecvMode::BufRing
-            | TcpRecvMode::BufRingLinked
-            | TcpRecvMode::BufRingMulti
-            | TcpRecvMode::BufRingBundleMulti => {
+            TcpRecvMode::RecvBufRing
+            | TcpRecvMode::RecvBufRingLinked
+            | TcpRecvMode::RecvBufRingMulti
+            | TcpRecvMode::RecvBufRingBundleMulti => {
                 Box::pin(norn_tcp_request_response_client_bufring(
                     server_addr,
                     connection,
@@ -935,13 +937,13 @@ async fn norn_tcp_request_response_client_bufring(
     let ring = tcp_bufring(3_000, connection, payload_len)?;
     let mut send_buf = vec![0x5A; payload_len];
     match recv_mode {
-        TcpRecvMode::BufRing => {
+        TcpRecvMode::RecvBufRing => {
             for _ in 0..requests {
                 send_buf = norn_tcp_send_all(&socket, send_buf).await?;
                 norn_tcp_recv_exact_ring(&socket, &ring, 0x5A, payload_len).await?;
             }
         }
-        TcpRecvMode::BufRingLinked => {
+        TcpRecvMode::RecvBufRingLinked => {
             for _ in 0..requests {
                 let ((send_res, next_send_buf), recv_res) =
                     socket.send(send_buf).then(socket.recv_ring(&ring)).await;
@@ -952,7 +954,7 @@ async fn norn_tcp_request_response_client_bufring(
                 norn_tcp_validate_exact_ring_buf(buf, 0x5A, payload_len)?;
             }
         }
-        TcpRecvMode::BufRingMulti => {
+        TcpRecvMode::RecvBufRingMulti => {
             // Drop the multishot op before returning the socket to in-context
             // drop; explicit close cannot consume its outstanding fd owner.
             {
@@ -964,7 +966,7 @@ async fn norn_tcp_request_response_client_bufring(
             }
             return Ok(());
         }
-        TcpRecvMode::BufRingBundleMulti => {
+        TcpRecvMode::RecvBufRingBundleMulti => {
             // Drop the multishot op before returning the socket to in-context
             // drop; explicit close cannot consume its outstanding fd owner.
             {
@@ -1342,9 +1344,9 @@ fn benches() -> Vec<TestDescAndFn> {
                     let recv_modes: &[TcpRecvMode] = match runtime {
                         RuntimeKind::Norn => &[
                             TcpRecvMode::Normal,
-                            TcpRecvMode::BufRing,
-                            TcpRecvMode::BufRingMulti,
-                            TcpRecvMode::BufRingBundleMulti,
+                            TcpRecvMode::RecvBufRing,
+                            TcpRecvMode::RecvBufRingMulti,
+                            TcpRecvMode::RecvBufRingBundleMulti,
                         ],
                         RuntimeKind::Tokio => &[TcpRecvMode::Normal],
                     };
@@ -1374,7 +1376,7 @@ fn benches() -> Vec<TestDescAndFn> {
     }
 
     for requests_per_connection in [64, 512] {
-        for recv_mode in [TcpRecvMode::BufRing, TcpRecvMode::BufRingLinked] {
+        for recv_mode in [TcpRecvMode::RecvBufRing, TcpRecvMode::RecvBufRingLinked] {
             benches.push(TestDescAndFn {
                 desc: TestDesc {
                     name: Cow::from(format!(
@@ -1414,7 +1416,7 @@ fn benches() -> Vec<TestDescAndFn> {
                     8,
                     requests_per_connection,
                     64,
-                    TcpRecvMode::BufRingMulti,
+                    TcpRecvMode::RecvBufRingMulti,
                     coord_mode,
                 ))),
             });
@@ -1424,9 +1426,9 @@ fn benches() -> Vec<TestDescAndFn> {
     for requests_per_connection in [1, 4, 16, 64] {
         for recv_mode in [
             TcpRecvMode::Normal,
-            TcpRecvMode::BufRing,
-            TcpRecvMode::BufRingMulti,
-            TcpRecvMode::BufRingBundleMulti,
+            TcpRecvMode::RecvBufRing,
+            TcpRecvMode::RecvBufRingMulti,
+            TcpRecvMode::RecvBufRingBundleMulti,
         ] {
             benches.push(TestDescAndFn {
                 desc: TestDesc {

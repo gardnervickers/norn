@@ -12,9 +12,16 @@ use std::net::SocketAddr;
 use std::os::fd::FromRawFd;
 
 use crate::buf::{set_init_checked, StableBuf, StableBufMut};
-use crate::bufring::{BufRingBuf, BufRingBufBundle, RecvBufRing};
-use crate::fd::NornFd;
+use crate::bufring::{RecvBuf, RecvBufBundle, RecvBufRing};
+use crate::fd::{BundledPermit, Direction, ModeConflict, NornFd};
 use crate::operation::{Multishot, Op, Operation, Singleshot};
+
+mod bundle_pump;
+mod bundle_send;
+
+pub(crate) use bundle_pump::{spawn_datagram_pump, DatagramQueue, QueuedDatagram, QueuedSegment};
+pub(crate) use bundle_pump::{spawn_stream_pump, PumpControl, PumpError, PumpPhase, PumpTerminal};
+pub(crate) use bundle_send::{SendBundle, SendEmptyDatagram};
 
 fn invalid_socket_addr_error() -> io::Error {
     io::Error::new(
@@ -162,28 +169,88 @@ impl Socket {
         );
     }
 
+    fn submit_io<T>(&self, op: T, direction: Direction) -> Op<T>
+    where
+        T: Operation + 'static,
+    {
+        let permit = self
+            .fd
+            .acquire_ordinary(direction)
+            .expect("ordinary socket operation constructed while bundled mode is active");
+        self.handle.submit_guarded(op, permit)
+    }
+
+    pub(crate) fn acquire_bundled(
+        &self,
+        direction: Direction,
+    ) -> Result<BundledPermit, ModeConflict> {
+        self.fd.acquire_bundled(direction)
+    }
+
+    pub(crate) fn acquire_ordinary(
+        &self,
+        direction: Direction,
+    ) -> Result<crate::fd::OrdinaryPermit, ModeConflict> {
+        self.fd.acquire_ordinary(direction)
+    }
+
+    pub(crate) fn supports_recvsend_bundle(&self) -> bool {
+        self.handle.supports_recvsend_bundle()
+    }
+
+    pub(crate) fn handle(&self) -> &crate::Handle {
+        &self.handle
+    }
+
+    pub(crate) fn recv_ring_bundle_multi_bundled(
+        &self,
+        ring: &RecvBufRing,
+        permit: BundledPermit,
+    ) -> Op<RecvRingBundleMulti> {
+        self.assert_bufring_driver(ring);
+        let op = RecvRingBundleMulti::new(self.fd.clone(), ring.clone(), 0);
+        self.handle.submit_bundled(op, permit)
+    }
+
+    pub(crate) fn send_bundle_bundled(
+        &self,
+        ring: std::rc::Rc<crate::bufring::send::SendRing>,
+        permit: BundledPermit,
+    ) -> Op<SendBundle> {
+        let op = SendBundle::new(self.fd.clone(), ring.bgid(), ring);
+        self.handle.submit_bundled(op, permit)
+    }
+
+    pub(crate) fn send_empty_datagram_bundled(
+        &self,
+        permit: BundledPermit,
+    ) -> Op<SendEmptyDatagram> {
+        self.handle
+            .submit_bundled(SendEmptyDatagram::new(self.fd.clone()), permit)
+    }
+
     pub(crate) fn recv_from_ring(&self, ring: &RecvBufRing) -> Op<RecvFromRing> {
         self.assert_bufring_driver(ring);
         let op = RecvFromRing::new(self.fd.clone(), ring.clone());
-        self.handle.submit(op)
+        self.submit_io(op, Direction::Read)
     }
 
     pub(crate) fn recv_from_ring_multi(&self, ring: &RecvBufRing) -> Op<RecvFromRingMulti> {
         self.assert_bufring_driver(ring);
         let op = RecvFromRingMulti::new(self.fd.clone(), ring.clone());
-        self.handle.submit(op)
+        self.submit_io(op, Direction::Read)
     }
 
     pub(crate) fn recv_ring_multi(&self, ring: &RecvBufRing) -> Op<RecvRingMulti> {
         self.assert_bufring_driver(ring);
         let op = RecvRingMulti::new(self.fd.clone(), ring.clone(), 0);
-        self.handle.submit(op)
+        self.submit_io(op, Direction::Read)
     }
 
     pub(crate) fn recv_ring_bundle(&self, ring: &RecvBufRing) -> Op<RecvRingBundle> {
         self.assert_bufring_driver(ring);
         let op = RecvRingBundle::new(self.fd.clone(), ring.clone(), 0);
-        self.handle.submit(op)
+        self.submit_io(op, Direction::Read)
     }
 
     pub(crate) fn recv_ring_bundle_with_flags(
@@ -193,13 +260,13 @@ impl Socket {
     ) -> Op<RecvRingBundle> {
         self.assert_bufring_driver(ring);
         let op = RecvRingBundle::new(self.fd.clone(), ring.clone(), flags);
-        self.handle.submit(op)
+        self.submit_io(op, Direction::Read)
     }
 
     pub(crate) fn recv_ring_bundle_multi(&self, ring: &RecvBufRing) -> Op<RecvRingBundleMulti> {
         self.assert_bufring_driver(ring);
         let op = RecvRingBundleMulti::new(self.fd.clone(), ring.clone(), 0);
-        self.handle.submit(op)
+        self.submit_io(op, Direction::Read)
     }
 
     pub(crate) fn recv_ring_bundle_multi_with_flags(
@@ -209,30 +276,38 @@ impl Socket {
     ) -> Op<RecvRingBundleMulti> {
         self.assert_bufring_driver(ring);
         let op = RecvRingBundleMulti::new(self.fd.clone(), ring.clone(), flags);
-        self.handle.submit(op)
+        self.submit_io(op, Direction::Read)
     }
 
     pub(crate) async fn recv_from<B>(&self, buf: B) -> (io::Result<(usize, SocketAddr)>, B)
     where
         B: StableBufMut + 'static,
     {
+        let permit = self
+            .fd
+            .acquire_ordinary(Direction::Read)
+            .expect("ordinary receive started while bundled mode is active");
         let mut buf = buf;
         if let Some(result) = self.try_recv_from(&mut buf, 0) {
             return (result, buf);
         }
         let op = RecvFrom::new(self.fd.clone(), buf, 0);
-        self.handle.submit(op).await
+        self.handle.submit_guarded(op, permit).await
     }
 
     pub(crate) async fn send_to<B>(&self, buf: B, addr: SocketAddr) -> (io::Result<usize>, B)
     where
         B: StableBuf + 'static,
     {
+        let permit = self
+            .fd
+            .acquire_ordinary(Direction::Write)
+            .expect("ordinary send started while bundled mode is active");
         if let Some(result) = self.try_send_to(&buf, Some(addr), 0) {
             return (result, buf);
         }
         let op = SendTo::new(self.fd.clone(), buf, Some(addr), 0);
-        self.handle.submit(op).await
+        self.handle.submit_guarded(op, permit).await
     }
 
     pub(crate) async fn recv_from_with_flags<B>(
@@ -243,12 +318,16 @@ impl Socket {
     where
         B: StableBufMut + 'static,
     {
+        let permit = self
+            .fd
+            .acquire_ordinary(Direction::Read)
+            .expect("ordinary receive started while bundled mode is active");
         let mut buf = buf;
         if let Some(result) = self.try_recv_from(&mut buf, flags) {
             return (result, buf);
         }
         let op = RecvFrom::new(self.fd.clone(), buf, flags as u32);
-        self.handle.submit(op).await
+        self.handle.submit_guarded(op, permit).await
     }
 
     pub(crate) async fn send_to_with_flags<B>(
@@ -260,11 +339,15 @@ impl Socket {
     where
         B: StableBuf + 'static,
     {
+        let permit = self
+            .fd
+            .acquire_ordinary(Direction::Write)
+            .expect("ordinary send started while bundled mode is active");
         if let Some(result) = self.try_send_to(&buf, Some(addr), flags) {
             return (result, buf);
         }
         let op = SendTo::new(self.fd.clone(), buf, Some(addr), flags as u32);
-        self.handle.submit(op).await
+        self.handle.submit_guarded(op, permit).await
     }
 
     pub(crate) fn recv<B>(&self, buf: B) -> Op<Recv<B>>
@@ -272,7 +355,7 @@ impl Socket {
         B: StableBufMut + 'static,
     {
         let op = Recv::new(self.fd.clone(), buf, 0);
-        self.handle.submit(op)
+        self.submit_io(op, Direction::Read)
     }
 
     pub(crate) fn send<B>(&self, buf: B) -> Op<Send<B>>
@@ -280,7 +363,7 @@ impl Socket {
         B: StableBuf + 'static,
     {
         let op = Send::new(self.fd.clone(), buf, 0);
-        self.handle.submit(op)
+        self.submit_io(op, Direction::Write)
     }
 
     pub(crate) fn recv_with_flags<B>(&self, buf: B, flags: i32) -> Op<Recv<B>>
@@ -288,7 +371,7 @@ impl Socket {
         B: StableBufMut + 'static,
     {
         let op = Recv::new(self.fd.clone(), buf, flags);
-        self.handle.submit(op)
+        self.submit_io(op, Direction::Read)
     }
 
     pub(crate) fn send_with_flags<B>(&self, buf: B, flags: i32) -> Op<Send<B>>
@@ -296,7 +379,7 @@ impl Socket {
         B: StableBuf + 'static,
     {
         let op = Send::new(self.fd.clone(), buf, flags);
-        self.handle.submit(op)
+        self.submit_io(op, Direction::Write)
     }
 
     pub(crate) fn send_zc<B>(&self, buf: B) -> Op<SendZc<B>>
@@ -304,7 +387,7 @@ impl Socket {
         B: StableBuf + 'static,
     {
         let op = SendZc::new(self.fd.clone(), buf, 0);
-        self.handle.submit(op)
+        self.submit_io(op, Direction::Write)
     }
 
     pub(crate) fn send_zc_with_flags<B>(&self, buf: B, flags: i32) -> Op<SendZc<B>>
@@ -312,7 +395,7 @@ impl Socket {
         B: StableBuf + 'static,
     {
         let op = SendZc::new(self.fd.clone(), buf, flags);
-        self.handle.submit(op)
+        self.submit_io(op, Direction::Write)
     }
 
     pub(crate) fn send_msg_zc<B>(&self, buf: B, flags: i32) -> Op<SendMsgZc<B>>
@@ -320,17 +403,17 @@ impl Socket {
         B: StableBuf + 'static,
     {
         let op = SendMsgZc::new(self.fd.clone(), buf, flags);
-        self.handle.submit(op)
+        self.submit_io(op, Direction::Write)
     }
 
     pub(crate) async fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()> {
-        let how = match how {
-            std::net::Shutdown::Read => libc::SHUT_RD,
-            std::net::Shutdown::Write => libc::SHUT_WR,
-            std::net::Shutdown::Both => libc::SHUT_RDWR,
+        let (how, direction) = match how {
+            std::net::Shutdown::Read => (libc::SHUT_RD, Direction::Read),
+            std::net::Shutdown::Write => (libc::SHUT_WR, Direction::Write),
+            std::net::Shutdown::Both => (libc::SHUT_RDWR, Direction::Both),
         };
         let op = Shutdown::new(self.fd.clone(), how);
-        self.handle.submit(op).await
+        self.submit_io(op, direction).await
     }
 
     pub(crate) fn poll_readiness<const MULTI: bool>(&self, events: u32) -> Op<Poll<MULTI>> {
@@ -812,7 +895,7 @@ unsafe impl Operation for RecvFromRing {
 }
 
 impl Singleshot for RecvFromRing {
-    type Output = io::Result<(BufRingBuf, SocketAddr)>;
+    type Output = io::Result<(RecvBuf, SocketAddr)>;
 
     fn complete(self, result: crate::operation::CQEResult) -> Self::Output {
         let mut this = self;
@@ -830,7 +913,7 @@ impl Singleshot for RecvFromRing {
 /// A bufring-backed receive buffer that exposes only payload bytes for `RecvMsgMulti`.
 #[derive(Debug)]
 pub struct RecvMsgRingBuf {
-    buf: BufRingBuf,
+    buf: RecvBuf,
     payload_offset: usize,
     payload_len: usize,
 }
@@ -844,7 +927,7 @@ impl std::ops::Deref for RecvMsgRingBuf {
 }
 
 impl RecvMsgRingBuf {
-    fn new(buf: BufRingBuf, payload_offset: usize, payload_len: usize) -> Self {
+    fn new(buf: RecvBuf, payload_offset: usize, payload_len: usize) -> Self {
         Self {
             buf,
             payload_offset,
@@ -975,7 +1058,7 @@ impl RecvRingMulti {
         Self { fd, ring, flags }
     }
 
-    fn to_item(&self, result: crate::operation::CQEResult) -> io::Result<BufRingBuf> {
+    fn to_item(&self, result: crate::operation::CQEResult) -> io::Result<RecvBuf> {
         let n = result.result?;
         self.ring.get_buf(n, result.flags)
     }
@@ -1006,7 +1089,7 @@ unsafe impl Operation for RecvRingMulti {
 }
 
 impl Multishot for RecvRingMulti {
-    type Item = io::Result<BufRingBuf>;
+    type Item = io::Result<RecvBuf>;
 
     fn update(&mut self, result: crate::operation::CQEResult) -> Self::Item {
         self.to_item(result)
@@ -1055,7 +1138,7 @@ unsafe impl Operation for RecvRingBundle {
 }
 
 impl Singleshot for RecvRingBundle {
-    type Output = io::Result<BufRingBufBundle>;
+    type Output = io::Result<RecvBufBundle>;
 
     fn complete(self, result: crate::operation::CQEResult) -> Self::Output {
         let n = result.result?;
@@ -1075,7 +1158,7 @@ impl RecvRingBundleMulti {
         Self { fd, ring, flags }
     }
 
-    fn to_item(&self, result: crate::operation::CQEResult) -> io::Result<BufRingBufBundle> {
+    fn to_item(&self, result: crate::operation::CQEResult) -> io::Result<RecvBufBundle> {
         let n = result.result?;
         self.ring.get_buf_bundle(n, result.flags)
     }
@@ -1108,7 +1191,7 @@ unsafe impl Operation for RecvRingBundleMulti {
 }
 
 impl Multishot for RecvRingBundleMulti {
-    type Item = io::Result<BufRingBufBundle>;
+    type Item = io::Result<RecvBufBundle>;
 
     fn update(&mut self, result: crate::operation::CQEResult) -> Self::Item {
         self.to_item(result)

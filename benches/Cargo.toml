@@ -101,3 +101,8 @@ harness = false
 name = "uring_completion_backlog"
 path = "uring_completion_backlog.rs"
 harness = false
+
+[[bench]]
+name = "bundle_send"
+path = "bundle_send.rs"
+harness = false

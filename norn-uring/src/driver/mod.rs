@@ -86,6 +86,7 @@ pub struct Handle {
 
 struct Shared {
     ring: RefCell<IoUring>,
+    recvsend_bundle: bool,
     backpressure: Notify,
     status: Cell<Status>,
     submit_error: RefCell<Option<(io::ErrorKind, String)>>,
@@ -282,6 +283,24 @@ impl Handle {
         Op::new(op, self.clone())
     }
 
+    pub(crate) fn submit_guarded<T>(
+        &self,
+        op: T,
+        terminal_guard: crate::fd::OrdinaryPermit,
+    ) -> Op<T>
+    where
+        T: Operation + 'static,
+    {
+        Op::new_guarded(op, self.clone(), terminal_guard)
+    }
+
+    pub(crate) fn submit_bundled<T>(&self, op: T, terminal_guard: crate::fd::BundledPermit) -> Op<T>
+    where
+        T: Operation + 'static,
+    {
+        Op::new_guarded(op, self.clone(), terminal_guard)
+    }
+
     /// Issue a cancellation request.
     ///
     /// Setting `sync` to true will cause the cancellation to
@@ -373,6 +392,10 @@ impl Handle {
         self.shared.health_error()
     }
 
+    pub(crate) fn supports_recvsend_bundle(&self) -> bool {
+        self.shared.recvsend_bundle
+    }
+
     pub(crate) fn same_driver(&self, other: &Self) -> bool {
         Rc::ptr_eq(&self.shared, &other.shared)
     }
@@ -394,9 +417,11 @@ impl Driver {
     /// Create a new [`Driver`] with the provided size from the provided [`io_uring::Builder`].
     pub fn new(mut builder: io_uring::Builder, size: u32) -> io::Result<Self> {
         let ring = builder.dontfork().build(size)?;
+        let recvsend_bundle = ring.params().is_feature_recvsend_bundle();
         Ok(Self {
             shared: Rc::new(Shared {
                 ring: RefCell::new(ring),
+                recvsend_bundle,
                 backpressure: Notify::default(),
                 status: Cell::new(Status::Running),
                 submit_error: RefCell::new(None),
@@ -731,11 +756,11 @@ impl Shared {
     fn try_push_batch(
         &self,
         mut entries: SmallVec<[ConfiguredEntry; 4]>,
-    ) -> Result<(), SmallVec<[ConfiguredEntry; 4]>> {
+    ) -> Result<(), Box<SmallVec<[ConfiguredEntry; 4]>>> {
         let mut ring = self.ring.borrow_mut();
         let mut sq = ring.submission();
         if sq.capacity() - sq.len() < entries.len() {
-            return Err(entries);
+            return Err(Box::new(entries));
         }
 
         if entries.len() == 1 {

@@ -36,7 +36,7 @@ pin_project_lite::pin_project! {
 
 enum PendingSubmission {
     Single(Option<ConfiguredEntry>),
-    Batch(SmallVec<[ConfiguredEntry; 4]>),
+    Batch(Box<SmallVec<[ConfiguredEntry; 4]>>),
 }
 
 impl PushFuture {
@@ -58,7 +58,7 @@ impl PushFuture {
         let inner = PushFutureInner {
             shared,
             notify: None,
-            pending: PendingSubmission::Batch(entries),
+            pending: PendingSubmission::Batch(Box::new(entries)),
         };
         PushFuture {
             shared: Some(shared),
@@ -103,9 +103,9 @@ impl Future for PushFutureInner<'_> {
                         return Poll::Ready(Err(err));
                     }
                     if let Err(returned_entries) =
-                        this.shared.try_push_batch(std::mem::take(entries))
+                        this.shared.try_push_batch(std::mem::take(entries.as_mut()))
                     {
-                        *entries = returned_entries;
+                        **entries = *returned_entries;
                         log::trace!(target: LOG, "ring.push.full");
                         Pin::set(&mut this.notify, Some(this.shared.backpressure.wait()));
                         continue;

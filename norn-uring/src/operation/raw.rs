@@ -6,6 +6,7 @@ use std::cell::UnsafeCell;
 use std::ptr::NonNull;
 use std::{io, mem};
 
+use crate::fd::TerminalPermit;
 use crate::operation::header::{Header, VTable};
 use crate::operation::Operation;
 
@@ -13,6 +14,7 @@ use crate::operation::Operation;
 pub(crate) struct RawOp<T> {
     header: Header,
     data: UnsafeCell<Option<T>>,
+    terminal_guard: UnsafeCell<Option<TerminalPermit>>,
 }
 
 impl<T> RawOp<T>
@@ -26,10 +28,18 @@ where
     };
 
     pub(crate) fn allocate(data: T) -> NonNull<Header> {
+        Self::allocate_guarded(data, None)
+    }
+
+    pub(crate) fn allocate_guarded(
+        data: T,
+        terminal_guard: Option<TerminalPermit>,
+    ) -> NonNull<Header> {
         let header = Header::new(&Self::VTABLE);
         let raw = RawOp {
             header,
             data: UnsafeCell::new(Some(data)),
+            terminal_guard: UnsafeCell::new(terminal_guard),
         };
         let ptr = Box::into_raw(Box::new(raw));
         // Safety: `ptr` is a valid pointer to a `Header`. RawOp is also
@@ -81,14 +91,18 @@ where
     unsafe fn complete(ptr: NonNull<Header>, result: CQEResult) -> bool {
         let more = result.more();
         let this = Self::from_raw_header(ptr);
-        let header = &this.as_ref().header;
-        assert!(!header.is_complete());
+        let raw = this.as_ref();
+        assert!(!raw.header.is_complete());
+        let header = &raw.header;
         {
             let mut completions = header.completions().borrow_mut();
             completions.push(result);
         }
         if !more {
             header.set_complete();
+            // Safety: the single-threaded driver serializes completion, and
+            // this is the only early-release path for the terminal guard.
+            (*raw.terminal_guard.get()).take();
         }
         if let Some(waker) = header.take_waker() {
             waker.wake();

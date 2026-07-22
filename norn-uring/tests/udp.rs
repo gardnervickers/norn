@@ -7,16 +7,31 @@ use std::task::Poll;
 use bytes::{Bytes, BytesMut};
 use futures_util::future::poll_fn;
 use futures_util::StreamExt;
-use norn_uring::bufring::{BufRingBufBundle, RecvBufRing};
-use norn_uring::net::UdpSocket;
+use norn_uring::buf::StableBufMut;
+use norn_uring::bufring::{RecvBufBundle, RecvBufRing, SendBuf, SendBufRing};
+use norn_uring::net::{
+    AttachUdpSendRingErrorKind, FinishUdpSendRingOutcome, UdpSocket, SEND_BUNDLE_MAX_SEGMENTS,
+};
 
 mod util;
 
-fn flatten_bundle(bundle: &BufRingBufBundle) -> Vec<u8> {
+fn flatten_bundle(bundle: &RecvBufBundle) -> Vec<u8> {
     bundle
         .iter()
         .flat_map(|chunk| chunk.iter().copied())
         .collect()
+}
+
+fn initialized_send_buf(mut buffer: SendBuf, bytes: &[u8]) -> SendBuf {
+    assert!(bytes.len() <= buffer.capacity());
+    for (slot, byte) in buffer.spare_capacity_mut()[..bytes.len()]
+        .iter_mut()
+        .zip(bytes)
+    {
+        slot.write(*byte);
+    }
+    unsafe { buffer.set_init(bytes.len()) };
+    buffer
 }
 
 const TRUNC_PAYLOAD: &[u8] = b"a datagram much larger than the receive buffer";
@@ -76,6 +91,275 @@ fn connected_send_recv() -> Result<(), Box<dyn std::error::Error>> {
         let n = res?;
         assert_eq!(&buf[..n], b"pong");
 
+        Ok(())
+    })
+}
+
+#[test]
+fn bundled_udp_preserves_multi_segment_datagram_boundaries(
+) -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let sender = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let receiver = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        sender.connect(receiver.local_addr()?).await?;
+        receiver.connect(sender.local_addr()?).await?;
+
+        let ring = SendBufRing::builder(19).buf_count(8).buf_len(32).build()?;
+        let mut sender = match sender.attach_send_ring(ring) {
+            Ok(sender) => sender,
+            Err(error) if error.kind() == AttachUdpSendRingErrorKind::Unsupported => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+
+        {
+            let mut datagram = sender.datagram();
+            let first = initialized_send_buf(datagram.acquire().await?, b"header-");
+            let first_len = first.len();
+            datagram.push(first, first_len)?;
+            let second = initialized_send_buf(datagram.acquire().await?, b"payload-one");
+            let second_len = second.len();
+            datagram.push(second, second_len)?;
+            datagram.commit().await.unwrap();
+        }
+        {
+            let mut datagram = sender.datagram();
+            for part in [b"second-".as_slice(), b"packet-", b"payload"] {
+                let buffer = initialized_send_buf(datagram.acquire().await?, part);
+                let len = buffer.len();
+                datagram.push(buffer, len)?;
+            }
+            datagram.commit().await.unwrap();
+        }
+        sender.datagram().commit().await.unwrap();
+        sender.flush().await?;
+
+        let FinishUdpSendRingOutcome::Drained { socket: _, ring } = sender.finish_send_ring().await
+        else {
+            panic!("bundled UDP sender did not drain cleanly");
+        };
+        assert_eq!(ring.buf_count(), 8);
+
+        let expected: [&[u8]; 3] = [b"header-payload-one", b"second-packet-payload", b""];
+        for message in expected {
+            let (result, buffer) = receiver.recv(BytesMut::with_capacity(64)).await;
+            let len = result?;
+            assert_eq!(&buffer[..len], message);
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn bundled_udp_builder_exhaustion_fails_without_waiting() -> Result<(), Box<dyn std::error::Error>>
+{
+    util::with_test_env(|| async {
+        let sender = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let receiver = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        sender.connect(receiver.local_addr()?).await?;
+
+        let ring = SendBufRing::builder(23).buf_count(3).buf_len(16).build()?;
+        let mut sender = match sender.attach_send_ring(ring) {
+            Ok(sender) => sender,
+            Err(error) if error.kind() == AttachUdpSendRingErrorKind::Unsupported => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+
+        let mut datagram = sender.datagram();
+        for byte in *b"abc" {
+            let buffer = initialized_send_buf(datagram.acquire().await?, &[byte]);
+            datagram.push(buffer, 1)?;
+        }
+        let error = datagram
+            .try_acquire()
+            .expect_err("builder must reject its segment limit synchronously");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        drop(datagram);
+
+        let FinishUdpSendRingOutcome::Drained { socket, ring } = sender.finish_send_ring().await
+        else {
+            panic!("bundled UDP sender did not drain cleanly");
+        };
+        drop(ring);
+        socket.close().await?;
+        receiver.close().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn bundled_udp_unpushed_acquisition_counts_toward_builder_limit(
+) -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let sender = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let receiver = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        sender.connect(receiver.local_addr()?).await?;
+
+        let ring = SendBufRing::builder(34).buf_count(1).buf_len(16).build()?;
+        let mut sender = match sender.attach_send_ring(ring) {
+            Ok(sender) => sender,
+            Err(error) if error.kind() == AttachUdpSendRingErrorKind::Unsupported => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+
+        let mut datagram = sender.datagram();
+        let held = datagram.acquire().await?;
+        let mut second = Box::pin(datagram.acquire());
+        let Poll::Ready(Err(error)) = futures_util::poll!(second.as_mut()) else {
+            panic!("builder must reject a second acquisition without waiting");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        drop(second);
+        drop(datagram);
+        drop(held);
+
+        let FinishUdpSendRingOutcome::Drained { socket, ring } = sender.finish_send_ring().await
+        else {
+            panic!("bundled UDP sender did not drain cleanly");
+        };
+        drop(ring);
+        socket.close().await?;
+        receiver.close().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn bundled_udp_empty_commit_rejects_an_unpushed_acquisition(
+) -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let sender = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let receiver = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        sender.connect(receiver.local_addr()?).await?;
+
+        let ring = SendBufRing::builder(35).buf_count(1).buf_len(16).build()?;
+        let mut sender = match sender.attach_send_ring(ring) {
+            Ok(sender) => sender,
+            Err(error) if error.kind() == AttachUdpSendRingErrorKind::Unsupported => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+
+        let mut datagram = sender.datagram();
+        let held = datagram.acquire().await?;
+        let error = datagram
+            .commit()
+            .await
+            .expect_err("empty commit must not wait behind its own acquisition");
+        assert_eq!(
+            error.error().to_io_error().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        drop(error);
+        drop(held);
+
+        let FinishUdpSendRingOutcome::Drained { socket, ring } = sender.finish_send_ring().await
+        else {
+            panic!("bundled UDP sender did not drain cleanly");
+        };
+        drop(ring);
+        socket.close().await?;
+        receiver.close().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn bundled_udp_caps_datagrams_at_kernel_bundle_limit() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let sender = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let receiver = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        sender.connect(receiver.local_addr()?).await?;
+
+        let ring = SendBufRing::builder(36).buf_count(512).buf_len(1).build()?;
+        let mut sender = match sender.attach_send_ring(ring) {
+            Ok(sender) => sender,
+            Err(error) if error.kind() == AttachUdpSendRingErrorKind::Unsupported => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+
+        let mut datagram = sender.datagram();
+        let mut held = Vec::with_capacity(SEND_BUNDLE_MAX_SEGMENTS);
+        for _ in 0..SEND_BUNDLE_MAX_SEGMENTS {
+            held.push(datagram.acquire().await?);
+        }
+        let error = datagram
+            .try_acquire()
+            .expect_err("builder must enforce the kernel's bundle limit before publication");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        drop(datagram);
+        drop(held);
+
+        let FinishUdpSendRingOutcome::Drained { socket, ring } = sender.finish_send_ring().await
+        else {
+            panic!("bundled UDP sender did not drain cleanly");
+        };
+        drop(ring);
+        socket.close().await?;
+        receiver.close().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn bundled_udp_flush_snapshots_only_committed_datagrams() -> Result<(), Box<dyn std::error::Error>>
+{
+    util::with_test_env(|| async {
+        let sender = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let receiver = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        sender.connect(receiver.local_addr()?).await?;
+
+        let ring = SendBufRing::builder(25).buf_count(2).buf_len(16).build()?;
+        let mut sender = match sender.attach_send_ring(ring) {
+            Ok(sender) => sender,
+            Err(error) if error.kind() == AttachUdpSendRingErrorKind::Unsupported => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+
+        let mut builder = sender.datagram();
+        let held = builder.acquire().await?;
+        drop(builder);
+        sender.flush().await?;
+        drop(held);
+
+        let FinishUdpSendRingOutcome::Drained { socket, ring } = sender.finish_send_ring().await
+        else {
+            panic!("bundled UDP sender did not drain cleanly");
+        };
+        drop(ring);
+        socket.close().await?;
+        receiver.close().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn bundled_udp_empty_datagrams_consume_ring_capacity() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let sender = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let receiver = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        sender.connect(receiver.local_addr()?).await?;
+
+        let ring = SendBufRing::builder(26).buf_count(1).buf_len(16).build()?;
+        let mut sender = match sender.attach_send_ring(ring) {
+            Ok(sender) => sender,
+            Err(error) if error.kind() == AttachUdpSendRingErrorKind::Unsupported => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+
+        sender.datagram().commit().await.unwrap();
+        let mut second = Box::pin(sender.datagram().commit());
+        assert!(matches!(
+            futures_util::poll!(second.as_mut()),
+            Poll::Pending
+        ));
+        drop(second);
+        sender.flush().await?;
+        let FinishUdpSendRingOutcome::Drained { socket, ring } = sender.finish_send_ring().await
+        else {
+            panic!("bundled UDP sender did not drain cleanly");
+        };
+        drop(ring);
+        socket.close().await?;
+        receiver.close().await?;
         Ok(())
     })
 }

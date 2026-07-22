@@ -133,16 +133,9 @@ impl Drop for PollSet {
 mod tests {
     use std::future::{pending, Future};
     use std::pin::pin;
-    use std::sync::Arc;
-    use std::task::{Context, Poll, Wake, Waker};
+    use std::task::{Context, Poll, Waker};
 
     use super::PollSet;
-
-    struct NoopWaker;
-
-    impl Wake for NoopWaker {
-        fn wake(self: Arc<Self>) {}
-    }
 
     #[test]
     fn dropping_pollset_cancels_pending_tasks() {
@@ -153,15 +146,13 @@ mod tests {
                 1usize
             });
 
-            let waker = Waker::from(Arc::new(NoopWaker));
-            let mut cx = Context::from_waker(&waker);
+            let mut cx = Context::from_waker(Waker::noop());
             let _ = set.as_mut().poll(&mut cx);
             handle
         };
 
         let mut handle = pin!(handle);
-        let waker = Waker::from(Arc::new(NoopWaker));
-        let mut cx = Context::from_waker(&waker);
+        let mut cx = Context::from_waker(Waker::noop());
         let poll = Future::poll(handle.as_mut(), &mut cx);
         let Poll::Ready(res) = poll else {
             panic!("expected dropped pollset to cancel pending tasks");

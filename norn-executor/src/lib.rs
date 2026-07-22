@@ -114,13 +114,18 @@ pub struct Handle {
 }
 
 impl Handle {
+    /// Returns a handle to the current executor, or `None` outside its context.
+    pub fn try_current() -> Option<Self> {
+        context::Context::handle()
+    }
+
     /// Returns a [`Handle`] to the current [`LocalExecutor`].
     ///
     /// ### Panics
     /// This function will panic if called from outside of a [`LocalExecutor`]
     /// context.
     pub fn current() -> Self {
-        context::Context::handle().expect("executor not set")
+        Self::try_current().expect("executor not set")
     }
 
     /// Spawn a [`Future`] onto the [`LocalExecutor`].

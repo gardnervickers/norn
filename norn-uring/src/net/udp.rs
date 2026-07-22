@@ -5,9 +5,16 @@ use std::net::SocketAddr;
 use socket2::{Domain, Type};
 
 use crate::buf::{StableBuf, StableBufMut};
-use crate::bufring::{BufRingBuf, RecvBufRing};
+use crate::bufring::{RecvBuf, RecvBufRing};
 use crate::net::socket;
 use crate::operation::Op;
+
+mod bundled_send;
+
+pub use bundled_send::{
+    AttachUdpSendRingError, AttachUdpSendRingErrorKind, BundledUdpSocket, DatagramCommitError,
+    DatagramPushError, FinishUdpSendRingOutcome, UdpDatagramBuilder, SEND_BUNDLE_MAX_SEGMENTS,
+};
 
 /// A UDP socket.
 ///
@@ -214,7 +221,7 @@ impl UdpSocket {
     /// # Panics
     ///
     /// Panics when the buffer ring was registered with another driver.
-    pub async fn recv_from_ring(&self, ring: &RecvBufRing) -> io::Result<(BufRingBuf, SocketAddr)> {
+    pub async fn recv_from_ring(&self, ring: &RecvBufRing) -> io::Result<(RecvBuf, SocketAddr)> {
         self.inner.recv_from_ring(ring).await
     }
 

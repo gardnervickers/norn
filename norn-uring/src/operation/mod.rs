@@ -15,6 +15,7 @@ use smallvec::SmallVec;
 
 use crate::driver::{PushFuture, TryPush};
 use crate::error::SubmitError;
+use crate::fd::TerminalPermit;
 use header::CompletionQueue;
 
 /// Low-level request customization for advanced io_uring users.
@@ -262,6 +263,26 @@ where
         true
     }
 
+    fn cancel_waiting(&mut self) -> bool {
+        let state = mem::replace(self, State::Done);
+        let handle = match state {
+            State::Waiting { mut handle } => handle.take().expect("handle missing"),
+            state => {
+                *self = state;
+                return false;
+            }
+        };
+        handle
+            .untyped()
+            .complete(CQEResult::synthetic(Err(io::Error::from_raw_os_error(
+                libc::ECANCELED,
+            ))));
+        *self = State::Submitted {
+            inner: SubmittedOp { inner: handle },
+        };
+        true
+    }
+
     fn finish_submit(&mut self) {
         let state = mem::replace(self, State::Done);
         *self = match state {
@@ -296,7 +317,19 @@ where
     T: Operation + 'static,
 {
     pub(crate) fn new(data: T, reactor: crate::Handle) -> Self {
-        let mut handle = TypedHandle::new(data);
+        Self::new_inner(data, reactor, None)
+    }
+
+    pub(crate) fn new_guarded(
+        data: T,
+        reactor: crate::Handle,
+        terminal_guard: impl Into<TerminalPermit>,
+    ) -> Self {
+        Self::new_inner(data, reactor, Some(terminal_guard.into()))
+    }
+
+    fn new_inner(data: T, reactor: crate::Handle, terminal_guard: Option<TerminalPermit>) -> Self {
+        let mut handle = TypedHandle::new_guarded(data, terminal_guard);
         // Safety: The handle was just created and no other references to its operation data
         // exist. `RawOp` keeps the data at a stable address until the operation completes.
         let data = unsafe { handle.data_mut().expect("operation already completed") };
@@ -373,6 +406,47 @@ where
                 let criteria = CancelBuilder::user_data(user_data as u64);
                 let _ = self.reactor.cancel(criteria, false);
             }
+        }
+    }
+
+    /// Prevent this operation from starting, or cancel it if it already reached
+    /// the kernel. Polling afterward drains the synthetic or kernel terminal
+    /// completion.
+    pub(crate) fn request_stop(mut self: Pin<&mut Self>) {
+        let cancel_submitted = {
+            let mut this = self.as_mut().project();
+            match this.state {
+                State::Prepared { .. } | State::ConfigureFailed { .. } => {
+                    if this.state.cancel_unsubmitted() {
+                        *this.completed = false;
+                    }
+                    false
+                }
+                State::Waiting { .. } if this.submit.is_some() => {
+                    // Dropping PushFuture first drops its ConfiguredEntry and
+                    // therefore the would-be kernel reference. The typed handle
+                    // in State::Waiting is then the sole operation owner.
+                    this.submit.set(None);
+                    if this.state.cancel_waiting() {
+                        *this.completed = false;
+                    }
+                    false
+                }
+                State::Waiting { .. } => {
+                    // This state is used by externally prepared request batches;
+                    // their entry may already be outside this Op.
+                    debug_assert!(
+                        false,
+                        "cannot stop an externally prepared waiting operation"
+                    );
+                    false
+                }
+                State::Submitted { .. } => !*this.completed,
+                State::Done => false,
+            }
+        };
+        if cancel_submitted {
+            self.cancel_unfinished();
         }
     }
 
@@ -470,6 +544,17 @@ where
 {
     pub(crate) fn new(data: T) -> Self {
         let ptr = raw::RawOp::<T>::allocate(data);
+        Self {
+            inner: RawOpRef::from(ptr),
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    fn new_guarded(data: T, terminal_guard: Option<TerminalPermit>) -> Self {
+        let Some(terminal_guard) = terminal_guard else {
+            return Self::new(data);
+        };
+        let ptr = raw::RawOp::<T>::allocate_guarded(data, Some(terminal_guard));
         Self {
             inner: RawOpRef::from(ptr),
             _marker: std::marker::PhantomData,
@@ -606,6 +691,7 @@ mod tests {
     use std::task::{Poll, Wake, Waker};
 
     use super::*;
+    use crate::fd::{Direction, NornFd};
 
     #[derive(Debug, Default)]
     struct TestOp(Vec<CQEResult>);
@@ -760,6 +846,65 @@ mod tests {
 
         drop(typed);
         assert_eq!(&*cleaned.borrow(), &[10, 20, 30]);
+    }
+
+    #[test]
+    fn terminal_guard_is_released_by_terminal_completion() {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let fd = NornFd::from_fd(fds[0]);
+        let permit = fd.acquire_ordinary(Direction::Read).unwrap();
+        let typed = TypedHandle::new_guarded(TestMultishot, Some(permit.into()));
+
+        assert!(fd.acquire_bundled(Direction::Read).is_err());
+        typed.untyped().complete(CQEResult::new(Ok(1), 0));
+        let bundled = fd.acquire_bundled(Direction::Read).unwrap();
+
+        drop(bundled);
+        drop(typed);
+        drop(fd);
+        unsafe { libc::close(fds[1]) };
+    }
+
+    #[test]
+    fn terminal_guard_survives_more_completions() {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let fd = NornFd::from_fd(fds[0]);
+        let permit = fd.acquire_ordinary(Direction::Read).unwrap();
+        let typed = TypedHandle::new_guarded(TestMultishot, Some(permit.into()));
+        let kernel_ref = typed.untyped().into_raw_usize();
+
+        let more_ref = unsafe { RawOpRef::from_raw_usize(kernel_ref) };
+        more_ref.complete(CQEResult::new(Ok(1), more_flag()));
+        assert!(fd.acquire_bundled(Direction::Read).is_err());
+
+        let terminal_ref = unsafe { RawOpRef::from_raw_usize(kernel_ref) };
+        terminal_ref.complete(CQEResult::new(Ok(2), 0));
+        let bundled = fd.acquire_bundled(Direction::Read).unwrap();
+
+        drop(bundled);
+        drop(typed);
+        drop(fd);
+        unsafe { libc::close(fds[1]) };
+    }
+
+    #[test]
+    fn dropping_unsubmitted_handle_releases_terminal_guard() {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let fd = NornFd::from_fd(fds[0]);
+        let permit = fd.acquire_ordinary(Direction::Write).unwrap();
+
+        drop(TypedHandle::new_guarded(
+            TestOp::default(),
+            Some(permit.into()),
+        ));
+        let bundled = fd.acquire_bundled(Direction::Write).unwrap();
+
+        drop(bundled);
+        drop(fd);
+        unsafe { libc::close(fds[1]) };
     }
 
     #[test]
@@ -922,6 +1067,53 @@ mod tests {
         let op = op.as_ref().get_ref();
         assert!(op.submit.is_none());
         assert!(matches!(op.state, State::Submitted { .. }));
+    }
+
+    #[test]
+    fn request_stop_cancels_an_operation_waiting_for_sq_space() {
+        #[derive(Debug)]
+        struct StoppableNop;
+
+        unsafe impl Operation for StoppableNop {
+            fn cleanup(&mut self, _: CQEResult) {}
+
+            fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+                Ok(io_uring::opcode::Nop::new().build())
+            }
+        }
+
+        impl Singleshot for StoppableNop {
+            type Output = (bool, io::Result<()>);
+
+            fn complete(self, result: CQEResult) -> Self::Output {
+                (result.is_synthetic(), result.result.map(drop))
+            }
+        }
+
+        let mut driver = crate::Driver::new(io_uring::IoUring::builder(), 2).unwrap();
+        let handle = driver.handle();
+        let waker = futures_test::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        let mut occupying = Vec::new();
+
+        loop {
+            let mut op = Box::pin(handle.submit(StoppableNop));
+            assert!(op.as_mut().poll(&mut cx).is_pending());
+            if matches!(op.as_ref().get_ref().state, State::Waiting { .. }) {
+                op.as_mut().request_stop();
+                let Poll::Ready((synthetic, Err(error))) = op.as_mut().poll(&mut cx) else {
+                    panic!("stopped SQ waiter did not complete synthetically")
+                };
+                assert!(synthetic);
+                assert_eq!(error.raw_os_error(), Some(libc::ECANCELED));
+                break;
+            }
+            occupying.push(op);
+            assert!(occupying.len() < 16, "submission queue did not fill");
+        }
+
+        drop(occupying);
+        norn_executor::park::Park::shutdown(&mut driver);
     }
 
     #[test]
