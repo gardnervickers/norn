@@ -373,24 +373,16 @@ mod tests {
     use std::cell::Cell;
     use std::future::{pending, Future};
     use std::pin::Pin;
-    use std::sync::Arc;
-    use std::task::{Context, Poll, Wake, Waker};
+    use std::task::{Context, Poll, Waker};
 
     use norn_executor::park::SpinPark;
     use norn_executor::LocalExecutor;
-
-    struct NoopWaker;
-
-    impl Wake for NoopWaker {
-        fn wake(self: Arc<Self>) {}
-    }
 
     fn poll_once<F>(fut: Pin<&mut F>) -> Poll<F::Output>
     where
         F: Future,
     {
-        let waker = Waker::from(Arc::new(NoopWaker));
-        let mut cx = Context::from_waker(&waker);
+        let mut cx = Context::from_waker(Waker::noop());
         fut.poll(&mut cx)
     }
 

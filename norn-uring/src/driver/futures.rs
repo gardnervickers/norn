@@ -34,6 +34,9 @@ pin_project_lite::pin_project! {
     }
 }
 
+// `PushFuture` normally lives inside the task allocation. Keep the first four
+// batch entries inline rather than adding a second allocation for this variant.
+#[allow(clippy::large_enum_variant)]
 enum PendingSubmission {
     Single(Option<ConfiguredEntry>),
     Batch(SmallVec<[ConfiguredEntry; 4]>),
@@ -102,10 +105,7 @@ impl Future for PushFutureInner<'_> {
                     if let Err(err) = this.shared.validate_batch_len(entries.len()) {
                         return Poll::Ready(Err(err));
                     }
-                    if let Err(returned_entries) =
-                        this.shared.try_push_batch(std::mem::take(entries))
-                    {
-                        *entries = returned_entries;
+                    if !this.shared.try_push_batch(entries) {
                         log::trace!(target: LOG, "ring.push.full");
                         Pin::set(&mut this.notify, Some(this.shared.backpressure.wait()));
                         continue;

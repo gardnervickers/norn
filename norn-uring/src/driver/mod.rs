@@ -727,27 +727,24 @@ impl Shared {
     /// Attempt to push a batch of entries into the submission queue.
     ///
     /// If the submission queue does not have enough free capacity for the full
-    /// batch, the original entries are returned unchanged.
-    fn try_push_batch(
-        &self,
-        mut entries: SmallVec<[ConfiguredEntry; 4]>,
-    ) -> Result<(), SmallVec<[ConfiguredEntry; 4]>> {
+    /// batch, returns `false` and leaves the entries unchanged.
+    fn try_push_batch(&self, entries: &mut SmallVec<[ConfiguredEntry; 4]>) -> bool {
         let mut ring = self.ring.borrow_mut();
         let mut sq = ring.submission();
         if sq.capacity() - sq.len() < entries.len() {
-            return Err(entries);
+            return false;
         }
 
         if entries.len() == 1 {
             let entry = entries.pop().expect("singleton batch missing entry");
             let entry = entry.into_entry_with_flags(Flags::empty());
             unsafe { sq.push(&entry) }.unwrap();
-            return Ok(());
+            return true;
         }
 
         let len = entries.len();
         let mut raw_entries = SmallVec::<[io_uring::squeue::Entry; 4]>::with_capacity(len);
-        for (idx, entry) in entries.into_iter().enumerate() {
+        for (idx, entry) in std::mem::take(entries).into_iter().enumerate() {
             let flags = if idx + 1 == len {
                 Flags::empty()
             } else {
@@ -756,7 +753,7 @@ impl Shared {
             raw_entries.push(entry.into_entry_with_flags(flags));
         }
         unsafe { sq.push_multiple(raw_entries.as_slice()) }.unwrap();
-        Ok(())
+        true
     }
 
     /// Attempt to push a new raw entry into the submission queue.
@@ -1297,7 +1294,8 @@ mod tests {
         let mut first = std::pin::pin!(handle.submit(NopOp));
         let mut first_batch = SmallVec::new();
         first.as_mut().prepare_batch(&mut first_batch);
-        assert!(driver.shared.try_push_batch(first_batch).is_ok());
+        assert!(driver.shared.try_push_batch(&mut first_batch));
+        assert!(first_batch.is_empty());
 
         let mut second = std::pin::pin!(handle.submit(NopOp));
         let mut third = std::pin::pin!(handle.submit(NopOp));
@@ -1305,10 +1303,7 @@ mod tests {
         second.as_mut().prepare_batch(&mut batch);
         third.as_mut().prepare_batch(&mut batch);
 
-        let batch = driver
-            .shared
-            .try_push_batch(batch)
-            .expect_err("batch should wait for full capacity");
+        assert!(!driver.shared.try_push_batch(&mut batch));
         assert_eq!(batch.len(), 2);
 
         let mut ring = driver.shared.ring.borrow_mut();
