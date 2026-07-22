@@ -43,8 +43,39 @@ pub struct RecvBufRing {
     rc: Rc<InnerBufRing>,
 }
 
-/// [`SendBufRing`] is a reference counted buffer ring used to stage outbound buffers for
-/// `SendBundle`.
+/// A reference-counted buffer ring used to stage outbound UDP send bundles.
+///
+/// A ring permits one active [`SendBundleBatch`] at a time. Buffers committed to that batch stay
+/// owned by the operation until io_uring reports its terminal completion, including when the
+/// application drops the send future.
+///
+/// # Example
+///
+/// ```no_run
+/// use norn_uring::bufring::SendBufRing;
+/// use norn_uring::net::UdpSocket;
+///
+/// # async fn send(socket: &UdpSocket) -> std::io::Result<()> {
+/// let ring = SendBufRing::builder(8)
+///     .buf_cnt(16)
+///     .buf_len(1500)
+///     .build()?;
+/// let batch = ring.batch()?;
+///
+/// let mut header = batch.checkout()?;
+/// header.as_mut_slice()[..4].copy_from_slice(b"head");
+/// header.set_len(4)?;
+/// header.commit()?;
+///
+/// let mut payload = batch.checkout()?;
+/// payload.as_mut_slice()[..4].copy_from_slice(b"body");
+/// payload.set_len(4)?;
+/// payload.commit()?;
+///
+/// socket.send_bundle(batch).await?;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Clone)]
 pub struct SendBufRing {
     rc: Rc<InnerSendBufRing>,
@@ -144,6 +175,16 @@ impl SendBufRing {
         })
     }
 
+    /// Returns the capacity of each buffer in the buffer ring.
+    pub fn buf_capacity(&self) -> usize {
+        self.rc.buf_capacity()
+    }
+
+    /// Returns the number of buffers in the buffer ring.
+    pub fn buf_count(&self) -> u16 {
+        self.rc.buf_cnt
+    }
+
     /// Returns the number of available buffers that can be checked out.
     pub fn available_buffers(&self) -> usize {
         self.rc.available_buffers()
@@ -159,7 +200,7 @@ impl SendBufRing {
 }
 
 impl SendBundleBatch {
-    /// Maximum number of buffers that can be committed to one UDP datagram batch.
+    /// Maximum number of buffers the kernel can collect into one UDP datagram bundle.
     pub const MAX_SEGMENTS: usize = 256;
 
     /// Check out a writable buffer from this batch.
@@ -344,6 +385,9 @@ impl SendBuf {
     }
 
     /// Returns this buffer as a writable slice.
+    ///
+    /// A reused buffer may contain bytes from an earlier batch. Call [`SendBuf::set_len`] only
+    /// after initializing every byte that should be sent.
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         let p = self.batch.ring.rc.stable_ptr_mut(self.bid);
         unsafe { std::slice::from_raw_parts_mut(p, self.capacity()) }
@@ -415,8 +459,8 @@ fn selected_bid_from_flags(flags: u32) -> io::Result<Bid> {
 }
 
 /// [`Builder`] is used to create a new receive or send buffer ring.
-#[derive(Clone, Debug)]
-pub struct Builder<T> {
+#[derive(Copy, Clone, Debug)]
+pub struct Builder<T = RecvBufRing> {
     bgid: Bgid,
     ring_entries: u16,
     buf_cnt: u16,
@@ -514,6 +558,13 @@ impl Builder<SendBufRing> {
     /// Return a send-side buffer ring used to stage outbound buffers for `SendBundle`.
     pub fn build(&self) -> io::Result<SendBufRing> {
         let b = self.normalized()?;
+
+        if b.buf_len > u32::MAX as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "send buffer length exceeds u32::MAX",
+            ));
+        }
 
         let handle = crate::Handle::current();
         let inner =
@@ -1519,7 +1570,10 @@ impl ops::Deref for BufRingBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{selected_bid_from_flags, InnerSendBufRing, SendBufRing, SendQueueState};
+    use super::{
+        selected_bid_from_flags, Builder, InnerSendBufRing, RecvBufRing, SendBufRing,
+        SendQueueState,
+    };
     use std::io;
     use std::sync::atomic;
 
@@ -1534,6 +1588,14 @@ mod tests {
         (0..=u32::MAX)
             .find(|flags| io_uring::cqueue::more(*flags))
             .expect("missing CQE more flag")
+    }
+
+    #[test]
+    fn receive_builder_keeps_legacy_default_type_and_copy_semantics() {
+        let builder: Builder = RecvBufRing::builder(31);
+        let copied = builder;
+        let _ = builder;
+        let _: Builder = copied;
     }
 
     #[test]

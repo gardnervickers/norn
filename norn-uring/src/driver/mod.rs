@@ -87,6 +87,7 @@ pub struct Handle {
 
 struct Shared {
     ring: RefCell<IoUring>,
+    supports_send_bundle: bool,
     backpressure: Notify,
     status: Cell<Status>,
     submit_error: RefCell<Option<(io::ErrorKind, String)>>,
@@ -288,6 +289,13 @@ impl Handle {
         Op::new(op, self.clone())
     }
 
+    /// Returns whether this driver's kernel supports bundled send and receive operations.
+    ///
+    /// Send bundles require Linux 6.10 or newer and the `IORING_FEAT_RECVSEND_BUNDLE` feature.
+    pub fn supports_send_bundle(&self) -> bool {
+        self.shared.supports_send_bundle
+    }
+
     /// Issue a cancellation request.
     ///
     /// Setting `sync` to true will cause the cancellation to
@@ -401,9 +409,11 @@ impl Driver {
     /// Create a new [`Driver`] with the provided size from the provided [`io_uring::Builder`].
     pub fn new(mut builder: io_uring::Builder, size: u32) -> io::Result<Self> {
         let ring = builder.dontfork().build(size)?;
+        let supports_send_bundle = ring.params().is_feature_recvsend_bundle();
         Ok(Self {
             shared: Rc::new(Shared {
                 ring: RefCell::new(ring),
+                supports_send_bundle,
                 backpressure: Notify::default(),
                 status: Cell::new(Status::Running),
                 submit_error: RefCell::new(None),

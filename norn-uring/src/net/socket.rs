@@ -285,6 +285,12 @@ impl Socket {
         flags: i32,
     ) -> io::Result<usize> {
         self.assert_sendbufring_driver(&batch);
+        if !self.handle.supports_send_bundle() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "the current io_uring driver does not support send bundles",
+            ));
+        }
         batch.validate_send()?;
         let op = SendBundleUdp::new(self.fd.clone(), batch, flags);
         self.handle.submit(op).await

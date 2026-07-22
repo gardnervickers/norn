@@ -99,7 +99,12 @@ impl UdpSocket {
     /// connected socket.
     ///
     /// The batch must have at least one and at most [`SendBundleBatch::MAX_SEGMENTS`] committed
-    /// buffers.
+    /// buffers. Use [`crate::Handle::supports_send_bundle`] to detect kernel support before
+    /// staging a batch.
+    ///
+    /// Dropping this future is cancellation-safe with respect to memory and buffer reuse: the
+    /// runtime retains the batch until the terminal completion. Cancellation does not guarantee
+    /// that the datagram was not sent.
     ///
     /// # Panics
     ///
@@ -112,6 +117,12 @@ impl UdpSocket {
     /// connected socket with the provided send flags.
     ///
     /// The batch must contain at most [`SendBundleBatch::MAX_SEGMENTS`] committed buffers.
+    /// Use [`crate::Handle::supports_send_bundle`] to detect kernel support before staging a
+    /// batch.
+    ///
+    /// Dropping this future is cancellation-safe with respect to memory and buffer reuse: the
+    /// runtime retains the batch until the terminal completion. Cancellation does not guarantee
+    /// that the datagram was not sent.
     ///
     /// # Panics
     ///
