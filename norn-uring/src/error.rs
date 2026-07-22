@@ -30,9 +30,7 @@ impl SubmitError {
 
     pub(crate) fn to_io_error(&self) -> io::Error {
         match &self.kind {
-            SubmitErrorKind::ShuttingDown => {
-                io::Error::new(io::ErrorKind::Other, "reactor is shutting down")
-            }
+            SubmitErrorKind::ShuttingDown => io::Error::other("reactor is shutting down"),
             SubmitErrorKind::Broken(err) => {
                 io::Error::new(err.kind(), format!("reactor submit path failed: {err}"))
             }
@@ -62,7 +60,7 @@ enum SubmitErrorKind {
 impl From<SubmitError> for io::Error {
     fn from(value: SubmitError) -> Self {
         match value.kind {
-            SubmitErrorKind::ShuttingDown => io::Error::new(io::ErrorKind::Other, value),
+            SubmitErrorKind::ShuttingDown => io::Error::other(value),
             SubmitErrorKind::Broken(err) => {
                 io::Error::new(err.kind(), format!("reactor submit path failed: {err}"))
             }

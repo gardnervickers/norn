@@ -141,7 +141,7 @@ impl bencher::TDynBenchFn for RegistrationBench {
 
 impl<const N: usize> FixedIoBench<N> {
     fn new(mode: IoMode, direction: Direction, queue_depth: usize, operations: usize) -> Self {
-        assert!(N >= 4096 && N % 4096 == 0);
+        assert!(N >= 4096 && N.is_multiple_of(4096));
         assert!(operations >= queue_depth);
         Self {
             mode,

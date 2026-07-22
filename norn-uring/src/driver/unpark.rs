@@ -18,10 +18,10 @@ use norn_executor::park;
 /// Bitfield used for coordinating parking/unparking.
 ///
 /// - `1 << 0`: Indicates that the reactor is entering or has entered sleep and will poll the eventfd.
-///             If a remote thread witnesses this, an eventfd write is necessary.
-///             This bit will only be set by the reactor.
+///   If a remote thread witnesses this, an eventfd write is necessary.
+///   This bit will only be set by the reactor.
 /// - `1 << 1`: Indicates that a remote thread has requested that the reactor wake up. The remote thread which
-///             successfully sets this bit is responsible for writing to the eventfd.
+///   successfully sets this bit is responsible for writing to the eventfd.
 ///
 ///
 #[derive(Copy, Clone)]

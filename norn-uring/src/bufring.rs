@@ -271,10 +271,7 @@ impl Builder {
         // larger than 2^15 anyway, so this is a good place to catch it. Here we return a unique
         // error that is more descriptive than the InvalidArg that would come from the interface.
         if b.ring_entries > (1 << 15) {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "ring_entries exceeded 32768",
-            ));
+            return Err(io::Error::other("ring_entries exceeded 32768"));
         }
 
         // Requirement of the interface is the ring entries is a power of two, making its and our
@@ -404,29 +401,26 @@ impl InnerBufRing {
             match e.raw_os_error() {
                 Some(libc::EINVAL) => {
                     // using buf_ring requires kernel 5.19 or greater.
-                    return Err(io::Error::new(
-                            io::ErrorKind::Other,
-                            format!("buf_ring.register returned {}, most likely indicating this kernel is not 5.19+", e),
-                            ));
+                    return Err(io::Error::other(format!(
+                        "buf_ring.register returned {}, most likely indicating this kernel is not 5.19+",
+                        e
+                    )));
                 }
                 Some(libc::EEXIST) => {
                     // Registering a duplicate bgid is not allowed. There is an `unregister`
                     // operations that can remove the first, but care must be taken that there
                     // are no outstanding operations that will still return a buffer from that
                     // one.
-                    return Err(io::Error::new(
-                            io::ErrorKind::Other,
-                            format!(
-                                "buf_ring.register returned `{}`, indicating the attempted buffer group id {} was already registered",
-                            e,
-                            bgid),
-                        ));
+                    return Err(io::Error::other(format!(
+                        "buf_ring.register returned `{}`, indicating the attempted buffer group id {} was already registered",
+                        e, bgid
+                    )));
                 }
                 _ => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("buf_ring.register returned `{}` for group id {}", e, bgid),
-                    ));
+                    return Err(io::Error::other(format!(
+                        "buf_ring.register returned `{}` for group id {}",
+                        e, bgid
+                    )));
                 }
             }
         };
