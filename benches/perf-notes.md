@@ -1240,3 +1240,59 @@ producer finishes while its consumer is not polled. Its 16,384 CQEs take a
 median `35.008 ms` to consume on `master` and `90.148 us` with the candidate, a
 paired `-99.740%` change. This is a defensive lagging-consumer win, not a claim
 that current steady consumers commonly build large backlogs.
+## 2026-07-20: Direct `BufRingBuf` UDP echo
+
+Goal: measure the allocation and throughput effect of sending a selected
+`BufRingBuf` directly instead of copying its initialized bytes into `Bytes`.
+The production baseline was exact `master`
+`3a80a12800abbbd431de0fe2e91731916ce816e7`; its only dirty changes were the
+copy-only benchmark harness and target registration. After the baseline, the
+harness gained the direct mode together with the `StableBuf` implementation.
+
+Environment:
+
+- local Linux `6.18.38` workstation, AMD Ryzen 9 5950X (16 cores / 32 threads),
+  62 GiB RAM, no swap;
+- ext4 on `/dev/nvme1n1p2`;
+- `rustc 1.85.0-nightly (6d9f6ae36 2024-12-16)` through `nix develop`;
+- CPUs were not pinned and frequency scaling remained enabled; and
+- loopback UDP, 32,768 sequential 1,024-byte request/response exchanges after
+  1,024 warmup exchanges.
+
+The benchmark uses a process-wide counting allocator. Counts cover the entire
+timed client/server loop, so the useful signal is the paired difference; they
+are cumulative allocation calls and requested bytes, not peak live memory.
+
+```text
+nix develop -c cargo bench -p benches --bench bufring_echo -- \
+  <copy|direct> 32768 1024
+```
+
+Initial copy-only baseline samples (nanoseconds per request):
+
+```text
+9744.69 9711.81 9713.16 9848.19 9704.50
+```
+
+Final alternating copy/direct samples:
+
+| sample | copy ns/request | direct ns/request | copy alloc/request | direct alloc/request | copy bytes/request | direct bytes/request |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 9807.38 | 9831.33 | 4.0001 | 3.0001 | 1608.06 | 584.06 |
+| 2 | 9751.84 | 9821.91 | 4.0001 | 3.0001 | 1608.06 | 584.06 |
+| 3 | 9966.08 | 10029.64 | 4.0001 | 3.0001 | 1608.06 | 584.06 |
+| 4 | 9818.09 | 9922.44 | 4.0001 | 3.0001 | 1608.06 | 584.06 |
+| 5 | 9788.62 | 9774.40 | 4.0001 | 3.0001 | 1608.06 | 584.06 |
+
+Medians were `9807.38 ns/request` (`101,964 requests/s`) for copy and
+`9831.33 ns/request` (`101,716 requests/s`) for direct. The direct-path median
+was 0.24% slower; the paired median delta was +0.64%, with the full range
+(-0.15% to +1.06%) small enough to treat throughput as unchanged on this
+unpinned workstation. The initial copy median was `9713.16 ns/request`; the
+0.97% later copy drift reinforces that conclusion.
+
+The direct path removed exactly one allocation and 1,024 allocated bytes per
+request: allocation calls fell 25.0%, and cumulative allocated bytes fell
+63.7%. The change is kept because this is a deterministic, payload-sized
+allocation removal and a useful owned-buffer API path, with no measurable
+throughput regression. No further optimization candidates were explored.

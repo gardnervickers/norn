@@ -12,6 +12,7 @@ use io_uring::types::{self, BufRingEntry};
 use io_uring::Submitter;
 use log::warn;
 
+use crate::buf::StableBuf;
 use crate::Handle;
 
 /// [`RecvBufRing`] is a reference counted buffer ring which can be registered
@@ -97,6 +98,10 @@ impl RecvBufRing {
 /// It is reference counted and will be returned to the buffer ring when dropped.
 /// Users should be careful to drop the buffer as soon as possible to avoid
 /// exhausting the buffer ring.
+///
+/// The buffer implements [`StableBuf`], so it can be moved directly into send
+/// operations. The selected buffer ID remains unavailable to receive operations
+/// until the send returns the buffer and that value is dropped.
 pub struct BufRingBuf {
     bufgroup: RecvBufRing,
     len: usize,
@@ -183,6 +188,21 @@ impl BufRingBuf {
     pub fn as_slice(&self) -> &[u8] {
         let p = self.bufgroup.rc.stable_ptr(self.bid);
         unsafe { std::slice::from_raw_parts(p, self.len) }
+    }
+}
+
+// Safety: `BufRingBuf` exclusively owns its selected BID. `InnerBufRing` keeps
+// the mmap allocation live and immovable, and the BID is not returned to the
+// kernel until this value is dropped. Moving the wrapper therefore cannot
+// invalidate the pointer or permit the kernel to reuse the exposed bytes while
+// a send operation owns the buffer.
+unsafe impl StableBuf for BufRingBuf {
+    fn stable_ptr(&self) -> *const u8 {
+        self.bufgroup.rc.stable_ptr(self.bid)
+    }
+
+    fn bytes_init(&self) -> usize {
+        self.len
     }
 }
 
