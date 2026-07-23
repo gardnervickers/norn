@@ -179,6 +179,76 @@ fn recv_ring_stream_socket_reports_peer() -> Result<(), Box<dyn std::error::Erro
 }
 
 #[test]
+fn recv_ring_buf_can_be_echoed_directly() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let (server, client) = connected_pair().await?;
+        let ring = RecvBufRing::builder(8).buf_cnt(1).buf_len(1024).build()?;
+        let payload = b"direct-tcp-echo".to_vec();
+
+        client.send(payload.clone()).await.0?;
+        let (buf, _) = server.recv_ring(&ring).await?;
+        assert_eq!(buf.as_slice(), payload.as_slice());
+
+        let (send_result, buf) = server.send(buf).await;
+        assert_eq!(send_result?, payload.len());
+        drop(buf);
+
+        let (recv_result, reply) = client.recv(BytesMut::with_capacity(payload.len())).await;
+        let reply_len = recv_result?;
+        assert_eq!(&reply[..reply_len], payload.as_slice());
+
+        server.close().await?;
+        client.close().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn recv_ring_buf_can_be_echoed_with_send_zc() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let (server, client) = connected_pair().await?;
+        let ring = RecvBufRing::builder(9).buf_cnt(1).buf_len(1024).build()?;
+
+        if let Err(err) = server.set_zerocopy(true).await {
+            server.close().await?;
+            client.close().await?;
+            if util::zerocopy_unsupported(&err) {
+                return Ok(());
+            }
+            return Err(err.into());
+        }
+
+        let payload = b"direct-tcp-zc-echo".to_vec();
+        client.send(payload.clone()).await.0?;
+        let (buf, _) = server.recv_ring(&ring).await?;
+
+        let (send_result, buf) = server.send_zc(buf).await;
+        let sent = match send_result {
+            Ok(sent) => sent,
+            Err(err) => {
+                drop(buf);
+                server.close().await?;
+                client.close().await?;
+                if util::zerocopy_unsupported(&err) {
+                    return Ok(());
+                }
+                return Err(err.into());
+            }
+        };
+        assert_eq!(sent, payload.len());
+        drop(buf);
+
+        let (recv_result, reply) = client.recv(BytesMut::with_capacity(payload.len())).await;
+        let reply_len = recv_result?;
+        assert_eq!(&reply[..reply_len], payload.as_slice());
+
+        server.close().await?;
+        client.close().await?;
+        Ok(())
+    })
+}
+
+#[test]
 fn send_zc_smoke() -> Result<(), Box<dyn std::error::Error>> {
     util::with_test_env(|| async {
         let (server, client) = connected_pair().await?;

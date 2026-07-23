@@ -297,6 +297,56 @@ fn send_recv_ring() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn recv_ring_buf_can_be_sent_directly_and_retains_its_slot(
+) -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let ring = RecvBufRing::builder(11).buf_cnt(1).buf_len(128).build()?;
+        let client = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let server = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let server_addr = server.local_addr()?;
+
+        client
+            .send_to(Bytes::from_static(b"direct-echo"), server_addr)
+            .await
+            .0?;
+        let (buf, peer) = server.recv_from_ring(&ring).await?;
+        let stable_ptr = buf.as_slice().as_ptr();
+
+        client
+            .send_to(Bytes::from_static(b"held-slot"), server_addr)
+            .await
+            .0?;
+        let (send_result, buf) = server.send_to(buf, peer).await;
+        assert_eq!(send_result?, b"direct-echo".len());
+        assert_eq!(buf.as_slice().as_ptr(), stable_ptr);
+
+        let err = server.recv_from_ring(&ring).await.unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ENOBUFS));
+
+        let (recv_result, reply) = client.recv_from(BytesMut::with_capacity(32)).await;
+        let (reply_len, reply_peer) = recv_result?;
+        assert_eq!(reply_peer, server_addr);
+        assert_eq!(&reply[..reply_len], b"direct-echo");
+
+        drop(buf);
+        client
+            .send_to(Bytes::from_static(b"recycled"), server_addr)
+            .await
+            .0?;
+        let (held, held_peer) = server.recv_from_ring(&ring).await?;
+        assert_eq!(held_peer, client.local_addr()?);
+        assert_eq!(&held[..], b"held-slot");
+        drop(held);
+
+        let (recycled, recycled_peer) = server.recv_from_ring(&ring).await?;
+        assert_eq!(recycled_peer, client.local_addr()?);
+        assert_eq!(&recycled[..], b"recycled");
+
+        Ok(())
+    })
+}
+
+#[test]
 fn duplicate_bgid_failure_keeps_original_ring_registered() -> Result<(), Box<dyn std::error::Error>>
 {
     util::with_test_env(|| async {

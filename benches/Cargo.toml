@@ -16,6 +16,7 @@ norn-kv = { path = "../examples/norn-kv" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 norn-uring = { path = "../norn-uring" }
+bytes = "1"
 io-uring = "0.7.11"
 libc = "0.2.149"
 hyper = { version = "1", features = ["client", "server", "http2"] }
@@ -100,4 +101,9 @@ harness = false
 [[bench]]
 name = "uring_completion_backlog"
 path = "uring_completion_backlog.rs"
+harness = false
+
+[[bench]]
+name = "bufring_echo"
+path = "bufring_echo.rs"
 harness = false
