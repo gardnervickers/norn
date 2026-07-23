@@ -1,5 +1,6 @@
 use std::any::Any;
 use std::cell::{Cell, RefCell, UnsafeCell};
+use std::num::NonZeroUsize;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,11 +39,29 @@ const LOG: &str = "norn_uring::driver";
 /// This will have a perf impact on each poll, but may ensure better overall performance.
 const NEEDS_PARK_CHECK_RINGS: bool = true;
 
+/// Number of CQEs copied out of the ring at once while draining.
+const COMPLETION_DRAIN_BATCH: usize = 32;
+
 /// Maximum time shutdown waits for the kernel to cancel all submitted requests.
 ///
 /// `IORING_REGISTER_SYNC_CANCEL` accepts a timeout, so teardown does not need to
 /// enter an unbounded syscall when a request cannot be cancelled.
 const SHUTDOWN_CANCEL_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// Options controlling normal [`Driver`] operation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DriverOptions {
+    /// Maximum number of completion queue entries handled by one normal park.
+    ///
+    /// The default, `None`, drains all ready completions and preserves the
+    /// driver's existing behavior. Setting a nonzero limit can improve
+    /// cooperative scheduling fairness when completions arrive faster than
+    /// application tasks consume them.
+    ///
+    /// Shutdown always drains completions exhaustively, regardless of this
+    /// option.
+    pub completion_drain_budget: Option<NonZeroUsize>,
+}
 
 /// [`Driver`] provides a [`Park`] implementation which will drive
 /// a [`IoUring`] instance, submitting new requests and waiting
@@ -51,6 +70,7 @@ const SHUTDOWN_CANCEL_TIMEOUT: Duration = Duration::from_millis(100);
 /// Interaction with the driver is done via [`Handle`]. The handle
 /// can be used to submit new requests to the driver.
 pub struct Driver {
+    options: DriverOptions,
     shared: Rc<Shared>,
     unparker: Arc<unpark::Unparker>,
     /// Storage passed to the kernel for the eventfd read.
@@ -165,7 +185,9 @@ impl std::fmt::Debug for Handle {
 
 impl std::fmt::Debug for Driver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Driver").finish()
+        f.debug_struct("Driver")
+            .field("options", &self.options)
+            .finish()
     }
 }
 
@@ -392,9 +414,22 @@ impl Driver {
     const CLOSE_FD_TOKEN: usize = 0x04;
 
     /// Create a new [`Driver`] with the provided size from the provided [`io_uring::Builder`].
-    pub fn new(mut builder: io_uring::Builder, size: u32) -> io::Result<Self> {
+    ///
+    /// This uses [`DriverOptions::default`]. Use
+    /// [`Driver::new_with_options`] to customize driver behavior.
+    pub fn new(builder: io_uring::Builder, size: u32) -> io::Result<Self> {
+        Self::new_with_options(builder, size, DriverOptions::default())
+    }
+
+    /// Create a new [`Driver`] with the provided builder, size, and options.
+    pub fn new_with_options(
+        mut builder: io_uring::Builder,
+        size: u32,
+        options: DriverOptions,
+    ) -> io::Result<Self> {
         let ring = builder.dontfork().build(size)?;
         Ok(Self {
+            options,
             shared: Rc::new(Shared {
                 ring: RefCell::new(ring),
                 backpressure: Notify::default(),
@@ -481,11 +516,17 @@ impl Driver {
     /// `N` is the number of entries to drain at a time. This is used to allocate
     /// storage for copying the entries out of the ring. This should be a small value.
     fn drain<const N: usize>(&self, max: usize) -> usize {
+        assert!(N > 0, "completion drain batch must be nonzero");
+        if max == 0 {
+            return 0;
+        }
         let mut entries: [mem::MaybeUninit<cqueue::Entry>; N] =
             unsafe { mem::MaybeUninit::uninit().assume_init() };
         let mut total_drained = 0;
         loop {
-            let (entries, has_more) = self.shared.drain_fill(&mut entries);
+            let remaining = max - total_drained;
+            let batch_len = remaining.min(N);
+            let (entries, has_more) = self.shared.drain_fill(&mut entries[..batch_len]);
             let nr_drained = entries.len();
             for cqe in entries {
                 let user_data = cqe.user_data() as usize;
@@ -533,15 +574,25 @@ impl Driver {
         }
         total_drained
     }
-}
 
-impl Park for Driver {
-    type Unparker = Arc<unpark::Unparker>;
+    fn drain_normal(&self, remaining: &mut Option<usize>) -> usize {
+        let drained = self.drain::<COMPLETION_DRAIN_BATCH>(remaining.unwrap_or(usize::MAX));
+        if let Some(remaining) = remaining {
+            *remaining -= drained;
+        }
+        drained
+    }
 
-    type Guard = context::DriverContextGuard;
+    fn drain_exhaustive(&self) -> usize {
+        self.drain::<COMPLETION_DRAIN_BATCH>(usize::MAX)
+    }
 
-    fn park(&mut self, mut mode: ParkMode) -> Result<(), io::Error> {
-        let drained = self.drain::<32>(usize::MAX);
+    fn park_with_completion_budget(
+        &mut self,
+        mut mode: ParkMode,
+        mut remaining: Option<usize>,
+    ) -> Result<(), io::Error> {
+        let drained = self.drain_normal(&mut remaining);
         if drained > 0 {
             trace!(target: LOG, "park.drained {}", drained);
             mode = ParkMode::NoPark;
@@ -552,10 +603,14 @@ impl Park for Driver {
                 Ok(_) => return Ok(()),
                 Err(err) if err.raw_os_error() == Some(libc::EBUSY) => {
                     trace!(target: LOG, "park.ebusy");
-                    let drained = self.drain::<32>(usize::MAX);
+                    let drained = self.drain_normal(&mut remaining);
                     trace!(target: LOG, "park.drained {}", drained);
+                    if remaining.is_some() && (drained == 0 || remaining == Some(0)) {
+                        // Yield to runnable work. The next park call will retry
+                        // any submission that remains queued.
+                        return Ok(());
+                    }
                     mode = ParkMode::NoPark;
-                    continue;
                 }
                 Err(err) if err.raw_os_error() == Some(libc::EINTR) => {
                     error!(target: LOG, "park.eintr");
@@ -564,6 +619,17 @@ impl Park for Driver {
                 Err(err) => return Err(err),
             }
         }
+    }
+}
+
+impl Park for Driver {
+    type Unparker = Arc<unpark::Unparker>;
+
+    type Guard = context::DriverContextGuard;
+
+    fn park(&mut self, mode: ParkMode) -> Result<(), io::Error> {
+        let budget = self.options.completion_drain_budget.map(NonZeroUsize::get);
+        self.park_with_completion_budget(mode, budget)
     }
 
     fn enter(&self) -> Self::Guard {
@@ -575,7 +641,8 @@ impl Park for Driver {
     }
 
     fn needs_park(&self) -> bool {
-        self.shared.needs_park()
+        self.shared
+            .needs_park(self.options.completion_drain_budget.is_some())
     }
 
     fn shutdown(&mut self) {
@@ -616,12 +683,12 @@ impl Driver {
                 if unsafe { self.shared.try_push_raw(&opcode) }.is_ok() {
                     self.shared.set_status(Status::Draining);
                 } else {
-                    let drained = self.drain::<32>(usize::MAX);
+                    let drained = self.drain_exhaustive();
                     trace!(target: LOG, "shutdown.push_drain.retry drained={}", drained);
                 }
             }
             if self.shared.status() == Status::Draining {
-                if let Err(err) = self.park(ParkMode::NextCompletion) {
+                if let Err(err) = self.park_with_completion_budget(ParkMode::NextCompletion, None) {
                     // Same fail-soft policy as above: prefer an explicit shutdown stop
                     // over panic while dropping the driver.
                     warn!(target: LOG, "shutdown.park.failed {:?}", err);
@@ -908,7 +975,7 @@ impl Shared {
         }
     }
 
-    fn needs_park(&self) -> bool {
+    fn needs_park(&self, completion_drain_is_bounded: bool) -> bool {
         // First check if there are any waiters, this is a cheap check
         // compared to checking the ring.
         if self.backpressure.waiters() > 0 {
@@ -917,7 +984,12 @@ impl Shared {
         if NEEDS_PARK_CHECK_RINGS {
             let mut ring = self.ring.borrow_mut();
             let (_, sq, cq) = ring.split();
-            sq.is_full() || cq.is_full()
+            sq.is_full()
+                || if completion_drain_is_bounded {
+                    !cq.is_empty()
+                } else {
+                    cq.is_full()
+                }
         } else {
             false
         }
@@ -927,9 +999,9 @@ impl Shared {
     ///
     /// Returns the filled buffer, and a flag indicating if there are more entries after
     /// this buffer.
-    fn drain_fill<'a, const N: usize>(
+    fn drain_fill<'a>(
         &'a self,
-        entries: &'a mut [mem::MaybeUninit<cqueue::Entry>; N],
+        entries: &'a mut [mem::MaybeUninit<cqueue::Entry>],
     ) -> (&'a mut [cqueue::Entry], bool) {
         let mut ring = self.ring.borrow_mut();
         let mut cq = ring.completion();
@@ -957,6 +1029,7 @@ mod tests {
     use std::net::TcpListener;
     use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixStream;
+    use std::rc::Rc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc};
     use std::task::Poll;
@@ -967,6 +1040,24 @@ mod tests {
     use super::*;
     use crate::operation::{CQEResult, Operation, Singleshot};
     use crate::Request;
+
+    fn preload_nop_completions(driver: &Driver, total: usize) {
+        let nop = opcode::Nop::new()
+            .build()
+            .user_data(Driver::CANCELLATION_TOKEN as u64);
+        let mut ring = driver.shared.ring.borrow_mut();
+        {
+            let mut sq = ring.submission();
+            assert!(sq.capacity() - sq.len() >= total);
+            for _ in 0..total {
+                // Safety: the test-only filler NOP references no external
+                // storage and uses a reserved completion token.
+                unsafe { sq.push(&nop) }.unwrap();
+            }
+        }
+        assert!(ring.submitter().submit_and_wait(total).unwrap() >= total);
+        assert_eq!(ring.completion().len(), total);
+    }
 
     enum LongLivedIo {
         Read {
@@ -1109,6 +1200,45 @@ mod tests {
             driver.shutdown_with_outcome(),
             ShutdownOutcome::CleanDrained
         );
+    }
+
+    #[test]
+    fn completion_drain_budget_is_opt_in() {
+        const BUDGET: usize = 2;
+        const TOTAL: usize = BUDGET + 1;
+
+        let mut unbounded = Driver::new(io_uring::IoUring::builder(), 4).unwrap();
+        preload_nop_completions(&unbounded, TOTAL);
+        unbounded.park(ParkMode::NoPark).unwrap();
+        assert_eq!(unbounded.shared.ring.borrow_mut().completion().len(), 0);
+
+        let options = DriverOptions {
+            completion_drain_budget: NonZeroUsize::new(BUDGET),
+        };
+        let mut bounded =
+            Driver::new_with_options(io_uring::IoUring::builder(), 4, options).unwrap();
+        preload_nop_completions(&bounded, TOTAL);
+        bounded.park(ParkMode::NoPark).unwrap();
+        assert_eq!(bounded.shared.ring.borrow_mut().completion().len(), 1);
+        assert!(bounded.needs_park());
+        bounded.park(ParkMode::NoPark).unwrap();
+        assert_eq!(bounded.shared.ring.borrow_mut().completion().len(), 0);
+    }
+
+    #[test]
+    fn shutdown_drain_is_exhaustive_past_normal_budget() {
+        let options = DriverOptions {
+            completion_drain_budget: NonZeroUsize::new(2),
+        };
+        let mut driver =
+            Driver::new_with_options(io_uring::IoUring::builder(), 4, options).unwrap();
+        preload_nop_completions(&driver, 3);
+
+        assert_eq!(
+            driver.shutdown_with_outcome(),
+            ShutdownOutcome::CleanDrained
+        );
+        assert_eq!(driver.shared.ring.borrow_mut().completion().len(), 0);
     }
 
     #[test]

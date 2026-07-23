@@ -42,7 +42,7 @@ pub mod fs;
 /// Asynchronous TCP and UDP networking.
 pub mod net;
 
-pub use driver::{Driver, Handle};
+pub use driver::{Driver, DriverOptions, Handle};
 pub use operation::{CQEResult, Multishot, Op, Operation, Singleshot};
 pub use request::{Map, Request, Then, ThenAux, WithTimeout};
 pub use util::noop;
