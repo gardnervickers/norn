@@ -41,15 +41,11 @@ type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 /// let output = ex.block_on(async {
 ///     let values = vec![10, 11, 12];
 ///     let suffix = String::from("!");
+///     let values_ref = &values;
+///     let suffix_ref = &suffix;
 ///     norn_nursery::scope!(|scope| {
-///         // These child futures borrow from stack data outside the scope body:
-///         // `values` and `suffix` are not `'static`.
-///         let first = scope.spawn(async {
-///             values.iter().sum::<i32>()
-///         });
-///         let second = scope.spawn(async {
-///             suffix.len()
-///         });
+///         let first = scope.spawn(async move |_| values_ref.iter().sum::<i32>());
+///         let second = scope.spawn(async move |_| suffix_ref.len());
 ///
 ///         first.await.unwrap() + second.await.unwrap() as i32
 ///     })
@@ -66,7 +62,7 @@ type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 /// let mut ex = LocalExecutor::new(SpinPark);
 /// let output = ex.block_on(async {
 ///     norn_nursery::scope!(|scope| -> Result<(), &'static str> {
-///         std::mem::drop(scope.spawn(async move {
+///         std::mem::drop(scope.spawn(async move |scope| {
 ///             let _: () = scope.terminate(Err("stop")).await;
 ///         }));
 ///         Ok(())
@@ -98,10 +94,13 @@ macro_rules! scope {
 pub struct Scope<'scope, 'env, R> {
     shared: Rc<Shared>,
     terminated: RefCell<Option<R>>,
-    _marker: PhantomData<&'scope &'env ()>,
+    _marker: PhantomData<(&'scope &'env (), &'env mut &'env ())>,
 }
 
-impl<'scope, R> Scope<'scope, '_, R> {
+impl<'scope, 'env, R> Scope<'scope, 'env, R>
+where
+    'env: 'scope,
+{
     fn new() -> Self {
         Self {
             shared: Rc::new(Shared::default()),
@@ -112,20 +111,44 @@ impl<'scope, R> Scope<'scope, '_, R> {
 
     /// Spawn a child task into this scope.
     ///
-    /// The task may borrow data from outside the scope. The scope will not
-    /// complete until all spawned child tasks have either finished or the scope
-    /// has been terminated.
-    pub fn spawn<F>(&'scope self, future: F) -> JoinHandle<F::Output>
+    /// The scope will not complete until all spawned child tasks have either
+    /// finished or the scope has been terminated.
+    ///
+    /// The async closure may borrow values from the environment surrounding the
+    /// scope and receives the scope handle for nested spawning or termination.
+    /// It may move values out of the scope body, but may not borrow values owned
+    /// by the scope body or another child.
+    ///
+    /// ```rust
+    /// let value = String::from("borrowed");
+    /// let value_ref = &value;
+    /// let _scope = norn_nursery::scope!(|scope| {
+    ///     let child = scope.spawn(async move |_| value_ref.len());
+    ///     child.await.unwrap()
+    /// });
+    /// ```
+    ///
+    /// ```compile_fail
+    /// let _scope = norn_nursery::scope!(|scope| {
+    ///     let value = String::from("body local");
+    ///     let value_ref = &value;
+    ///     let child = scope.spawn(async move |_| value_ref.len());
+    ///     child.await.unwrap()
+    /// });
+    /// ```
+    pub fn spawn<F, T>(&'scope self, task: F) -> JoinHandle<T>
     where
-        F: Future + 'scope,
+        F: for<'task> AsyncFnOnce(&'task Scope<'task, 'env, R>) -> T + 'env,
+        T: 'env,
     {
+        let future = task(self);
         let scheduler = Scheduler {
             shared: Rc::clone(&self.shared),
         };
 
-        // Safety: The caller only receives `&Scope` while the surrounding
-        // `ScopeBody` exists and guarantees that `clear` is called before
-        // dropping captures borrowed by child futures.
+        // Safety: the closure and output are valid for the surrounding
+        // environment. The produced future may additionally borrow `self`,
+        // which remains alive until every child has been destroyed.
         let (runnable, handle) = unsafe { self.shared.taskset.bind(future, scheduler) };
         if let Some(runnable) = runnable {
             self.shared.active.set(self.shared.active.get() + 1);
@@ -151,7 +174,7 @@ impl<'scope, R> Scope<'scope, '_, R> {
     /// let mut ex = LocalExecutor::new(SpinPark);
     /// let output = ex.block_on(async {
     ///     norn_nursery::scope!(|scope| -> Result<(), &'static str> {
-    ///         std::mem::drop(scope.spawn(async move {
+    ///         std::mem::drop(scope.spawn(async move |scope| {
     ///             let _: () = scope.terminate(Err("cancelled")).await;
     ///         }));
     ///         Ok(())
@@ -261,8 +284,8 @@ struct ScopeClearGuard<'scope, 'env, R> {
 
 impl<R> Drop for ScopeClearGuard<'_, '_, R> {
     fn drop(&mut self) {
-        // Clear tasks before the scope body frame is dropped, so child futures
-        // cannot outlive borrows owned by the body future.
+        // Clear registered tasks before the remaining ScopeBody fields are
+        // dropped. Borrowed children have a separate caller-checked contract.
         self.scope.clear();
     }
 }
@@ -390,14 +413,29 @@ mod tests {
     fn borrows_outer_stack() {
         let mut ex = LocalExecutor::new(SpinPark);
         let out = ex.block_on(async {
-            let value = 22;
+            let value = String::from("borrowed");
+            let value_ref = &value;
             crate::scope!(|scope| {
-                let child = scope.spawn(async move { value });
-                child.await.unwrap() * 4
+                let child = scope.spawn(async move |_| value_ref.len());
+                child.await.unwrap()
             })
             .await
         });
-        assert_eq!(out, 88);
+        assert_eq!(out, 8);
+    }
+
+    #[test]
+    fn moves_body_local_into_child() {
+        let mut ex = LocalExecutor::new(SpinPark);
+        let out = ex.block_on(async {
+            crate::scope!(|scope| {
+                let value = String::from("moved");
+                let child = scope.spawn(async move |_| value.len());
+                child.await.unwrap()
+            })
+            .await
+        });
+        assert_eq!(out, 5);
     }
 
     #[test]
@@ -406,8 +444,8 @@ mod tests {
         let out = ex.block_on(async {
             let base = 3;
             crate::scope!(|scope| {
-                let parent = scope.spawn(async move {
-                    let child = scope.spawn(async move { base + 1 });
+                let parent = scope.spawn(async move |scope| {
+                    let child = scope.spawn(async move |_| base + 1);
                     child.await.unwrap() * 2
                 });
                 parent.await.unwrap() + 1
@@ -422,10 +460,11 @@ mod tests {
         let mut ex = LocalExecutor::new(SpinPark);
         let out = ex.block_on(async {
             let input = [1_i32, 2, 3, 4, 5, 6, 7, 8];
+            let input_ref = &input;
             crate::scope!(|scope| {
                 let mut handles = Vec::new();
-                for value in &input {
-                    handles.push(scope.spawn(async move { *value * 2 }));
+                for value in input_ref {
+                    handles.push(scope.spawn(async move |_| *value * 2));
                 }
 
                 let mut sum = 0;
@@ -447,7 +486,7 @@ mod tests {
         ex.block_on(async {
             crate::scope!(|scope| {
                 for _ in 0..16 {
-                    std::mem::drop(scope.spawn(async {
+                    std::mem::drop(scope.spawn(async |_| {
                         completed_ref.set(completed_ref.get() + 1);
                     }));
                 }
@@ -462,7 +501,7 @@ mod tests {
         let mut ex = LocalExecutor::new(SpinPark);
         let out = ex.block_on(async {
             crate::scope!(|scope| {
-                let handle = scope.spawn(async {
+                let handle = scope.spawn(async |_| {
                     pending::<()>().await;
                     1usize
                 });
@@ -481,7 +520,7 @@ mod tests {
         let mut ex = LocalExecutor::new(SpinPark);
         let out = ex.block_on(async {
             crate::scope!(|scope| {
-                let handle = scope.spawn(async move {
+                let handle = scope.spawn(async move |_| {
                     panic!("boom");
                     #[allow(unreachable_code)]
                     0usize
@@ -500,10 +539,10 @@ mod tests {
         let mut ex = LocalExecutor::new(SpinPark);
         let out = ex.block_on(async {
             crate::scope!(|scope| -> &'static str {
-                std::mem::drop(scope.spawn(async move {
+                std::mem::drop(scope.spawn(async move |scope| {
                     let _: () = scope.terminate("first").await;
                 }));
-                std::mem::drop(scope.spawn(async move {
+                std::mem::drop(scope.spawn(async move |scope| {
                     let _: () = scope.terminate("second").await;
                 }));
                 "body"
@@ -518,7 +557,7 @@ mod tests {
         let mut ex = LocalExecutor::new(SpinPark);
         let out = ex.block_on(async {
             crate::scope!(|scope| -> Result<(), &'static str> {
-                std::mem::drop(scope.spawn(async move {
+                std::mem::drop(scope.spawn(async move |scope| {
                     let _: () = scope.terminate(Err("boom")).await;
                 }));
                 Ok(())
@@ -542,7 +581,7 @@ mod tests {
         let dropped = Cell::new(false);
         let dropped_ref = &dropped;
         let mut fut = Box::pin(crate::scope!(|scope| {
-            std::mem::drop(scope.spawn(async {
+            std::mem::drop(scope.spawn(async move |_| {
                 let _flag = DropFlag(dropped_ref);
                 pending::<()>().await;
             }));
@@ -554,37 +593,5 @@ mod tests {
 
         drop(fut);
         assert!(dropped.get());
-    }
-
-    #[test]
-    fn drop_partially_polled_scope_cancels_children_before_body_frame_drop() {
-        struct ReadBodyLocalOnDrop<'a> {
-            local: &'a Cell<usize>,
-        }
-
-        impl Future for ReadBodyLocalOnDrop<'_> {
-            type Output = ();
-
-            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
-                Poll::Pending
-            }
-        }
-
-        impl Drop for ReadBodyLocalOnDrop<'_> {
-            fn drop(&mut self) {
-                self.local.set(self.local.get() + 1);
-            }
-        }
-
-        let mut fut = Box::pin(crate::scope!(|scope| {
-            let local = Cell::new(0usize);
-            std::mem::drop(scope.spawn(ReadBodyLocalOnDrop { local: &local }));
-            pending::<()>().await
-        }));
-
-        let poll = poll_once(fut.as_mut());
-        assert!(matches!(poll, Poll::Pending));
-
-        drop(fut);
     }
 }
