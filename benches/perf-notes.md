@@ -1296,3 +1296,76 @@ request: allocation calls fell 25.0%, and cumulative allocated bytes fell
 63.7%. The change is kept because this is a deterministic, payload-sized
 allocation removal and a useful owned-buffer API path, with no measurable
 throughput regression. No further optimization candidates were explored.
+
+## 2026-07-21: Optional bounded normal completion draining
+
+Issue: [#56](https://github.com/gardnervickers/norn/issues/56).
+
+This follow-up is evaluated separately from the completion-storage change
+above. It lets applications opt normal driver park calls into a finite CQE
+scheduling quantum while leaving the default and shutdown draining exhaustive.
+
+### Behavioral contract
+
+- `DriverOptions::default()` preserves exhaustive completion draining.
+- When `completion_drain_budget` is configured, one normal `Driver::park` call
+  handles at most that many CQEs before returning to the executor.
+- The initial drain and the outer `EBUSY` recovery path share one total budget;
+  an `EBUSY` retry cannot start a second quantum.
+- With a configured budget, any pending CQE makes `needs_park` true, so the
+  executor continues re-entering the driver while runnable application work
+  remains.
+- Shutdown uses a separate exhaustive drain because it must observe its drain
+  sentinel before releasing kernel-owned resources.
+
+The bound supplies cooperative scheduling fairness, not producer backpressure.
+It does not cap total pending completions when an application consumer is
+slower than the kernel producer.
+
+### Selection evidence
+
+The host, toolchain, CPU affinity, workload definitions, and integrity checks
+match the storage experiment above. Every completed budget cohort used seven
+alternating, process-isolated baseline/candidate pairs. Synthetic queue cases
+are omitted because the driver budget is not on those paths.
+
+The frozen baseline is `f2dfe081db1b7c6e6d0402915b433afe6fa90c00` (tree
+`dd8560552e2126cc4a57d4dc6bc2e1add68187ea`). Budget candidates were:
+
+| budget | commit | tree |
+| ---: | --- | --- |
+| 32 | `3ce4a5fa8097371a62de5d3ce1e3a44fcdbdf40d` | `5703ca821b38794ddfbc59f77251332c7b25cd2b` |
+| 64 | `2ef9ef982fd8c8b573766cfa66c8874ae97f4a85` | `465d69ea467f3f5ebdd18a247d0c459436f58b21` |
+| 128 | `d98af5f8115e6852a112207b02e58589a083e93c` | `3f099fccd8577eeae39f29198a020c419ab7852f` |
+
+Paired median elapsed-time deltas against the frozen baseline were:
+
+| budget | UDP steady, 4,096 | burst 1,024 | burst 4,096 | TCP guard |
+| ---: | ---: | ---: | ---: | ---: |
+| 32 | -0.258% | -0.387% | -0.578% | +0.493% |
+| 64 | -0.411% | +0.316% | -0.495% | +0.353% |
+| 128 | -0.227% | +0.429% | +0.468% | +0.369% |
+
+All three completed budgets remain within 0.6% of baseline on the valid
+steady-state, burst, and TCP guard workloads. Budget 32 is the smallest tested
+quantum and therefore the best-supported initial opt-in value. The API defaults
+the budget off because the measurements do not justify changing scheduling
+behavior for every application.
+
+### Fairness and exclusion evidence
+
+The regression test preloads `B + 1` real NOP CQEs and proves one configured
+quantum leaves exactly one CQE pending, reports that the driver still needs
+parking, and drains the remainder on the next park. It also proves the default
+drains the same backlog exhaustively. A separate real-CQE test proves shutdown
+still drains exhaustively past a configured budget.
+
+The repeated multishot latency cohort described in the storage note remains
+excluded: it did not prove terminal cancellation had completed between samples.
+This change therefore makes no measured p99 or request-latency claim. Its
+acceptance evidence is the deterministic scheduling invariant plus neutral
+throughput guardrails.
+
+The budget-256 cohort stopped at 63 of 70 process logs and is not used for
+selection. Completed logs, excluded latency logs, and the cutoff are preserved
+under `/tmp/norn-completion-corrected-combined-v2-2026-07-21/`.
