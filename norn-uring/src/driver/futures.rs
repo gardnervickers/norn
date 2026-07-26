@@ -26,51 +26,76 @@ fn drop_static_shared(shared: &'static Shared) {
 }
 
 pin_project_lite::pin_project! {
-    struct PushFutureInner<'a> {
+    struct PushFutureInner<'a, P> {
         shared: &'a Shared,
         #[pin]
         notify: Option<Notified<'a>>,
-        pending: PendingSubmission,
+        pending: P,
     }
 }
 
-// `PushFuture` normally lives inside the task allocation. Keep the first four
-// batch entries inline rather than adding a second allocation for this variant.
-#[allow(clippy::large_enum_variant)]
-enum PendingSubmission {
-    Single(Option<ConfiguredEntry>),
-    Batch(SmallVec<[ConfiguredEntry; 4]>),
+pub(crate) struct SingleSubmission(Option<ConfiguredEntry>);
+
+pub(crate) struct BatchSubmission(SmallVec<[ConfiguredEntry; 4]>);
+
+trait PendingSubmission {
+    fn try_submit(&mut self, shared: &Shared) -> Result<bool, SubmitError>;
 }
 
-impl PushFuture {
+impl PendingSubmission for SingleSubmission {
+    fn try_submit(&mut self, shared: &Shared) -> Result<bool, SubmitError> {
+        let entry = self.0.take().expect("entry already submitted");
+        match shared.try_push(entry) {
+            Ok(()) => Ok(true),
+            Err(entry) => {
+                self.0 = Some(entry);
+                Ok(false)
+            }
+        }
+    }
+}
+
+impl PendingSubmission for BatchSubmission {
+    fn try_submit(&mut self, shared: &Shared) -> Result<bool, SubmitError> {
+        shared.validate_batch_len(self.0.len())?;
+        Ok(shared.try_push_batch(&mut self.0))
+    }
+}
+
+impl PushFutureImpl<SingleSubmission> {
     pub(super) fn new(shared: Rc<Shared>, entry: ConfiguredEntry) -> Self {
         let shared = into_static_shared(shared);
         let inner = PushFutureInner {
             shared,
             notify: Some(shared.backpressure.wait()),
-            pending: PendingSubmission::Single(Some(entry)),
+            pending: SingleSubmission(Some(entry)),
         };
-        PushFuture {
-            shared: Some(shared),
-            fut: Some(inner),
-        }
-    }
-
-    pub(super) fn new_batch(shared: Rc<Shared>, entries: SmallVec<[ConfiguredEntry; 4]>) -> Self {
-        let shared = into_static_shared(shared);
-        let inner = PushFutureInner {
-            shared,
-            notify: None,
-            pending: PendingSubmission::Batch(entries),
-        };
-        PushFuture {
+        PushFutureImpl {
             shared: Some(shared),
             fut: Some(inner),
         }
     }
 }
 
-impl Future for PushFutureInner<'_> {
+impl PushFutureImpl<BatchSubmission> {
+    pub(super) fn new_batch(shared: Rc<Shared>, entries: SmallVec<[ConfiguredEntry; 4]>) -> Self {
+        let shared = into_static_shared(shared);
+        let inner = PushFutureInner {
+            shared,
+            notify: None,
+            pending: BatchSubmission(entries),
+        };
+        PushFutureImpl {
+            shared: Some(shared),
+            fut: Some(inner),
+        }
+    }
+}
+
+impl<P> Future for PushFutureInner<'_, P>
+where
+    P: PendingSubmission,
+{
     type Output = Result<(), SubmitError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -89,44 +114,30 @@ impl Future for PushFutureInner<'_> {
                 Pin::set(&mut this.notify, None);
             }
 
-            match &mut *this.pending {
-                PendingSubmission::Single(entry) => {
-                    if let Err(returned_entry) = this
-                        .shared
-                        .try_push(entry.take().expect("entry already submitted"))
-                    {
-                        *entry = Some(returned_entry);
-                        log::trace!(target: LOG, "ring.push.full");
-                        Pin::set(&mut this.notify, Some(this.shared.backpressure.wait()));
-                        continue;
-                    }
+            match this.pending.try_submit(this.shared) {
+                Ok(true) => {
+                    log::trace!(target: LOG, "ring.push.ok");
+                    return Poll::Ready(Ok(()));
                 }
-                PendingSubmission::Batch(entries) => {
-                    if let Err(err) = this.shared.validate_batch_len(entries.len()) {
-                        return Poll::Ready(Err(err));
-                    }
-                    if !this.shared.try_push_batch(entries) {
-                        log::trace!(target: LOG, "ring.push.full");
-                        Pin::set(&mut this.notify, Some(this.shared.backpressure.wait()));
-                        continue;
-                    }
+                Ok(false) => {
+                    log::trace!(target: LOG, "ring.push.full");
+                    Pin::set(&mut this.notify, Some(this.shared.backpressure.wait()));
                 }
+                Err(err) => return Poll::Ready(Err(err)),
             }
-            log::trace!(target: LOG, "ring.push.ok");
-            return Poll::Ready(Ok(()));
         }
     }
 }
 
 pin_project_lite::pin_project! {
     /// A future which guarantees that the reactor will not be dropped
-    pub(crate) struct PushFuture {
+    pub(crate) struct PushFutureImpl<P> {
         shared: Option<&'static Shared>,
         #[pin]
-        fut: Option<PushFutureInner<'static>>,
+        fut: Option<PushFutureInner<'static, P>>,
     }
 
-    impl PinnedDrop for PushFuture {
+    impl<P> PinnedDrop for PushFutureImpl<P> {
         fn drop(this: Pin<&mut Self>) {
             let mut me = this.project();
             me.fut.set(None);
@@ -137,8 +148,12 @@ pin_project_lite::pin_project! {
     }
 }
 
-impl Future for PushFuture {
+impl<P> Future for PushFutureImpl<P>
+where
+    P: PendingSubmission,
+{
     type Output = Result<(), SubmitError>;
+
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.as_mut().project();
         let fut = this
@@ -146,5 +161,21 @@ impl Future for PushFuture {
             .as_pin_mut()
             .expect("cannot poll future after completion");
         fut.poll(cx)
+    }
+}
+
+pub(crate) type PushFuture = PushFutureImpl<SingleSubmission>;
+pub(crate) type PushBatchFuture = PushFutureImpl<BatchSubmission>;
+
+#[cfg(test)]
+mod tests {
+    use super::{PushBatchFuture, PushFuture};
+
+    #[test]
+    fn single_entry_waiter_does_not_reserve_batch_storage() {
+        assert!(
+            std::mem::size_of::<PushFuture>() * 2 < std::mem::size_of::<PushBatchFuture>(),
+            "single-entry submission should remain materially smaller than batch submission"
+        );
     }
 }
