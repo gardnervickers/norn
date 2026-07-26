@@ -1452,3 +1452,124 @@ single-entry path and the four-entry linked batch path both remain inline and
 allocation-free. `cargo test --workspace --all-features`, strict workspace
 clippy, formatting, and diff checks pass. An independent review found no
 correctness, safety, API, allocation, or benchmark-evidence issues.
+
+## 2026-07-26: Runnable queue layout
+
+Issue: [#57](https://github.com/gardnervickers/norn/issues/57).
+
+Goal: reduce single-thread task scheduling overhead without changing FIFO,
+wake-during-poll, shutdown, or allocation behavior. Lower latency is better.
+The acceptance threshold is a repeatable 5% improvement in the focused yield
+case with no material regression elsewhere.
+
+### Environment and methodology
+
+- Machine: AMD Ryzen 9 5950X, 16 cores / 32 threads, Linux 6.18.38.
+- Toolchain: Rust 1.97.0.
+- CPU affinity: CPU 15, whose SMT sibling is CPU 31; the scaling governor was
+  `performance`.
+- Baseline: clean merged `master` at
+  `a5aebd32c12e135003c0589f820bdd108ff3585a`.
+- Full guardrail matrices:
+  `taskset -c 15 cargo bench -p benches --bench schedule_task` and
+  `taskset -c 15 cargo bench -p benches --bench task_state`.
+- Focused case:
+  `taskset -c 15 cargo bench -p benches --bench task_state --
+  'bench_task_yield/tasks=128/yields=32'`.
+- Initial focused comparisons use five process-isolated runs; the final
+  exact-tree comparison uses seven alternating baseline/candidate pairs.
+- The repository's built-in 1,000 Hz pprof harness profiles the focused case;
+  system `perf` is not installed on this host.
+
+### Clean-master baseline
+
+The `schedule_task` matrix measured:
+
+- join: `81 ns`.
+- spawn 1: `35 ns`.
+- spawn 128: `4,917 ns`.
+- spawn 1024: `39,557 ns`.
+
+The `task_state` matrix measured:
+
+- 1 task, 1 / 8 / 32 yields: `36`, `99`, and `305 ns`.
+- 32 tasks, 1 / 8 / 32 yields: `1,225`, `3,181`, and `9,843 ns`.
+- 128 tasks, 1 / 8 / 32 yields: `4,775`, `12,470`, and `38,855 ns`.
+
+Focused raw runs were `38,258`, `38,550`, `38,569`, `39,728`, and
+`38,249 ns`; median `38,550 ns`. The fourth run is a visible high outlier, so
+candidate comparisons must be alternated against a refreshed baseline before
+acceptance.
+
+The 263-sample baseline profile still contains the `VecDeque` index/capacity
+chain: `pop_front -> wrap_add -> to_wrapped_index` and
+`push_back -> is_full -> capacity`. This supports testing a power-of-two queue
+layout, but the profile alone is not evidence of a win.
+
+### Boxed power-of-two ring with initialized slots
+
+Hypothesis: a private FIFO backed by `Box<[Option<Runnable>]>` can replace
+`VecDeque`'s wrap/capacity chain with a mask while retaining one allocation,
+power-of-two doubling, capacity retention, and safe element management.
+
+The candidate included a regression that filled, partially drained, wrapped,
+grew from 1,024 to 2,048 entries, and verified exact FIFO order and retained
+capacity. All 31 `norn-task` unit tests and its doc test passed.
+
+Focused raw runs were `43,428`, `43,856`, `43,287`, `43,300`, and
+`43,726 ns`; median `43,428 ns`, a `12.7%` regression from baseline.
+
+Decision: reject. Initializing and updating `Option` slots costs substantially
+more than the `VecDeque` mechanics this representation removes. The source
+change was reverted before trying another layout.
+
+### Uninitialized power-of-two ring
+
+Hypothesis: using `MaybeUninit<Runnable>` preserves `VecDeque`'s uninitialized
+storage and allocation behavior while replacing its general wrap logic with a
+power-of-two mask.
+
+The first version tracked a masked head plus length. Its initial focused runs
+were `39,406`, `36,898`, `36,806`, `37,959`, and `36,783 ns`; median
+`36,898 ns`, `4.3%` faster than the original baseline but short of the 5%
+acceptance threshold.
+
+Seven exact-tree alternating pairs produced baseline values of `38,590`,
+`38,269`, `38,909`, `39,128`, `41,640`, `40,811`, and `39,785 ns` and
+candidate values of `36,726`, `37,485`, `37,427`, `37,925`, `37,699`,
+`37,739`, and `37,631 ns`. Medians were `39,128 ns` and `37,631 ns`,
+respectively, only `3.8%` faster. The candidate was more stable, but still did
+not meet the predeclared threshold.
+
+A follow-up replaced masked head plus length with monotonically wrapping head
+and tail counters. Focused runs were `39,120`, `41,868`, `38,732`, `38,857`,
+and `38,627 ns`; median `38,857 ns`. Decision: reject the counter layout; its
+extra distance calculation erased the earlier improvement.
+
+Removing the empty-queue head reset from the original masked layout produced
+`37,303`, `37,688`, `38,247`, `37,328`, and `37,280 ns`; median
+`37,328 ns`, only `3.2%` faster than the original baseline. Caching the mask as
+another queue field produced a `38,646 ns` median (`38,534`, `38,646`,
+`39,284`, `38,661`, and `38,228 ns`) and was neutral.
+
+A linear retained buffer replaced wrapping with occasional compaction of the
+live tail. Its runs were `37,008`, `37,704`, `37,884`, `37,509`, and
+`37,594 ns`; median `37,594 ns`, only `2.5%` faster. Decision: reject; the
+infrequent bulk copy did not improve on the masked ring.
+
+The final profile of the best masked version contained no `VecDeque`
+wrap/capacity frames, confirming that the intended cost was removed rather
+than renamed. Queue pop still occupied 36 of 234 samples (`15.38%` cumulative),
+while `State::prepare_poll` accounted for 113 samples (`48.29%`) and
+`TaskRef::vtable` for 27 (`11.54%`). The remaining queue work and changed code
+shape consumed enough of the saved time that the measured improvement stayed
+below the acceptance threshold.
+
+Decision: retain no implementation. The best candidate preserved one
+allocation, 1,024-entry initial capacity, power-of-two growth, exact FIFO
+ordering across wraparound, and retained overflow capacity, but improved the
+focused case by only `3.8%` in exact-tree alternating runs. Adding a private
+unsafe queue for that sub-threshold gain is not justified. The rejected
+initialized-slot, masked, counter, cached-mask, and linear variants are
+documented here so this work is not repeated without a new workload or stronger
+profile signal.
