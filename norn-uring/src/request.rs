@@ -1,7 +1,6 @@
 #![allow(private_interfaces)]
 
 use std::future::Future;
-use std::io;
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
 use std::time::Duration;
@@ -10,13 +9,24 @@ use smallvec::SmallVec;
 
 use crate::driver::PushFuture;
 use crate::error::SubmitError;
-use crate::operation::{CQEResult, ConfiguredEntry, Op, Operation, Singleshot};
+use crate::operation::{ConfiguredEntry, Op, Singleshot};
+
+mod timeout;
+
+pub use timeout::{
+    LinkedTimeoutControl, Timeout, TimeoutControl, TimeoutOutcome, TimeoutRemove, TimeoutUpdate,
+    WithTimeout,
+};
 
 mod private {
     use super::*;
 
     pub trait Chainable: Future {
         fn reactor(&self) -> &crate::Handle;
+        /// Wait until batch preparation can proceed without consuming entries.
+        fn poll_ready_to_prepare(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+            Poll::Ready(())
+        }
         /// Prepare entries and return whether later linked requests may be submitted.
         fn prepare_batch(self: Pin<&mut Self>, batch: &mut SmallVec<[ConfiguredEntry; 4]>) -> bool;
         fn cancel_unsubmitted(self: Pin<&mut Self>);
@@ -63,89 +73,14 @@ pub trait Request: Future + Sized + private::Chainable {
     ///
     /// The returned future resolves to this request's output. If the timeout
     /// expires first, the linked request is canceled and its output reflects
-    /// that cancellation.
+    /// that cancellation. Call [`WithTimeout::control`] before moving the
+    /// future if the deadline may need to be reset while the request is active.
     fn timeout(self, duration: Duration) -> WithTimeout<Self> {
         WithTimeout::new(self, duration)
     }
 }
 
 impl<T> Request for T where T: Future + Sized + private::Chainable {}
-
-pin_project_lite::pin_project! {
-    /// A request future with a terminal linked timeout.
-    #[must_use = "futures do nothing unless you `.await` or poll them"]
-    pub struct WithTimeout<R>
-    where
-        R: Request,
-    {
-        #[pin]
-        inner: ThenAux<R, Op<LinkTimeoutOp>>,
-    }
-}
-
-impl<R> std::fmt::Debug for WithTimeout<R>
-where
-    R: Request,
-{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WithTimeout").finish()
-    }
-}
-
-impl<R> WithTimeout<R>
-where
-    R: Request,
-{
-    fn new(inner: R, duration: Duration) -> Self {
-        let reactor = inner.reactor().clone();
-        let timeout = Op::new(LinkTimeoutOp::new(duration), reactor);
-        Self {
-            inner: ThenAux::new(inner, timeout),
-        }
-    }
-}
-
-impl<R> Future for WithTimeout<R>
-where
-    R: Request,
-{
-    type Output = R::Output;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.project().inner.poll(cx)
-    }
-}
-
-#[derive(Debug)]
-struct LinkTimeoutOp {
-    timespec: io_uring::types::Timespec,
-}
-
-impl LinkTimeoutOp {
-    fn new(duration: Duration) -> Self {
-        Self {
-            timespec: duration.into(),
-        }
-    }
-}
-
-// Safety: the timeout specification is stored inline in this pinned operation,
-// so its SQE pointer remains valid until the terminal completion.
-unsafe impl Operation for LinkTimeoutOp {
-    fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
-        Ok(io_uring::opcode::LinkTimeout::new(&self.timespec).build())
-    }
-
-    fn cleanup(&mut self, _: CQEResult) {}
-}
-
-impl Singleshot for LinkTimeoutOp {
-    type Output = std::io::Result<()>;
-
-    fn complete(self, result: CQEResult) -> Self::Output {
-        result.result.map(|_| ())
-    }
-}
 
 pin_project_lite::pin_project! {
     /// A linked request that yields both inner results.
@@ -238,32 +173,42 @@ where
 
             if !*submitted {
                 if submit.is_none() {
+                    ready!(left.as_mut().poll_ready_to_prepare(cx));
+                    ready!(right.as_mut().poll_ready_to_prepare(cx));
                     let mut batch = SmallVec::new();
                     if !left.as_mut().prepare_batch(&mut batch) {
                         right.as_mut().cancel_unsubmitted();
                     } else {
                         right.as_mut().prepare_batch(&mut batch);
                     }
-                    let reactor = left.as_ref().get_ref().reactor().clone();
-                    submit.set(Some(reactor.push_batch(batch)));
-                }
-
-                let fut = submit
-                    .as_mut()
-                    .as_pin_mut()
-                    .expect("submit future must exist");
-                match ready!(fut.poll(cx)) {
-                    Ok(()) => {
+                    if batch.is_empty() {
                         left.as_mut().finish_submit();
                         right.as_mut().finish_submit();
-                    }
-                    Err(err) => {
-                        left.as_mut().fail_submit(&err);
-                        right.as_mut().fail_submit(&err);
+                        *submitted = true;
+                    } else {
+                        let reactor = left.as_ref().get_ref().reactor().clone();
+                        submit.set(Some(reactor.push_batch(batch)));
                     }
                 }
-                submit.set(None);
-                *submitted = true;
+
+                if !*submitted {
+                    let fut = submit
+                        .as_mut()
+                        .as_pin_mut()
+                        .expect("submit future must exist");
+                    match ready!(fut.poll(cx)) {
+                        Ok(()) => {
+                            left.as_mut().finish_submit();
+                            right.as_mut().finish_submit();
+                        }
+                        Err(err) => {
+                            left.as_mut().fail_submit(&err);
+                            right.as_mut().fail_submit(&err);
+                        }
+                    }
+                    submit.set(None);
+                    *submitted = true;
+                }
             }
         }
 
@@ -391,32 +336,42 @@ where
 
             if !*submitted {
                 if submit.is_none() {
+                    ready!(left.as_mut().poll_ready_to_prepare(cx));
+                    ready!(right.as_mut().poll_ready_to_prepare(cx));
                     let mut batch = SmallVec::new();
                     if !left.as_mut().prepare_batch(&mut batch) {
                         right.as_mut().cancel_unsubmitted();
                     } else {
                         right.as_mut().prepare_batch(&mut batch);
                     }
-                    let reactor = left.as_ref().get_ref().reactor().clone();
-                    submit.set(Some(reactor.push_batch(batch)));
-                }
-
-                let fut = submit
-                    .as_mut()
-                    .as_pin_mut()
-                    .expect("submit future must exist");
-                match ready!(fut.poll(cx)) {
-                    Ok(()) => {
+                    if batch.is_empty() {
                         left.as_mut().finish_submit();
                         right.as_mut().finish_submit();
-                    }
-                    Err(err) => {
-                        left.as_mut().fail_submit(&err);
-                        right.as_mut().fail_submit(&err);
+                        *submitted = true;
+                    } else {
+                        let reactor = left.as_ref().get_ref().reactor().clone();
+                        submit.set(Some(reactor.push_batch(batch)));
                     }
                 }
-                submit.set(None);
-                *submitted = true;
+
+                if !*submitted {
+                    let fut = submit
+                        .as_mut()
+                        .as_pin_mut()
+                        .expect("submit future must exist");
+                    match ready!(fut.poll(cx)) {
+                        Ok(()) => {
+                            left.as_mut().finish_submit();
+                            right.as_mut().finish_submit();
+                        }
+                        Err(err) => {
+                            left.as_mut().fail_submit(&err);
+                            right.as_mut().fail_submit(&err);
+                        }
+                    }
+                    submit.set(None);
+                    *submitted = true;
+                }
             }
         }
 
@@ -537,6 +492,20 @@ where
         }
     }
 
+    fn poll_ready_to_prepare(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = self.project();
+        let ThenStateProj::Pending {
+            mut left,
+            mut right,
+            ..
+        } = this.state.project()
+        else {
+            panic!("cannot prepare completed request");
+        };
+        ready!(left.as_mut().poll_ready_to_prepare(cx));
+        right.as_mut().poll_ready_to_prepare(cx)
+    }
+
     fn prepare_batch(self: Pin<&mut Self>, batch: &mut SmallVec<[ConfiguredEntry; 4]>) -> bool {
         let this = self.project();
         let ThenStateProj::Pending {
@@ -628,6 +597,20 @@ where
         }
     }
 
+    fn poll_ready_to_prepare(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = self.project();
+        let ThenAuxStateProj::Pending {
+            mut left,
+            mut right,
+            ..
+        } = this.state.project()
+        else {
+            panic!("cannot prepare completed request");
+        };
+        ready!(left.as_mut().poll_ready_to_prepare(cx));
+        right.as_mut().poll_ready_to_prepare(cx)
+    }
+
     fn prepare_batch(self: Pin<&mut Self>, batch: &mut SmallVec<[ConfiguredEntry; 4]>) -> bool {
         let this = self.project();
         let ThenAuxStateProj::Pending {
@@ -716,6 +699,10 @@ where
         self.inner.reactor()
     }
 
+    fn poll_ready_to_prepare(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        self.project().inner.poll_ready_to_prepare(cx)
+    }
+
     fn prepare_batch(self: Pin<&mut Self>, batch: &mut SmallVec<[ConfiguredEntry; 4]>) -> bool {
         self.project().inner.prepare_batch(batch)
     }
@@ -740,12 +727,14 @@ where
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::io;
     use std::rc::Rc;
     use std::time::Duration;
 
     use norn_executor::LocalExecutor;
 
     use super::*;
+    use crate::operation::{CQEResult, Operation};
 
     #[derive(Debug)]
     struct TaggedNop(u8);

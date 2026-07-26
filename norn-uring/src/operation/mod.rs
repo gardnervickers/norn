@@ -109,6 +109,10 @@ pub(crate) struct ConfiguredEntry {
 }
 
 impl ConfiguredEntry {
+    pub(crate) fn target_user_data(&self) -> u64 {
+        self.handle.as_raw_usize() as u64
+    }
+
     pub(crate) fn into_entry_with_flags(self, flags: Flags) -> io_uring::squeue::Entry {
         self.entry
             .flags(flags)
@@ -117,6 +121,39 @@ impl ConfiguredEntry {
 
     pub(crate) fn new(handle: RawOpRef, entry: io_uring::squeue::Entry) -> Self {
         Self { entry, handle }
+    }
+}
+
+/// An owned identity for an operation submitted through this driver.
+///
+/// Keeping this value alive keeps the operation allocation alive, which makes
+/// its `user_data` identity safe to use as the target of a later io_uring
+/// control request even if the original operation completes in the meantime.
+pub(crate) struct OpTarget {
+    handle: RawOpRef,
+}
+
+impl OpTarget {
+    pub(crate) fn user_data(&self) -> u64 {
+        self.handle.as_raw_usize() as u64
+    }
+
+    pub(crate) fn is_complete(&self) -> bool {
+        self.handle.is_complete()
+    }
+}
+
+impl Clone for OpTarget {
+    fn clone(&self) -> Self {
+        Self {
+            handle: self.handle.clone(),
+        }
+    }
+}
+
+impl std::fmt::Debug for OpTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpTarget").finish_non_exhaustive()
     }
 }
 
@@ -296,17 +333,36 @@ where
     T: Operation + 'static,
 {
     pub(crate) fn new(data: T, reactor: crate::Handle) -> Self {
+        let (handle, entry) = Self::prepare(data);
+        match entry {
+            Ok(entry) => Self::from_parts(handle, entry, reactor),
+            Err(err) => Self::configure_failed(handle, err, reactor),
+        }
+    }
+
+    pub(crate) fn new_with_target(data: T, reactor: crate::Handle) -> (Self, OpTarget) {
+        let (handle, entry) = Self::prepare(data);
+        let target = OpTarget {
+            handle: handle.untyped(),
+        };
+        let operation = match entry {
+            Ok(entry) => Self::from_parts(handle, entry, reactor),
+            Err(err) => Self::configure_failed(handle, err, reactor),
+        };
+        (operation, target)
+    }
+
+    fn prepare(data: T) -> (TypedHandle<T>, io::Result<ConfiguredEntry>) {
         let mut handle = TypedHandle::new(data);
         // Safety: The handle was just created and no other references to its operation data
         // exist. `RawOp` keeps the data at a stable address until the operation completes.
         let data = unsafe { handle.data_mut().expect("operation already completed") };
 
-        let entry = match T::configure(data) {
-            Ok(entry) => entry,
-            Err(err) => return Self::configure_failed(handle, err, reactor),
-        };
-        let entry = ConfiguredEntry::new(handle.untyped(), entry);
+        let entry = T::configure(data).map(|entry| ConfiguredEntry::new(handle.untyped(), entry));
+        (handle, entry)
+    }
 
+    fn from_parts(handle: TypedHandle<T>, entry: ConfiguredEntry, reactor: crate::Handle) -> Self {
         Self {
             submit: None,
             state: State::Prepared {
@@ -334,6 +390,10 @@ where
 
     pub(crate) fn handle(&self) -> &crate::Handle {
         &self.reactor
+    }
+
+    pub(crate) fn is_submitted(&self) -> bool {
+        matches!(self.state, State::Submitted { .. })
     }
 
     pub(crate) fn prepare_batch(
@@ -651,6 +711,46 @@ mod tests {
         let handle_usize = handle.into_raw_usize();
         let handle = unsafe { RawOpRef::from_raw_usize(handle_usize) };
         drop(handle);
+    }
+
+    #[test]
+    fn op_target_retains_operation_identity_and_allocation() {
+        #[derive(Debug)]
+        struct DropTracked(Rc<Cell<bool>>);
+
+        impl Drop for DropTracked {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+
+        unsafe impl Operation for DropTracked {
+            fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+                unreachable!("the target lifetime test does not configure an SQE")
+            }
+
+            fn cleanup(&mut self, _: CQEResult) {}
+        }
+
+        let dropped = Rc::new(Cell::new(false));
+        let typed = TypedHandle::new(DropTracked(Rc::clone(&dropped)));
+        let target = OpTarget {
+            handle: typed.untyped(),
+        };
+        let user_data = target.user_data();
+
+        drop(typed);
+        assert!(
+            !dropped.get(),
+            "target must retain the operation allocation"
+        );
+        assert_eq!(target.user_data(), user_data);
+
+        drop(target);
+        assert!(
+            dropped.get(),
+            "last target reference must release the operation"
+        );
     }
 
     #[derive(Debug, Default)]
