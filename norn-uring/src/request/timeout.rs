@@ -780,36 +780,45 @@ impl private::Chainable for TimeoutRemove {
         &self.target.reactor
     }
 
+    fn poll_ready_to_prepare(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if self.as_ref().get_ref().initialized
+            || self.as_ref().get_ref().target.state.lifecycle.get() != TimeoutLifecycle::Queued
+        {
+            self.project().waiting.take();
+            return Poll::Ready(());
+        }
+
+        let this = self.project();
+        let replace = match this.waiting.as_ref() {
+            Some(registered) => !registered.will_wake(cx.waker()),
+            None => true,
+        };
+        if replace {
+            if let Some(registered) = this.waiting.take() {
+                this.target.state.unregister_waiter(&registered);
+            }
+            this.target.state.register_waiter(cx.waker());
+            *this.waiting = Some(cx.waker().clone());
+        }
+        Poll::Pending
+    }
+
     fn prepare_batch(mut self: Pin<&mut Self>, batch: &mut SmallVec<[ConfiguredEntry; 4]>) -> bool {
         if !self.as_ref().get_ref().initialized
             && self.as_ref().get_ref().target.state.lifecycle.get() == TimeoutLifecycle::Queued
         {
             let target = self.as_ref().get_ref().target.operation.user_data();
-            if let Some(position) = batch
+            let position = batch
                 .iter()
                 .position(|entry| entry.target_user_data() == target)
-            {
-                batch.remove(position);
+                .expect("queued timeout from another batch must wait for submission");
+            batch.remove(position);
 
-                let this = self.as_mut().project();
-                this.target.state.mark_canceled_before_submit();
-                *this.local_result = Some(true);
-                *this.initialized = true;
-                return true;
-            }
-
-            // The target is waiting for capacity in a different submission.
-            // Keep this request chainable by issuing a normal kernel removal;
-            // its result accurately reports whether the target reached the
-            // kernel before this batch did.
-            let operation = self.as_ref().get_ref().target.operation.clone();
-            let reactor = self.as_ref().get_ref().target.reactor.clone();
-            let mut this = self.as_mut().project();
-            this.inner.set(Some(Op::new(
-                TimeoutRemoveOp { target: operation },
-                reactor,
-            )));
+            let this = self.as_mut().project();
+            this.target.state.mark_canceled_before_submit();
+            *this.local_result = Some(true);
             *this.initialized = true;
+            return true;
         }
 
         let initialized = self.as_mut().initialize();
@@ -1470,28 +1479,79 @@ mod tests {
     }
 
     #[test]
-    fn queued_timeout_cancel_remains_chainable_from_another_batch() {
-        let driver = crate::Driver::new(io_uring::IoUring::builder(), 1).unwrap();
+    fn queued_timeout_cancel_waits_before_submitting_another_batch() {
+        let mut driver = crate::Driver::new(io_uring::IoUring::builder(), 2).unwrap();
         let handle = driver.handle();
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
 
+        // Leave one SQ slot free. The target's two-entry batch cannot fit, but
+        // the buggy one-entry removal batch could otherwise overtake it.
         let mut filler = std::pin::pin!(handle.submit(Nop));
         assert!(Future::poll(filler.as_mut(), &mut cx).is_pending());
 
         let timeout = handle.timeout(Duration::from_secs(60));
         let control = timeout.control();
-        let mut timeout = std::pin::pin!(timeout);
-        assert!(Future::poll(timeout.as_mut(), &mut cx).is_pending());
+        let mut target = std::pin::pin!(handle.submit(Nop).then(timeout));
+        assert!(Future::poll(target.as_mut(), &mut cx).is_pending());
         assert_eq!(
             control.target.state.lifecycle.get(),
             TimeoutLifecycle::Queued
         );
 
-        let mut cancel = std::pin::pin!(control.cancel());
-        let mut batch = SmallVec::new();
-        private::Chainable::prepare_batch(cancel.as_mut(), &mut batch);
-        assert_eq!(batch.len(), 1, "kernel removal should remain chainable");
+        // A locally canceled timeout contributes no SQE, leaving this as a
+        // one-entry chain while still exercising recursive batch readiness.
+        let local = handle.timeout(Duration::from_secs(60));
+        let local_control = local.control();
+        let mut local_cancel = std::pin::pin!(local_control.cancel());
+        assert!(poll_ready(local_cancel.as_mut()).unwrap());
+        let mut local_then_cancel = std::pin::pin!(local.then(control.cancel()));
+        assert!(Future::poll(local_then_cancel.as_mut(), &mut cx).is_pending());
+
+        driver.park(ParkMode::NoPark).unwrap();
+        driver.park(ParkMode::NoPark).unwrap();
+        assert!(
+            Future::poll(local_then_cancel.as_mut(), &mut cx).is_pending(),
+            "queued removal overtook its target and completed with ENOENT"
+        );
+
+        assert!(Future::poll(target.as_mut(), &mut cx).is_pending());
+        assert_eq!(
+            control.target.state.lifecycle.get(),
+            TimeoutLifecycle::Submitted
+        );
+
+        // The target batch is now ahead of the removal batch in the SQ.
+        assert!(Future::poll(local_then_cancel.as_mut(), &mut cx).is_pending());
+        driver.park(ParkMode::NoPark).unwrap();
+        assert!(Future::poll(local_then_cancel.as_mut(), &mut cx).is_pending());
+        driver.park(ParkMode::NoPark).unwrap();
+
+        let mut cancel_output = None;
+        let mut target_output = None;
+        for _ in 0..4 {
+            driver.park(ParkMode::NextCompletion).unwrap();
+            if cancel_output.is_none() {
+                if let Poll::Ready(output) = Future::poll(local_then_cancel.as_mut(), &mut cx) {
+                    cancel_output = Some(output);
+                }
+            }
+            if target_output.is_none() {
+                if let Poll::Ready(output) = Future::poll(target.as_mut(), &mut cx) {
+                    target_output = Some(output);
+                }
+            }
+            if cancel_output.is_some() && target_output.is_some() {
+                break;
+            }
+        }
+
+        let (local, canceled) = cancel_output.expect("control chain did not complete");
+        assert_eq!(local.unwrap(), TimeoutOutcome::Canceled);
+        assert!(canceled.unwrap());
+        let (nop, timeout) = target_output.expect("target chain did not complete");
+        nop.unwrap();
+        assert_eq!(timeout.unwrap(), TimeoutOutcome::Canceled);
     }
 
     #[test]

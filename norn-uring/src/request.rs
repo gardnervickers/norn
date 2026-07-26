@@ -23,6 +23,10 @@ mod private {
 
     pub trait Chainable: Future {
         fn reactor(&self) -> &crate::Handle;
+        /// Wait until batch preparation can proceed without consuming entries.
+        fn poll_ready_to_prepare(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+            Poll::Ready(())
+        }
         /// Prepare entries and return whether later linked requests may be submitted.
         fn prepare_batch(self: Pin<&mut Self>, batch: &mut SmallVec<[ConfiguredEntry; 4]>) -> bool;
         fn cancel_unsubmitted(self: Pin<&mut Self>);
@@ -169,6 +173,8 @@ where
 
             if !*submitted {
                 if submit.is_none() {
+                    ready!(left.as_mut().poll_ready_to_prepare(cx));
+                    ready!(right.as_mut().poll_ready_to_prepare(cx));
                     let mut batch = SmallVec::new();
                     if !left.as_mut().prepare_batch(&mut batch) {
                         right.as_mut().cancel_unsubmitted();
@@ -330,6 +336,8 @@ where
 
             if !*submitted {
                 if submit.is_none() {
+                    ready!(left.as_mut().poll_ready_to_prepare(cx));
+                    ready!(right.as_mut().poll_ready_to_prepare(cx));
                     let mut batch = SmallVec::new();
                     if !left.as_mut().prepare_batch(&mut batch) {
                         right.as_mut().cancel_unsubmitted();
@@ -484,6 +492,20 @@ where
         }
     }
 
+    fn poll_ready_to_prepare(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = self.project();
+        let ThenStateProj::Pending {
+            mut left,
+            mut right,
+            ..
+        } = this.state.project()
+        else {
+            panic!("cannot prepare completed request");
+        };
+        ready!(left.as_mut().poll_ready_to_prepare(cx));
+        right.as_mut().poll_ready_to_prepare(cx)
+    }
+
     fn prepare_batch(self: Pin<&mut Self>, batch: &mut SmallVec<[ConfiguredEntry; 4]>) -> bool {
         let this = self.project();
         let ThenStateProj::Pending {
@@ -575,6 +597,20 @@ where
         }
     }
 
+    fn poll_ready_to_prepare(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = self.project();
+        let ThenAuxStateProj::Pending {
+            mut left,
+            mut right,
+            ..
+        } = this.state.project()
+        else {
+            panic!("cannot prepare completed request");
+        };
+        ready!(left.as_mut().poll_ready_to_prepare(cx));
+        right.as_mut().poll_ready_to_prepare(cx)
+    }
+
     fn prepare_batch(self: Pin<&mut Self>, batch: &mut SmallVec<[ConfiguredEntry; 4]>) -> bool {
         let this = self.project();
         let ThenAuxStateProj::Pending {
@@ -661,6 +697,10 @@ where
 {
     fn reactor(&self) -> &crate::Handle {
         self.inner.reactor()
+    }
+
+    fn poll_ready_to_prepare(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        self.project().inner.poll_ready_to_prepare(cx)
     }
 
     fn prepare_batch(self: Pin<&mut Self>, batch: &mut SmallVec<[ConfiguredEntry; 4]>) -> bool {
