@@ -117,22 +117,22 @@ struct Shared {
     submit_error: RefCell<Option<(io::ErrorKind, String)>>,
     shutdown_outcome: Cell<Option<ShutdownOutcome>>,
     #[cfg(test)]
-    cancel_all_failures: RefCell<std::collections::VecDeque<i32>>,
-    #[cfg(test)]
-    cancel_all_attempts: Cell<usize>,
-    #[cfg(test)]
-    drain_failures: RefCell<std::collections::VecDeque<usize>>,
-    #[cfg(test)]
-    operations_drain_attempts: Cell<usize>,
-    #[cfg(test)]
-    resources_drain_attempts: Cell<usize>,
-    #[cfg(test)]
-    submit_failures: RefCell<std::collections::VecDeque<i32>>,
-    #[cfg(test)]
-    submit_limits: RefCell<std::collections::VecDeque<(usize, usize)>>,
+    shutdown_test: ShutdownTest,
     // This field must be declared after `ring`: fields are dropped in declaration
     // order, so retained registered storage is released only after the ring.
     registered_buffers: RegisteredBuffers,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct ShutdownTest {
+    cancel_all_failures: RefCell<std::collections::VecDeque<i32>>,
+    cancel_all_attempts: Cell<usize>,
+    drain_failures: RefCell<std::collections::VecDeque<usize>>,
+    operations_drain_attempts: Cell<usize>,
+    resources_drain_attempts: Cell<usize>,
+    submit_failures: RefCell<std::collections::VecDeque<i32>>,
+    submit_limits: RefCell<std::collections::VecDeque<(usize, usize)>>,
 }
 
 pub(crate) struct FixedBufReservation {
@@ -462,19 +462,7 @@ impl Driver {
                 submit_error: RefCell::new(None),
                 shutdown_outcome: Cell::new(None),
                 #[cfg(test)]
-                cancel_all_failures: RefCell::new(std::collections::VecDeque::new()),
-                #[cfg(test)]
-                cancel_all_attempts: Cell::new(0),
-                #[cfg(test)]
-                drain_failures: RefCell::new(std::collections::VecDeque::new()),
-                #[cfg(test)]
-                operations_drain_attempts: Cell::new(0),
-                #[cfg(test)]
-                resources_drain_attempts: Cell::new(0),
-                #[cfg(test)]
-                submit_failures: RefCell::new(std::collections::VecDeque::new()),
-                #[cfg(test)]
-                submit_limits: RefCell::new(std::collections::VecDeque::new()),
+                shutdown_test: ShutdownTest::default(),
                 registered_buffers: RegisteredBuffers::new(),
             }),
             unparker: Arc::new(unpark::Unparker::new()?),
@@ -802,7 +790,7 @@ impl Driver {
                     if unsafe { self.shared.try_push_raw(&opcode) }.is_ok() {
                         self.shared.set_status(Status::DrainingResources);
                     } else {
-                        let drained = self.drain::<32>(usize::MAX);
+                        let drained = self.drain_exhaustive();
                         trace!(target: LOG, "shutdown.push_resources_drain.retry drained={drained}");
                         if drained == 0 {
                             std::thread::sleep(Duration::from_millis(1));
@@ -810,7 +798,9 @@ impl Driver {
                     }
                 }
                 Status::DrainingResources => {
-                    if let Err(err) = self.park(ParkMode::NextCompletion) {
+                    if let Err(err) =
+                        self.park_with_completion_budget(ParkMode::NextCompletion, None)
+                    {
                         self.retry_shutdown("park_cleanup", &err);
                     }
                 }
@@ -954,12 +944,14 @@ impl Shared {
 
     fn submit_once(&self, mode: ParkMode) -> io::Result<usize> {
         #[cfg(test)]
-        if let Some(errno) = self.submit_failures.borrow_mut().pop_front() {
+        if let Some(errno) = self.shutdown_test.submit_failures.borrow_mut().pop_front() {
             return Err(io::Error::from_raw_os_error(errno));
         }
 
         #[cfg(test)]
-        if let Some((limit, expected_remaining)) = self.submit_limits.borrow_mut().pop_front() {
+        if let Some((limit, expected_remaining)) =
+            self.shutdown_test.submit_limits.borrow_mut().pop_front()
+        {
             assert_eq!(mode, ParkMode::NoPark);
             let mut ring = self.ring.borrow_mut();
             let pending = {
@@ -1142,9 +1134,15 @@ impl Shared {
     pub(crate) fn cancel_all(&self) -> io::Result<()> {
         #[cfg(test)]
         {
-            self.cancel_all_attempts
-                .set(self.cancel_all_attempts.get() + 1);
-            if let Some(errno) = self.cancel_all_failures.borrow_mut().pop_front() {
+            self.shutdown_test
+                .cancel_all_attempts
+                .set(self.shutdown_test.cancel_all_attempts.get() + 1);
+            if let Some(errno) = self
+                .shutdown_test
+                .cancel_all_failures
+                .borrow_mut()
+                .pop_front()
+            {
                 return Err(io::Error::from_raw_os_error(errno));
             }
         }
@@ -1165,7 +1163,10 @@ impl Shared {
 
     #[cfg(test)]
     fn fail_next_cancel_all(&self, errno: i32) {
-        self.cancel_all_failures.borrow_mut().push_back(errno);
+        self.shutdown_test
+            .cancel_all_failures
+            .borrow_mut()
+            .push_back(errno);
     }
 
     #[cfg(test)]
@@ -1174,21 +1175,24 @@ impl Shared {
             token,
             Driver::OPERATIONS_DRAIN_TOKEN | Driver::RESOURCES_DRAIN_TOKEN
         ));
-        self.drain_failures.borrow_mut().push_back(token);
+        self.shutdown_test
+            .drain_failures
+            .borrow_mut()
+            .push_back(token);
     }
 
     #[cfg(test)]
     fn fail_drain_sentinel(&self, token: usize) -> bool {
         let attempts = match token {
-            Driver::OPERATIONS_DRAIN_TOKEN => &self.operations_drain_attempts,
-            Driver::RESOURCES_DRAIN_TOKEN => &self.resources_drain_attempts,
+            Driver::OPERATIONS_DRAIN_TOKEN => &self.shutdown_test.operations_drain_attempts,
+            Driver::RESOURCES_DRAIN_TOKEN => &self.shutdown_test.resources_drain_attempts,
             _ => unreachable!("unknown drain sentinel token"),
         };
         attempts.set(attempts.get() + 1);
 
-        let should_fail = self.drain_failures.borrow().front() == Some(&token);
+        let should_fail = self.shutdown_test.drain_failures.borrow().front() == Some(&token);
         if should_fail {
-            self.drain_failures.borrow_mut().pop_front();
+            self.shutdown_test.drain_failures.borrow_mut().pop_front();
             true
         } else {
             false
@@ -1197,13 +1201,17 @@ impl Shared {
 
     #[cfg(test)]
     fn fail_next_submit(&self, errno: i32) {
-        self.submit_failures.borrow_mut().push_back(errno);
+        self.shutdown_test
+            .submit_failures
+            .borrow_mut()
+            .push_back(errno);
     }
 
     #[cfg(test)]
     fn limit_next_submit(&self, limit: usize, expected_remaining: usize) {
         assert!(limit > 0);
-        self.submit_limits
+        self.shutdown_test
+            .submit_limits
             .borrow_mut()
             .push_back((limit, expected_remaining));
     }
@@ -1262,6 +1270,7 @@ mod tests {
     use std::net::TcpListener;
     use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixStream;
+    use std::process::Command;
     use std::rc::Rc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc};
@@ -1382,9 +1391,11 @@ mod tests {
             drop(handle);
             driver.shared.fail_next_cancel_all(libc::EIO);
             let outcome = driver.shutdown_with_outcome();
-            let cancel_all_attempts = driver.shared.cancel_all_attempts.get();
-            let operations_drain_attempts = driver.shared.operations_drain_attempts.get();
-            let resources_drain_attempts = driver.shared.resources_drain_attempts.get();
+            let cancel_all_attempts = driver.shared.shutdown_test.cancel_all_attempts.get();
+            let operations_drain_attempts =
+                driver.shared.shutdown_test.operations_drain_attempts.get();
+            let resources_drain_attempts =
+                driver.shared.shutdown_test.resources_drain_attempts.get();
             let shared_refs = Rc::strong_count(&driver.shared);
             drop(driver);
             tx.send((
@@ -1464,8 +1475,11 @@ mod tests {
                 driver.shared.fail_next_cancel_all(errno);
             }
             let outcome = driver.shutdown_with_outcome();
-            tx.send((outcome, driver.shared.cancel_all_attempts.get()))
-                .unwrap();
+            tx.send((
+                outcome,
+                driver.shared.shutdown_test.cancel_all_attempts.get(),
+            ))
+            .unwrap();
         });
         rx.recv_timeout(Duration::from_secs(2))
             .expect("shutdown did not reach the drain barriers")
@@ -1519,8 +1533,8 @@ mod tests {
             let outcome = driver.shutdown_with_outcome();
             tx.send((
                 outcome,
-                driver.shared.operations_drain_attempts.get(),
-                driver.shared.resources_drain_attempts.get(),
+                driver.shared.shutdown_test.operations_drain_attempts.get(),
+                driver.shared.shutdown_test.resources_drain_attempts.get(),
             ))
             .unwrap();
         });
@@ -1832,6 +1846,22 @@ mod tests {
 
     #[test]
     fn shutdown_waits_for_cleanup_generated_close_before_returning() {
+        const CHILD_ENV: &str = "NORN_URING_CLEANUP_CLOSE_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            // This regression deliberately closes a numeric descriptor and reuses
+            // that exact number with dup2. Run it in a private process FD table so
+            // parallel unit tests cannot claim that number between those steps.
+            let status = Command::new(std::env::current_exe().unwrap())
+                .arg("driver::tests::shutdown_waits_for_cleanup_generated_close_before_returning")
+                .arg("--exact")
+                .arg("--test-threads=1")
+                .env(CHILD_ENV, "1")
+                .status()
+                .expect("failed to spawn isolated cleanup-close regression");
+            assert!(status.success(), "isolated cleanup-close regression failed");
+            return;
+        }
+
         #[derive(Debug)]
         struct PendingFdOp {
             _fd: fd::NornFd,
@@ -1903,14 +1933,19 @@ mod tests {
 
         Park::shutdown(&mut driver);
 
-        assert!(driver.shared.submit_failures.borrow().is_empty());
+        assert!(driver
+            .shared
+            .shutdown_test
+            .submit_failures
+            .borrow()
+            .is_empty());
         assert_eq!(
-            driver.shared.operations_drain_attempts.get(),
+            driver.shared.shutdown_test.operations_drain_attempts.get(),
             1,
             "the operations drain barrier must succeed on its first attempt"
         );
         assert_eq!(
-            driver.shared.resources_drain_attempts.get(),
+            driver.shared.shutdown_test.resources_drain_attempts.get(),
             1,
             "the cleanup-generated close must be compatible with IO_DRAIN"
         );
