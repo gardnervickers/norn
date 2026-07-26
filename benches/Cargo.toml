@@ -6,6 +6,9 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+bundle-instrumentation = ["norn-uring/bench-instrumentation"]
+
 [dependencies]
 norn-task = { path = "../norn-task" }
 norn-channel = { path = "../norn-channel" }
@@ -107,3 +110,9 @@ harness = false
 name = "bufring_echo"
 path = "bufring_echo.rs"
 harness = false
+
+[[bench]]
+name = "bundle_recv"
+path = "bundle_recv.rs"
+harness = false
+required-features = ["bundle-instrumentation"]

@@ -1573,3 +1573,119 @@ unsafe queue for that sub-threshold gain is not justified. The rejected
 initialized-slot, masked, counter, cached-mask, and linear variants are
 documented here so this work is not repeated without a new workload or stronger
 profile signal.
+
+## 2026-07-26: Receive-bundle release overhead
+
+Issue: [#62](https://github.com/gardnervickers/norn/issues/62).
+
+Goal: reduce the allocation, reference-counting, and buffer-ring tail
+publication work performed when a receive bundle is dropped. Lower latency,
+allocations, allocated bytes, and tail publications are better. Single-buffer
+bundles must not regress.
+
+### Environment and methodology
+
+- Machine: AMD Ryzen 9 5950X, 16 cores / 32 threads, Linux 6.18.38.
+- Toolchain: Rust 1.97.0.
+- CPU affinity: CPU 15, whose SMT sibling is CPU 31; the scaling governor was
+  `performance`.
+- Baseline: merged `master` at
+  `9c370a170d25392ca400a32b0223991e636e1860` plus benchmark-only allocation
+  and tail-publication instrumentation.
+- Workload: framed loopback TCP using multishot receive bundles, 256-byte ring
+  buffers, one outstanding request, and 1, 2, 4, or 16 buffers per frame.
+  TCP is used because a UDP datagram larger than one provided buffer is
+  truncated rather than split across a receive bundle.
+- Each process performs 1,024 warmup requests followed by 16,384 measured
+  requests. Latency results are medians of five process-isolated runs.
+- Command:
+  `taskset -c 15 cargo bench -p benches --features bundle-instrumentation
+  --bench bundle_recv -- <segments> 16384`.
+- The client reuses its payload and acknowledgement storage. The server checks
+  every byte, drops each completed bundle before acknowledging the frame, and
+  measures allocations around only the steady-state request loop.
+
+### Baseline
+
+| buffers | median ns/request | allocations/request | bytes/request | tail publications/request |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 11,201.51 | 4.0002 | 416.02 | 1 |
+| 2 | 11,650.62 | 4.0002 | 440.04 | 2 |
+| 4 | 11,880.09 | 4.0002 | 488.07 | 4 |
+| 16 | 13,466.92 | 4.0002 | 776.26 | 16 |
+
+Raw latency values:
+
+- 1 buffer: `11,201.51`, `11,303.11`, `11,184.98`, `11,120.92`, and
+  `11,248.61 ns/request`.
+- 2 buffers: `11,626.96`, `11,635.12`, `11,650.62`, `11,679.22`, and
+  `11,795.35 ns/request`.
+- 4 buffers: `11,880.09`, `11,901.70`, `11,880.54`, `11,829.82`, and
+  `11,839.99 ns/request`.
+- 16 buffers: `13,466.92`, `13,517.45`, `13,457.04`, `13,497.90`, and
+  `13,454.39 ns/request`.
+
+The allocation count is independent of bundle width because the bundle adds
+one `Vec` allocation per completion. Its allocated size grows by 24 bytes per
+additional `BufRingBuf`. Tail publication scales exactly with buffer count
+because every element drop performs its own release store.
+
+### Batched tail publication with the existing representation
+
+Hypothesis: keep `Vec<BufRingBuf>` and the public API unchanged, but suppress
+the element drops and return all owned BIDs before one release publication.
+
+| buffers | median ns/request | delta | allocations/request | bytes/request | tail publications/request |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 11,278.53 | +0.7% | 4.0002 | 416.02 | 1 |
+| 2 | 11,730.24 | +0.7% | 4.0002 | 440.04 | 1 |
+| 4 | 11,987.95 | +0.9% | 4.0002 | 488.07 | 1 |
+| 16 | 13,557.93 | +0.7% | 4.0002 | 776.26 | 1 |
+
+Raw latency values:
+
+- 1 buffer: `11,278.53`, `11,280.22`, `11,259.35`, `11,322.12`, and
+  `11,229.53 ns/request`.
+- 2 buffers: `11,708.45`, `11,700.17`, `11,730.24`, `11,756.64`, and
+  `11,742.65 ns/request`.
+- 4 buffers: `11,980.49`, `12,011.74`, `12,037.95`, `11,987.95`, and
+  `11,949.63 ns/request`.
+- 16 buffers: `13,557.28`, `13,520.46`, `13,612.48`, `13,557.93`, and
+  `13,599.05 ns/request`.
+
+Decision: useful primitive but not sufficient alone. It deterministically
+reduces N release stores to one, but the extra manual-drop bookkeeping is
+latency-neutral and leaves the allocation and per-buffer ring clones intact.
+Retain it only if the compact representation provides a material combined
+benefit.
+
+### Compact common-case representation
+
+Hypothesis: store a numerically sequential BID range directly in the bundle,
+falling back to an inline `SmallVec` only when the ring's observed BID order is
+not sequential. Materialize individual `BufRingBuf` values only when the caller
+uses `into_bufs`.
+
+| buffers | median ns/request | delta | allocations/request | bytes/request | tail publications/request |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 11,214.51 | +0.1% | 3.0002 | 392.02 | 1 |
+| 2 | 11,677.04 | +0.2% | 3.0002 | 392.04 | 1 |
+| 4 | 11,852.12 | -0.2% | 3.0002 | 392.07 | 1 |
+| 16 | 13,418.61 | -0.4% | 3.0002 | 392.26 | 1 |
+
+Raw latency values:
+
+- 1 buffer: `11,225.38`, `11,300.17`, `11,137.68`, `11,142.53`, and
+  `11,214.51 ns/request`.
+- 2 buffers: `11,677.04`, `11,817.52`, `11,646.17`, `11,598.23`, and
+  `11,755.75 ns/request`.
+- 4 buffers: `11,890.27`, `11,852.12`, `11,809.73`, `11,877.49`, and
+  `11,815.88 ns/request`.
+- 16 buffers: `13,418.61`, `13,450.24`, `13,468.50`, `13,382.29`, and
+  `13,363.60 ns/request`.
+
+Decision: retain. The common path removes the per-completion `Vec` allocation
+and all per-buffer `Rc` clones, keeps allocated bytes essentially constant as
+bundle width grows, and reduces tail publication from N release stores to one.
+Median latency remains within 0.4% of baseline at every width, including the
+single-buffer case.

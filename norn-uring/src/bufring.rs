@@ -11,6 +11,7 @@ use std::{fmt, io, ops, ptr};
 use io_uring::types::{self, BufRingEntry};
 use io_uring::Submitter;
 use log::warn;
+use smallvec::SmallVec;
 
 use crate::buf::StableBuf;
 use crate::Handle;
@@ -76,6 +77,15 @@ impl RecvBufRing {
         self.rc.buf_cnt
     }
 
+    /// Returns the number of buffer-ring tail publications.
+    ///
+    /// This counter is available only for benchmark instrumentation and
+    /// includes registration-time publication.
+    #[cfg(feature = "bench-instrumentation")]
+    pub fn release_publications(&self) -> u64 {
+        self.rc.release_publications.get()
+    }
+
     pub(crate) fn get_buf(&self, res: u32, flags: u32) -> io::Result<BufRingBuf> {
         self.rc.get_buf(self.clone(), res, flags)
     }
@@ -112,15 +122,84 @@ pub struct BufRingBuf {
 ///
 /// This is primarily used by recv bundle operations that may consume multiple provided buffers
 /// for a single completion.
-#[derive(Debug)]
 pub struct BufRingBufBundle {
-    bufs: Vec<BufRingBuf>,
+    bufgroup: Option<RecvBufRing>,
+    bids: BundleBids,
     len: usize,
 }
 
+#[derive(Debug)]
+enum BundleBids {
+    Empty,
+    Contiguous { first: Bid, count: u16 },
+    Sparse(SmallVec<[Bid; 4]>),
+}
+
+impl BundleBids {
+    fn push(&mut self, bid: Bid, buf_cnt: u16) {
+        match self {
+            Self::Empty => {
+                *self = Self::Contiguous {
+                    first: bid,
+                    count: 1,
+                };
+            }
+            Self::Contiguous { first, count }
+                if sequential_bid(*first, usize::from(*count), buf_cnt) == bid =>
+            {
+                *count += 1;
+            }
+            Self::Contiguous { first, count } => {
+                let mut bids = SmallVec::with_capacity(usize::from(*count) + 1);
+                for index in 0..usize::from(*count) {
+                    bids.push(sequential_bid(*first, index, buf_cnt));
+                }
+                bids.push(bid);
+                *self = Self::Sparse(bids);
+            }
+            Self::Sparse(bids) => bids.push(bid),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::Contiguous { count, .. } => usize::from(*count),
+            Self::Sparse(bids) => bids.len(),
+        }
+    }
+
+    fn get(&self, index: usize, buf_cnt: u16) -> Bid {
+        match self {
+            Self::Empty => panic!("bundle bid index out of bounds"),
+            Self::Contiguous { first, count } => {
+                assert!(index < usize::from(*count));
+                sequential_bid(*first, index, buf_cnt)
+            }
+            Self::Sparse(bids) => bids[index],
+        }
+    }
+}
+
+fn sequential_bid(first: Bid, offset: usize, buf_cnt: u16) -> Bid {
+    ((usize::from(first) + offset) % usize::from(buf_cnt)) as Bid
+}
+
 impl BufRingBufBundle {
-    fn new(bufs: Vec<BufRingBuf>, len: usize) -> Self {
-        Self { bufs, len }
+    fn empty() -> Self {
+        Self {
+            bufgroup: None,
+            bids: BundleBids::Empty,
+            len: 0,
+        }
+    }
+
+    fn new(bufgroup: RecvBufRing, bids: BundleBids, len: usize) -> Self {
+        Self {
+            bufgroup: Some(bufgroup),
+            bids,
+            len,
+        }
     }
 
     /// Returns the total number of initialized bytes across all buffers in this bundle.
@@ -135,17 +214,89 @@ impl BufRingBufBundle {
 
     /// Returns the number of ring buffers contained in this bundle.
     pub fn buffer_count(&self) -> usize {
-        self.bufs.len()
+        self.bids.len()
     }
 
     /// Returns an iterator over payload slices for each buffer in this bundle.
     pub fn iter(&self) -> impl Iterator<Item = &[u8]> + '_ {
-        self.bufs.iter().map(BufRingBuf::as_slice)
+        let count = self.buffer_count();
+        (0..count).map(move |index| {
+            let ring = self
+                .bufgroup
+                .as_ref()
+                .expect("non-empty bundle must retain its buffer ring");
+            let bid = self.bids.get(index, ring.rc.buf_cnt);
+            let len = self.buffer_len(index, count, ring.rc.buf_len);
+            let ptr = ring.rc.stable_ptr(bid);
+            // Safety: the bundle exclusively owns this BID until drop, and the
+            // initialized length is bounded by the registered buffer size.
+            unsafe { std::slice::from_raw_parts(ptr, len) }
+        })
     }
 
     /// Consumes this bundle and returns the underlying ring buffers.
-    pub fn into_bufs(self) -> Vec<BufRingBuf> {
-        self.bufs
+    pub fn into_bufs(mut self) -> Vec<BufRingBuf> {
+        let count = self.buffer_count();
+        let mut bufs = Vec::with_capacity(count);
+        let Some(ring) = self.bufgroup.as_ref() else {
+            return bufs;
+        };
+        for index in 0..count {
+            let bid = self.bids.get(index, ring.rc.buf_cnt);
+            assert!(bid < ring.rc.buf_cnt);
+            assert!(self.buffer_len(index, count, ring.rc.buf_len) <= ring.rc.buf_len);
+        }
+
+        let mut bufgroup = self.bufgroup.take();
+        for index in 0..count {
+            let ring = bufgroup
+                .as_ref()
+                .expect("bundle ring must remain available through materialization");
+            let bid = self.bids.get(index, ring.rc.buf_cnt);
+            let len = self.buffer_len(index, count, ring.rc.buf_len);
+            let owner = if index + 1 == count {
+                bufgroup
+                    .take()
+                    .expect("final buffer must take the bundle ring")
+            } else {
+                ring.clone()
+            };
+            bufs.push(BufRingBuf::new(owner, bid, len));
+        }
+        bufs
+    }
+
+    fn buffer_len(&self, index: usize, count: usize, capacity: usize) -> usize {
+        if index + 1 == count {
+            self.len - capacity * (count - 1)
+        } else {
+            capacity
+        }
+    }
+}
+
+impl Drop for BufRingBufBundle {
+    fn drop(&mut self) {
+        let Some(ring) = &self.bufgroup else {
+            return;
+        };
+        // Safety: the bundle owns every selected BID exactly once. Publish the
+        // updated tail only after all entries have been written.
+        for index in 0..self.bids.len() {
+            let bid = self.bids.get(index, ring.rc.buf_cnt);
+            unsafe { ring.rc.dropping_bid_deferred(bid) };
+        }
+        ring.rc.buf_ring_sync();
+    }
+}
+
+impl fmt::Debug for BufRingBufBundle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BufRingBufBundle")
+            .field("bgid", &self.bufgroup.as_ref().map(RecvBufRing::bgid))
+            .field("buffer_count", &self.buffer_count())
+            .field("len", &self.len)
+            .finish()
     }
 }
 
@@ -342,6 +493,9 @@ struct InnerBufRing {
     // Cached consume head used for recv bundle operations. This tracks the next ring slot expected
     // to be consumed by bundle-aware receives.
     bundle_head: Cell<u16>,
+
+    #[cfg(feature = "bench-instrumentation")]
+    release_publications: Cell<u64>,
 }
 
 impl InnerBufRing {
@@ -400,6 +554,8 @@ impl InnerBufRing {
             local_tail: Cell::new(0),
             shared_tail,
             bundle_head: Cell::new(0),
+            #[cfg(feature = "bench-instrumentation")]
+            release_publications: Cell::new(0),
         };
 
         Ok(buf_ring)
@@ -470,6 +626,12 @@ impl InnerBufRing {
         self.buf_ring_sync();
     }
 
+    // Safety: see `dropping_bid`. The caller must publish the updated tail
+    // after adding all deferred BIDs.
+    unsafe fn dropping_bid_deferred(&self, bid: Bid) {
+        self.buf_ring_push(bid);
+    }
+
     // Returns the buffer group id.
     fn bgid(&self) -> Bgid {
         self.bgid
@@ -514,7 +676,7 @@ impl InnerBufRing {
         let total_len = res as usize;
         let Some(first_bid) = io_uring::cqueue::buffer_select(flags) else {
             if total_len == 0 {
-                return Ok(BufRingBufBundle::new(Vec::new(), 0));
+                return Ok(BufRingBufBundle::empty());
             }
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -558,12 +720,17 @@ impl InnerBufRing {
             ));
         }
 
-        let mut bufs = Vec::with_capacity(needed);
-        let mut remaining = total_len;
+        let mut bids = BundleBids::Empty;
         for i in 0..needed {
             let ring_index = head.wrapping_add(i as u16);
             let bid = self.bid_at_ring_index(ring_index);
             if bid >= self.buf_cnt {
+                // Return any valid BIDs already claimed by this completion.
+                drop(BufRingBufBundle::new(
+                    buf_ring.clone(),
+                    std::mem::replace(&mut bids, BundleBids::Empty),
+                    0,
+                ));
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
@@ -572,17 +739,11 @@ impl InnerBufRing {
                     ),
                 ));
             }
-            let len = if i + 1 == needed {
-                remaining
-            } else {
-                self.buf_len
-            };
-            bufs.push(BufRingBuf::new(buf_ring.clone(), bid, len));
-            remaining = remaining.saturating_sub(len);
+            bids.push(bid, self.buf_cnt);
         }
 
         self.bundle_head.set(head.wrapping_add(needed as u16));
-        Ok(BufRingBufBundle::new(bufs, total_len))
+        Ok(BufRingBufBundle::new(buf_ring, bids, total_len))
     }
 
     fn buf_capacity(&self) -> usize {
@@ -636,6 +797,9 @@ impl InnerBufRing {
     // Make 'local_tail' visible to the kernel. Called after buf_ring_push() has been
     // called to fill in new buffers.
     fn buf_ring_sync(&self) {
+        #[cfg(feature = "bench-instrumentation")]
+        self.release_publications
+            .set(self.release_publications.get().wrapping_add(1));
         unsafe {
             (*self.shared_tail).store(self.local_tail.get(), atomic::Ordering::Release);
         }
@@ -727,12 +891,50 @@ impl ops::Deref for BufRingBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::selected_bid_from_flags;
+    use super::{selected_bid_from_flags, BundleBids};
     use std::io;
 
     #[test]
     fn selected_bid_requires_buffer_select_flag() {
         let err = selected_bid_from_flags(0).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn bundle_bids_keep_wrapping_sequence_compact() {
+        let mut bids = BundleBids::Empty;
+        for bid in [62, 63, 0, 1] {
+            bids.push(bid, 64);
+        }
+
+        assert!(matches!(
+            &bids,
+            BundleBids::Contiguous {
+                first: 62,
+                count: 4
+            }
+        ));
+        assert_eq!(
+            (0..bids.len())
+                .map(|index| bids.get(index, 64))
+                .collect::<Vec<_>>(),
+            [62, 63, 0, 1]
+        );
+    }
+
+    #[test]
+    fn bundle_bids_preserve_sparse_release_order() {
+        let mut bids = BundleBids::Empty;
+        for bid in [3, 4, 9, 8, 1] {
+            bids.push(bid, 16);
+        }
+
+        assert!(matches!(&bids, BundleBids::Sparse(_)));
+        assert_eq!(
+            (0..bids.len())
+                .map(|index| bids.get(index, 16))
+                .collect::<Vec<_>>(),
+            [3, 4, 9, 8, 1]
+        );
     }
 }
