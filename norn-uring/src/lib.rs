@@ -29,6 +29,8 @@ pub(crate) mod fd;
 pub(crate) mod operation;
 mod registered_buffers;
 mod request;
+#[cfg(test)]
+mod test_util;
 pub(crate) mod util;
 
 /// Stable buffer traits and adapters for io_uring operations.
