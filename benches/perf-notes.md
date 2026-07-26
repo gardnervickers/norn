@@ -1369,3 +1369,86 @@ throughput guardrails.
 The budget-256 cohort stopped at 63 of 70 process logs and is not used for
 selection. Completed logs, excluded latency logs, and the cutoff are preserved
 under `/tmp/norn-completion-corrected-combined-v2-2026-07-21/`.
+
+## 2026-07-26: Operation submission-state footprint
+
+Issue: [#58](https://github.com/gardnervickers/norn/issues/58).
+
+Goal: reduce the stack and task-allocation footprint reserved by every
+`norn-uring` operation without adding an allocation to ordinary single-entry
+submission. Lower type sizes and lower benchmark times are better.
+
+### Environment and methodology
+
+- Machine: AMD Ryzen 9 5950X, 16 cores / 32 threads, Linux 6.18.38.
+- Toolchain: Rust 1.97.0; the repository Nix nightly was used only for
+  `-Zprint-type-sizes`.
+- CPU affinity: CPU 15, whose SMT sibling is CPU 31; the scaling governor was
+  `performance`.
+- Baseline: clean `master` at `9f4ac18c7f1ae24f1924d528dca27d5f9f3df56d`.
+- Each latency result below is the median of five process-isolated `bencher`
+  runs after a release-profile warmup build.
+- Common path:
+  `taskset -c 15 cargo bench -p benches --bench noop_submit -- 'bench_noop/num_tasks=64/n=100000'`.
+- Forced backpressure:
+  `taskset -c 15 cargo bench -p benches --bench noop_submit -- 'bench_noop_backpressure/ring_entries=2/n=4096'`.
+- Type sizes were captured from a clean isolated target directory with
+  `RUSTFLAGS=-Zprint-type-sizes cargo test -p norn-uring --lib --no-run`.
+
+### Clean-master baseline
+
+Type sizes:
+
+- `PendingSubmission`: 304 bytes.
+- `PushFutureInner`: 368 bytes.
+- `PushFuture`: 376 bytes.
+- `Op<TaggedNop>`: 480 bytes.
+- `State<TaggedNop>`: 88 bytes.
+
+Raw common-path times were `14.211`, `14.070`, `14.104`, `14.162`, and
+`14.163 ms`; median `14.162 ms`.
+
+Raw forced-backpressure times were `2.074`, `2.104`, `2.073`, `2.077`, and
+`2.083 ms`; median `2.077 ms`.
+
+### Separate single-entry and batch waiter types
+
+Hypothesis: parameterizing the waiter by its pending submission shape lets
+ordinary `Op` futures reserve space for one entry while linked requests retain
+the existing four-entry inline `SmallVec`, with no new allocation in either
+path.
+
+Type-size result:
+
+- Single-entry `PushFuture`: 144 bytes, down from 376 bytes (`61.7%`).
+- `Op<TaggedNop>`: 256 bytes, down from 480 bytes (`46.7%`).
+- Batch `PushFuture`: unchanged at 376 bytes.
+- `State<TaggedNop>`: unchanged at 88 bytes.
+
+The common-path candidate times were `13.846`, `14.359`, `13.925`, `13.858`,
+and `13.716 ms`; median `13.858 ms`, `2.1%` faster than baseline. This is below
+the repository's normal throughput materiality threshold and is treated as a
+neutral guardrail, not as the reason to keep the change.
+
+The forced-backpressure candidate times were `2.046`, `2.061`, `2.061`,
+`2.092`, and `2.039 ms`; median `2.061 ms`, `0.8%` faster than baseline and
+also neutral.
+
+An alternating linked TCP guard used
+`bench_tcp_request_response_linked/runtime=norn/recv=bufring_linked/connections=8/requests_per_connection=512/payload=1`.
+Clean-master runs were `50.842`, `50.892`, and `50.911 ms`; candidate runs were
+`50.586`, `50.556`, and `50.559 ms`. The candidate median was `50.559 ms`,
+`0.7%` faster than the `50.892 ms` baseline median and therefore neutral.
+
+An alternating UDP guard used
+`bench_udp_request_response/runtime=norn/recv=single/window=32/total_requests=4096/payload=64`.
+Clean-master runs were `32.501`, `32.502`, and `32.351 ms`; candidate runs were
+`32.576`, `32.286`, and `32.264 ms`. The candidate median was `32.286 ms`,
+`0.7%` faster than the `32.501 ms` baseline median and therefore neutral.
+
+Decision: keep. The footprint reduction is deterministic and material, while
+all measured execution paths remain within 2.1% of baseline. The ordinary
+single-entry path and the four-entry linked batch path both remain inline and
+allocation-free. `cargo test --workspace --all-features`, strict workspace
+clippy, formatting, and diff checks pass. An independent review found no
+correctness, safety, API, allocation, or benchmark-evidence issues.

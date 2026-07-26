@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use smallvec::SmallVec;
 
-use crate::driver::PushFuture;
+use crate::driver::PushBatchFuture;
 use crate::error::SubmitError;
 use crate::operation::{ConfiguredEntry, Op, Singleshot};
 
@@ -118,7 +118,7 @@ pin_project_lite::pin_project! {
             #[pin]
             right: B,
             #[pin]
-            submit: Option<PushFuture>,
+            submit: Option<PushBatchFuture>,
             left_output: Option<A::Output>,
             right_output: Option<B::Output>,
             submitted: bool,
@@ -281,7 +281,7 @@ pin_project_lite::pin_project! {
             #[pin]
             right: B,
             #[pin]
-            submit: Option<PushFuture>,
+            submit: Option<PushBatchFuture>,
             left_output: Option<A::Output>,
             right_done: bool,
             submitted: bool,

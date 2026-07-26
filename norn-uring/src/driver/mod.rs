@@ -23,7 +23,7 @@ pub(crate) use crate::registered_buffers::{
     Retention as FixedBufRetention,
 };
 use crate::util::notify::Notify;
-pub(crate) use futures::PushFuture;
+pub(crate) use futures::{PushBatchFuture, PushFuture};
 
 #[cfg(test)]
 use crate::registered_buffers::State as FixedBufState;
@@ -363,8 +363,8 @@ impl Handle {
     ///
     /// If the submission queue is full, this will block until there
     /// is space or the driver has shutdown.
-    pub(crate) fn push_batch(&self, entries: SmallVec<[ConfiguredEntry; 4]>) -> PushFuture {
-        PushFuture::new_batch(Rc::clone(&self.shared), entries)
+    pub(crate) fn push_batch(&self, entries: SmallVec<[ConfiguredEntry; 4]>) -> PushBatchFuture {
+        PushBatchFuture::new_batch(Rc::clone(&self.shared), entries)
     }
 
     pub(crate) fn close_fd(&self, kind: &fd::FdKind) -> Result<(), CloseFdError> {
