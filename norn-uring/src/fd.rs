@@ -288,11 +288,19 @@ mod tests {
 
     #[test]
     fn terminal_close_error_does_not_close_reused_descriptor() {
+        crate::test_util::run_isolated(
+            "fd::tests::terminal_close_error_does_not_close_reused_descriptor",
+            terminal_close_error_does_not_close_reused_descriptor_isolated,
+        );
+    }
+
+    fn terminal_close_error_does_not_close_reused_descriptor_isolated() {
         let [read_end, write_end] = pipe();
         let fd = NornFd::from_fd(read_end);
 
         // Model the kernel invalidating the original descriptor before returning a late error,
-        // then another thread reusing the same integer descriptor.
+        // then reusing the same integer descriptor. Isolation prevents another parallel test
+        // from claiming the number between close and dup2.
         assert_eq!(unsafe { libc::close(read_end) }, 0);
         assert_eq!(unsafe { libc::dup2(write_end, read_end) }, read_end);
 

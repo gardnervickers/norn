@@ -1270,7 +1270,6 @@ mod tests {
     use std::net::TcpListener;
     use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixStream;
-    use std::process::Command;
     use std::rc::Rc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc};
@@ -1846,22 +1845,13 @@ mod tests {
 
     #[test]
     fn shutdown_waits_for_cleanup_generated_close_before_returning() {
-        const CHILD_ENV: &str = "NORN_URING_CLEANUP_CLOSE_CHILD";
-        if std::env::var_os(CHILD_ENV).is_none() {
-            // This regression deliberately closes a numeric descriptor and reuses
-            // that exact number with dup2. Run it in a private process FD table so
-            // parallel unit tests cannot claim that number between those steps.
-            let status = Command::new(std::env::current_exe().unwrap())
-                .arg("driver::tests::shutdown_waits_for_cleanup_generated_close_before_returning")
-                .arg("--exact")
-                .arg("--test-threads=1")
-                .env(CHILD_ENV, "1")
-                .status()
-                .expect("failed to spawn isolated cleanup-close regression");
-            assert!(status.success(), "isolated cleanup-close regression failed");
-            return;
-        }
+        crate::test_util::run_isolated(
+            "driver::tests::shutdown_waits_for_cleanup_generated_close_before_returning",
+            shutdown_waits_for_cleanup_generated_close_before_returning_isolated,
+        );
+    }
 
+    fn shutdown_waits_for_cleanup_generated_close_before_returning_isolated() {
         #[derive(Debug)]
         struct PendingFdOp {
             _fd: fd::NornFd,
