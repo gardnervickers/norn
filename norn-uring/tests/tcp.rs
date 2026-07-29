@@ -249,6 +249,62 @@ fn recv_ring_buf_can_be_echoed_with_send_zc() -> Result<(), Box<dyn std::error::
 }
 
 #[test]
+fn recv_bundle_recycles_compact_and_materialized_buffers() -> Result<(), Box<dyn std::error::Error>>
+{
+    util::with_test_env(|| async {
+        let (server, client) = connected_pair().await?;
+        server.set_nodelay(true).await?;
+        client.set_nodelay(true).await?;
+        let ring = RecvBufRing::builder(10).buf_cnt(32).buf_len(256).build()?;
+
+        // The first round materializes and returns BIDs in reverse order. The
+        // second consumes the untouched half of the ring. The third therefore
+        // observes the reversed, non-contiguous BID sequence and exercises the
+        // compact representation's sparse fallback.
+        for (round, materialize_in_reverse) in [true, false, false].into_iter().enumerate() {
+            let payload = vec![0x5A + round as u8; 4_096];
+            let (send_result, payload) = client.send(payload).await;
+            assert_eq!(send_result?, payload.len());
+
+            let mut received = Vec::with_capacity(payload.len());
+            let mut saw_multi_buffer_bundle = false;
+            while received.len() < payload.len() {
+                let bundle = match server.recv_bundle(&ring).await {
+                    Ok(bundle) => bundle,
+                    Err(err) if util::recv_bundle_unsupported(&err) => {
+                        server.close().await?;
+                        client.close().await?;
+                        return Ok(());
+                    }
+                    Err(err) => return Err(err.into()),
+                };
+                saw_multi_buffer_bundle |= bundle.buffer_count() > 1;
+                if materialize_in_reverse {
+                    let bufs = bundle.into_bufs();
+                    for buf in &bufs {
+                        received.extend_from_slice(buf);
+                    }
+                    for buf in bufs.into_iter().rev() {
+                        drop(buf);
+                    }
+                } else {
+                    for chunk in bundle.iter() {
+                        received.extend_from_slice(chunk);
+                    }
+                }
+            }
+
+            assert!(saw_multi_buffer_bundle);
+            assert_eq!(received, payload);
+        }
+
+        server.close().await?;
+        client.close().await?;
+        Ok(())
+    })
+}
+
+#[test]
 fn send_zc_smoke() -> Result<(), Box<dyn std::error::Error>> {
     util::with_test_env(|| async {
         let (server, client) = connected_pair().await?;

@@ -107,3 +107,8 @@ harness = false
 name = "bufring_echo"
 path = "bufring_echo.rs"
 harness = false
+
+[[bench]]
+name = "bundle_recv"
+path = "bundle_recv.rs"
+harness = false
