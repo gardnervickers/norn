@@ -167,7 +167,6 @@ fn main() {
 
     let before_allocations = ALLOCATIONS.load(Ordering::Relaxed);
     let before_bytes = ALLOCATED_BYTES.load(Ordering::Relaxed);
-    let before_publications = ring.release_publications();
     let start = Instant::now();
     executor
         .block_on(run_round(&server, &client, &ring, requests, segments))
@@ -175,16 +174,14 @@ fn main() {
     let elapsed = start.elapsed();
     let allocations = ALLOCATIONS.load(Ordering::Relaxed) - before_allocations;
     let allocated_bytes = ALLOCATED_BYTES.load(Ordering::Relaxed) - before_bytes;
-    let publications = ring.release_publications() - before_publications;
 
     println!(
-        "segments={segments} requests={requests} payload={} elapsed_ns={} ns_per_request={:.2} requests_per_second={:.2} allocations={allocations} allocations_per_request={:.4} allocated_bytes={allocated_bytes} allocated_bytes_per_request={:.2} tail_publications={publications} tail_publications_per_request={:.4}",
+        "segments={segments} requests={requests} payload={} elapsed_ns={} ns_per_request={:.2} requests_per_second={:.2} allocations={allocations} allocations_per_request={:.4} allocated_bytes={allocated_bytes} allocated_bytes_per_request={:.2}",
         segments * BUFFER_LEN,
         elapsed.as_nanos(),
         elapsed.as_nanos() as f64 / requests as f64,
         requests as f64 / elapsed.as_secs_f64(),
         allocations as f64 / requests as f64,
         allocated_bytes as f64 / requests as f64,
-        publications as f64 / requests as f64,
     );
 }

@@ -77,15 +77,6 @@ impl RecvBufRing {
         self.rc.buf_cnt
     }
 
-    /// Returns the number of buffer-ring tail publications.
-    ///
-    /// This counter is available only for benchmark instrumentation and
-    /// includes registration-time publication.
-    #[cfg(feature = "bench-instrumentation")]
-    pub fn release_publications(&self) -> u64 {
-        self.rc.release_publications.get()
-    }
-
     pub(crate) fn get_buf(&self, res: u32, flags: u32) -> io::Result<BufRingBuf> {
         self.rc.get_buf(self.clone(), res, flags)
     }
@@ -493,9 +484,6 @@ struct InnerBufRing {
     // Cached consume head used for recv bundle operations. This tracks the next ring slot expected
     // to be consumed by bundle-aware receives.
     bundle_head: Cell<u16>,
-
-    #[cfg(feature = "bench-instrumentation")]
-    release_publications: Cell<u64>,
 }
 
 impl InnerBufRing {
@@ -554,8 +542,6 @@ impl InnerBufRing {
             local_tail: Cell::new(0),
             shared_tail,
             bundle_head: Cell::new(0),
-            #[cfg(feature = "bench-instrumentation")]
-            release_publications: Cell::new(0),
         };
 
         Ok(buf_ring)
@@ -797,9 +783,6 @@ impl InnerBufRing {
     // Make 'local_tail' visible to the kernel. Called after buf_ring_push() has been
     // called to fill in new buffers.
     fn buf_ring_sync(&self) {
-        #[cfg(feature = "bench-instrumentation")]
-        self.release_publications
-            .set(self.release_publications.get().wrapping_add(1));
         unsafe {
             (*self.shared_tail).store(self.local_tail.get(), atomic::Ordering::Release);
         }

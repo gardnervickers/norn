@@ -1599,11 +1599,13 @@ bundles must not regress.
 - Each process performs 1,024 warmup requests followed by 16,384 measured
   requests. Latency results are medians of five process-isolated runs.
 - Command:
-  `taskset -c 15 cargo bench -p benches --features bundle-instrumentation
-  --bench bundle_recv -- <segments> 16384`.
+  `taskset -c 15 cargo bench -p benches --bench bundle_recv --
+  <segments> 16384`.
 - The client reuses its payload and acknowledgement storage. The server checks
   every byte, drops each completed bundle before acknowledging the frame, and
   measures allocations around only the steady-state request loop.
+- Tail-publication counts were collected with a temporary experiment-only
+  counter. That counter and its feature flag are not retained in the crate.
 
 ### Baseline
 
