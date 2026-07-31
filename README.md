@@ -17,6 +17,7 @@ polled, scheduled, and woken on the runtime thread that owns them.
 | [`norn-timer`](norn-timer/) | A timer-wheel `Park` layer with system and simulated clocks. |
 | [`norn-uring`](norn-uring/) | A Linux-only `io_uring` driver with filesystem, TCP, UDP, registered-buffer, and device-command APIs. |
 | [`norn-channel`](norn-channel/) | Bounded cross-thread channels that keep receive-side waking on the destination runtime thread. |
+| [`norn-multicore`](norn-multicore/) | Fixed process-local groups of thread-affine runtimes connected through `norn-channel`. |
 | [`norn-nursery`](norn-nursery/) | Scoped local concurrency for child futures that may borrow from their environment. |
 
 There is no top-level `norn` runtime crate. Applications select the layers they
