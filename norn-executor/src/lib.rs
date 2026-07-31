@@ -71,6 +71,20 @@ impl<P: park::Park> LocalExecutor<P> {
     where
         F: Future,
     {
+        self.try_block_on(fut)
+            .unwrap_or_else(|error| panic!("park failed: {error}"))
+    }
+
+    /// Blocks the current thread until the provided [`Future`] has completed.
+    ///
+    /// This is the fallible counterpart to [`LocalExecutor::block_on`]. It
+    /// returns an error when the underlying [`park::Park`] layer fails instead
+    /// of panicking, allowing runtime orchestration layers to propagate driver
+    /// failures through their normal lifecycle APIs.
+    pub fn try_block_on<F>(&mut self, fut: F) -> Result<F::Output, std::io::Error>
+    where
+        F: Future,
+    {
         let _g = self.enter();
         let fut = pin!(fut);
         let notifier = match self.root_notifier.take() {
@@ -82,7 +96,7 @@ impl<P: park::Park> LocalExecutor<P> {
         loop {
             if let Some(result) = root.try_poll() {
                 self.root_notifier = root.into_reusable_notifier();
-                return result;
+                return Ok(result);
             }
             let mut has_remaining_tasks = false;
             while let Some(next) = self.taskqueue.next() {
@@ -96,7 +110,7 @@ impl<P: park::Park> LocalExecutor<P> {
             if root.is_notified() || has_remaining_tasks {
                 mode = park::ParkMode::NoPark;
             }
-            self.park.park(mode).unwrap();
+            self.park.park(mode)?;
         }
     }
 
@@ -360,6 +374,13 @@ mod tests {
 
             fn shutdown(&mut self) {}
         }
+
+        let mut fallible = LocalExecutor::new(FailingPark);
+        let error = fallible
+            .try_block_on(future::pending::<()>())
+            .expect_err("try_block_on should return park errors");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(error.to_string(), "park failed");
 
         let mut executor = LocalExecutor::new(FailingPark);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
