@@ -14,6 +14,8 @@ pub(crate) trait TimerList {
     fn remove(&self, entry: ptr::NonNull<Entry>);
 
     fn add(&self, entry: Pin<&mut Entry>, duration: Duration);
+
+    fn add_at(&self, entry: Pin<&mut Entry>, deadline: u64);
 }
 
 pin_project_lite::pin_project! {
@@ -22,6 +24,7 @@ pin_project_lite::pin_project! {
         #[pin]
         entry: Entry,
         duration: Duration,
+        deadline: Option<u64>,
     }
 
     impl<T> PinnedDrop for Sleep<T> where T: TimerList {
@@ -54,7 +57,11 @@ where
                 State::Unregistered => {
                     debug_assert!(!me.entry.is_registered());
 
-                    me.timer.add(me.entry.as_mut(), *me.duration);
+                    if let Some(deadline) = *me.deadline {
+                        me.timer.add_at(me.entry.as_mut(), deadline);
+                    } else {
+                        me.timer.add(me.entry.as_mut(), *me.duration);
+                    }
                     continue;
                 }
                 State::Registered => {
@@ -89,6 +96,16 @@ where
             timer,
             entry: Entry::new(),
             duration,
+            deadline: None,
+        }
+    }
+
+    pub(crate) fn new_at(timer: T, deadline: u64) -> Self {
+        Self {
+            timer,
+            entry: Entry::new(),
+            duration: Duration::ZERO,
+            deadline: Some(deadline),
         }
     }
 
@@ -98,11 +115,17 @@ where
     /// and reset the deadline to zero. Future calls to [`Sleep::poll`] will
     /// then re-register the sleep relative to the current tick.
     pub(crate) fn reset(&mut self) {
+        self.reset_entry();
+        self.deadline = None;
+    }
+
+    fn reset_entry(&mut self) {
         if self.entry.is_registered() {
             let entry = ptr::NonNull::from(&mut self.entry);
             self.timer.remove(entry);
         }
         debug_assert!(!self.entry.is_registered());
+        self.entry.state.set(State::Unregistered);
         self.entry.complete.set(Ok(()));
         self.entry.deadline.set(0);
         // Safety: Reset has exclusive access to the sleep and entry.
