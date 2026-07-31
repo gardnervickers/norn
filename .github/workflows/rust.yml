@@ -36,6 +36,7 @@ jobs:
       matrix:
         package:
         - norn-channel
+        - norn-multicore
         - norn-nursery
         - norn-task
         - norn-executor
