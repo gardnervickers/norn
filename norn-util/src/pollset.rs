@@ -14,6 +14,26 @@ use norn_task::{JoinHandle, Runnable, Schedule, TaskSet};
 /// Polling a `PollSet` drives all currently runnable tasks and then returns
 /// [`Poll::Pending`]. It is intended to be embedded in another future that
 /// controls lifecycle and shutdown.
+///
+/// # Example
+///
+/// ```
+/// use std::future::Future;
+/// use std::pin::pin;
+/// use std::task::{Context, Poll, Waker};
+///
+/// use norn_util::PollSet;
+///
+/// let mut tasks = pin!(PollSet::new());
+/// let mut result = pin!(tasks.as_ref().spawn(async { 42 }));
+/// let mut cx = Context::from_waker(Waker::noop());
+///
+/// assert_eq!(tasks.as_mut().poll(&mut cx), Poll::Pending);
+/// let Poll::Ready(Ok(value)) = result.as_mut().poll(&mut cx) else {
+///     panic!("task did not complete");
+/// };
+/// assert_eq!(value, 42);
+/// ```
 #[must_use = "futures do nothing unless awaited or polled"]
 pub struct PollSet {
     shared: Rc<Shared>,

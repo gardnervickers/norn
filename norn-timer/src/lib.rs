@@ -1,21 +1,40 @@
-//! Timer Wheel implementation for Norn.
+//! Timer-wheel support for Norn runtimes.
 //!
-//! Much of the implementation is based on the
-//! timer wheel implementation found in [Tokio].
+//! [`Driver`] wraps another [`Park`] implementation, advances a hierarchical
+//! timer wheel when the executor parks, and limits the inner park duration to
+//! the next timer deadline. [`Handle`] creates [`Sleep`] futures. [`Clock`] can
+//! track system time or manually advanced time for deterministic tests.
 //!
-//! This implementation takes a different approach for
-//! storing timers and integrates with Norn's [`Park`] trait.
+//! # Example
 //!
-//! # Components
-//! - [`Driver`]: [`Park`] wrapper that advances timer wheels.
-//! - [`Handle`]: creates [`Sleep`] futures.
-//! - [`Clock`]: system or simulated time source.
+//! ```no_run
+//! use std::time::Duration;
 //!
-//! [Tokio]:https://github.com/tokio-rs/tokio
+//! use norn_executor::park::ThreadPark;
+//! use norn_executor::LocalExecutor;
+//! use norn_timer::{Clock, Driver, Handle};
+//!
+//! let timer = Driver::new(ThreadPark::default(), Clock::system());
+//! let mut executor = LocalExecutor::new(timer);
+//! executor.block_on(async {
+//!     Handle::current()
+//!         .sleep(Duration::from_millis(10))
+//!         .await
+//!         .unwrap();
+//! });
+//! ```
+//!
+//! The wheel layout is based on the timer implementation in
+//! [Tokio](https://github.com/tokio-rs/tokio).
 #![deny(
     missing_docs,
     missing_debug_implementations,
     rust_2018_idioms,
+    rustdoc::bare_urls,
+    rustdoc::broken_intra_doc_links,
+    unreachable_pub,
+    clippy::doc_markdown,
+    clippy::missing_errors_doc,
     clippy::missing_safety_doc
 )]
 use std::future::Future;

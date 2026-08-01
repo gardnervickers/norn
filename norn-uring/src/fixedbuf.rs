@@ -60,7 +60,7 @@ pub use crate::buf::FixedBuffer;
 
 const MAX_FIXED_BUFFERS: usize = 1 << 14;
 
-/// An owned dense table of buffers registered with one io_uring driver.
+/// An owned dense table of buffers registered with one `io_uring` driver.
 ///
 /// The pool is not cloneable. Borrow it to acquire multiple slots, and call
 /// [`FixedBufPool::unregister`] to recover the original buffers.
@@ -430,7 +430,7 @@ impl Handle {
     ///
     /// Every returned slice must obey the complete [`FixedBuffer`] safety
     /// contract until the returned pool is successfully unregistered or its
-    /// io_uring is destroyed. Regions selected from different values must not
+    /// `io_uring` is destroyed. Regions selected from different values must not
     /// overlap; registration also checks and rejects overlapping intervals.
     ///
     /// # Errors

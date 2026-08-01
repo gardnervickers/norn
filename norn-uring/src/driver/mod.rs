@@ -34,7 +34,7 @@ mod unpark;
 
 const LOG: &str = "norn_uring::driver";
 
-/// True if the needs_park check should check the submission and completion queues.
+/// True if the `needs_park` check should check the submission and completion queues.
 ///
 /// This will have a perf impact on each poll, but may ensure better overall performance.
 const NEEDS_PARK_CHECK_RINGS: bool = true;
@@ -309,7 +309,9 @@ impl Handle {
 
     /// Returns a handle to the current driver.
     ///
-    /// If the current thread is not in a driver context, this will panic.
+    /// # Panics
+    ///
+    /// Panics if the current thread is not inside a [`Driver`] context.
     #[track_caller]
     pub fn current() -> Self {
         Self::try_current().expect("not in driver context")
@@ -426,13 +428,13 @@ impl Driver {
     /// Signals that all operations admitted before shutdown are terminal.
     const OPERATIONS_DRAIN_TOKEN: usize = 0x01;
 
-    /// [Driver::UNPARKER_WAKE_TOKEN] is a special token which is used to signal unparker wake events.
+    /// [`Driver::UNPARKER_WAKE_TOKEN`] is a special token which is used to signal unparker wake events.
     const UNPARKER_WAKE_TOKEN: usize = 0x02;
 
-    /// [Driver::CANCELLATION_TOKEN] is a special token which is used to signal cancellation events.
+    /// [`Driver::CANCELLATION_TOKEN`] is a special token which is used to signal cancellation events.
     const CANCELLATION_TOKEN: usize = 0x03;
 
-    /// [Driver::CLOSE_FD_TOKEN] is a special token which is used to signal close fd events.
+    /// [`Driver::CLOSE_FD_TOKEN`] is a special token which is used to signal close fd events.
     const CLOSE_FD_TOKEN: usize = 0x04;
 
     /// Signals that all work generated while reaping operation completions is terminal.
@@ -442,11 +444,21 @@ impl Driver {
     ///
     /// This uses [`DriverOptions::default`]. Use
     /// [`Driver::new_with_options`] to customize driver behavior.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `io_uring` instance or its eventfd-based
+    /// unparker cannot be created.
     pub fn new(builder: io_uring::Builder, size: u32) -> io::Result<Self> {
         Self::new_with_options(builder, size, DriverOptions::default())
     }
 
     /// Create a new [`Driver`] with the provided builder, size, and options.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `io_uring` instance or its eventfd-based
+    /// unparker cannot be created.
     pub fn new_with_options(
         mut builder: io_uring::Builder,
         size: u32,

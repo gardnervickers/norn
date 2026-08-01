@@ -32,7 +32,7 @@ impl UnparkerState {
         self.0 & Unparker::REMOTE_THREAD_BIT == Unparker::REMOTE_THREAD_BIT
     }
 
-    /// is_park returns true if the Unparker is currently "parked" waiting on and eventfd update.
+    /// `is_park` returns true if the Unparker is currently "parked" waiting on and eventfd update.
     pub(crate) fn is_parked(self) -> bool {
         self.0 & Unparker::REACTOR_PARK_BIT == Unparker::REACTOR_PARK_BIT
     }

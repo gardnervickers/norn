@@ -102,7 +102,7 @@ where
     }
 }
 
-/// The result value and flags from one io_uring completion queue entry.
+/// The result value and flags from one `io_uring` completion queue entry.
 ///
 /// Values of this type are created by the runtime and passed to
 /// [`Operation`](crate::Operation), [`Singleshot`](crate::Singleshot), and
@@ -142,6 +142,10 @@ impl CQEResult {
     }
 
     /// Consume the completion and return its result value.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error reported by the kernel or by request submission.
     pub fn into_result(self) -> io::Result<u32> {
         self.result
     }
@@ -221,7 +225,7 @@ impl RawOpRef {
     /// Returns the inner pointer.
     ///
     /// This will **not** decrement the reference count. It is the callers responsibility
-    /// to ensure that the returned pointer is passed to Handle::from_raw later.
+    /// to ensure that the returned pointer is passed to `Handle::from_raw` later.
     #[inline]
     pub(crate) fn into_raw(self) -> *const () {
         let raw = self.inner.as_ptr();
@@ -233,7 +237,7 @@ impl RawOpRef {
     ///
     /// ### Safety
     /// The caller must ensure that the pointer was previously obtained from a call
-    /// to [Handle::into_raw]. The caller must also ensure that the allocation backing
+    /// to [`Handle::into_raw`]. The caller must also ensure that the allocation backing
     /// the operation referenced by this [Handle] has not been dropped.
     #[inline]
     unsafe fn from_raw(ptr: *const ()) -> Self {
@@ -253,7 +257,7 @@ impl RawOpRef {
     ///
     /// ### Safety
     /// The caller must ensure that the pointer was previously obtained from a call
-    /// to [Handle::into_raw]. The caller must also ensure that the allocation backing
+    /// to [`Handle::into_raw`]. The caller must also ensure that the allocation backing
     /// the operation referenced by this [Handle] has not been dropped.
     #[inline]
     pub(crate) unsafe fn from_raw_usize(addr: usize) -> Self {

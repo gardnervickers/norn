@@ -17,7 +17,7 @@ mod linux {
     use norn_uring::net::{TcpListener, TcpSocket};
     use tonic::{Request, Response, Status};
 
-    pub mod pingpong {
+    mod pingpong {
         tonic::include_proto!("pingpong.v1");
     }
 
@@ -197,7 +197,7 @@ mod linux {
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
     }
 
-    pub fn run() -> Result<(), BoxError> {
+    pub(crate) fn run() -> Result<(), BoxError> {
         let config = parse_args()?;
         let builder = io_uring::IoUring::builder();
         let driver = norn_uring::Driver::new(builder, 256)?;
@@ -444,13 +444,13 @@ mod linux {
         }
     }
 
-    pub struct PanicSyncSend<T> {
+    struct PanicSyncSend<T> {
         value: Option<ManuallyDrop<T>>,
         tid: std::thread::ThreadId,
     }
 
     impl<T> PanicSyncSend<T> {
-        pub fn new(value: T) -> PanicSyncSend<T> {
+        fn new(value: T) -> PanicSyncSend<T> {
             PanicSyncSend {
                 value: Some(ManuallyDrop::new(value)),
                 tid: std::thread::current().id(),

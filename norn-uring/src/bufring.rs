@@ -1,7 +1,7 @@
 //! Support for io_uring registered buffer rings.
 //!
 //! Copied from the test code here
-//! https://github.com/tokio-rs/io-uring/blob/master/io-uring-test/src/tests/register_buf_ring.rs
+//! <https://github.com/tokio-rs/io-uring/blob/master/io-uring-test/src/tests/register_buf_ring.rs>
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -17,7 +17,7 @@ use crate::buf::StableBuf;
 use crate::Handle;
 
 /// [`RecvBufRing`] is a reference counted buffer ring which can be registered
-/// with io_uring to provide buffers for read operations.
+/// with `io_uring` to provide buffers for read operations.
 ///
 /// # Example
 ///
@@ -398,14 +398,14 @@ impl Builder {
 
     /// The number of ring entries to create for the buffer ring.
     ///
-    /// The number will be made a power of 2, and will be the maximum of the ring_entries setting
-    /// and the buf_cnt setting. The interface will enforce a maximum of 2^15 (32768).
+    /// The number will be made a power of 2, and will be the maximum of the `ring_entries` setting
+    /// and the `buf_cnt` setting. The interface will enforce a maximum of 2^15 (32768).
     pub fn ring_entries(mut self, ring_entries: u16) -> Builder {
         self.ring_entries = ring_entries;
         self
     }
 
-    /// The number of buffers to allocate. If left zero, the ring_entries value will be used.
+    /// The number of buffers to allocate. If left zero, the `ring_entries` value will be used.
     pub fn buf_cnt(mut self, buf_cnt: u16) -> Builder {
         self.buf_cnt = buf_cnt;
         self
@@ -418,6 +418,11 @@ impl Builder {
     }
 
     /// Return a [`RecvBufRing`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid ring configuration, allocation failure,
+    /// duplicate buffer-group ID, or kernel registration failure.
     pub fn build(&self) -> io::Result<RecvBufRing> {
         let mut b: Builder = *self;
 

@@ -7,7 +7,11 @@ use crate::Handle;
 
 /// Remove a file from the filesystem.
 ///
-/// This is equivalent to unlinkat.
+/// This is equivalent to `unlinkat(2)`.
+///
+/// # Errors
+///
+/// Returns an error if the path is invalid or the kernel cannot remove it.
 pub async fn remove_file<P: AsRef<Path>>(path: P) -> io::Result<()> {
     let path = path.as_ref().to_owned();
     let handle = Handle::current();
@@ -17,6 +21,10 @@ pub async fn remove_file<P: AsRef<Path>>(path: P) -> io::Result<()> {
 }
 
 /// Create a directory at the specified path.
+///
+/// # Errors
+///
+/// Returns an error if the path is invalid or the kernel cannot create it.
 pub async fn create_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
     let path = path.as_ref().to_owned();
     let handle = Handle::current();
@@ -26,6 +34,10 @@ pub async fn create_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
 }
 
 /// Remove a directory from the filesystem.
+///
+/// # Errors
+///
+/// Returns an error if the path is invalid or the kernel cannot remove it.
 pub async fn remove_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
     let path = path.as_ref().to_owned();
     let handle = Handle::current();
@@ -37,6 +49,10 @@ pub async fn remove_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
 /// Rename a file or directory.
 ///
 /// This is equivalent to `renameat2` with no special flags.
+///
+/// # Errors
+///
+/// Returns an error if either path is invalid or the kernel cannot rename it.
 pub async fn rename<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Result<()> {
     let from = from.as_ref().to_owned();
     let to = to.as_ref().to_owned();
@@ -47,6 +63,10 @@ pub async fn rename<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Resul
 }
 
 /// Create a symbolic link at `linkpath` pointing to `target`.
+///
+/// # Errors
+///
+/// Returns an error if either path is invalid or the kernel cannot create the link.
 pub async fn symlink<P: AsRef<Path>, Q: AsRef<Path>>(target: P, linkpath: Q) -> io::Result<()> {
     let target = target.as_ref().to_owned();
     let linkpath = linkpath.as_ref().to_owned();
@@ -57,6 +77,10 @@ pub async fn symlink<P: AsRef<Path>, Q: AsRef<Path>>(target: P, linkpath: Q) -> 
 }
 
 /// Create a hard link at `newpath` for `oldpath`.
+///
+/// # Errors
+///
+/// Returns an error if either path is invalid or the kernel cannot create the link.
 pub async fn hard_link<P: AsRef<Path>, Q: AsRef<Path>>(oldpath: P, newpath: Q) -> io::Result<()> {
     let oldpath = oldpath.as_ref().to_owned();
     let newpath = newpath.as_ref().to_owned();
@@ -69,6 +93,10 @@ pub async fn hard_link<P: AsRef<Path>, Q: AsRef<Path>>(oldpath: P, newpath: Q) -
 /// Read metadata using `statx(2)`.
 ///
 /// `flags` and `mask` map directly to the `statx(2)` system call arguments.
+///
+/// # Errors
+///
+/// Returns an error if the path is invalid or the `statx(2)` call fails.
 pub async fn statx<P: AsRef<Path>>(path: P, flags: i32, mask: u32) -> io::Result<libc::statx> {
     let path = path.as_ref().to_owned();
     let handle = Handle::current();
@@ -77,6 +105,10 @@ pub async fn statx<P: AsRef<Path>>(path: P, flags: i32, mask: u32) -> io::Result
 }
 
 /// Read file metadata with `STATX_BASIC_STATS`.
+///
+/// # Errors
+///
+/// Returns an error under the same conditions as [`statx`].
 pub async fn metadata<P: AsRef<Path>>(path: P) -> io::Result<libc::statx> {
     statx(path, libc::AT_STATX_SYNC_AS_STAT, libc::STATX_BASIC_STATS).await
 }

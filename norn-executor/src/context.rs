@@ -38,7 +38,7 @@ impl Context {
 }
 
 #[derive(Debug)]
-pub struct ContextGuard;
+pub(crate) struct ContextGuard;
 
 impl Drop for ContextGuard {
     fn drop(&mut self) {

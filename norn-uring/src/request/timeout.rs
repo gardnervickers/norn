@@ -140,7 +140,7 @@ impl std::fmt::Debug for TimeoutTarget {
 
 /// A cloneable controller for a standalone [`Timeout`].
 ///
-/// The controller retains the timeout's opaque io_uring identity, so a cancel
+/// The controller retains the timeout's opaque `io_uring` identity, so a cancel
 /// or reset request can never accidentally target a newer operation that reused
 /// the same allocation address.
 #[derive(Clone)]

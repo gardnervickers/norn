@@ -16,8 +16,8 @@ use bytes::{Bytes, BytesMut};
 ///
 /// ### Safety
 /// Implementors of this trait must ensure that the pointer returned by
-/// stable_ptr is valid and points to initialized memory of at least
-/// bytes_init bytes.
+/// `stable_ptr` is valid and points to initialized memory of at least
+/// `bytes_init` bytes.
 ///
 /// Furthermore, the pointer must remain valid for the lifetime of the
 /// request it is used in, and must not be moved.

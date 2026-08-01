@@ -1,3 +1,32 @@
+//! A fixed-slot key/value store used to exercise Norn filesystem APIs.
+//!
+//! [`Store`] persists values in fixed-size slots, protects records with a CRC,
+//! and uses generation-bearing [`Key`] values to reject stale slot references.
+//! The Linux backend uses `norn-uring` with aligned direct-I/O buffers; other
+//! platforms use blocking file operations behind the same async interface.
+//!
+//! # Example
+//!
+//! ```no_run
+//! use norn_kv::{Store, StoreConfig};
+//!
+//! # async fn example() -> norn_kv::Result<()> {
+//! let path = std::env::temp_dir().join("norn-kv-example.dat");
+//! let mut store = Store::open(&path, StoreConfig::default()).await?;
+//! let key = store.put(b"value".to_vec()).await?;
+//! assert_eq!(store.get(key).await?, Some(b"value".to_vec()));
+//! # Ok(())
+//! # }
+//! ```
+#![deny(
+    missing_docs,
+    rustdoc::bare_urls,
+    rustdoc::broken_intra_doc_links,
+    unreachable_pub,
+    clippy::doc_markdown,
+    clippy::missing_errors_doc
+)]
+
 use std::io;
 use std::path::Path;
 
@@ -105,6 +134,11 @@ pub struct Store {
 
 impl Store {
     /// Open, preallocate, and recover a fixed-slot KV file.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidConfig`] for an unusable slot layout, or
+    /// [`Error::Io`] if the underlying allocation or recovery I/O fails.
     pub async fn open(path: impl AsRef<Path>, config: StoreConfig) -> Result<Self> {
         config.validate()?;
         let path = path.as_ref();
@@ -129,6 +163,11 @@ impl Store {
     }
 
     /// Store bytes in a free slot and return an opaque key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ValueTooLarge`] if the value does not fit in a slot, or
+    /// [`Error::Io`] if writing the record fails.
     pub async fn put(&mut self, value: Vec<u8>) -> Result<Key> {
         let payload_capacity = self.payload_capacity();
         if value.len() > payload_capacity {
@@ -175,6 +214,10 @@ impl Store {
 
     /// Read a key, returning `Ok(None)` if the key is missing, stale, deleted,
     /// or its slot fails format/CRC validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] if reading the referenced slot fails.
     pub async fn get(&self, key: Key) -> Result<Option<Vec<u8>>> {
         let Some((slot, generation)) = self.decode_key(key) else {
             return Ok(None);
@@ -196,6 +239,10 @@ impl Store {
     }
 
     /// Delete a key, returning whether a live slot was actually marked deleted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] if reading or rewriting the referenced slot fails.
     pub async fn delete(&mut self, key: Key) -> Result<bool> {
         let Some((slot, generation)) = self.decode_key(key) else {
             return Ok(false);
@@ -537,17 +584,17 @@ fn set_bit(word: &mut u64, bit: usize, enabled: bool) {
 
 mod block {
     #[cfg(not(target_os = "linux"))]
-    pub use blocking::{BlockBuf, BlockFile};
+    pub(crate) use blocking::{BlockBuf, BlockFile};
     #[cfg(target_os = "linux")]
-    pub use linux::{BlockBuf, BlockFile};
+    pub(crate) use linux::{BlockBuf, BlockFile};
 
     #[cfg(target_os = "linux")]
-    pub fn zeroed(len: usize) -> std::io::Result<BlockBuf> {
+    pub(crate) fn zeroed(len: usize) -> std::io::Result<BlockBuf> {
         BlockBuf::zeroed(len)
     }
 
     #[cfg(not(target_os = "linux"))]
-    pub fn zeroed(len: usize) -> std::io::Result<BlockBuf> {
+    pub(crate) fn zeroed(len: usize) -> std::io::Result<BlockBuf> {
         Ok(vec![0; len])
     }
 
@@ -560,16 +607,20 @@ mod block {
         use norn_uring::buf::{StableBuf, StableBufMut};
         use norn_uring::fs;
 
-        pub type BlockBuf = AlignedBuf;
+        pub(crate) type BlockBuf = AlignedBuf;
 
         #[derive(Debug)]
-        pub struct BlockFile {
+        pub(crate) struct BlockFile {
             file: fs::File,
             block_size: usize,
         }
 
         impl BlockFile {
-            pub async fn open(path: &Path, total_len: u64, block_size: usize) -> io::Result<Self> {
+            pub(crate) async fn open(
+                path: &Path,
+                total_len: u64,
+                block_size: usize,
+            ) -> io::Result<Self> {
                 let needs_prealloc = match std::fs::metadata(path) {
                     Ok(metadata) => metadata.len() < total_len,
                     Err(err) if err.kind() == io::ErrorKind::NotFound => true,
@@ -590,7 +641,7 @@ mod block {
                 Ok(Self { file, block_size })
             }
 
-            pub async fn read_block(&self, block: usize) -> io::Result<BlockBuf> {
+            pub(crate) async fn read_block(&self, block: usize) -> io::Result<BlockBuf> {
                 let buf = AlignedBuf::zeroed(self.block_size)?;
                 let (res, buf) = self.file.read_at(buf, self.offset(block)).await;
                 let n = res?;
@@ -606,7 +657,11 @@ mod block {
                 Ok(buf)
             }
 
-            pub async fn write_block(&self, block: usize, buf: BlockBuf) -> io::Result<BlockBuf> {
+            pub(crate) async fn write_block(
+                &self,
+                block: usize,
+                buf: BlockBuf,
+            ) -> io::Result<BlockBuf> {
                 if buf.len != self.block_size {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
@@ -637,13 +692,13 @@ mod block {
         }
 
         #[derive(Debug)]
-        pub struct AlignedBuf {
+        pub(crate) struct AlignedBuf {
             ptr: NonNull<u8>,
             len: usize,
         }
 
         impl AlignedBuf {
-            pub fn zeroed(len: usize) -> io::Result<Self> {
+            pub(crate) fn zeroed(len: usize) -> io::Result<Self> {
                 let mut ptr = std::ptr::null_mut();
                 let res =
                     unsafe { libc::posix_memalign(&mut ptr, super::super::BLOCK_ALIGNMENT, len) };
@@ -660,11 +715,11 @@ mod block {
                 Ok(this)
             }
 
-            pub fn as_slice(&self) -> &[u8] {
+            pub(crate) fn as_slice(&self) -> &[u8] {
                 unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
             }
 
-            pub fn as_mut_slice(&mut self) -> &mut [u8] {
+            pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
                 unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
             }
         }
@@ -726,16 +781,20 @@ mod block {
         use std::path::Path;
         use std::sync::Mutex;
 
-        pub type BlockBuf = Vec<u8>;
+        pub(crate) type BlockBuf = Vec<u8>;
 
         #[derive(Debug)]
-        pub struct BlockFile {
+        pub(crate) struct BlockFile {
             file: Mutex<File>,
             block_size: usize,
         }
 
         impl BlockFile {
-            pub async fn open(path: &Path, total_len: u64, block_size: usize) -> io::Result<Self> {
+            pub(crate) async fn open(
+                path: &Path,
+                total_len: u64,
+                block_size: usize,
+            ) -> io::Result<Self> {
                 let file = std::fs::OpenOptions::new()
                     .create(true)
                     .truncate(false)
@@ -751,7 +810,7 @@ mod block {
                 })
             }
 
-            pub async fn read_block(&self, block: usize) -> io::Result<Vec<u8>> {
+            pub(crate) async fn read_block(&self, block: usize) -> io::Result<Vec<u8>> {
                 let mut buf = vec![0; self.block_size];
                 let mut file = self
                     .file
@@ -762,7 +821,11 @@ mod block {
                 Ok(buf)
             }
 
-            pub async fn write_block(&self, block: usize, bytes: BlockBuf) -> io::Result<BlockBuf> {
+            pub(crate) async fn write_block(
+                &self,
+                block: usize,
+                bytes: BlockBuf,
+            ) -> io::Result<BlockBuf> {
                 if bytes.len() != self.block_size {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
