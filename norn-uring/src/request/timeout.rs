@@ -1485,8 +1485,8 @@ mod tests {
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
 
-        // Leave one SQ slot free. The target's two-entry batch cannot fit, but
-        // the buggy one-entry removal batch could otherwise overtake it.
+        // Leave one SQ slot free. The target's two-entry batch cannot fit. The
+        // buggy one-entry removal batch could otherwise overtake it.
         let mut filler = std::pin::pin!(handle.submit(Nop));
         assert!(Future::poll(filler.as_mut(), &mut cx).is_pending());
 

@@ -1,8 +1,7 @@
 # norn-kv
 
 `norn-kv` is a small fixed-slot key/value store used as an end-to-end example
-for Norn's file APIs. It is an example package, not a general-purpose storage
-engine.
+for Norn's file APIs. Its scope is demonstration and testing of those APIs.
 
 Each value occupies one fixed-size slot. Records include a generation number
 and CRC; the generation is encoded into the returned `Key`, allowing the store

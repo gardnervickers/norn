@@ -83,8 +83,8 @@ Raw logs: `/tmp/norn-channel-benchmark/baseline/`.
 
 Correctness and the latency and multi-producer measurements were stable. The
 single-producer throughput results were not: they exceeded the 5% noise
-threshold and had large within-process variance as well. These results are a
-diagnostic baseline, not accepted performance evidence.
+threshold and had large within-process variance as well. These results serve
+only as a diagnostic baseline and do not qualify as performance evidence.
 
 Decision: retain the implementation, increase timed work to 65,536 messages
 per round, and rerun before attempting channel optimizations. This reduces the
@@ -133,9 +133,9 @@ The added unsafe queue implementation was not justified by the result.
 ### Benchmark correction: isolate channel transfer from caller backoff
 
 The A0 and A0b queue capacity was 4,096 messages, so each 65,536-message round
-spent substantial time in the benchmark's `Full` retry spin loop. That loop is
-caller policy, not channel work, and its producer/consumer phase changes caused
-the unstable 1P/1C modes. The primary throughput matrix now uses a bounded
+spent substantial time in the benchmark's `Full` retry spin loop. That loop
+measures caller policy. Its producer/consumer phase changes caused the unstable
+1P/1C modes. The primary throughput matrix now uses a bounded
 capacity equal to each timed round (65,536 messages for A0c and 262,144 for
 A0d). This remains bounded while avoiding deliberate saturation;
 capacity/backoff behavior should be measured separately once a producer-side

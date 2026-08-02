@@ -4,10 +4,9 @@ Norn is a Rust workspace for composing single-threaded asynchronous runtimes.
 It separates local task scheduling, executor control flow, timers, cross-thread
 message delivery, and Linux `io_uring` I/O into independent crates.
 
-The project is experimental. Its APIs are still evolving, and it is not a
-drop-in replacement for a general-purpose async runtime. In particular, Norn
-tasks and task wakers are thread-affine: they must be polled, scheduled, and
-woken on the runtime thread that owns them.
+The project is experimental, and its APIs are still evolving. Norn targets
+custom runtimes built around thread-affine tasks and task wakers: they must be
+polled, scheduled, and woken on the runtime thread that owns them.
 
 ## Workspace crates
 
@@ -65,8 +64,8 @@ crates can still be built on macOS.
   scoped borrowing, nested child tasks, and early termination.
 
 The [`benches`](benches/) package contains focused task, executor, timer,
-channel, HTTP, buffer, and `io_uring` benchmarks. Benchmarks are measurement
-tools; this README does not make performance claims from them.
+channel, HTTP, buffer, and `io_uring` benchmarks. Results and methodology are
+recorded alongside the benchmarks.
 
 ## Building and checking documentation
 
@@ -90,5 +89,5 @@ The task representation and scheduling state machine draw on techniques used
 by [Tokio](https://github.com/tokio-rs/tokio). The `io_uring` submission model
 also draws on [tokio-uring](https://github.com/tokio-rs/tokio-uring), and the
 scoped-concurrency API is informed by the
-[`moro`](https://github.com/nikomatsakis/moro) experiment. These are design
-influences, not API-compatibility claims.
+[`moro`](https://github.com/nikomatsakis/moro) experiment. These projects are
+design influences. Norn makes no API-compatibility claim.

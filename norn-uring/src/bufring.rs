@@ -768,7 +768,7 @@ impl InnerBufRing {
         // N.B. The uring buf_ring indexing mechanism calls for the tail values to exceed the
         // actual number of ring entries. This allows the uring interface to distinguish between
         // empty and full buf_rings. As a result, the ring mask is only applied to the index used
-        // for computing the ring entry, not to the tail value itself.
+        // solely for computing the ring entry; it does not apply to the tail value.
 
         let old_tail = self.local_tail.get();
         self.local_tail.set(old_tail.wrapping_add(1));
@@ -808,8 +808,8 @@ impl Drop for InnerBufRing {
     }
 }
 
-/// An anonymous region of memory mapped using `mmap(2)`, not backed by a file
-/// but that is guaranteed to be page-aligned and zero-filled.
+/// An anonymous region of page-aligned, zero-filled memory mapped using
+/// `mmap(2)` with no file backing.
 struct AnonymousMmap {
     addr: ptr::NonNull<libc::c_void>,
     len: usize,
