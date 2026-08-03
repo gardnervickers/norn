@@ -29,6 +29,10 @@ impl UdpSocket {
     /// # Errors
     ///
     /// Returns an error if the socket cannot be created or bound.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called outside an active [`Driver`](crate::Driver) context.
     pub async fn bind(addr: SocketAddr) -> io::Result<UdpSocket> {
         let inner = socket::Socket::bind(addr, Domain::for_address(addr), Type::DGRAM).await?;
         Ok(UdpSocket { inner })

@@ -150,6 +150,10 @@ impl OpenOptions {
     ///
     /// Returns an error for an invalid option combination or path, or when the
     /// kernel cannot open the file.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called outside an active [`Driver`](crate::Driver) context.
     pub async fn open<P: AsRef<Path>>(self, path: P) -> io::Result<File> {
         File::open_with_options(path, self).await
     }

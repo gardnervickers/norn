@@ -423,6 +423,10 @@ impl Builder {
     ///
     /// Returns an error for an invalid ring configuration, allocation failure,
     /// duplicate buffer-group ID, or kernel registration failure.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called outside an active [`Driver`](crate::Driver) context.
     pub fn build(&self) -> io::Result<RecvBufRing> {
         let mut b: Builder = *self;
 

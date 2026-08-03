@@ -12,6 +12,10 @@ use crate::Handle;
 /// # Errors
 ///
 /// Returns an error if the path is invalid or the kernel cannot remove it.
+///
+/// # Panics
+///
+/// Panics if called outside an active [`Driver`](crate::Driver) context.
 pub async fn remove_file<P: AsRef<Path>>(path: P) -> io::Result<()> {
     let path = path.as_ref().to_owned();
     let handle = Handle::current();
@@ -25,6 +29,10 @@ pub async fn remove_file<P: AsRef<Path>>(path: P) -> io::Result<()> {
 /// # Errors
 ///
 /// Returns an error if the path is invalid or the kernel cannot create it.
+///
+/// # Panics
+///
+/// Panics if called outside an active [`Driver`](crate::Driver) context.
 pub async fn create_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
     let path = path.as_ref().to_owned();
     let handle = Handle::current();
@@ -38,6 +46,10 @@ pub async fn create_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
 /// # Errors
 ///
 /// Returns an error if the path is invalid or the kernel cannot remove it.
+///
+/// # Panics
+///
+/// Panics if called outside an active [`Driver`](crate::Driver) context.
 pub async fn remove_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
     let path = path.as_ref().to_owned();
     let handle = Handle::current();
@@ -53,6 +65,10 @@ pub async fn remove_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
 /// # Errors
 ///
 /// Returns an error if either path is invalid or the kernel cannot rename it.
+///
+/// # Panics
+///
+/// Panics if called outside an active [`Driver`](crate::Driver) context.
 pub async fn rename<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Result<()> {
     let from = from.as_ref().to_owned();
     let to = to.as_ref().to_owned();
@@ -67,6 +83,10 @@ pub async fn rename<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Resul
 /// # Errors
 ///
 /// Returns an error if either path is invalid or the kernel cannot create the link.
+///
+/// # Panics
+///
+/// Panics if called outside an active [`Driver`](crate::Driver) context.
 pub async fn symlink<P: AsRef<Path>, Q: AsRef<Path>>(target: P, linkpath: Q) -> io::Result<()> {
     let target = target.as_ref().to_owned();
     let linkpath = linkpath.as_ref().to_owned();
@@ -81,6 +101,10 @@ pub async fn symlink<P: AsRef<Path>, Q: AsRef<Path>>(target: P, linkpath: Q) -> 
 /// # Errors
 ///
 /// Returns an error if either path is invalid or the kernel cannot create the link.
+///
+/// # Panics
+///
+/// Panics if called outside an active [`Driver`](crate::Driver) context.
 pub async fn hard_link<P: AsRef<Path>, Q: AsRef<Path>>(oldpath: P, newpath: Q) -> io::Result<()> {
     let oldpath = oldpath.as_ref().to_owned();
     let newpath = newpath.as_ref().to_owned();
@@ -97,6 +121,10 @@ pub async fn hard_link<P: AsRef<Path>, Q: AsRef<Path>>(oldpath: P, newpath: Q) -
 /// # Errors
 ///
 /// Returns an error if the path is invalid or the `statx(2)` call fails.
+///
+/// # Panics
+///
+/// Panics if called outside an active [`Driver`](crate::Driver) context.
 pub async fn statx<P: AsRef<Path>>(path: P, flags: i32, mask: u32) -> io::Result<libc::statx> {
     let path = path.as_ref().to_owned();
     let handle = Handle::current();
@@ -109,6 +137,10 @@ pub async fn statx<P: AsRef<Path>>(path: P, flags: i32, mask: u32) -> io::Result
 /// # Errors
 ///
 /// Returns an error under the same conditions as [`statx`].
+///
+/// # Panics
+///
+/// Panics if called outside an active [`Driver`](crate::Driver) context.
 pub async fn metadata<P: AsRef<Path>>(path: P) -> io::Result<libc::statx> {
     statx(path, libc::AT_STATX_SYNC_AS_STAT, libc::STATX_BASIC_STATS).await
 }
@@ -117,6 +149,10 @@ pub async fn metadata<P: AsRef<Path>>(path: P) -> io::Result<libc::statx> {
 ///
 /// On success, returns the attribute size. When the buffer has zero capacity,
 /// this performs a size query and leaves the buffer unchanged.
+///
+/// # Panics
+///
+/// Panics if called outside an active [`Driver`](crate::Driver) context.
 pub async fn get_xattr<P, N, B>(path: P, name: N, buf: B) -> (io::Result<usize>, B)
 where
     P: AsRef<Path>,
@@ -133,6 +169,10 @@ where
 }
 
 /// Set an extended attribute on a path from the provided buffer.
+///
+/// # Panics
+///
+/// Panics if called outside an active [`Driver`](crate::Driver) context.
 pub async fn set_xattr<P, N, B>(path: P, name: N, value: B, flags: i32) -> (io::Result<()>, B)
 where
     P: AsRef<Path>,

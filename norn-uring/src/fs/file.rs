@@ -51,6 +51,10 @@ impl std::fmt::Debug for PipeWriter {
 /// # Errors
 ///
 /// Returns an error if the operating system cannot create the pipe.
+///
+/// # Panics
+///
+/// Panics if called outside an active [`Driver`](crate::Driver) context.
 pub fn pipe() -> io::Result<(PipeReader, PipeWriter)> {
     let handle = crate::Handle::current();
     let mut fds: [RawFd; 2] = [0; 2];
@@ -90,6 +94,10 @@ impl File {
     /// # Errors
     ///
     /// Returns an error if the path is invalid or the kernel cannot open the file.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called outside an active [`Driver`](crate::Driver) context.
     pub async fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let mut opts = opts::OpenOptions::new();
         opts.read(true).open(path).await

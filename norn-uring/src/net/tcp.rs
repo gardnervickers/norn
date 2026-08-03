@@ -74,6 +74,10 @@ impl TcpListener {
     ///
     /// Returns an error if the socket cannot be created, bound, or placed in
     /// listening mode.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called outside an active [`Driver`](crate::Driver) context.
     pub async fn bind(addr: SocketAddr, backlog: u32) -> io::Result<TcpListener> {
         let inner = socket::Socket::bind(addr, Domain::for_address(addr), Type::STREAM).await?;
         inner.listen(backlog).await?;
@@ -103,6 +107,11 @@ impl TcpListener {
     /// # Errors
     ///
     /// Returns an error if the accept operation fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if polled outside the [`Driver`](crate::Driver) context that owns
+    /// the listener.
     pub async fn accept(&self) -> io::Result<(TcpSocket, SocketAddr)> {
         let (socket, addr) = self.socket.accept().await?;
         Ok((TcpSocket { socket }, addr))
@@ -134,6 +143,12 @@ impl TcpListener {
 }
 
 pin_project_lite::pin_project! {
+    /// A stream of connections accepted by a [`TcpListener`].
+    ///
+    /// # Panics
+    ///
+    /// Polling may panic outside the [`Driver`](crate::Driver) context that
+    /// owns the listener.
     pub struct Incoming<'a> {
         listener: &'a socket::Socket,
         #[pin]
@@ -179,6 +194,10 @@ impl TcpSocket {
     /// # Errors
     ///
     /// Returns an error if the socket cannot be created or connected.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called outside an active [`Driver`](crate::Driver) context.
     pub async fn connect(addr: SocketAddr) -> io::Result<TcpSocket> {
         let domain = Domain::for_address(addr);
         let socket_type = Type::STREAM;

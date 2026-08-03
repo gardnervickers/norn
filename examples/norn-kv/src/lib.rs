@@ -166,8 +166,9 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::ValueTooLarge`] if the value does not fit in a slot, or
-    /// [`Error::Io`] if writing the record fails.
+    /// Returns [`Error::ValueTooLarge`] if the value does not fit in a slot.
+    /// Returns [`Error::Io`] when the store has no free slot, buffer allocation
+    /// fails, or writing the record fails.
     pub async fn put(&mut self, value: Vec<u8>) -> Result<Key> {
         let payload_capacity = self.payload_capacity();
         if value.len() > payload_capacity {
