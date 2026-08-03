@@ -18,7 +18,7 @@ const LOG: &str = "norn_uring::net::tcp";
 
 /// A TCP listener.
 ///
-/// A TcpListener can be used to accept incoming TCP connections.
+/// A `TcpListener` can be used to accept incoming TCP connections.
 pub struct TcpListener {
     socket: socket::Socket,
 }
@@ -28,7 +28,8 @@ pub struct TcpListener {
 /// [`TcpSocket`] provides a low-level interface for configuring a socket
 /// and sending or receiving owned buffers.
 ///
-/// A [`TcpSocket`] can be converted into a [`TcpStream`] using [`into_stream`].
+/// A [`TcpSocket`] can be converted into a [`TcpStream`] using
+/// [`TcpSocket::into_stream`].
 /// [`TcpStream`] is a stateful wrapper around [`TcpSocket`] that implements
 /// [`AsyncRead`](tokio::io::AsyncRead) and [`AsyncWrite`](tokio::io::AsyncWrite).
 pub struct TcpSocket {
@@ -68,23 +69,49 @@ impl std::fmt::Debug for TcpStream {
 
 impl TcpListener {
     /// Creates a TCP listener bound to the specified address.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the socket cannot be created, bound, or placed in
+    /// listening mode.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called outside an active [`Driver`](crate::Driver) context.
     pub async fn bind(addr: SocketAddr, backlog: u32) -> io::Result<TcpListener> {
         let inner = socket::Socket::bind(addr, Domain::for_address(addr), Type::STREAM).await?;
         inner.listen(backlog).await?;
         Ok(TcpListener { socket: inner })
     }
 
-    /// Set value for the SO_REUSEADDR option on this socket.
+    /// Set value for the `SO_REUSEADDR` option on this socket.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the socket option cannot be changed.
     pub async fn set_reuse_address(&self, reuse: bool) -> io::Result<()> {
         self.socket.set_reuse_address(reuse).await
     }
 
     /// Returns the local address that this listener is bound to.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the address cannot be read from the socket.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.socket.local_addr()
     }
 
     /// Accepts a new incoming connection to this listener.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the accept operation fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if polled outside the [`Driver`](crate::Driver) context that owns
+    /// the listener.
     pub async fn accept(&self) -> io::Result<(TcpSocket, SocketAddr)> {
         let (socket, addr) = self.socket.accept().await?;
         Ok((TcpSocket { socket }, addr))
@@ -105,12 +132,23 @@ impl TcpListener {
     /// by this call; queued, submitted, and completed-but-unconsumed operations
     /// continue retaining the descriptor until they are dropped or consumed. If
     /// close is rejected, dropping the last owner still closes the descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::WouldBlock`] while another owner or operation
+    /// retains the descriptor, or another I/O error if close fails.
     pub async fn close(self) -> io::Result<()> {
         self.socket.close().await
     }
 }
 
 pin_project_lite::pin_project! {
+    /// A stream of connections accepted by a [`TcpListener`].
+    ///
+    /// # Panics
+    ///
+    /// Polling may panic outside the [`Driver`](crate::Driver) context that
+    /// owns the listener.
     pub struct Incoming<'a> {
         listener: &'a socket::Socket,
         #[pin]
@@ -152,6 +190,14 @@ impl Stream for Incoming<'_> {
 
 impl TcpSocket {
     /// Creates a TCP connection to the specified address.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the socket cannot be created or connected.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called outside an active [`Driver`](crate::Driver) context.
     pub async fn connect(addr: SocketAddr) -> io::Result<TcpSocket> {
         let domain = Domain::for_address(addr);
         let socket_type = Type::STREAM;
@@ -162,16 +208,28 @@ impl TcpSocket {
     }
 
     /// Returns the local address that this stream is bound to.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the address cannot be read from the socket.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.socket.local_addr()
     }
 
     /// Returns the remote address that this stream is connected to.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the peer address cannot be read from the socket.
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
         self.socket.peer_addr()
     }
 
     /// Shuts down the read, write, or both halves of this connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the kernel cannot shut down the requested half.
     pub async fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()> {
         self.socket.shutdown(how).await
     }
@@ -202,18 +260,18 @@ impl TcpSocket {
         self.socket.send_with_flags(buf, flags)
     }
 
-    /// Send data from the given buffer using io_uring zerocopy send.
+    /// Send data from the given buffer using `io_uring` zerocopy send.
     ///
     /// This method does not fall back to regular send if zerocopy is unsupported.
-    /// Callers should enable `SO_ZEROCOPY` with [`set_zerocopy`] first.
+    /// Callers should enable `SO_ZEROCOPY` with [`TcpSocket::set_zerocopy`] first.
     pub fn send_zc<B: StableBuf>(&self, buf: B) -> Op<socket::SendZc<B>> {
         self.socket.send_zc(buf)
     }
 
-    /// Send data from the given buffer using io_uring zerocopy send with send flags.
+    /// Send data from the given buffer using `io_uring` zerocopy send with send flags.
     ///
     /// This method does not fall back to regular send if zerocopy is unsupported.
-    /// Callers should enable `SO_ZEROCOPY` with [`set_zerocopy`] first.
+    /// Callers should enable `SO_ZEROCOPY` with [`TcpSocket::set_zerocopy`] first.
     pub fn send_zc_with_flags<B: StableBuf>(&self, buf: B, flags: i32) -> Op<socket::SendZc<B>> {
         self.socket.send_zc_with_flags(buf, flags)
     }
@@ -223,10 +281,10 @@ impl TcpSocket {
         self.send_with_flags(buf, flags)
     }
 
-    /// Send a message from the given buffer using io_uring zerocopy sendmsg.
+    /// Send a message from the given buffer using `io_uring` zerocopy sendmsg.
     ///
     /// This method does not fall back to regular sendmsg if zerocopy is unsupported.
-    /// Callers should enable `SO_ZEROCOPY` with [`set_zerocopy`] first.
+    /// Callers should enable `SO_ZEROCOPY` with [`TcpSocket::set_zerocopy`] first.
     pub fn send_msg_zc<B: StableBuf>(&self, buf: B, flags: i32) -> Op<socket::SendMsgZc<B>> {
         self.socket.send_msg_zc(buf, flags)
     }
@@ -324,6 +382,11 @@ impl TcpSocket {
     /// by this call; queued, submitted, and completed-but-unconsumed operations
     /// continue retaining the descriptor until they are dropped or consumed. If
     /// close is rejected, dropping the last owner still closes the descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::WouldBlock`] while another owner or operation
+    /// retains the descriptor, or another I/O error if close fails.
     pub async fn close(self) -> io::Result<()> {
         self.socket.close().await
     }
@@ -336,30 +399,54 @@ impl TcpSocket {
         self.socket.poll_readiness(events)
     }
 
-    /// Set value for the SO_RCVBUF option on this socket.
+    /// Set value for the `SO_RCVBUF` option on this socket.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the socket option cannot be changed.
     pub async fn set_recv_buffer_size(&self, size: usize) -> io::Result<()> {
         self.socket.set_recv_buffer_size(size).await
     }
-    /// Set value for the SO_SNDBUF option on this socket.
+    /// Set value for the `SO_SNDBUF` option on this socket.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the socket option cannot be changed.
     pub async fn set_send_buffer_size(&self, size: usize) -> io::Result<()> {
         self.socket.set_send_buffer_size(size).await
     }
 
-    /// Set value for the SO_REUSEADDR option on this socket.
+    /// Set value for the `SO_REUSEADDR` option on this socket.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the socket option cannot be changed.
     pub async fn set_reuse_address(&self, reuse: bool) -> io::Result<()> {
         self.socket.set_reuse_address(reuse).await
     }
 
-    /// Set value for the SO_KEEPALIVE option on this socket.
+    /// Set value for the `SO_KEEPALIVE` option on this socket.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the socket option cannot be changed.
     pub async fn set_keepalive(&self, keepalive: bool) -> io::Result<()> {
         self.socket.set_keepalive(keepalive).await
     }
-    /// Set the value of the TCP_NODELAY option on this socket.
+    /// Set the value of the `TCP_NODELAY` option on this socket.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the socket option cannot be changed.
     pub async fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
         self.socket.set_nodelay(nodelay).await
     }
 
     /// Enable or disable `SO_ZEROCOPY` on this socket.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the socket option cannot be changed or is unsupported.
     pub async fn set_zerocopy(&self, enabled: bool) -> io::Result<()> {
         self.socket.set_zerocopy(enabled).await
     }

@@ -17,6 +17,7 @@ impl std::fmt::Debug for ThreadPark {
 }
 
 #[derive(Clone)]
+/// A cross-thread wake handle for [`ThreadPark`].
 pub struct ThreadUnpark {
     inner: Arc<Inner>,
 }

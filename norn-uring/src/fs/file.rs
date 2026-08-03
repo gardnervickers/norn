@@ -47,6 +47,14 @@ impl std::fmt::Debug for PipeWriter {
 }
 
 /// Create a nonblocking pipe.
+///
+/// # Errors
+///
+/// Returns an error if the operating system cannot create the pipe.
+///
+/// # Panics
+///
+/// Panics if called outside an active [`Driver`](crate::Driver) context.
 pub fn pipe() -> io::Result<(PipeReader, PipeWriter)> {
     let handle = crate::Handle::current();
     let mut fds: [RawFd; 2] = [0; 2];
@@ -82,12 +90,20 @@ impl File {
     }
 
     /// Open a file in read-only mode at the provided path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the path is invalid or the kernel cannot open the file.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called outside an active [`Driver`](crate::Driver) context.
     pub async fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let mut opts = opts::OpenOptions::new();
         opts.read(true).open(path).await
     }
 
-    /// Returns a new [`OpenOptions`] object which can be used to open a file.
+    /// Returns a new [`opts::OpenOptions`] object which can be used to open a file.
     pub fn with_options() -> opts::OpenOptions {
         opts::OpenOptions::new()
     }
@@ -234,6 +250,10 @@ impl File {
     }
 
     /// Truncate or extend the underlying file, updating the file length.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the kernel cannot change the file length.
     pub async fn set_len(&self, len: u64) -> io::Result<()> {
         let truncate = Truncate::new(self.fd.clone(), len);
         self.handle.submit(truncate).await
@@ -264,6 +284,11 @@ impl File {
     /// Provide access pattern advice for the file.
     ///
     /// This maps to `posix_fadvise(2)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `len` cannot be represented by `off_t` or the
+    /// kernel rejects the advice.
     pub async fn advise(&self, offset: u64, len: u64, advice: i32) -> io::Result<()> {
         let len = u64_to_off_t(len, "fadvise length")?;
         let op = Advise::new(self.fd.clone(), offset, len, advice);
@@ -300,6 +325,10 @@ impl File {
     }
 
     /// Splice bytes from this file into the provided pipe.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the splice operation fails.
     pub async fn splice_to_pipe(
         &self,
         dst: &PipeWriter,
@@ -319,6 +348,10 @@ impl File {
     }
 
     /// Splice bytes from the provided pipe into this file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the splice operation fails.
     pub async fn splice_from_pipe(
         &self,
         src: &PipeReader,
@@ -344,6 +377,11 @@ impl File {
     /// by this call; queued, submitted, and completed-but-unconsumed operations
     /// continue retaining the descriptor until they are dropped or consumed. If
     /// close is rejected, dropping the last owner still closes the descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::WouldBlock`] while another owner or operation
+    /// retains the descriptor, or another I/O error if close fails.
     pub async fn close(self) -> io::Result<()> {
         self.fd.close().await
     }
@@ -351,6 +389,10 @@ impl File {
 
 impl PipeReader {
     /// Splice bytes from this pipe into the provided file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the splice operation fails.
     pub async fn splice_to(
         &self,
         dst: &File,
@@ -370,6 +412,10 @@ impl PipeReader {
     }
 
     /// Duplicate bytes from this pipe into another pipe without consuming them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the tee operation fails.
     pub async fn tee_to(&self, dst: &PipeWriter, len: u32, flags: u32) -> io::Result<usize> {
         let tee = TeeOp::new(self.fd.clone(), dst.fd.clone(), len, flags);
         self.handle.submit(tee).await
@@ -382,6 +428,11 @@ impl PipeReader {
     /// by this call; queued, submitted, and completed-but-unconsumed operations
     /// continue retaining the descriptor until they are dropped or consumed. If
     /// close is rejected, dropping the last owner still closes the descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::WouldBlock`] while another owner or operation
+    /// retains the descriptor, or another I/O error if close fails.
     pub async fn close(self) -> io::Result<()> {
         self.fd.close().await
     }
@@ -389,6 +440,10 @@ impl PipeReader {
 
 impl PipeWriter {
     /// Splice bytes from the provided file into this pipe.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the splice operation fails.
     pub async fn splice_from(
         &self,
         src: &File,
@@ -414,6 +469,11 @@ impl PipeWriter {
     /// by this call; queued, submitted, and completed-but-unconsumed operations
     /// continue retaining the descriptor until they are dropped or consumed. If
     /// close is rejected, dropping the last owner still closes the descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::WouldBlock`] while another owner or operation
+    /// retains the descriptor, or another I/O error if close fails.
     pub async fn close(self) -> io::Result<()> {
         self.fd.close().await
     }

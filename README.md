@@ -1,41 +1,93 @@
 # Norn
 
-Norn is an experimental set of libraries for building single-threaded asynchronous
-runtimes.
+Norn is a Rust workspace for composing single-threaded asynchronous runtimes.
+It separates local task scheduling, executor control flow, timers, cross-thread
+message delivery, and Linux `io_uring` I/O into independent crates.
 
-## What Itch Does It Scratch?
+The project is experimental, and its APIs are still evolving. Norn targets
+custom runtimes built around thread-affine tasks and task wakers: they must be
+polled, scheduled, and woken on the runtime thread that owns them.
 
-Norn is designed for applications which meet two criteria:
+## Workspace crates
 
-1. Fundementally I/O bound
-2. Trivially shardable or non-parallizable.
+| Crate | Role |
+| --- | --- |
+| [`norn-task`](norn-task/) | Local task allocation, scheduling, cancellation, and join handles. |
+| [`norn-executor`](norn-executor/) | A local executor and the `Park`/`Unpark` interfaces used to compose runtime drivers. |
+| [`norn-timer`](norn-timer/) | A timer-wheel `Park` layer with system and simulated clocks. |
+| [`norn-uring`](norn-uring/) | A Linux-only `io_uring` driver with filesystem, TCP, UDP, and registered-buffer APIs. |
+| [`norn-channel`](norn-channel/) | Bounded cross-thread channels that keep receive-side waking on the destination runtime thread. |
+| [`norn-nursery`](norn-nursery/) | Scoped local concurrency for child futures that may borrow from their environment. |
+| [`norn-util`](norn-util/) | Utilities for embedding and polling sets of local tasks. |
 
-## Why use Norn over X?
+There is no top-level `norn` runtime crate. Applications select the layers they
+need and place them under `norn-executor::LocalExecutor`. For example, the timer
+driver wraps another `Park` implementation, while `norn-uring::Driver` can serve
+as the Linux I/O layer.
 
-You probably should not. Norn is not a general purpose runtime. It's meant
-for very specific workloads (sharded I/O bound storage systems).
+## Minimal executor
 
-## Status of the Project
+```rust
+use norn_executor::park::SpinPark;
+use norn_executor::{spawn, LocalExecutor};
 
-Norn is still in the early stages of development. The API is still in flux
-and in most cases non-existant.
+let mut executor = LocalExecutor::new(SpinPark);
+let value = executor.block_on(async {
+    spawn(async { 21 * 2 }).await.unwrap()
+});
 
-- [`norn-task`] is the core task system. It is mostly complete. I don't envision
-  any substantial changes to the API.
-- [`norn-executor`] is the single-threaded executor. It is not complete. The
-  API is likely to change.
-- [`norn-channel`] provides bounded cross-thread channels whose receive-side
-  wakers remain local to a destination executor.
-- [`norn-nursery`] provides scoped async concurrency on top of `norn-task`.
-  It is inspired by [moro].
-- [`norn-uring`] is a uring-based backend for the executor. It is not complete
-  and hardly useful. The API is very likely to change.
+assert_eq!(value, 42);
+```
 
-## Design Inspo
+`SpinPark` is useful for examples and cases where busy-spinning is intentional.
+`ThreadPark` blocks the runtime thread on a condition variable. On Linux,
+`norn-uring::Driver` implements the same `Park` interface and drives I/O
+completion while the executor is parked.
 
-Much of the design of the task system and async submission handling was inspired
-by Tokio and tokio-uring. The general approach to handling tasks is very similar
-in that we use a single allocation per task, and track tasks in a linked list
-for easy shutdown.
+## Platform support
 
-[moro]: https://github.com/nikomatsakis/moro
+`norn-task`, `norn-executor`, `norn-timer`, `norn-channel`, `norn-nursery`, and
+`norn-util` are platform-independent Rust crates. `norn-uring` and its I/O APIs
+are compiled only on Linux. The workspace is structured so the non-`io_uring`
+crates can still be built on macOS.
+
+## Examples
+
+- [`examples/norn-kv`](examples/norn-kv/) is a small block-oriented key/value
+  store. It uses `norn-uring` on Linux and a blocking backend elsewhere.
+- [`examples/ping-pong-grpc`](examples/ping-pong-grpc/) runs a tonic gRPC
+  client and server over Norn's executor, timer, TCP, and filesystem layers.
+  This example requires Linux.
+- [`norn-channel` crate documentation](norn-channel/src/lib.rs) demonstrates a
+  sharded cross-thread channel topology.
+- [`norn-nursery` crate documentation](norn-nursery/src/lib.rs) demonstrates
+  scoped borrowing, nested child tasks, and early termination.
+
+The [`benches`](benches/) package contains focused task, executor, timer,
+channel, HTTP, buffer, and `io_uring` benchmarks. Results and methodology are
+recorded alongside the benchmarks.
+
+## Building and checking documentation
+
+The repository includes a Nix development shell with the Rust tooling used by
+the project:
+
+```console
+nix develop
+cargo test --workspace --all-features
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
+```
+
+Linux and a kernel with `io_uring` support are required to run the
+`norn-uring` tests. The other crates can be tested independently with commands
+such as `cargo test -p norn-task` or `cargo test -p norn-timer`.
+
+## Design sources
+
+The task representation and scheduling state machine draw on techniques used
+by [Tokio](https://github.com/tokio-rs/tokio). The `io_uring` submission model
+also draws on [tokio-uring](https://github.com/tokio-rs/tokio-uring), and the
+scoped-concurrency API is informed by the
+[`moro`](https://github.com/nikomatsakis/moro) experiment. These projects are
+design influences. Norn makes no API-compatibility claim.

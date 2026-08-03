@@ -118,7 +118,7 @@ operations.
 
 Norn provides implementations for:
 
-- `Vec<u8>` (its initialized length, not spare capacity),
+- `Vec<u8>` (its initialized length; spare capacity is excluded),
 - `Box<[u8]>`,
 - `BytesMut` (its initialized length),
 - `[u8; N]`, and
@@ -329,16 +329,17 @@ raw io_uring submission is a safe extension point.
 
 ## Registration lifetime and panic safety
 
-The pool's inner allocation stores a weak driver token plus a generation, not a
-strong `Handle`. Fixed operations already carry the file descriptor's driver
-ownership; the pool must not add a `RawOp -> FixedBuf -> pool -> Shared` cycle
+The pool's inner allocation stores a weak driver token plus a generation. It
+does not hold a strong `Handle`. Fixed operations already carry the file
+descriptor's driver ownership; the pool must not add a
+`RawOp -> FixedBuf -> pool -> Shared` cycle
 if fail-soft shutdown abandons completions. If the weak token cannot upgrade,
 ring destruction has already made the storage safe to release.
 
 Norn's pre-existing `RawOp -> NornFd -> Handle/Shared` ownership can itself
 form a fail-soft shutdown leak when an operation is permanently abandoned. A
-fixed operation does not add a new edge to that cycle, but it can increase the
-leaked footprint by retaining its pool and registered pages. Repairing that
+fixed operation adds no new edge to that cycle. It can increase the leaked
+footprint by retaining its pool and registered pages. Repairing that
 general operation/descriptor shutdown cycle is tracked as separate runtime
 work rather than weakening fixed-buffer lifetime safety.
 

@@ -215,7 +215,7 @@ for Tokio, and all four raw cases remain below the 3% max-to-min threshold.
 - Final summary: five 128-yield paired runs show a consistent 30.12% to 32.95%
   lower incremental scheduling cost for Norn.
 - Confidence: high for this synthetic single-threaded loopback workload on this
-  host; not a claim about general gRPC latency or remote-network performance.
+  host. General gRPC latency and remote-network performance remain unmeasured.
 - Remaining ideas: repeat on a dedicated production-like Linux host, and add a
   split-endpoint variant if client-side and server-side runtime costs need to be
   separated.
@@ -259,8 +259,8 @@ for Tokio, and all four raw cases remain below the 3% max-to-min threshold.
   38,487 / 37,886 ns), only 0.68% faster than baseline and within run noise.
 - Conclusion: no additional inline annotation met the 5% threshold. The
   remaining hot profile entries are state-transition work, `VecDeque`
-  mechanics, and a raw-waker callback boundary; improving them would require a
-  data-structure or state-machine change, not another inline hint.
+  mechanics, and a raw-waker callback boundary. Further improvement would
+  require a data-structure or state-machine change.
 
 ## Limitations
 

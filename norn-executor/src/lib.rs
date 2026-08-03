@@ -1,12 +1,40 @@
-//! Provides a single-threaded executor for driving [`Future`]s
-//! to completion.
+//! A single-threaded executor for driving [`Future`]s to completion.
 //!
-//! # Modules
-//! - [`park`]: parking and unparking abstractions plus built-in implementations.
+//! [`LocalExecutor`] runs local tasks from `norn-task` and delegates idle time
+//! to a [`park::Park`] implementation. Park layers may block the thread or
+//! drive another subsystem such as timers or `io_uring`.
+//!
+//! Futures spawned through [`spawn`] or [`Handle::spawn`] must be `'static`, but
+//! they do not need to implement `Send`; all task polling remains on the thread
+//! driving the executor.
+//!
+//! # Example
+//!
+//! ```
+//! use norn_executor::park::SpinPark;
+//! use norn_executor::{spawn, LocalExecutor};
+//!
+//! let mut executor = LocalExecutor::new(SpinPark);
+//! let answer = executor.block_on(async {
+//!     spawn(async { 40 + 2 }).await.unwrap()
+//! });
+//!
+//! assert_eq!(answer, 42);
+//! ```
+//!
+//! # Runtime layers
+//!
+//! See [`park`] for the composition interface and built-in parking
+//! implementations.
 #![deny(
     missing_docs,
     missing_debug_implementations,
     rust_2018_idioms,
+    rustdoc::bare_urls,
+    rustdoc::broken_intra_doc_links,
+    unreachable_pub,
+    clippy::doc_markdown,
+    clippy::missing_errors_doc,
     clippy::missing_safety_doc
 )]
 use std::future::Future;

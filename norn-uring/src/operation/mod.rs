@@ -17,7 +17,7 @@ use crate::driver::{PushFuture, TryPush};
 use crate::error::SubmitError;
 use header::CompletionQueue;
 
-/// Low-level request customization for advanced io_uring users.
+/// Low-level request customization for advanced `io_uring` users.
 ///
 /// # Safety
 ///
@@ -52,6 +52,11 @@ pub unsafe trait Operation {
     /// The address of `self` remains stable while the returned entry may be accessed by the
     /// kernel. Implementations may store pointers to fields of `self` in the entry, but must not
     /// invalidate the pointed-to storage during that period.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the operation cannot construct a valid submission
+    /// queue entry. The runtime delivers this through the normal completion path.
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry>;
 
     /// Release resources represented by an unconsumed completion.
@@ -127,7 +132,7 @@ impl ConfiguredEntry {
 /// An owned identity for an operation submitted through this driver.
 ///
 /// Keeping this value alive keeps the operation allocation alive, which makes
-/// its `user_data` identity safe to use as the target of a later io_uring
+/// its `user_data` identity safe to use as the target of a later `io_uring`
 /// control request even if the original operation completes in the meantime.
 pub(crate) struct OpTarget {
     handle: RawOpRef,
@@ -574,7 +579,7 @@ where
     /// This will succeed if the operation is complete.
     ///
     /// # Safety
-    /// Callers must ensure that there are no other references to the data (such as Self::data_mut).
+    /// Callers must ensure that there are no other references to the data (such as `Self::data_mut`).
     unsafe fn try_take(&self) -> Option<T> {
         if !self.is_complete() {
             return None;

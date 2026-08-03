@@ -166,10 +166,10 @@ pub(crate) struct VTable {
     /// Called when a completion is received for the operation.
     ///
     /// Note that an operation may receive multiple completions.
-    /// The CQEResult more flag will be set to indicate if there
+    /// The `CQEResult` more flag will be set to indicate if there
     /// are additional completions.
     ///
-    /// If CQEResult::more returns false, ensure that Header::set_complete
+    /// If `CQEResult::more` returns false, ensure that `Header::set_complete`
     /// is called.
     ///
     /// # Safety:
@@ -232,7 +232,7 @@ impl Header {
     /// Set the complete flag.
     ///
     /// # Safety
-    /// This should **only** be called if CQEResult::more returns false.
+    /// This should **only** be called if `CQEResult::more` returns false.
     pub(crate) unsafe fn set_complete(&self) {
         self.complete.set(true);
     }

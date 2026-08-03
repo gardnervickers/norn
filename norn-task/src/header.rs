@@ -6,7 +6,7 @@ use cordyceps::list::Links;
 use crate::state::StateCell;
 use crate::task_cell::VTable;
 
-pub struct Header {
+pub(crate) struct Header {
     state: StateCell,
     vtable: &'static VTable,
     waker: UnsafeCell<Option<Waker>>,

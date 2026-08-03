@@ -113,7 +113,7 @@ impl OpenOptions {
         self
     }
 
-    /// Sets the option to open this file in O_DIRECT mode.
+    /// Sets the option to open this file in `O_DIRECT` mode.
     ///
     /// Note: This will only work for files backed by a disk. In memory files, like those
     /// created by tempfs will return an error.
@@ -122,13 +122,13 @@ impl OpenOptions {
         self
     }
 
-    /// Sets the option to open this file in O_SYNC mode.
+    /// Sets the option to open this file in `O_SYNC` mode.
     pub fn sync(&mut self, sync: bool) -> &mut Self {
         self.sync = sync;
         self
     }
 
-    /// Sets the option to open this file in O_DSYNC mode.
+    /// Sets the option to open this file in `O_DSYNC` mode.
     pub fn dsync(&mut self, dsync: bool) -> &mut Self {
         self.dsync = dsync;
         self
@@ -145,6 +145,15 @@ impl OpenOptions {
     }
 
     /// Open the file with the configured options.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid option combination or path, or when the
+    /// kernel cannot open the file.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called outside an active [`Driver`](crate::Driver) context.
     pub async fn open<P: AsRef<Path>>(self, path: P) -> io::Result<File> {
         File::open_with_options(path, self).await
     }

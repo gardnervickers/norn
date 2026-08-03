@@ -1,7 +1,7 @@
 //! Support for io_uring registered buffer rings.
 //!
 //! Copied from the test code here
-//! https://github.com/tokio-rs/io-uring/blob/master/io-uring-test/src/tests/register_buf_ring.rs
+//! <https://github.com/tokio-rs/io-uring/blob/master/io-uring-test/src/tests/register_buf_ring.rs>
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -17,7 +17,7 @@ use crate::buf::StableBuf;
 use crate::Handle;
 
 /// [`RecvBufRing`] is a reference counted buffer ring which can be registered
-/// with io_uring to provide buffers for read operations.
+/// with `io_uring` to provide buffers for read operations.
 ///
 /// # Example
 ///
@@ -398,14 +398,14 @@ impl Builder {
 
     /// The number of ring entries to create for the buffer ring.
     ///
-    /// The number will be made a power of 2, and will be the maximum of the ring_entries setting
-    /// and the buf_cnt setting. The interface will enforce a maximum of 2^15 (32768).
+    /// The number will be made a power of 2, and will be the maximum of the `ring_entries` setting
+    /// and the `buf_cnt` setting. The interface will enforce a maximum of 2^15 (32768).
     pub fn ring_entries(mut self, ring_entries: u16) -> Builder {
         self.ring_entries = ring_entries;
         self
     }
 
-    /// The number of buffers to allocate. If left zero, the ring_entries value will be used.
+    /// The number of buffers to allocate. If left zero, the `ring_entries` value will be used.
     pub fn buf_cnt(mut self, buf_cnt: u16) -> Builder {
         self.buf_cnt = buf_cnt;
         self
@@ -418,6 +418,15 @@ impl Builder {
     }
 
     /// Return a [`RecvBufRing`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid ring configuration, allocation failure,
+    /// duplicate buffer-group ID, or kernel registration failure.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called outside an active [`Driver`](crate::Driver) context.
     pub fn build(&self) -> io::Result<RecvBufRing> {
         let mut b: Builder = *self;
 
@@ -763,7 +772,7 @@ impl InnerBufRing {
         // N.B. The uring buf_ring indexing mechanism calls for the tail values to exceed the
         // actual number of ring entries. This allows the uring interface to distinguish between
         // empty and full buf_rings. As a result, the ring mask is only applied to the index used
-        // for computing the ring entry, not to the tail value itself.
+        // solely for computing the ring entry; it does not apply to the tail value.
 
         let old_tail = self.local_tail.get();
         self.local_tail.set(old_tail.wrapping_add(1));
@@ -803,8 +812,8 @@ impl Drop for InnerBufRing {
     }
 }
 
-/// An anonymous region of memory mapped using `mmap(2)`, not backed by a file
-/// but that is guaranteed to be page-aligned and zero-filled.
+/// An anonymous region of page-aligned, zero-filled memory mapped using
+/// `mmap(2)` with no file backing.
 struct AnonymousMmap {
     addr: ptr::NonNull<libc::c_void>,
     len: usize,

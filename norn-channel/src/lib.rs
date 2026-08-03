@@ -67,6 +67,11 @@
     missing_docs,
     missing_debug_implementations,
     rust_2018_idioms,
+    rustdoc::bare_urls,
+    rustdoc::broken_intra_doc_links,
+    unreachable_pub,
+    clippy::doc_markdown,
+    clippy::missing_errors_doc,
     clippy::missing_safety_doc
 )]
 

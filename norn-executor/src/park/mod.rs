@@ -67,6 +67,11 @@ pub trait Park {
     /// Trigger a park operation, passing control to the next layer.
     ///
     /// Layers must respect the [`ParkMode`] passed to this method.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when the underlying parking mechanism cannot
+    /// submit work, wait for an event, or otherwise make progress.
     fn park(&mut self, mode: ParkMode) -> Result<(), io::Error>;
 
     /// Get a [`Park::Guard`] for this [`Park`] instance.

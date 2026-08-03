@@ -835,8 +835,8 @@ manifest, checked per-pair rows, and the summary remain under
 `delta` is the median of per-trial `100 * (fixed / ordinary - 1)` values, so a
 negative value favors fixed buffers. `MAD` and `range` describe those paired
 deltas. `signs` is the number of pairs in which fixed was faster. The time
-columns are independent medians and are included for scale, not used as the
-primary effect estimate.
+columns are independent medians included for scale. The primary effect estimate
+uses paired deltas.
 
 | direction | QD | ordinary median | fixed median | paired delta | MAD | range | signs |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -1047,9 +1047,9 @@ matrices are preserved under
 
 The depth-one result was exact at the harness's integer-nanosecond resolution.
 The 1,024 central value was stable despite one wide Bencher dispersion report.
-The fixed-work 16K range was about 11%; candidate disposition therefore uses
-paired process isolation, not this three-run range alone. Every invariant probe
-passed: constant-depth capacity stayed `128 -> 128`, and the full 897-entry
+The fixed-work 16K range was about 11%, which makes three runs insufficient for
+candidate disposition. The disposition therefore uses paired process isolation.
+Every invariant probe passed: constant-depth capacity stayed `128 -> 128`, and the full 897-entry
 suffix was cleaned in FIFO order exactly once.
 
 Every raw baseline, trial, rejected variant, and final paired result will be
@@ -1238,8 +1238,9 @@ a tiny fraction of the full socket workload. The `IO_DRAIN`-fenced timeout case
 then isolates the opposite, valid regime using only public APIs: a multishot
 producer finishes while its consumer is not polled. Its 16,384 CQEs take a
 median `35.008 ms` to consume on `master` and `90.148 us` with the candidate, a
-paired `-99.740%` change. This is a defensive lagging-consumer win, not a claim
-that current steady consumers commonly build large backlogs.
+paired `-99.740%` change. This result characterizes the deliberately lagging
+consumer case; the prevalence of large backlogs under steady workloads remains
+unmeasured.
 ## 2026-07-20: Direct `BufRingBuf` UDP echo
 
 Goal: measure the allocation and throughput effect of sending a selected
@@ -1260,8 +1261,9 @@ Environment:
   1,024 warmup exchanges.
 
 The benchmark uses a process-wide counting allocator. Counts cover the entire
-timed client/server loop, so the useful signal is the paired difference; they
-are cumulative allocation calls and requested bytes, not peak live memory.
+timed client/server loop, so the useful signal is the paired difference. They
+measure cumulative allocation calls and requested bytes. Peak live memory is
+outside the measurement.
 
 ```text
 nix develop -c cargo bench -p benches --bench bufring_echo -- \
@@ -1318,9 +1320,9 @@ scheduling quantum while leaving the default and shutdown draining exhaustive.
 - Shutdown uses a separate exhaustive drain because it must observe its drain
   sentinel before releasing kernel-owned resources.
 
-The bound supplies cooperative scheduling fairness, not producer backpressure.
-It does not cap total pending completions when an application consumer is
-slower than the kernel producer.
+The bound supplies cooperative scheduling fairness. Producer backpressure
+requires a separate mechanism. Total pending completions remain unbounded when
+an application consumer is slower than the kernel producer.
 
 ### Selection evidence
 
@@ -1427,8 +1429,8 @@ Type-size result:
 
 The common-path candidate times were `13.846`, `14.359`, `13.925`, `13.858`,
 and `13.716 ms`; median `13.858 ms`, `2.1%` faster than baseline. This is below
-the repository's normal throughput materiality threshold and is treated as a
-neutral guardrail, not as the reason to keep the change.
+the repository's normal throughput materiality threshold and serves as a
+neutral guardrail. It does not justify retaining the change by itself.
 
 The forced-backpressure candidate times were `2.046`, `2.061`, `2.061`,
 `2.092`, and `2.039 ms`; median `2.061 ms`, `0.8%` faster than baseline and

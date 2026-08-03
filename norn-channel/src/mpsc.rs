@@ -209,6 +209,11 @@ where
     /// Messages may be sent before attachment. Attachment verifies the driver
     /// endpoint, registers the local receiver, then checks for buffered
     /// messages or closure so a concurrent send cannot lose a wakeup.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `handle` belongs to a different [`Endpoint`] than the one
+    /// used to create this channel.
     pub fn attach(mut self, handle: &Handle) -> Receiver<T> {
         let shared = self
             .shared
@@ -289,6 +294,11 @@ impl<T> Sender<T> {
     /// Attempt to enqueue one message without waiting for capacity.
     ///
     /// On failure, ownership of the message is returned to the caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrySendError::Full`] when the bounded queue has no remaining
+    /// capacity, or [`TrySendError::Closed`] after the receiver closes.
     pub fn try_send(&self, value: T) -> Result<(), TrySendError<T>> {
         // TODO: Add bounded bulk submit after defining partial-enqueue return
         // semantics and measuring whether producers naturally form batches.
@@ -338,6 +348,11 @@ impl<T> fmt::Debug for Receiver<T> {
 
 impl<T> Receiver<T> {
     /// Attempt to receive one message without waiting.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TryRecvError::Empty`] while the open channel has no buffered
+    /// message, or [`TryRecvError::Closed`] once it is closed and drained.
     pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
         if let Some(value) = self.local.shared.queue.pop() {
             return Ok(value);
@@ -365,6 +380,11 @@ impl<T> Receiver<T> {
     /// # Panics
     ///
     /// Panics if `limit` is zero.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TryRecvError::Empty`] while the open channel has no buffered
+    /// message, or [`TryRecvError::Closed`] once it is closed and drained.
     pub fn try_recv_many(
         &mut self,
         output: &mut Vec<T>,
@@ -613,6 +633,11 @@ where
     /// Messages may be sent on any lane before attachment. Attachment verifies
     /// the driver endpoint, registers the local receiver, then checks every
     /// lane for buffered messages so a concurrent send cannot lose a wakeup.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `handle` belongs to a different [`Endpoint`] than the one
+    /// used to create this channel.
     pub fn attach(mut self, handle: &Handle) -> ShardedReceiver<T> {
         let shared = self
             .shared
@@ -712,6 +737,11 @@ impl<T> ShardedSender<T> {
     ///
     /// On failure, ownership of the message is returned to the caller. A full
     /// result applies to this lane even if another lane still has capacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrySendError::Full`] when this lane has no remaining capacity,
+    /// or [`TrySendError::Closed`] after the receiver closes.
     pub fn try_send(&self, value: T) -> Result<(), TrySendError<T>> {
         // TODO: Add bounded bulk submit after defining partial-enqueue return
         // semantics and measuring whether producers naturally form batches.
@@ -765,6 +795,11 @@ impl<T> fmt::Debug for ShardedReceiver<T> {
 
 impl<T> ShardedReceiver<T> {
     /// Attempt to receive one message without waiting.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TryRecvError::Empty`] while the open channel has no buffered
+    /// message, or [`TryRecvError::Closed`] once it is closed and drained.
     pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
         if let Some(value) = self.local.pop() {
             return Ok(value);
@@ -792,6 +827,11 @@ impl<T> ShardedReceiver<T> {
     /// # Panics
     ///
     /// Panics if `limit` is zero.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TryRecvError::Empty`] while the open channel has no buffered
+    /// message, or [`TryRecvError::Closed`] once it is closed and drained.
     pub fn try_recv_many(
         &mut self,
         output: &mut Vec<T>,

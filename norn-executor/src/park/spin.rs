@@ -8,6 +8,7 @@ use crate::park::{Park, ParkMode, Unpark};
 pub struct SpinPark;
 
 #[derive(Debug, Clone, Copy)]
+/// The no-op [`Unpark`] handle associated with [`SpinPark`].
 pub struct NoopUnparker;
 
 impl Unpark for NoopUnparker {
