@@ -57,17 +57,19 @@
 )]
 
 use std::any::Any;
+use std::cell::RefCell;
 use std::error::Error;
 use std::fmt;
-use std::future::Future;
+use std::future::{poll_fn, Future};
 use std::io;
-use std::pin::Pin;
+use std::pin::{pin, Pin};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard};
 use std::task::{Context, Poll, Waker};
 use std::thread::{self, JoinHandle};
 
-use norn_channel::{DriverBuilder, Endpoint};
+use norn_channel::{mpsc as channel, DriverBuilder, Endpoint};
 use norn_executor::park::{Park, ThreadPark};
 use norn_executor::LocalExecutor;
 
@@ -134,16 +136,16 @@ mod output {
 pub use output::WorkerOutput;
 
 #[derive(Debug)]
-struct ShutdownState {
+struct ShutdownRemote {
     requested: AtomicBool,
-    wakers: Mutex<Vec<Waker>>,
+    signal: channel::Sender<()>,
 }
 
-impl ShutdownState {
-    fn new() -> Self {
+impl ShutdownRemote {
+    fn new(signal: channel::Sender<()>) -> Self {
         Self {
             requested: AtomicBool::new(false),
-            wakers: Mutex::new(Vec::new()),
+            signal,
         }
     }
 
@@ -152,23 +154,42 @@ impl ShutdownState {
             return;
         }
 
-        let wakers = std::mem::take(&mut *lock(&self.wakers));
-        for waker in wakers {
-            waker.wake();
-        }
+        let _ = self.signal.try_send(());
     }
 
     fn is_requested(&self) -> bool {
         self.requested.load(Ordering::Acquire)
     }
+}
+
+#[derive(Debug)]
+struct ShutdownState {
+    remote: Arc<ShutdownRemote>,
+    wakers: RefCell<Vec<Waker>>,
+}
+
+impl ShutdownState {
+    fn new(remote: Arc<ShutdownRemote>) -> Self {
+        Self {
+            remote,
+            wakers: RefCell::new(Vec::new()),
+        }
+    }
+
+    fn deliver(&self) {
+        let wakers = std::mem::take(&mut *self.wakers.borrow_mut());
+        for waker in wakers {
+            waker.wake();
+        }
+    }
 
     fn poll_requested(&self, cx: &Context<'_>) -> Poll<()> {
-        if self.is_requested() {
+        if self.remote.is_requested() {
             return Poll::Ready(());
         }
 
-        let mut wakers = lock(&self.wakers);
-        if self.is_requested() {
+        let mut wakers = self.wakers.borrow_mut();
+        if self.remote.is_requested() {
             return Poll::Ready(());
         }
         if !wakers.iter().any(|waker| waker.will_wake(cx.waker())) {
@@ -180,7 +201,7 @@ impl ShutdownState {
 
 #[derive(Debug)]
 struct GroupControl {
-    workers: Vec<Arc<ShutdownState>>,
+    workers: Vec<Arc<ShutdownRemote>>,
 }
 
 impl GroupControl {
@@ -195,7 +216,7 @@ impl GroupControl {
 #[derive(Debug)]
 #[must_use = "shutdown requests are observed only when this future is awaited or polled"]
 pub struct ShutdownRequested {
-    state: Arc<ShutdownState>,
+    state: Rc<ShutdownState>,
 }
 
 impl Future for ShutdownRequested {
@@ -215,6 +236,7 @@ pub struct WorkerContext {
     id: WorkerId,
     channels: norn_channel::Handle,
     control: Arc<GroupControl>,
+    shutdown: Rc<ShutdownState>,
 }
 
 impl WorkerContext {
@@ -236,7 +258,7 @@ impl WorkerContext {
     /// Return a future that resolves when group shutdown is requested.
     pub fn shutdown_requested(&self) -> ShutdownRequested {
         ShutdownRequested {
-            state: Arc::clone(&self.control.workers[self.id.index()]),
+            state: Rc::clone(&self.shutdown),
         }
     }
 
@@ -461,6 +483,7 @@ enum WorkerExit {
 struct Bootstrap {
     id: WorkerId,
     driver: DriverBuilder,
+    shutdown: channel::DetachedReceiver<()>,
     control: Arc<GroupControl>,
     gate: Arc<StartGate>,
     startup: mpsc::Sender<StartEvent>,
@@ -472,6 +495,7 @@ type WorkerTask = Box<dyn FnOnce(Bootstrap) -> WorkerExit + Send + 'static>;
 struct WorkerSlot {
     driver: Option<DriverBuilder>,
     endpoint: Endpoint,
+    shutdown: Option<channel::DetachedReceiver<()>>,
     task: Option<WorkerTask>,
 }
 
@@ -505,22 +529,24 @@ impl Builder {
             "runtime group must contain at least one worker"
         );
 
-        let control = Arc::new(GroupControl {
-            workers: (0..worker_count)
-                .map(|_| Arc::new(ShutdownState::new()))
-                .collect(),
-        });
+        let mut shutdown_controls = Vec::with_capacity(worker_count);
         let workers = (0..worker_count)
             .map(|_| {
                 let driver = DriverBuilder::new();
                 let endpoint = driver.endpoint().clone();
+                let (signal, shutdown) = channel::bounded(&endpoint, 1);
+                shutdown_controls.push(Arc::new(ShutdownRemote::new(signal)));
                 WorkerSlot {
                     driver: Some(driver),
                     endpoint,
+                    shutdown: Some(shutdown),
                     task: None,
                 }
             })
             .collect();
+        let control = Arc::new(GroupControl {
+            workers: shutdown_controls,
+        });
 
         Self {
             workers,
@@ -613,6 +639,7 @@ impl Builder {
             let Bootstrap {
                 id,
                 driver,
+                shutdown,
                 control,
                 gate,
                 startup,
@@ -632,6 +659,9 @@ impl Builder {
 
             let driver = driver.build(park);
             let channels = driver.handle();
+            let shutdown = shutdown.attach(&channels);
+            let shutdown_state =
+                Rc::new(ShutdownState::new(Arc::clone(&control.workers[id.index()])));
             let mut executor = LocalExecutor::new(driver);
             startup_reported.store(true, Ordering::Release);
             let _ = startup.send(StartEvent::Ready);
@@ -643,8 +673,10 @@ impl Builder {
                 id,
                 channels,
                 control: Arc::clone(&control),
+                shutdown: Rc::clone(&shutdown_state),
             };
-            let result = match executor.try_block_on(main(context)) {
+            let worker_main = run_worker_main(main(context), shutdown, shutdown_state);
+            let result = match executor.try_block_on(worker_main) {
                 Ok(output) => output.into_result().map_err(|error| {
                     WorkerFailure::error(worker, WorkerFailureKind::Application, error)
                 }),
@@ -691,6 +723,10 @@ impl Builder {
             let id = WorkerId::new(index);
             let task = slot.task.take().expect("workers were validated above");
             let driver = slot.driver.take().expect("worker driver already consumed");
+            let shutdown = slot
+                .shutdown
+                .take()
+                .expect("worker shutdown receiver already consumed");
             let control = Arc::clone(&self.control);
             let gate_for_worker = Arc::clone(&gate);
             let startup = startup_tx.clone();
@@ -701,6 +737,7 @@ impl Builder {
             let bootstrap = Bootstrap {
                 id,
                 driver,
+                shutdown,
                 control,
                 gate: gate_for_worker,
                 startup,
@@ -759,6 +796,28 @@ impl Builder {
             workers: threads,
         })
     }
+}
+
+async fn run_worker_main<F>(
+    main: F,
+    mut shutdown: channel::Receiver<()>,
+    state: Rc<ShutdownState>,
+) -> F::Output
+where
+    F: Future,
+{
+    let mut main = pin!(main);
+    let mut shutdown = pin!(shutdown.recv());
+    let mut delivered = false;
+
+    poll_fn(|cx| {
+        if !delivered && shutdown.as_mut().poll(cx).is_ready() {
+            delivered = true;
+            state.deliver();
+        }
+        main.as_mut().poll(cx)
+    })
+    .await
 }
 
 struct WorkerThread {
@@ -872,10 +931,11 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
-    use std::future::pending;
+    use std::future::{pending, poll_fn};
+    use std::pin::pin;
     use std::rc::Rc;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+    use std::sync::{mpsc as std_mpsc, Arc};
 
     use norn_channel::mpsc;
     use norn_executor::park::{Park, ParkMode, SpinPark, Unpark};
@@ -972,6 +1032,43 @@ mod tests {
 
         let group = builder.start().unwrap();
         assert_eq!(group.worker_count(), 3);
+        group.shutdown().unwrap();
+    }
+
+    #[test]
+    fn shutdown_wakes_background_tasks_on_their_owning_workers() {
+        let mut builder = Builder::new(2);
+        let (ready_tx, ready_rx) = std_mpsc::channel();
+
+        for worker in builder.worker_ids().collect::<Vec<_>>() {
+            let ready = ready_tx.clone();
+            builder
+                .worker(worker, move |context| async move {
+                    let waiter_context = context.clone();
+                    let waiter = norn_executor::spawn(async move {
+                        let mut shutdown = pin!(waiter_context.shutdown_requested());
+                        let mut announced = false;
+                        poll_fn(|cx| {
+                            let result = shutdown.as_mut().poll(cx);
+                            if !announced {
+                                ready.send(()).unwrap();
+                                announced = true;
+                            }
+                            result
+                        })
+                        .await;
+                    });
+
+                    waiter.await.unwrap();
+                })
+                .unwrap();
+        }
+        drop(ready_tx);
+
+        let group = builder.start().unwrap();
+        for _ in 0..2 {
+            ready_rx.recv().unwrap();
+        }
         group.shutdown().unwrap();
     }
 
