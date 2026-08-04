@@ -87,7 +87,7 @@ impl File {
         opts.read(true).open(path).await
     }
 
-    /// Returns a new [`OpenOptions`] object which can be used to open a file.
+    /// Returns a new [`opts::OpenOptions`] object which can be used to open a file.
     pub fn with_options() -> opts::OpenOptions {
         opts::OpenOptions::new()
     }

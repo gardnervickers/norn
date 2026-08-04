@@ -11,7 +11,7 @@ use crate::operation::Op;
 
 /// A UDP socket.
 ///
-/// After creating a `UdpSocket` by [`bind`]ing it to a socket address, data can be
+/// After creating a `UdpSocket` by [`UdpSocket::bind`]ing it to a socket address, data can be
 /// [sent to] and [received from] any other socket address.
 pub struct UdpSocket {
     inner: socket::Socket,
@@ -32,7 +32,7 @@ impl UdpSocket {
 
     /// Connect this socket to a remote address.
     ///
-    /// A connected UDP socket can use [`send`] and [`recv`] without passing
+    /// A connected UDP socket can use [`UdpSocket::send`] and [`UdpSocket::recv`] without passing
     /// an address for each operation.
     pub async fn connect(&self, addr: SocketAddr) -> io::Result<()> {
         self.inner.connect(addr).await
@@ -98,7 +98,7 @@ impl UdpSocket {
     /// Sends a single datagram on a connected socket using io_uring zerocopy send.
     ///
     /// This method does not fall back to regular send if zerocopy is unsupported.
-    /// Callers should enable `SO_ZEROCOPY` with [`set_zerocopy`] first.
+    /// Callers should enable `SO_ZEROCOPY` with [`UdpSocket::set_zerocopy`] first.
     pub async fn send_zc<B>(&self, buf: B) -> (io::Result<usize>, B)
     where
         B: StableBuf + 'static,
@@ -109,7 +109,7 @@ impl UdpSocket {
     /// Sends a single datagram on a connected socket using io_uring zerocopy send with flags.
     ///
     /// This method does not fall back to regular send if zerocopy is unsupported.
-    /// Callers should enable `SO_ZEROCOPY` with [`set_zerocopy`] first.
+    /// Callers should enable `SO_ZEROCOPY` with [`UdpSocket::set_zerocopy`] first.
     pub async fn send_zc_with_flags<B>(&self, buf: B, flags: i32) -> (io::Result<usize>, B)
     where
         B: StableBuf + 'static,
@@ -189,7 +189,7 @@ impl UdpSocket {
     /// Sends a message on a connected socket using io_uring zerocopy sendmsg.
     ///
     /// This method does not fall back to regular sendmsg if zerocopy is unsupported.
-    /// Callers should enable `SO_ZEROCOPY` with [`set_zerocopy`] first.
+    /// Callers should enable `SO_ZEROCOPY` with [`UdpSocket::set_zerocopy`] first.
     pub async fn send_msg_zc<B>(&self, buf: B, flags: i32) -> (io::Result<usize>, B)
     where
         B: StableBuf + 'static,

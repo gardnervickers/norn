@@ -1,7 +1,7 @@
 //! Support for io_uring registered buffer rings.
 //!
 //! Copied from the test code here
-//! https://github.com/tokio-rs/io-uring/blob/master/io-uring-test/src/tests/register_buf_ring.rs
+//! <https://github.com/tokio-rs/io-uring/blob/master/io-uring-test/src/tests/register_buf_ring.rs>
 
 use std::cell::Cell;
 use std::rc::Rc;

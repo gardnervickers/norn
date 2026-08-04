@@ -28,7 +28,8 @@ pub struct TcpListener {
 /// [`TcpSocket`] provides a low-level interface for configuring a socket
 /// and sending or receiving owned buffers.
 ///
-/// A [`TcpSocket`] can be converted into a [`TcpStream`] using [`into_stream`].
+/// A [`TcpSocket`] can be converted into a [`TcpStream`] using
+/// [`TcpSocket::into_stream`].
 /// [`TcpStream`] is a stateful wrapper around [`TcpSocket`] that implements
 /// [`AsyncRead`](tokio::io::AsyncRead) and [`AsyncWrite`](tokio::io::AsyncWrite).
 pub struct TcpSocket {
@@ -205,7 +206,7 @@ impl TcpSocket {
     /// Send data from the given buffer using io_uring zerocopy send.
     ///
     /// This method does not fall back to regular send if zerocopy is unsupported.
-    /// Callers should enable `SO_ZEROCOPY` with [`set_zerocopy`] first.
+    /// Callers should enable `SO_ZEROCOPY` with [`TcpSocket::set_zerocopy`] first.
     pub fn send_zc<B: StableBuf>(&self, buf: B) -> Op<socket::SendZc<B>> {
         self.socket.send_zc(buf)
     }
@@ -213,7 +214,7 @@ impl TcpSocket {
     /// Send data from the given buffer using io_uring zerocopy send with send flags.
     ///
     /// This method does not fall back to regular send if zerocopy is unsupported.
-    /// Callers should enable `SO_ZEROCOPY` with [`set_zerocopy`] first.
+    /// Callers should enable `SO_ZEROCOPY` with [`TcpSocket::set_zerocopy`] first.
     pub fn send_zc_with_flags<B: StableBuf>(&self, buf: B, flags: i32) -> Op<socket::SendZc<B>> {
         self.socket.send_zc_with_flags(buf, flags)
     }
@@ -226,7 +227,7 @@ impl TcpSocket {
     /// Send a message from the given buffer using io_uring zerocopy sendmsg.
     ///
     /// This method does not fall back to regular sendmsg if zerocopy is unsupported.
-    /// Callers should enable `SO_ZEROCOPY` with [`set_zerocopy`] first.
+    /// Callers should enable `SO_ZEROCOPY` with [`TcpSocket::set_zerocopy`] first.
     pub fn send_msg_zc<B: StableBuf>(&self, buf: B, flags: i32) -> Op<socket::SendMsgZc<B>> {
         self.socket.send_msg_zc(buf, flags)
     }
