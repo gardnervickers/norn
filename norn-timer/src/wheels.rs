@@ -22,11 +22,15 @@ impl entry::TimerList for Rc<Wheels> {
     }
 
     fn add(&self, entry: Pin<&mut entry::Entry>, duration: Duration) {
-        if duration.is_zero() {
+        let expiration = self.elapsed().saturating_add(duration.as_millis() as u64);
+        self.add_at(entry, expiration);
+    }
+
+    fn add_at(&self, entry: Pin<&mut entry::Entry>, expiration: u64) {
+        if expiration <= self.elapsed() {
             entry.as_ref().fire(Ok(()));
             return;
         }
-        let expiration = self.elapsed() + duration.as_millis() as u64;
         entry.set_registered(expiration);
         let entry = unsafe { ptr::NonNull::from(entry.get_unchecked_mut()) };
         Wheels::insert(self, entry);

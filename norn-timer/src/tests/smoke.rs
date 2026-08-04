@@ -39,6 +39,26 @@ fn zero_duration() {
     });
 }
 
+#[test]
+fn sleep_until_uses_an_absolute_deadline() {
+    let clock = Clock::simulated();
+    let park = FastPark(clock.clone());
+    let timer = Driver::new(park, clock);
+    let mut executor = LocalExecutor::new(timer);
+
+    executor.block_on(async {
+        let handle = Handle::current();
+        let deadline = handle.clock().now() + Duration::from_secs(1);
+        let sleep = handle.sleep_until(deadline);
+
+        // Advancing after construction must not extend the sleep relative to
+        // the point at which it is first polled.
+        handle.clock().advance(Duration::from_secs(2));
+        sleep.await.unwrap();
+        assert!(handle.clock().now() >= deadline);
+    });
+}
+
 struct FastPark(Clock);
 
 #[derive(Debug, Clone, Copy)]
