@@ -1063,6 +1063,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "norn-multicore"
+version = "0.1.0"
+dependencies = [
+ "norn-channel",
+ "norn-executor",
+]
+
+[[package]]
 name = "norn-nursery"
 version = "0.1.0"
 dependencies = [

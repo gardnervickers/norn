@@ -26,6 +26,8 @@ and in most cases non-existant.
   API is likely to change.
 - [`norn-channel`] provides bounded cross-thread channels whose receive-side
   wakers remain local to a destination executor.
+- [`norn-multicore`] constructs and manages fixed groups of process-local,
+  thread-affine Norn runtimes connected through `norn-channel`.
 - [`norn-nursery`] provides scoped async concurrency on top of `norn-task`.
   It is inspired by [moro].
 - [`norn-uring`] is a uring-based backend for the executor. It is not complete
