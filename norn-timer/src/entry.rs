@@ -112,11 +112,11 @@ where
     /// Reset this [`Sleep`] instance.
     ///
     /// This will unlink it from the timer if it is currently registered,
-    /// and reset the deadline to zero. Future calls to [`Sleep::poll`] will
-    /// then re-register the sleep relative to the current tick.
+    /// and reset the timer entry. Future calls to [`Sleep::poll`] will then
+    /// re-register the sleep using its initial relative duration or absolute
+    /// deadline.
     pub(crate) fn reset(&mut self) {
         self.reset_entry();
-        self.deadline = None;
     }
 
     fn reset_entry(&mut self) {

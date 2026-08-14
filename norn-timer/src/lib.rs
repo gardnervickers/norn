@@ -104,8 +104,9 @@ impl Future for Sleep {
 impl Sleep {
     /// Reset the timer.
     ///
-    /// This will clear any timer state and reset it
-    /// for its initial duration on the next poll.
+    /// This clears any timer state. On the next poll, a relative sleep starts
+    /// its initial duration again, while an absolute sleep retains its initial
+    /// deadline.
     ///
     /// This can be used to implement retry logic without
     /// having to reallocate the timer.

@@ -59,6 +59,26 @@ fn sleep_until_uses_an_absolute_deadline() {
     });
 }
 
+#[test]
+fn reset_preserves_sleep_until_deadline() {
+    let clock = Clock::simulated();
+    let park = FastPark(clock.clone());
+    let timer = Driver::new(park, clock);
+    let mut executor = LocalExecutor::new(timer);
+
+    executor.block_on(async {
+        let handle = Handle::current();
+        let deadline = handle.clock().now() + Duration::from_secs(1);
+        let mut sleep = handle.sleep_until(deadline);
+
+        handle.clock().advance(Duration::from_millis(250));
+        sleep.reset();
+        sleep.await.unwrap();
+
+        assert!(handle.clock().now() >= deadline);
+    });
+}
+
 struct FastPark(Clock);
 
 #[derive(Debug, Clone, Copy)]
