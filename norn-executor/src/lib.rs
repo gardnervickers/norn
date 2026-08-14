@@ -81,7 +81,7 @@ impl<P: park::Park> LocalExecutor<P> {
     /// returns an error when the underlying [`park::Park`] layer fails instead
     /// of panicking, allowing runtime orchestration layers to propagate driver
     /// failures through their normal lifecycle APIs.
-    pub fn try_block_on<F>(&mut self, fut: F) -> Result<F::Output, std::io::Error>
+    /// # Errors\n    ///\n    /// Returns an error when the underlying [`park::Park::park`] operation\n    /// fails.\n    pub fn try_block_on<F>(&mut self, fut: F) -> Result<F::Output, std::io::Error>
     where
         F: Future,
     {
