@@ -32,10 +32,12 @@
 //! # Modules
 //!
 //! - [`buf`]: stable buffer traits and adapters used by I/O operations.
+//! - [`block`]: typed commands for Linux block devices.
 //! - [`bufring`]: registered `io_uring` buffer-ring support.
 //! - [`fixedbuf`]: caller-owned buffers registered for fixed I/O.
 //! - [`fs`]: asynchronous filesystem operations.
 //! - [`net`]: asynchronous TCP and UDP networking.
+//! - [`uring_cmd`]: the low-level device-command extension contract.
 //!
 //! # Low-level extension APIs
 //!
@@ -71,6 +73,8 @@ mod request;
 mod test_util;
 pub(crate) mod util;
 
+/// Commands for Linux block devices.
+pub mod block;
 /// Stable buffer traits and adapters for io_uring operations.
 pub mod buf;
 /// Registered io_uring buffer-ring support.
@@ -81,6 +85,9 @@ pub mod fixedbuf;
 pub mod fs;
 /// Asynchronous TCP and UDP networking.
 pub mod net;
+/// Device-specific commands submitted through `IORING_OP_URING_CMD`.
+pub mod uring_cmd;
+
 pub use driver::{Driver, DriverOptions, Handle};
 pub use fd::UringFd;
 pub use operation::{CQEResult, Multishot, Op, Operation, Singleshot};

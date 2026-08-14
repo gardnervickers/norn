@@ -15,7 +15,7 @@ polled, scheduled, and woken on the runtime thread that owns them.
 | [`norn-task`](norn-task/) | Local task allocation, scheduling, cancellation, and join handles. |
 | [`norn-executor`](norn-executor/) | A local executor and the `Park`/`Unpark` interfaces used to compose runtime drivers. |
 | [`norn-timer`](norn-timer/) | A timer-wheel `Park` layer with system and simulated clocks. |
-| [`norn-uring`](norn-uring/) | A Linux-only `io_uring` driver with filesystem, TCP, UDP, and registered-buffer APIs. |
+| [`norn-uring`](norn-uring/) | A Linux-only `io_uring` driver with filesystem, TCP, UDP, registered-buffer, and device-command APIs. |
 | [`norn-channel`](norn-channel/) | Bounded cross-thread channels that keep receive-side waking on the destination runtime thread. |
 | [`norn-nursery`](norn-nursery/) | Scoped local concurrency for child futures that may borrow from their environment. |
 | [`norn-util`](norn-util/) | Utilities for embedding and polling sets of local tasks. |
