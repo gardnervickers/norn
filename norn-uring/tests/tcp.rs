@@ -54,6 +54,24 @@ fn single_accept_connection() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn tcp_socket_round_trips_through_uring_fd() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let (server, client) = connected_pair().await?;
+        let server = TcpSocket::from_uring_fd(server.into_uring_fd());
+
+        let payload = b"round-trip".to_vec();
+        client.send(payload).await.0?;
+        let (result, buffer) = server.recv(BytesMut::with_capacity(16)).await;
+        let length = result?;
+        assert_eq!(&buffer[..length], b"round-trip");
+
+        server.close().await?;
+        client.close().await?;
+        Ok(())
+    })
+}
+
+#[test]
 fn close_rejects_unpolled_operation_without_invalidating_it(
 ) -> Result<(), Box<dyn std::error::Error>> {
     util::with_test_env(|| async {

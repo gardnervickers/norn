@@ -24,6 +24,24 @@ fn open_close() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn file_round_trips_through_uring_fd() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let dir = util::ThreadNameTestDir::new();
+        let path = dir.join("uring-fd-round-trip");
+        let mut opts = fs::OpenOptions::new();
+        opts.create(true).write(true).read(true);
+
+        let file = opts.open(path).await?;
+        let fd = file.into_uring_fd();
+        let file = fs::File::from_uring_fd(fd);
+        let (result, buffer) = file.write_at(b"round-trip".to_vec(), 0).await;
+        assert_eq!(result?, buffer.len());
+        file.close().await?;
+        Ok(())
+    })
+}
+
+#[test]
 fn create_uses_readable_default_mode() -> Result<(), Box<dyn std::error::Error>> {
     util::with_test_env(|| async {
         let dir = util::ThreadNameTestDir::new();

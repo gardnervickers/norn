@@ -81,8 +81,8 @@ pub mod fixedbuf;
 pub mod fs;
 /// Asynchronous TCP and UDP networking.
 pub mod net;
-
 pub use driver::{Driver, DriverOptions, Handle};
+pub use fd::UringFd;
 pub use operation::{CQEResult, Multishot, Op, Operation, Singleshot};
 pub use request::{
     LinkedTimeoutControl, Map, Request, Then, ThenAux, Timeout, TimeoutControl, TimeoutOutcome,

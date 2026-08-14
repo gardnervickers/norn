@@ -9,6 +9,7 @@ use socket2::{Domain, Type};
 
 use crate::buf::{StableBuf, StableBufMut};
 use crate::bufring::RecvBufRing;
+use crate::fd::UringFd;
 use crate::net::socket;
 use crate::operation::Op;
 
@@ -68,6 +69,26 @@ impl std::fmt::Debug for TcpStream {
 }
 
 impl TcpListener {
+    /// Wrap a driver-bound descriptor as a TCP listener.
+    ///
+    /// This does not inspect the descriptor. The kernel validates its socket
+    /// type and listening state when operations are submitted.
+    pub fn from_uring_fd(fd: UringFd) -> Self {
+        Self {
+            socket: socket::Socket::from_uring_fd(fd),
+        }
+    }
+
+    /// Return the underlying driver-bound descriptor.
+    pub fn as_uring_fd(&self) -> &UringFd {
+        self.socket.as_uring_fd()
+    }
+
+    /// Consume this listener and return its driver-bound descriptor.
+    pub fn into_uring_fd(self) -> UringFd {
+        self.socket.into_uring_fd()
+    }
+
     /// Creates a TCP listener bound to the specified address.
     ///
     /// # Errors
@@ -189,6 +210,26 @@ impl Stream for Incoming<'_> {
 }
 
 impl TcpSocket {
+    /// Wrap a driver-bound descriptor as a TCP socket.
+    ///
+    /// This does not inspect the descriptor. The kernel validates whether it
+    /// supports each requested TCP operation.
+    pub fn from_uring_fd(fd: UringFd) -> Self {
+        Self {
+            socket: socket::Socket::from_uring_fd(fd),
+        }
+    }
+
+    /// Return the underlying driver-bound descriptor.
+    pub fn as_uring_fd(&self) -> &UringFd {
+        self.socket.as_uring_fd()
+    }
+
+    /// Consume this socket and return its driver-bound descriptor.
+    pub fn into_uring_fd(self) -> UringFd {
+        self.socket.into_uring_fd()
+    }
+
     /// Creates a TCP connection to the specified address.
     ///
     /// # Errors
