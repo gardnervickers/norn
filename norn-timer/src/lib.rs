@@ -41,7 +41,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::Context;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub use clock::Clock;
 pub use error::{Error, ErrorKind};
@@ -102,6 +102,7 @@ pin_project_lite::pin_project! {
     pub struct Sleep {
         #[pin]
         inner: entry::Sleep<Rc<wheels::Wheels>>,
+        clock: Clock,
     }
 }
 
@@ -122,8 +123,9 @@ impl Future for Sleep {
 impl Sleep {
     /// Reset the timer.
     ///
-    /// This will clear any timer state and reset it
-    /// for its initial duration on the next poll.
+    /// This clears any timer state. On the next poll, a relative sleep starts
+    /// its initial duration again, while an absolute sleep retains its initial
+    /// deadline.
     ///
     /// This can be used to implement retry logic without
     /// having to reallocate the timer.
@@ -138,7 +140,24 @@ impl Handle {
     /// Once the duration has elapsed, the timer will fire.
     pub fn sleep(&self, duration: Duration) -> Sleep {
         let inner = entry::Sleep::new(self.wheels.clone(), duration);
-        Sleep { inner }
+        Sleep {
+            inner,
+            clock: self.clock.clone(),
+        }
+    }
+
+    /// Create a new timer that completes at an absolute deadline.
+    ///
+    /// If the deadline has already elapsed, the sleep completes on its next
+    /// poll. The deadline uses the same clock as this handle, so simulated
+    /// clocks can be advanced after constructing the sleep without changing
+    /// its target time.
+    pub fn sleep_until(&self, deadline: Instant) -> Sleep {
+        let inner = entry::Sleep::new_at(self.wheels.clone(), self.clock.instant_to_tick(deadline));
+        Sleep {
+            inner,
+            clock: self.clock.clone(),
+        }
     }
 
     /// Get the clock used by the timer.

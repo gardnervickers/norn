@@ -34,7 +34,7 @@ impl Clock {
     }
 
     /// Convert the provided instant to a tick which can be used inside the time driver.
-    fn instant_to_tick(&self, t: Instant) -> u64 {
+    pub(crate) fn instant_to_tick(&self, t: Instant) -> u64 {
         let dur: Duration = t
             .checked_duration_since(self.start)
             .unwrap_or_else(|| Duration::from_secs(0));
