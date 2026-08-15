@@ -5,27 +5,24 @@ use std::os::fd::RawFd;
 use std::path::Path;
 
 use crate::buf::{set_init_checked, StableBuf, StableBufMut};
-use crate::fd::{FdKind, NornFd};
+use crate::fd::{FdKind, NornFd, UringFd};
 use crate::fixedbuf::FixedBuf;
 use crate::fs::opts;
 use crate::operation::{CQEResult, Operation, Singleshot};
 
 /// A reference to an open file on the filesystem.
 pub struct File {
-    fd: NornFd,
-    handle: crate::Handle,
+    fd: UringFd,
 }
 
 /// The read end of a pipe.
 pub struct PipeReader {
-    fd: NornFd,
-    handle: crate::Handle,
+    fd: UringFd,
 }
 
 /// The write end of a pipe.
 pub struct PipeWriter {
-    fd: NornFd,
-    handle: crate::Handle,
+    fd: UringFd,
 }
 
 impl std::fmt::Debug for File {
@@ -64,12 +61,10 @@ pub fn pipe() -> io::Result<(PipeReader, PipeWriter)> {
     }
 
     let read = PipeReader {
-        fd: NornFd::from_fd(fds[0]),
-        handle: handle.clone(),
+        fd: UringFd::from_fd_on(fds[0], handle.clone()),
     };
     let write = PipeWriter {
-        fd: NornFd::from_fd(fds[1]),
-        handle,
+        fd: UringFd::from_fd_on(fds[1], handle),
     };
     Ok((read, write))
 }
@@ -86,7 +81,9 @@ impl File {
         let open = Open::new(path.as_ref(), access_mode, creation_mode, opts.mode)?;
         let handle = crate::Handle::current();
         let fd = handle.submit(open).await?;
-        Ok(Self { fd, handle })
+        Ok(Self {
+            fd: UringFd::from_inner(fd),
+        })
     }
 
     /// Open a file in read-only mode at the provided path.
@@ -108,6 +105,24 @@ impl File {
         opts::OpenOptions::new()
     }
 
+    /// Return the underlying driver-bound descriptor.
+    pub fn as_uring_fd(&self) -> &UringFd {
+        &self.fd
+    }
+
+    /// Consume this file wrapper and return its driver-bound descriptor.
+    pub fn into_uring_fd(self) -> UringFd {
+        self.fd
+    }
+
+    /// Wrap a driver-bound descriptor as a file.
+    ///
+    /// The kernel validates whether the descriptor supports each requested
+    /// filesystem operation.
+    pub fn from_uring_fd(fd: UringFd) -> Self {
+        Self { fd }
+    }
+
     /// Read bytes from the file into the specified buffer.
     ///
     /// The read will start at the provided offset.
@@ -119,8 +134,8 @@ impl File {
     where
         B: StableBufMut + 'static,
     {
-        let read = ReadAt::new(self.fd.clone(), buf, offset);
-        self.handle.submit(read)
+        let read = ReadAt::new(self.fd.lease(), buf, offset);
+        self.fd.submit(read)
     }
 
     /// Write the specified buffer to the file.
@@ -134,8 +149,8 @@ impl File {
     where
         B: StableBuf + 'static,
     {
-        let write = WriteAt::new(self.fd.clone(), buf, offset);
-        self.handle.submit(write)
+        let write = WriteAt::new(self.fd.lease(), buf, offset);
+        self.fd.submit(write)
     }
 
     /// Read bytes into a registered fixed buffer.
@@ -156,11 +171,11 @@ impl File {
         B: 'static,
     {
         assert!(
-            buf.same_driver(&self.handle),
+            buf.same_driver(self.fd.handle()),
             "fixed buffer and file must target the same driver"
         );
-        let read = ReadFixedAt::new(self.fd.clone(), buf, offset);
-        self.handle.submit(read)
+        let read = ReadFixedAt::new(self.fd.lease(), buf, offset);
+        self.fd.submit(read)
     }
 
     /// Write a registered fixed buffer's logical payload.
@@ -184,11 +199,11 @@ impl File {
         B: 'static,
     {
         assert!(
-            buf.same_driver(&self.handle),
+            buf.same_driver(self.fd.handle()),
             "fixed buffer and file must target the same driver"
         );
-        let write = WriteFixedAt::new(self.fd.clone(), buf, offset);
-        self.handle.submit(write)
+        let write = WriteFixedAt::new(self.fd.lease(), buf, offset);
+        self.fd.submit(write)
     }
 
     /// Read bytes from the file into a set of buffers.
@@ -198,8 +213,8 @@ impl File {
     where
         B: StableBufMut + 'static,
     {
-        let read = ReadVectoredAt::new(self.fd.clone(), bufs, offset);
-        self.handle.submit(read).await
+        let read = ReadVectoredAt::new(self.fd.lease(), bufs, offset);
+        self.fd.submit(read).await
     }
 
     /// Write bytes from a set of buffers to the file.
@@ -209,22 +224,22 @@ impl File {
     where
         B: StableBuf + 'static,
     {
-        let write = WriteVectoredAt::new(self.fd.clone(), bufs, offset);
-        self.handle.submit(write).await
+        let write = WriteVectoredAt::new(self.fd.lease(), bufs, offset);
+        self.fd.submit(write).await
     }
 
     /// Sync the file and metadata to disk.
     pub fn sync(&self) -> impl crate::Request<Output = io::Result<()>> {
         let flags = FsyncFlags::empty();
-        let sync = Sync::new(self.fd.clone(), flags);
-        self.handle.submit(sync)
+        let sync = Sync::new(self.fd.lease(), flags);
+        self.fd.submit(sync)
     }
 
     /// Sync only the data in the file to disk.
     pub fn datasync(&self) -> impl crate::Request<Output = io::Result<()>> {
         let flags = FsyncFlags::DATASYNC;
-        let sync = Sync::new(self.fd.clone(), flags);
-        self.handle.submit(sync)
+        let sync = Sync::new(self.fd.lease(), flags);
+        self.fd.submit(sync)
     }
 
     /// Sync a range of the file.
@@ -234,8 +249,8 @@ impl File {
         len: u32,
         flags: u32,
     ) -> impl crate::Request<Output = io::Result<()>> {
-        let sync = SyncRange::new(self.fd.clone(), offset, len, flags);
-        self.handle.submit(sync)
+        let sync = SyncRange::new(self.fd.lease(), offset, len, flags);
+        self.fd.submit(sync)
     }
 
     /// Call `fallocate` on the file.
@@ -245,8 +260,8 @@ impl File {
         len: u64,
         mode: i32,
     ) -> impl crate::Request<Output = io::Result<()>> {
-        let fallocate = Fallocate::new(self.fd.clone(), offset, len, mode);
-        self.handle.submit(fallocate)
+        let fallocate = Fallocate::new(self.fd.lease(), offset, len, mode);
+        self.fd.submit(fallocate)
     }
 
     /// Truncate or extend the underlying file, updating the file length.
@@ -255,8 +270,8 @@ impl File {
     ///
     /// Returns an error if the kernel cannot change the file length.
     pub async fn set_len(&self, len: u64) -> io::Result<()> {
-        let truncate = Truncate::new(self.fd.clone(), len);
-        self.handle.submit(truncate).await
+        let truncate = Truncate::new(self.fd.lease(), len);
+        self.fd.submit(truncate).await
     }
 
     /// Allocate additional space in the file without changing the file length metadata.
@@ -291,8 +306,8 @@ impl File {
     /// kernel rejects the advice.
     pub async fn advise(&self, offset: u64, len: u64, advice: i32) -> io::Result<()> {
         let len = u64_to_off_t(len, "fadvise length")?;
-        let op = Advise::new(self.fd.clone(), offset, len, advice);
-        self.handle.submit(op).await
+        let op = Advise::new(self.fd.lease(), offset, len, advice);
+        self.fd.submit(op).await
     }
 
     /// Read an extended attribute from this file into the provided buffer.
@@ -304,11 +319,11 @@ impl File {
         N: AsRef<[u8]>,
         B: StableBufMut + 'static,
     {
-        let op = match FileGetXattr::new(self.fd.clone(), name.as_ref(), buf) {
+        let op = match FileGetXattr::new(self.fd.lease(), name.as_ref(), buf) {
             Ok(op) => op,
             Err((err, buf)) => return (Err(err), buf),
         };
-        self.handle.submit(op).await
+        self.fd.submit(op).await
     }
 
     /// Set an extended attribute on this file from the provided buffer.
@@ -317,11 +332,11 @@ impl File {
         N: AsRef<[u8]>,
         B: StableBuf + 'static,
     {
-        let op = match FileSetXattr::new(self.fd.clone(), name.as_ref(), value, flags) {
+        let op = match FileSetXattr::new(self.fd.lease(), name.as_ref(), value, flags) {
             Ok(op) => op,
             Err((err, value)) => return (Err(err), value),
         };
-        self.handle.submit(op).await
+        self.fd.submit(op).await
     }
 
     /// Splice bytes from this file into the provided pipe.
@@ -337,14 +352,14 @@ impl File {
         flags: u32,
     ) -> io::Result<usize> {
         let splice = SpliceOp::new(
-            self.fd.clone(),
+            self.fd.lease(),
             option_offset_to_i64(src_offset)?,
-            dst.fd.clone(),
+            dst.fd.lease(),
             -1,
             len,
             flags,
         );
-        self.handle.submit(splice).await
+        self.fd.submit(splice).await
     }
 
     /// Splice bytes from the provided pipe into this file.
@@ -360,14 +375,14 @@ impl File {
         flags: u32,
     ) -> io::Result<usize> {
         let splice = SpliceOp::new(
-            src.fd.clone(),
+            src.fd.lease(),
             -1,
-            self.fd.clone(),
+            self.fd.lease(),
             option_offset_to_i64(dst_offset)?,
             len,
             flags,
         );
-        self.handle.submit(splice).await
+        self.fd.submit(splice).await
     }
 
     /// Close the file.
@@ -388,6 +403,24 @@ impl File {
 }
 
 impl PipeReader {
+    /// Return the underlying driver-bound descriptor.
+    pub fn as_uring_fd(&self) -> &UringFd {
+        &self.fd
+    }
+
+    /// Consume this pipe end and return its driver-bound descriptor.
+    pub fn into_uring_fd(self) -> UringFd {
+        self.fd
+    }
+
+    /// Wrap a driver-bound descriptor as the read end of a pipe.
+    ///
+    /// The kernel validates whether the descriptor supports each requested
+    /// pipe operation.
+    pub fn from_uring_fd(fd: UringFd) -> Self {
+        Self { fd }
+    }
+
     /// Splice bytes from this pipe into the provided file.
     ///
     /// # Errors
@@ -401,14 +434,14 @@ impl PipeReader {
         flags: u32,
     ) -> io::Result<usize> {
         let splice = SpliceOp::new(
-            self.fd.clone(),
+            self.fd.lease(),
             -1,
-            dst.fd.clone(),
+            dst.fd.lease(),
             option_offset_to_i64(dst_offset)?,
             len,
             flags,
         );
-        self.handle.submit(splice).await
+        self.fd.submit(splice).await
     }
 
     /// Duplicate bytes from this pipe into another pipe without consuming them.
@@ -417,8 +450,8 @@ impl PipeReader {
     ///
     /// Returns an error if the tee operation fails.
     pub async fn tee_to(&self, dst: &PipeWriter, len: u32, flags: u32) -> io::Result<usize> {
-        let tee = TeeOp::new(self.fd.clone(), dst.fd.clone(), len, flags);
-        self.handle.submit(tee).await
+        let tee = TeeOp::new(self.fd.lease(), dst.fd.lease(), len, flags);
+        self.fd.submit(tee).await
     }
 
     /// Close the pipe read end.
@@ -439,6 +472,24 @@ impl PipeReader {
 }
 
 impl PipeWriter {
+    /// Return the underlying driver-bound descriptor.
+    pub fn as_uring_fd(&self) -> &UringFd {
+        &self.fd
+    }
+
+    /// Consume this pipe end and return its driver-bound descriptor.
+    pub fn into_uring_fd(self) -> UringFd {
+        self.fd
+    }
+
+    /// Wrap a driver-bound descriptor as the write end of a pipe.
+    ///
+    /// The kernel validates whether the descriptor supports each requested
+    /// pipe operation.
+    pub fn from_uring_fd(fd: UringFd) -> Self {
+        Self { fd }
+    }
+
     /// Splice bytes from the provided file into this pipe.
     ///
     /// # Errors
@@ -452,14 +503,14 @@ impl PipeWriter {
         flags: u32,
     ) -> io::Result<usize> {
         let splice = SpliceOp::new(
-            src.fd.clone(),
+            src.fd.lease(),
             option_offset_to_i64(src_offset)?,
-            self.fd.clone(),
+            self.fd.lease(),
             -1,
             len,
             flags,
         );
-        self.handle.submit(splice).await
+        self.fd.submit(splice).await
     }
 
     /// Close the pipe write end.

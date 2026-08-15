@@ -623,6 +623,19 @@ fn close_socket() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn udp_socket_round_trips_through_uring_fd() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let socket = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let address = socket.local_addr()?;
+        let socket = UdpSocket::from_uring_fd(socket.into_uring_fd());
+
+        assert_eq!(socket.local_addr()?, address);
+        socket.close().await?;
+        Ok(())
+    })
+}
+
+#[test]
 fn poll_readiness_smoke() -> Result<(), Box<dyn std::error::Error>> {
     util::with_test_env(|| async {
         let s1 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;

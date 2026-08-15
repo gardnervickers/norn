@@ -13,7 +13,7 @@ use std::os::fd::FromRawFd;
 
 use crate::buf::{set_init_checked, StableBuf, StableBufMut};
 use crate::bufring::{BufRingBuf, BufRingBufBundle, RecvBufRing};
-use crate::fd::NornFd;
+use crate::fd::{NornFd, UringFd};
 use crate::operation::{Multishot, Op, Operation, Singleshot};
 
 fn invalid_socket_addr_error() -> io::Error {
@@ -87,18 +87,35 @@ fn as_socket_addr_or_peer(
     as_socket_addr(addr)
 }
 
-#[derive(Clone)]
 pub(crate) struct Socket {
-    fd: NornFd,
-    handle: crate::Handle,
+    fd: UringFd,
+}
+
+impl Clone for Socket {
+    fn clone(&self) -> Self {
+        Self {
+            fd: self.fd.clone_internal(),
+        }
+    }
 }
 
 impl Socket {
     pub(crate) fn from_fd(fd: NornFd) -> Self {
         Self {
-            fd,
-            handle: crate::Handle::current(),
+            fd: UringFd::from_inner(fd),
         }
+    }
+
+    pub(crate) fn from_uring_fd(fd: UringFd) -> Self {
+        Self { fd }
+    }
+
+    pub(crate) fn as_uring_fd(&self) -> &UringFd {
+        &self.fd
+    }
+
+    pub(crate) fn into_uring_fd(self) -> UringFd {
+        self.fd
     }
 
     pub(crate) async fn open(
@@ -123,8 +140,8 @@ impl Socket {
         socket_type: Type,
     ) -> io::Result<Self> {
         let socket = Self::open(domain, socket_type, None).await?;
-        let op = BindSocket::new(socket.fd.clone(), addr);
-        socket.handle.submit(op).await?;
+        let op = BindSocket::new(socket.fd.lease(), addr);
+        socket.fd.submit(op).await?;
         Ok(socket)
     }
 
@@ -132,58 +149,58 @@ impl Socket {
         let backlog = i32::try_from(backlog).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "listen backlog exceeds i32")
         })?;
-        let op = ListenSocket::new(self.fd.clone(), backlog);
-        self.handle.submit(op).await
+        let op = ListenSocket::new(self.fd.lease(), backlog);
+        self.fd.submit(op).await
     }
 
     pub(crate) async fn accept(&self) -> io::Result<(Self, SocketAddr)> {
-        let op = Accept::<false>::new(self.fd.clone());
-        let (fd, addr) = self.handle.submit(op).await?;
+        let op = Accept::<false>::new(self.fd.lease());
+        let (fd, addr) = self.fd.submit(op).await?;
         let socket = Self::from_fd(fd);
         Ok((socket, addr))
     }
 
     pub(crate) fn accept_multi(&self) -> Op<Accept<true>> {
-        let op = Accept::<true>::new(self.fd.clone());
-        self.handle.submit(op)
+        let op = Accept::<true>::new(self.fd.lease());
+        self.fd.submit(op)
     }
 
     pub(crate) async fn connect(&self, addr: SocketAddr) -> io::Result<()> {
-        let op = Connect::new(self.fd.clone(), addr);
-        self.handle.submit(op).await?;
+        let op = Connect::new(self.fd.lease(), addr);
+        self.fd.submit(op).await?;
         Ok(())
     }
 
     #[track_caller]
     fn assert_bufring_driver(&self, ring: &RecvBufRing) {
         assert!(
-            ring.same_driver(&self.handle),
+            ring.same_driver(self.fd.handle()),
             "buffer ring and socket must target the same driver"
         );
     }
 
     pub(crate) fn recv_from_ring(&self, ring: &RecvBufRing) -> Op<RecvFromRing> {
         self.assert_bufring_driver(ring);
-        let op = RecvFromRing::new(self.fd.clone(), ring.clone());
-        self.handle.submit(op)
+        let op = RecvFromRing::new(self.fd.lease(), ring.clone());
+        self.fd.submit(op)
     }
 
     pub(crate) fn recv_from_ring_multi(&self, ring: &RecvBufRing) -> Op<RecvFromRingMulti> {
         self.assert_bufring_driver(ring);
-        let op = RecvFromRingMulti::new(self.fd.clone(), ring.clone());
-        self.handle.submit(op)
+        let op = RecvFromRingMulti::new(self.fd.lease(), ring.clone());
+        self.fd.submit(op)
     }
 
     pub(crate) fn recv_ring_multi(&self, ring: &RecvBufRing) -> Op<RecvRingMulti> {
         self.assert_bufring_driver(ring);
-        let op = RecvRingMulti::new(self.fd.clone(), ring.clone(), 0);
-        self.handle.submit(op)
+        let op = RecvRingMulti::new(self.fd.lease(), ring.clone(), 0);
+        self.fd.submit(op)
     }
 
     pub(crate) fn recv_ring_bundle(&self, ring: &RecvBufRing) -> Op<RecvRingBundle> {
         self.assert_bufring_driver(ring);
-        let op = RecvRingBundle::new(self.fd.clone(), ring.clone(), 0);
-        self.handle.submit(op)
+        let op = RecvRingBundle::new(self.fd.lease(), ring.clone(), 0);
+        self.fd.submit(op)
     }
 
     pub(crate) fn recv_ring_bundle_with_flags(
@@ -192,14 +209,14 @@ impl Socket {
         flags: i32,
     ) -> Op<RecvRingBundle> {
         self.assert_bufring_driver(ring);
-        let op = RecvRingBundle::new(self.fd.clone(), ring.clone(), flags);
-        self.handle.submit(op)
+        let op = RecvRingBundle::new(self.fd.lease(), ring.clone(), flags);
+        self.fd.submit(op)
     }
 
     pub(crate) fn recv_ring_bundle_multi(&self, ring: &RecvBufRing) -> Op<RecvRingBundleMulti> {
         self.assert_bufring_driver(ring);
-        let op = RecvRingBundleMulti::new(self.fd.clone(), ring.clone(), 0);
-        self.handle.submit(op)
+        let op = RecvRingBundleMulti::new(self.fd.lease(), ring.clone(), 0);
+        self.fd.submit(op)
     }
 
     pub(crate) fn recv_ring_bundle_multi_with_flags(
@@ -208,8 +225,8 @@ impl Socket {
         flags: i32,
     ) -> Op<RecvRingBundleMulti> {
         self.assert_bufring_driver(ring);
-        let op = RecvRingBundleMulti::new(self.fd.clone(), ring.clone(), flags);
-        self.handle.submit(op)
+        let op = RecvRingBundleMulti::new(self.fd.lease(), ring.clone(), flags);
+        self.fd.submit(op)
     }
 
     pub(crate) async fn recv_from<B>(&self, buf: B) -> (io::Result<(usize, SocketAddr)>, B)
@@ -220,8 +237,8 @@ impl Socket {
         if let Some(result) = self.try_recv_from(&mut buf, 0) {
             return (result, buf);
         }
-        let op = RecvFrom::new(self.fd.clone(), buf, 0);
-        self.handle.submit(op).await
+        let op = RecvFrom::new(self.fd.lease(), buf, 0);
+        self.fd.submit(op).await
     }
 
     pub(crate) async fn send_to<B>(&self, buf: B, addr: SocketAddr) -> (io::Result<usize>, B)
@@ -231,8 +248,8 @@ impl Socket {
         if let Some(result) = self.try_send_to(&buf, Some(addr), 0) {
             return (result, buf);
         }
-        let op = SendTo::new(self.fd.clone(), buf, Some(addr), 0);
-        self.handle.submit(op).await
+        let op = SendTo::new(self.fd.lease(), buf, Some(addr), 0);
+        self.fd.submit(op).await
     }
 
     pub(crate) async fn recv_from_with_flags<B>(
@@ -247,8 +264,8 @@ impl Socket {
         if let Some(result) = self.try_recv_from(&mut buf, flags) {
             return (result, buf);
         }
-        let op = RecvFrom::new(self.fd.clone(), buf, flags as u32);
-        self.handle.submit(op).await
+        let op = RecvFrom::new(self.fd.lease(), buf, flags as u32);
+        self.fd.submit(op).await
     }
 
     pub(crate) async fn send_to_with_flags<B>(
@@ -263,64 +280,64 @@ impl Socket {
         if let Some(result) = self.try_send_to(&buf, Some(addr), flags) {
             return (result, buf);
         }
-        let op = SendTo::new(self.fd.clone(), buf, Some(addr), flags as u32);
-        self.handle.submit(op).await
+        let op = SendTo::new(self.fd.lease(), buf, Some(addr), flags as u32);
+        self.fd.submit(op).await
     }
 
     pub(crate) fn recv<B>(&self, buf: B) -> Op<Recv<B>>
     where
         B: StableBufMut + 'static,
     {
-        let op = Recv::new(self.fd.clone(), buf, 0);
-        self.handle.submit(op)
+        let op = Recv::new(self.fd.lease(), buf, 0);
+        self.fd.submit(op)
     }
 
     pub(crate) fn send<B>(&self, buf: B) -> Op<Send<B>>
     where
         B: StableBuf + 'static,
     {
-        let op = Send::new(self.fd.clone(), buf, 0);
-        self.handle.submit(op)
+        let op = Send::new(self.fd.lease(), buf, 0);
+        self.fd.submit(op)
     }
 
     pub(crate) fn recv_with_flags<B>(&self, buf: B, flags: i32) -> Op<Recv<B>>
     where
         B: StableBufMut + 'static,
     {
-        let op = Recv::new(self.fd.clone(), buf, flags);
-        self.handle.submit(op)
+        let op = Recv::new(self.fd.lease(), buf, flags);
+        self.fd.submit(op)
     }
 
     pub(crate) fn send_with_flags<B>(&self, buf: B, flags: i32) -> Op<Send<B>>
     where
         B: StableBuf + 'static,
     {
-        let op = Send::new(self.fd.clone(), buf, flags);
-        self.handle.submit(op)
+        let op = Send::new(self.fd.lease(), buf, flags);
+        self.fd.submit(op)
     }
 
     pub(crate) fn send_zc<B>(&self, buf: B) -> Op<SendZc<B>>
     where
         B: StableBuf + 'static,
     {
-        let op = SendZc::new(self.fd.clone(), buf, 0);
-        self.handle.submit(op)
+        let op = SendZc::new(self.fd.lease(), buf, 0);
+        self.fd.submit(op)
     }
 
     pub(crate) fn send_zc_with_flags<B>(&self, buf: B, flags: i32) -> Op<SendZc<B>>
     where
         B: StableBuf + 'static,
     {
-        let op = SendZc::new(self.fd.clone(), buf, flags);
-        self.handle.submit(op)
+        let op = SendZc::new(self.fd.lease(), buf, flags);
+        self.fd.submit(op)
     }
 
     pub(crate) fn send_msg_zc<B>(&self, buf: B, flags: i32) -> Op<SendMsgZc<B>>
     where
         B: StableBuf + 'static,
     {
-        let op = SendMsgZc::new(self.fd.clone(), buf, flags);
-        self.handle.submit(op)
+        let op = SendMsgZc::new(self.fd.lease(), buf, flags);
+        self.fd.submit(op)
     }
 
     pub(crate) async fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()> {
@@ -329,13 +346,13 @@ impl Socket {
             std::net::Shutdown::Write => libc::SHUT_WR,
             std::net::Shutdown::Both => libc::SHUT_RDWR,
         };
-        let op = Shutdown::new(self.fd.clone(), how);
-        self.handle.submit(op).await
+        let op = Shutdown::new(self.fd.lease(), how);
+        self.fd.submit(op).await
     }
 
     pub(crate) fn poll_readiness<const MULTI: bool>(&self, events: u32) -> Op<Poll<MULTI>> {
-        let op = Poll::<MULTI>::new(self.fd.clone(), events);
-        self.handle.submit(op)
+        let op = Poll::<MULTI>::new(self.fd.lease(), events);
+        self.fd.submit(op)
     }
 
     pub(crate) fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -407,8 +424,8 @@ impl Socket {
     where
         T: Copy + 'static,
     {
-        let op = SetSockOpt::new(self.fd.clone(), level as u32, optname as u32, value);
-        self.handle.submit(op).await
+        let op = SetSockOpt::new(self.fd.lease(), level as u32, optname as u32, value);
+        self.fd.submit(op).await
     }
 
     fn try_send_to<B>(
@@ -1848,8 +1865,8 @@ mod tests {
 
     use super::*;
 
-    fn assert_accept_flags(fd: &NornFd) {
-        let crate::fd::FdKind::Fd(fd) = fd.kind() else {
+    fn assert_accept_flags(kind: &crate::fd::FdKind) {
+        let crate::fd::FdKind::Fd(fd) = kind else {
             panic!("accepted socket used a fixed descriptor");
         };
 
@@ -1878,7 +1895,7 @@ mod tests {
             let connector = connect_from_thread(listener.local_addr()?);
 
             let (socket, _) = listener.accept().await?;
-            assert_accept_flags(&socket.fd);
+            assert_accept_flags(socket.fd.kind());
 
             connector.join().expect("connector thread panicked")?;
             socket.close().await?;
@@ -1904,7 +1921,7 @@ mod tests {
                     .await
                     .expect("multishot accept ended before yielding")?
             };
-            assert_accept_flags(&socket);
+            assert_accept_flags(socket.kind());
 
             connector.join().expect("connector thread panicked")?;
             socket.close().await?;
@@ -1937,8 +1954,7 @@ mod tests {
             return Err(io::Error::last_os_error());
         }
         Ok(Socket {
-            fd: NornFd::from_fd(fd),
-            handle,
+            fd: UringFd::from_fd_on(fd, handle),
         })
     }
 

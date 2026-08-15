@@ -6,6 +6,7 @@ use socket2::{Domain, Type};
 
 use crate::buf::{StableBuf, StableBufMut};
 use crate::bufring::{BufRingBuf, RecvBufRing};
+use crate::fd::UringFd;
 use crate::net::socket;
 use crate::operation::Op;
 
@@ -24,6 +25,26 @@ impl std::fmt::Debug for UdpSocket {
 }
 
 impl UdpSocket {
+    /// Wrap a driver-bound descriptor as a UDP socket.
+    ///
+    /// This does not inspect the descriptor. The kernel validates whether it
+    /// supports each requested UDP operation.
+    pub fn from_uring_fd(fd: UringFd) -> Self {
+        Self {
+            inner: socket::Socket::from_uring_fd(fd),
+        }
+    }
+
+    /// Return the underlying driver-bound descriptor.
+    pub fn as_uring_fd(&self) -> &UringFd {
+        self.inner.as_uring_fd()
+    }
+
+    /// Consume this socket and return its driver-bound descriptor.
+    pub fn into_uring_fd(self) -> UringFd {
+        self.inner.into_uring_fd()
+    }
+
     /// Creates a UDP socket from the given address.
     ///
     /// # Errors

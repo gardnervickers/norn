@@ -18,8 +18,80 @@ use io_uring::{opcode, types};
 use log::warn;
 
 use crate::driver::CloseFdError;
-use crate::operation::{Operation, Singleshot};
+use crate::operation::{Op, Operation, Singleshot};
 use crate::Handle;
+
+/// A driver-bound file descriptor used by `io_uring` operations.
+///
+/// `UringFd` owns the descriptor and keeps it associated with the driver that
+/// created it. Higher-level types such as filesystem files and sockets are
+/// wrappers around this resource.
+///
+/// Submitted operations retain the descriptor until their terminal
+/// completion. Consequently, [`UringFd::close`] returns
+/// [`io::ErrorKind::WouldBlock`] while operations or internal shared socket
+/// views still retain it.
+pub struct UringFd {
+    inner: NornFd,
+}
+
+impl std::fmt::Debug for UringFd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UringFd").finish_non_exhaustive()
+    }
+}
+
+impl UringFd {
+    pub(crate) fn from_fd_on(fd: RawFd, handle: Handle) -> Self {
+        Self {
+            inner: NornFd::from_fd_on(fd, handle),
+        }
+    }
+
+    pub(crate) fn from_inner(inner: NornFd) -> Self {
+        Self { inner }
+    }
+
+    pub(crate) fn lease(&self) -> NornFd {
+        self.inner.clone()
+    }
+
+    pub(crate) fn clone_internal(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+
+    pub(crate) fn kind(&self) -> &FdKind {
+        self.inner.kind()
+    }
+
+    pub(crate) fn handle(&self) -> &Handle {
+        self.inner
+            .inner
+            .handle
+            .as_ref()
+            .expect("descriptor is not bound to an io_uring driver")
+    }
+
+    pub(crate) fn submit<T>(&self, op: T) -> Op<T>
+    where
+        T: Operation + 'static,
+    {
+        self.handle().submit(op)
+    }
+
+    /// Close the descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::WouldBlock`] if an operation or another
+    /// internal socket view still retains the descriptor. Other errors are
+    /// reported by the kernel close operation.
+    pub async fn close(self) -> io::Result<()> {
+        self.inner.close().await
+    }
+}
 
 /// [`NornFd`] is a reference counted file descriptor.
 #[derive(Clone, Debug)]
@@ -48,6 +120,11 @@ impl NornFd {
         Self::new(FdKind::Fd(types::Fd(raw)))
     }
 
+    pub(crate) fn from_fd_on(fd: RawFd, handle: Handle) -> Self {
+        let raw = fd.as_raw_fd();
+        Self::new_with_handle(FdKind::Fd(types::Fd(raw)), Some(handle))
+    }
+
     /// Create a new [`NornFd`] from a fixed file descriptor.
     #[allow(dead_code)]
     pub(crate) fn from_fixed(fixed: types::Fixed) -> Self {
@@ -55,7 +132,10 @@ impl NornFd {
     }
 
     fn new(kind: FdKind) -> Self {
-        let handle = Handle::try_current();
+        Self::new_with_handle(kind, Handle::try_current())
+    }
+
+    fn new_with_handle(kind: FdKind, handle: Option<Handle>) -> Self {
         let inner = Inner {
             kind,
             handle,
