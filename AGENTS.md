@@ -8,7 +8,6 @@ Norn is an experimental set of Rust crates for building **single-threaded async 
 2. `norn-executor`: `LocalExecutor<P: Park>` event loop over a `TaskQueue`.
 3. `norn-timer`: `Park` wrapper that adds timer-wheel scheduling.
 4. `norn-uring`: `Park` implementation backed by `io_uring` plus fs/net APIs.
-5. `norn-util`: scoped task polling utility (`PollSet`).
 
 The project is intentionally not general-purpose today; APIs are still in flux in executor/uring layers.
 
@@ -18,7 +17,6 @@ The project is intentionally not general-purpose today; APIs are still in flux i
 - `norn-executor/`: single-thread executor and `Park` abstraction (`SpinPark`, `ThreadPark`).
 - `norn-timer/`: timer wheel + `Clock::{system, simulated}` as a `Park` wrapper.
 - `norn-uring/`: `io_uring` reactor, operation lifecycle, stable buffers, bufring, fs, tcp/udp.
-- `norn-util/`: `PollSet` future for scoped local task orchestration.
 - `benches/`: `bencher` harness (`schedule_task`, `noop_submit`, `timers`, `hyper`).
 - `hack/`: helper scripts (`miri.sh`, `coverage.sh`).
 - `.github/workflows/`: CI (`cargo build`, `cargo test`, `nix build` on Ubuntu).
@@ -80,7 +78,7 @@ The project is intentionally not general-purpose today; APIs are still in flux i
 ## Platform and Build Constraints
 
 - This repo is actively developed on both macOS and Linux.
-- `norn-task`, `norn-executor`, `norn-timer`, and `norn-util` are expected to build and benchmark on macOS and Linux.
+- `norn-task`, `norn-executor`, `norn-timer`, `norn-channel`, and `norn-nursery` are expected to build and benchmark on macOS and Linux.
 - `norn-uring` is Linux-only and is explicitly gated with `cfg(target_os = "linux")` (crate + integration tests).
 - On macOS, `norn-uring` is compiled out; workspace checks should still pass for non-uring crates.
 - CI runs on Ubuntu:

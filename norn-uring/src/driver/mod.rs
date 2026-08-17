@@ -13,8 +13,11 @@ use log::{debug, error, trace, warn};
 use norn_executor::park::{Park, ParkMode};
 use smallvec::SmallVec;
 
+use crate::bufring::{
+    BufRingStorage, Registration as RegisteredBufRing, Registry as RegisteredBufRings,
+    ReserveError as ReserveBufRingError,
+};
 use crate::error::SubmitError;
-use crate::fd;
 use crate::operation::{complete_operation, ConfiguredEntry, Op, Operation};
 use crate::registered_buffers::Registry as RegisteredBuffers;
 pub(crate) use crate::registered_buffers::{
@@ -118,8 +121,9 @@ struct Shared {
     shutdown_outcome: Cell<Option<ShutdownOutcome>>,
     #[cfg(test)]
     shutdown_test: ShutdownTest,
-    // This field must be declared after `ring`: fields are dropped in declaration
+    // These fields must be declared after `ring`: fields are dropped in declaration
     // order, so retained registered storage is released only after the ring.
+    registered_buf_rings: RegisteredBufRings,
     registered_buffers: RegisteredBuffers,
 }
 
@@ -139,6 +143,17 @@ pub(crate) struct FixedBufReservation {
     shared: Rc<Shared>,
     generation: FixedBufGeneration,
     committed: bool,
+}
+
+pub(crate) struct BufRingReservation {
+    shared: Rc<Shared>,
+    registration: Rc<RegisteredBufRing>,
+    committed: bool,
+}
+
+pub(crate) struct BufRingRegistration {
+    shared: Rc<Shared>,
+    registration: Rc<RegisteredBufRing>,
 }
 
 #[derive(Clone)]
@@ -263,6 +278,68 @@ impl FixedBufReservation {
     }
 }
 
+impl BufRingReservation {
+    pub(crate) fn register(
+        &self,
+        register: impl FnOnce(&Submitter<'_>) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let ring = self.shared.ring.try_borrow().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "io_uring is already borrowed during buffer-ring registration",
+            )
+        })?;
+        self.registration.arm_kernel_call();
+        let result = register(&ring.submitter());
+        if result.is_err() {
+            self.registration.kernel_call_failed();
+        }
+        result
+    }
+
+    pub(crate) fn commit(mut self) -> BufRingRegistration {
+        self.registration.commit();
+        self.committed = true;
+        BufRingRegistration {
+            shared: Rc::clone(&self.shared),
+            registration: Rc::clone(&self.registration),
+        }
+    }
+}
+
+impl Drop for BufRingReservation {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        if let Err(err) = self
+            .shared
+            .registered_buf_rings
+            .rollback(&self.shared.ring, &self.registration)
+        {
+            warn!(target: LOG, "buf_ring.registration_rollback_deferred {err:?}");
+        }
+    }
+}
+
+impl BufRingRegistration {
+    pub(crate) fn same_driver(&self, handle: &Handle) -> bool {
+        Rc::ptr_eq(&self.shared, &handle.shared)
+    }
+}
+
+impl Drop for BufRingRegistration {
+    fn drop(&mut self) {
+        if let Err(err) = self
+            .shared
+            .registered_buf_rings
+            .release(&self.shared.ring, &self.registration)
+        {
+            warn!(target: LOG, "buf_ring.release_deferred {err:?}");
+        }
+    }
+}
+
 impl Drop for FixedBufReservation {
     fn drop(&mut self) {
         if !self.committed {
@@ -369,12 +446,8 @@ impl Handle {
         PushBatchFuture::new_batch(Rc::clone(&self.shared), entries)
     }
 
-    pub(crate) fn close_fd(&self, kind: &fd::FdKind) -> Result<(), CloseFdError> {
-        self.shared.close_fd(kind)
-    }
-
-    pub(crate) fn with_submitter<U>(&self, f: impl FnOnce(&Submitter<'_>) -> U) -> U {
-        self.shared.with_submitter(f)
+    pub(crate) fn close_fd(&self, fd: types::Fd) -> Result<(), CloseFdError> {
+        self.shared.close_fd(fd)
     }
 
     pub(crate) fn reserve_fixed_buffers(
@@ -388,6 +461,28 @@ impl Handle {
         Ok(FixedBufReservation {
             shared: Rc::clone(&self.shared),
             generation,
+            committed: false,
+        })
+    }
+
+    pub(crate) fn reserve_buf_ring(
+        &self,
+        storage: Rc<BufRingStorage>,
+    ) -> io::Result<BufRingReservation> {
+        if self.shared.status() != Status::Running {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "io_uring driver is not accepting buffer-ring registrations",
+            ));
+        }
+        let registration = self
+            .shared
+            .registered_buf_rings
+            .reserve(&self.shared.ring, storage)
+            .map_err(map_reserve_buf_ring_error)?;
+        Ok(BufRingReservation {
+            shared: Rc::clone(&self.shared),
+            registration,
             committed: false,
         })
     }
@@ -412,6 +507,23 @@ impl Handle {
     pub(crate) fn test_with_ring_borrowed_mut(&self, f: impl FnOnce()) {
         let _ring = self.shared.ring.borrow_mut();
         f();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_with_buf_ring_registry_borrowed(&self, f: impl FnOnce()) {
+        self.shared.registered_buf_rings.test_with_borrowed(f);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_registered_buf_rings(&self) -> usize {
+        self.shared.registered_buf_rings.test_len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_fail_next_buf_ring_release(&self, errno: i32) {
+        self.shared
+            .registered_buf_rings
+            .test_fail_next_release(errno);
     }
 
     /// Returns the first recorded fatal driver submit error, if any.
@@ -475,6 +587,7 @@ impl Driver {
                 shutdown_outcome: Cell::new(None),
                 #[cfg(test)]
                 shutdown_test: ShutdownTest::default(),
+                registered_buf_rings: RegisteredBufRings::new(),
                 registered_buffers: RegisteredBuffers::new(),
             }),
             unparker: Arc::new(unpark::Unparker::new()?),
@@ -672,6 +785,7 @@ impl Driver {
         mut mode: ParkMode,
         mut remaining: Option<usize>,
     ) -> Result<(), io::Error> {
+        self.shared.retry_buf_ring_releases();
         let drained = self.drain_normal(&mut remaining);
         if drained > 0 {
             trace!(target: LOG, "park.drained {}", drained);
@@ -829,6 +943,12 @@ impl Driver {
 }
 
 impl Shared {
+    fn retry_buf_ring_releases(&self) {
+        if let Err(err) = self.registered_buf_rings.retry_deferred(&self.ring) {
+            warn!(target: LOG, "buf_ring.release_retry_failed {err:?}");
+        }
+    }
+
     fn validate_batch_len(&self, batch_len: usize) -> Result<(), SubmitError> {
         if batch_len <= 1 {
             return Ok(());
@@ -1117,12 +1237,10 @@ impl Shared {
         Ok(())
     }
 
-    fn close_fd(&self, kind: &fd::FdKind) -> Result<(), CloseFdError> {
-        let entry = match kind {
-            fd::FdKind::Fd(fd) => opcode::Close::new(types::Fd(fd.0)).build(),
-            fd::FdKind::Fixed(fd) => opcode::Close::new(types::Fixed(fd.0)).build(),
-        }
-        .user_data(Driver::CLOSE_FD_TOKEN as u64);
+    fn close_fd(&self, fd: types::Fd) -> Result<(), CloseFdError> {
+        let entry = opcode::Close::new(fd)
+            .build()
+            .user_data(Driver::CLOSE_FD_TOKEN as u64);
 
         if unsafe { self.try_push_raw(&entry) }.is_err() {
             // The close entry is still caller-owned, so a submit failure here proves
@@ -1263,6 +1381,23 @@ impl Shared {
     }
 }
 
+fn map_reserve_buf_ring_error(err: ReserveBufRingError) -> io::Error {
+    match err {
+        ReserveBufRingError::RegistryBorrowed => io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "buffer-ring registration registry is already borrowed",
+        ),
+        ReserveBufRingError::DuplicateBgid => io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "buffer group id is already registered with this driver",
+        ),
+        ReserveBufRingError::OutOfMemory => io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            "unable to retain buffer-ring registration storage",
+        ),
+    }
+}
+
 impl Drop for Driver {
     fn drop(&mut self) {
         let outcome = self.shutdown_with_outcome();
@@ -1291,6 +1426,7 @@ mod tests {
     use smallvec::SmallVec;
 
     use super::*;
+    use crate::fd;
     use crate::operation::{CQEResult, Operation, Singleshot};
     use crate::Request;
 
@@ -1759,7 +1895,7 @@ mod tests {
         // Safety: RawOp keeps the timeout storage stable until the terminal CQE.
         unsafe impl Operation for PendingFdOp {
             fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
-                let _ = self.fd.kind();
+                let _ = self.fd.fd();
                 Ok(opcode::Timeout::new(&self.timeout).build())
             }
 
@@ -1775,14 +1911,14 @@ mod tests {
         }
 
         #[derive(Debug)]
-        struct PendingFixedFdOp {
+        struct PendingFixedBufOp {
             fd: fd::NornFd,
             buf: crate::fixedbuf::FixedBuf<Vec<u8>>,
             timeout: Timespec,
             dropped: Rc<Cell<usize>>,
         }
 
-        impl Drop for PendingFixedFdOp {
+        impl Drop for PendingFixedBufOp {
             fn drop(&mut self) {
                 self.dropped.set(self.dropped.get() + 1);
             }
@@ -1790,9 +1926,9 @@ mod tests {
 
         // Safety: RawOp keeps the timeout storage stable until the terminal CQE.
         // The operation also retains a registered fixed buffer during that period.
-        unsafe impl Operation for PendingFixedFdOp {
+        unsafe impl Operation for PendingFixedBufOp {
             fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
-                let _ = self.fd.kind();
+                let _ = self.fd.fd();
                 let _ = self.buf.index();
                 Ok(opcode::Timeout::new(&self.timeout).build())
             }
@@ -1800,7 +1936,7 @@ mod tests {
             fn cleanup(&mut self, _: CQEResult) {}
         }
 
-        impl Singleshot for PendingFixedFdOp {
+        impl Singleshot for PendingFixedBufOp {
             type Output = io::Result<()>;
 
             fn complete(self, result: CQEResult) -> Self::Output {
@@ -1821,7 +1957,7 @@ mod tests {
             timeout: Timespec::new().sec(3_600),
             dropped: Rc::clone(&dropped),
         }));
-        let mut fixed_op = Box::pin(handle.submit(PendingFixedFdOp {
+        let mut fixed_op = Box::pin(handle.submit(PendingFixedBufOp {
             fd,
             buf: fixed_buf,
             timeout: Timespec::new().sec(3_600),

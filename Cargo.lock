@@ -221,7 +221,6 @@ dependencies = [
  "norn-task",
  "norn-timer",
  "norn-uring",
- "norn-util",
  "pin-project-lite",
  "pprof",
  "prost 0.14.3",
@@ -1112,13 +1111,6 @@ dependencies = [
  "sptr",
  "thiserror",
  "tokio",
-]
-
-[[package]]
-name = "norn-util"
-version = "0.1.0"
-dependencies = [
- "norn-task",
 ]
 
 [[package]]

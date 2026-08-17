@@ -17,7 +17,6 @@ pub(crate) enum State {
     Registering(Generation),
     RegisteringKernel(Generation),
     Registered(Generation),
-    Released(Generation),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,7 +146,7 @@ impl Registry {
             if state == State::RegisteringKernel(generation)
                 && err.raw_os_error() == Some(libc::ENXIO)
             {
-                self.mark_released(generation);
+                self.mark_released();
                 return Ok(Release::Unregistered);
             }
             return Err(ReleaseError::Io(err));
@@ -156,7 +155,7 @@ impl Registry {
         if self.state.get() != state {
             return Err(ReleaseError::StateMismatch);
         }
-        self.mark_released(generation);
+        self.mark_released();
         Ok(Release::Unregistered)
     }
 
@@ -196,7 +195,7 @@ impl Registry {
             // invariant mismatch. Keep it until ring destruction; assuming
             // that Empty means the kernel has forgotten its pointers would
             // defeat the conservative fail-safe.
-            State::Empty | State::Released(_) => return,
+            State::Empty => return,
             state @ (State::RegisteringKernel(generation) | State::Registered(generation)) => {
                 if retained_generation != generation {
                     warn!(target: LOG, "retry_unregister.active_generation_mismatch");
@@ -217,7 +216,7 @@ impl Registry {
                     if state == State::RegisteringKernel(generation)
                         && err.raw_os_error() == Some(libc::ENXIO)
                     {
-                        self.mark_released(generation);
+                        self.mark_released();
                         self.release_retained_storage();
                         return;
                     }
@@ -228,7 +227,7 @@ impl Registry {
                     warn!(target: LOG, "retry_unregister.state_mismatch");
                     return;
                 }
-                self.mark_released(generation);
+                self.mark_released();
             }
             State::Registering(_) => return,
         }
@@ -236,8 +235,7 @@ impl Registry {
         self.release_retained_storage();
     }
 
-    fn mark_released(&self, generation: Generation) {
-        self.state.set(State::Released(generation));
+    fn mark_released(&self) {
         self.state.set(State::Empty);
     }
 
@@ -335,6 +333,7 @@ mod tests {
             registry.unregister(&ring, second),
             Ok(Release::Unregistered)
         ));
+        assert_eq!(registry.test_state(), State::Empty);
         drop(registered);
         drop(ring);
         drop(registry);

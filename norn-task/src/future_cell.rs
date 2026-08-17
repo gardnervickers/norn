@@ -209,6 +209,7 @@ impl<F: Future> Drop for Inner<F> {
 /// Tasks can fail for one of two reasons. Either the task was cancelled, or
 /// the task panicked. Users can check which of these two reasons caused the
 /// failure via the [`TaskError::is_cancelled`] and [`TaskError::is_panic`]
+/// methods.
 pub struct TaskError {
     inner: Kind,
 }
@@ -223,11 +224,22 @@ impl TaskError {
     pub fn is_cancelled(&self) -> bool {
         matches!(self.inner, Kind::Cancelled)
     }
+
+    /// Consumes this error and returns the panic payload, if the task panicked.
+    ///
+    /// The payload can be inspected with `Box::downcast` or passed to
+    /// [`std::panic::resume_unwind`] to resume the original panic. This returns
+    /// `None` when the task was cancelled.
+    pub fn into_panic(self) -> Option<Box<dyn Any + Send + 'static>> {
+        match self.inner {
+            Kind::Panic(payload) => Some(payload),
+            Kind::Cancelled => None,
+        }
+    }
 }
 
 enum Kind {
     Cancelled,
-    #[allow(dead_code)]
     Panic(Box<dyn Any + Send + 'static>),
 }
 

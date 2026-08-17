@@ -1,7 +1,6 @@
 use std::cell::{Cell, UnsafeCell};
 use std::pin::Pin;
 use std::ptr;
-use std::rc::Rc;
 use std::time::Duration;
 
 use cordyceps::List;
@@ -16,17 +15,13 @@ pub(crate) struct Wheels {
     next_expiration_dirty: Cell<bool>,
 }
 
-impl entry::TimerList for Rc<Wheels> {
-    fn remove(&self, entry: ptr::NonNull<entry::Entry>) {
-        Wheels::remove(self, entry);
-    }
-
-    fn add(&self, entry: Pin<&mut entry::Entry>, duration: Duration) {
+impl Wheels {
+    pub(crate) fn add(&self, entry: Pin<&mut entry::Entry>, duration: Duration) {
         let expiration = self.elapsed().saturating_add(duration.as_millis() as u64);
         self.add_at(entry, expiration);
     }
 
-    fn add_at(&self, entry: Pin<&mut entry::Entry>, expiration: u64) {
+    pub(crate) fn add_at(&self, entry: Pin<&mut entry::Entry>, expiration: u64) {
         if expiration <= self.elapsed() {
             entry.as_ref().fire(Ok(()));
             return;
@@ -35,9 +30,7 @@ impl entry::TimerList for Rc<Wheels> {
         let entry = unsafe { ptr::NonNull::from(entry.get_unchecked_mut()) };
         Wheels::insert(self, entry);
     }
-}
 
-impl Wheels {
     pub(crate) fn new() -> Self {
         Self {
             elapsed: Cell::new(0),
@@ -101,7 +94,7 @@ impl Wheels {
 
     fn insert(&self, entry: ptr::NonNull<entry::Entry>) {
         if self.shutdown.get() {
-            unsafe { entry.as_ref().fire(Err(error::Error::shutdown())) };
+            unsafe { entry.as_ref().fire(Err(error::Error::Shutdown)) };
             return;
         }
         let expiration = unsafe { entry.as_ref().expiration() };
@@ -126,7 +119,10 @@ impl Wheels {
         }
     }
 
-    fn remove(&self, entry: ptr::NonNull<entry::Entry>) -> Option<ptr::NonNull<entry::Entry>> {
+    pub(crate) fn remove(
+        &self,
+        entry: ptr::NonNull<entry::Entry>,
+    ) -> Option<ptr::NonNull<entry::Entry>> {
         let (wheel, slot) = unsafe { entry.as_ref().location() };
         // Safety: See `insert`; removal performs no user callbacks.
         let removed = unsafe { (&mut *self.levels.get())[wheel].remove_entry(entry) };
@@ -197,7 +193,7 @@ impl Wheels {
         while let Some(exp) = self.next_expiration() {
             let entries = self.take_entries(&exp);
             for entry in entries {
-                unsafe { entry.as_ref().fire(Err(error::Error::shutdown())) };
+                unsafe { entry.as_ref().fire(Err(error::Error::Shutdown)) };
             }
         }
     }
@@ -232,7 +228,7 @@ mod tests {
     use std::time::Duration;
 
     use crate::clock::Clock;
-    use crate::Driver;
+    use crate::{Driver, Error};
 
     use super::*;
 
@@ -266,13 +262,7 @@ mod tests {
         drop(handle);
         let poll = sleep.as_mut().poll(&mut cx);
         match poll {
-            Poll::Ready(Err(err)) => {
-                assert!(
-                    err.to_string().contains("shut down"),
-                    "unexpected timer drop error: {}",
-                    err
-                );
-            }
+            Poll::Ready(Err(err)) => assert_eq!(err, Error::Shutdown),
             other => panic!("expected shutdown error after timer drop, got: {other:?}"),
         }
     }

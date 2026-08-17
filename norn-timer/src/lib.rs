@@ -37,14 +37,12 @@
     clippy::missing_errors_doc,
     clippy::missing_safety_doc
 )]
-use std::future::Future;
-use std::pin::Pin;
 use std::rc::Rc;
-use std::task::Context;
 use std::time::{Duration, Instant};
 
 pub use clock::Clock;
-pub use error::{Error, ErrorKind};
+pub use entry::Sleep;
+pub use error::Error;
 use norn_executor::park::{Park, ParkMode};
 
 mod clock;
@@ -93,57 +91,12 @@ impl std::fmt::Debug for Handle {
     }
 }
 
-pin_project_lite::pin_project! {
-    /// Future returned by [`Handle::sleep`].
-    ///
-    /// This future will resolve once the specified duration has elapsed,
-    /// or the time driver is shut down.
-    #[must_use = "futures do nothing unless you `.await` or poll them"]
-    pub struct Sleep {
-        #[pin]
-        inner: entry::Sleep<Rc<wheels::Wheels>>,
-        clock: Clock,
-    }
-}
-
-impl std::fmt::Debug for Sleep {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("Sleep").finish()
-    }
-}
-
-impl Future for Sleep {
-    type Output = Result<(), Error>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> std::task::Poll<Self::Output> {
-        self.project().inner.poll(cx)
-    }
-}
-
-impl Sleep {
-    /// Reset the timer.
-    ///
-    /// This clears any timer state. On the next poll, a relative sleep starts
-    /// its initial duration again, while an absolute sleep retains its initial
-    /// deadline.
-    ///
-    /// This can be used to implement retry logic without
-    /// having to reallocate the timer.
-    pub fn reset(&mut self) {
-        self.inner.reset();
-    }
-}
-
 impl Handle {
     /// Create a new timer with the specified duration.
     ///
     /// Once the duration has elapsed, the timer will fire.
     pub fn sleep(&self, duration: Duration) -> Sleep {
-        let inner = entry::Sleep::new(self.wheels.clone(), duration);
-        Sleep {
-            inner,
-            clock: self.clock.clone(),
-        }
+        Sleep::new(self.wheels.clone(), duration)
     }
 
     /// Create a new timer that completes at an absolute deadline.
@@ -153,11 +106,7 @@ impl Handle {
     /// clocks can be advanced after constructing the sleep without changing
     /// its target time.
     pub fn sleep_until(&self, deadline: Instant) -> Sleep {
-        let inner = entry::Sleep::new_at(self.wheels.clone(), self.clock.instant_to_tick(deadline));
-        Sleep {
-            inner,
-            clock: self.clock.clone(),
-        }
+        Sleep::new_at(self.wheels.clone(), self.clock.instant_to_tick(deadline))
     }
 
     /// Get the clock used by the timer.

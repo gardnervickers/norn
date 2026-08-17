@@ -10,7 +10,6 @@
 use std::fs::File;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::Arc;
 use std::{fmt, io};
 
 use norn_executor::park;
@@ -59,23 +58,12 @@ impl fmt::Debug for UnparkerState {
 }
 
 /// Unparker contains an eventfd instance which can wakeup the driver.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
+// This type is exposed only as `Park::Unparker`; callers use the trait interface.
+#[allow(unnameable_types)]
 pub struct Unparker {
-    inner: Arc<Inner>,
-}
-
-struct Inner {
     flag: AtomicU8,
     fd: File,
-}
-
-impl std::fmt::Debug for Inner {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Inner")
-            .field("flag", &self.flag)
-            .field("fd", &self.fd)
-            .finish()
-    }
 }
 
 impl Unparker {
@@ -91,21 +79,19 @@ impl Unparker {
         }
 
         Ok(Unparker {
-            inner: Arc::new(Inner {
-                flag: AtomicU8::new(0x00),
-                fd: unsafe { FromRawFd::from_raw_fd(fd) },
-            }),
+            flag: AtomicU8::new(0x00),
+            fd: unsafe { FromRawFd::from_raw_fd(fd) },
         })
     }
 
     #[cfg(test)]
     pub(crate) fn state(&self) -> UnparkerState {
-        UnparkerState(self.inner.flag.load(Ordering::Acquire))
+        UnparkerState(self.flag.load(Ordering::Acquire))
     }
 
     /// Consume a pending wake or prepare the unparker for parking.
     pub(crate) fn park(&self) -> ParkAction {
-        let mut state = self.inner.flag.load(Ordering::Acquire);
+        let mut state = self.flag.load(Ordering::Acquire);
         loop {
             let current = UnparkerState(state);
             if current.woken() {
@@ -116,7 +102,7 @@ impl Unparker {
                 }
 
                 let next = state & !Self::REMOTE_THREAD_BIT;
-                match self.inner.flag.compare_exchange_weak(
+                match self.flag.compare_exchange_weak(
                     state,
                     next,
                     Ordering::AcqRel,
@@ -135,12 +121,10 @@ impl Unparker {
             }
 
             let next = state | Self::REACTOR_PARK_BIT;
-            match self.inner.flag.compare_exchange_weak(
-                state,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
+            match self
+                .flag
+                .compare_exchange_weak(state, next, Ordering::AcqRel, Ordering::Acquire)
+            {
                 Ok(_) => return ParkAction::Arm,
                 Err(actual) => state = actual,
             }
@@ -149,7 +133,7 @@ impl Unparker {
 
     /// Reset this unparker. This should be called to clear the parking status from the reactor.
     pub(crate) fn reset(&self) {
-        self.inner.flag.fetch_and(
+        self.flag.fetch_and(
             !Self::REACTOR_PARK_BIT & !Self::REMOTE_THREAD_BIT,
             Ordering::Release,
         );
@@ -160,16 +144,15 @@ impl Unparker {
     /// This is used when park preparation fails before an eventfd read is
     /// successfully queued.
     pub(crate) fn clear_parked(&self) {
-        self.inner
-            .flag
+        self.flag
             .fetch_and(!Self::REACTOR_PARK_BIT, Ordering::Release);
     }
 
     /// Wake this unparker from a remote thread.
     pub(crate) fn wake_inner(&self) {
         use io::Write;
-        let flag = &self.inner.flag;
-        let fd = &self.inner.fd;
+        let flag = &self.flag;
+        let fd = &self.fd;
         // First, try to set the remote thread bit to signal the wakeup.
         let state = flag.fetch_or(Self::REMOTE_THREAD_BIT, Ordering::AcqRel);
         let state = UnparkerState(state);
@@ -181,18 +164,18 @@ impl Unparker {
     }
 
     /// Wake this unparker from a remote thread.
-    pub(crate) fn wake(self: &Arc<Self>) {
+    pub(crate) fn wake(&self) {
         self.wake_inner()
     }
 
     pub(crate) fn raw_fd(&self) -> RawFd {
-        self.inner.fd.as_raw_fd()
+        self.fd.as_raw_fd()
     }
 }
 
 impl AsRawFd for Unparker {
     fn as_raw_fd(&self) -> RawFd {
-        self.inner.fd.as_raw_fd()
+        self.fd.as_raw_fd()
     }
 }
 
@@ -204,7 +187,7 @@ impl park::Unpark for Unparker {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Barrier;
+    use std::sync::{Arc, Barrier};
 
     use super::*;
 

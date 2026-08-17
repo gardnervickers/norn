@@ -3,17 +3,18 @@
 //! Copied from the test code here
 //! <https://github.com/tokio-rs/io-uring/blob/master/io-uring-test/src/tests/register_buf_ring.rs>
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::{self, AtomicU16};
 use std::{fmt, io, ops, ptr};
 
 use io_uring::types::{self, BufRingEntry};
-use io_uring::Submitter;
+use io_uring::{IoUring, Submitter};
 use log::warn;
 use smallvec::SmallVec;
 
 use crate::buf::StableBuf;
+use crate::driver::BufRingRegistration;
 use crate::Handle;
 
 /// [`RecvBufRing`] is a reference counted buffer ring which can be registered
@@ -56,9 +57,12 @@ impl fmt::Debug for RecvBufRing {
 }
 
 impl RecvBufRing {
-    fn new(buf_ring: InnerBufRing) -> Self {
+    fn new(registration: BufRingRegistration, storage: Rc<BufRingStorage>) -> Self {
         RecvBufRing {
-            rc: Rc::new(buf_ring),
+            rc: Rc::new(InnerBufRing {
+                registration,
+                storage,
+            }),
         }
     }
 
@@ -90,7 +94,7 @@ impl RecvBufRing {
     }
 
     pub(crate) fn same_driver(&self, handle: &Handle) -> bool {
-        self.rc.handle.same_driver(handle)
+        self.rc.registration.same_driver(handle)
     }
 }
 
@@ -359,7 +363,306 @@ impl Drop for BufRingBuf {
 pub type Bgid = u16;
 
 /// Identifier for a buffer within a registered buffer group.
-pub type Bid = u16;
+pub(crate) type Bid = u16;
+
+const REGISTRY_LOG: &str = "norn_uring::bufring::registry";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RegistrationState {
+    Registering,
+    RegisteringKernel,
+    Registered,
+    ReleaseRequested,
+    Unregistered,
+}
+
+pub(crate) struct Registration {
+    bgid: Bgid,
+    state: Cell<RegistrationState>,
+    // The registry owns the backing storage before the kernel can observe it.
+    // This lets drop request release without allocating or risking reclamation
+    // while an unregister attempt is deferred.
+    _storage: Rc<BufRingStorage>,
+}
+
+impl Registration {
+    pub(crate) fn state(&self) -> RegistrationState {
+        self.state.get()
+    }
+
+    pub(crate) fn arm_kernel_call(&self) {
+        assert_eq!(
+            self.state.replace(RegistrationState::RegisteringKernel),
+            RegistrationState::Registering,
+            "provided-buffer-ring registration changed before the kernel call"
+        );
+    }
+
+    pub(crate) fn kernel_call_failed(&self) {
+        assert_eq!(
+            self.state.replace(RegistrationState::Registering),
+            RegistrationState::RegisteringKernel,
+            "provided-buffer-ring registration changed after a failed kernel call"
+        );
+    }
+
+    pub(crate) fn commit(&self) {
+        assert_eq!(
+            self.state.replace(RegistrationState::Registered),
+            RegistrationState::RegisteringKernel,
+            "provided-buffer-ring registration changed before commit"
+        );
+    }
+
+    fn request_release(&self) -> Result<(), ReleaseError> {
+        match self.state.get() {
+            RegistrationState::Registered | RegistrationState::RegisteringKernel => {
+                self.state.set(RegistrationState::ReleaseRequested);
+                Ok(())
+            }
+            RegistrationState::ReleaseRequested | RegistrationState::Unregistered => Ok(()),
+            RegistrationState::Registering => Err(ReleaseError::StateMismatch),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReserveError {
+    RegistryBorrowed,
+    DuplicateBgid,
+    OutOfMemory,
+}
+
+#[derive(Debug)]
+pub(crate) enum ReleaseError {
+    RegistryBorrowed,
+    RingBorrowed,
+    StateMismatch,
+    Io(io::Error),
+}
+
+impl fmt::Display for ReleaseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RegistryBorrowed => f.write_str("buffer-ring registry is already borrowed"),
+            Self::RingBorrowed => f.write_str("io_uring is already borrowed"),
+            Self::StateMismatch => f.write_str("buffer-ring registration state mismatch"),
+            Self::Io(err) => write!(f, "buffer-ring unregistration failed: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for ReleaseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(err) => Some(err),
+            Self::RegistryBorrowed | Self::RingBorrowed | Self::StateMismatch => None,
+        }
+    }
+}
+
+/// Driver-owned registrations for provided buffer rings.
+///
+/// The driver owns each backing allocation before registration and drops this
+/// registry after its `IoUring`. A buffer-ring handle can therefore request
+/// release without allocating; failed attempts remain owned and are retried.
+pub(crate) struct Registry {
+    registrations: RefCell<Vec<Rc<Registration>>>,
+    retry_on_park: Cell<bool>,
+    #[cfg(test)]
+    release_failures: RefCell<std::collections::VecDeque<i32>>,
+}
+
+impl Registry {
+    pub(crate) fn new() -> Self {
+        Self {
+            registrations: RefCell::new(Vec::new()),
+            retry_on_park: Cell::new(false),
+            #[cfg(test)]
+            release_failures: RefCell::new(std::collections::VecDeque::new()),
+        }
+    }
+
+    pub(crate) fn reserve(
+        &self,
+        ring: &RefCell<IoUring>,
+        storage: Rc<BufRingStorage>,
+    ) -> Result<Rc<Registration>, ReserveError> {
+        if let Err(err) = self.release_requested(ring) {
+            warn!(target: REGISTRY_LOG, "release.retry_failed: {err:?}");
+        }
+
+        let mut registrations = self
+            .registrations
+            .try_borrow_mut()
+            .map_err(|_| ReserveError::RegistryBorrowed)?;
+        if registrations
+            .iter()
+            .any(|registration| registration.bgid == storage.bgid)
+        {
+            return Err(ReserveError::DuplicateBgid);
+        }
+        registrations
+            .try_reserve(1)
+            .map_err(|_| ReserveError::OutOfMemory)?;
+        let registration = Rc::new(Registration {
+            bgid: storage.bgid,
+            state: Cell::new(RegistrationState::Registering),
+            _storage: storage,
+        });
+        registrations.push(Rc::clone(&registration));
+        Ok(registration)
+    }
+
+    pub(crate) fn rollback(
+        &self,
+        ring: &RefCell<IoUring>,
+        registration: &Rc<Registration>,
+    ) -> Result<(), ReleaseError> {
+        match registration.state() {
+            RegistrationState::Registering => {
+                registration.state.set(RegistrationState::Unregistered);
+                self.release_or_defer(ring)
+            }
+            RegistrationState::RegisteringKernel => {
+                registration.request_release()?;
+                self.release_or_defer(ring)
+            }
+            RegistrationState::Registered
+            | RegistrationState::ReleaseRequested
+            | RegistrationState::Unregistered => Err(ReleaseError::StateMismatch),
+        }
+    }
+
+    pub(crate) fn release(
+        &self,
+        ring: &RefCell<IoUring>,
+        registration: &Rc<Registration>,
+    ) -> Result<(), ReleaseError> {
+        registration.request_release()?;
+        self.release_or_defer(ring)
+    }
+
+    pub(crate) fn retry_deferred(&self, ring: &RefCell<IoUring>) -> Result<(), ReleaseError> {
+        if !self.retry_on_park.replace(false) {
+            return Ok(());
+        }
+        // A failed retry remains safely retained, but does not turn every park
+        // into another syscall. The next registration attempt retries again.
+        self.release_requested(ring)
+    }
+
+    fn release_or_defer(&self, ring: &RefCell<IoUring>) -> Result<(), ReleaseError> {
+        let result = self.release_requested(ring);
+        if result.is_err() {
+            self.retry_on_park.set(true);
+        }
+        result
+    }
+
+    pub(crate) fn release_requested(&self, ring: &RefCell<IoUring>) -> Result<(), ReleaseError> {
+        let mut index = 0;
+        let mut first_error = None;
+        loop {
+            let registration = {
+                let registrations = self
+                    .registrations
+                    .try_borrow()
+                    .map_err(|_| ReleaseError::RegistryBorrowed)?;
+                let Some(registration) = registrations.get(index) else {
+                    break;
+                };
+                Rc::clone(registration)
+            };
+
+            if !matches!(
+                registration.state(),
+                RegistrationState::ReleaseRequested | RegistrationState::Unregistered
+            ) {
+                index += 1;
+                continue;
+            }
+
+            if let Err(err) = self.release_one(ring, &registration) {
+                first_error.get_or_insert(err);
+                index += 1;
+            }
+            // Successful release uses swap_remove, so inspect the entry which
+            // moved into this index before advancing.
+        }
+        match first_error {
+            Some(err) => Err(err),
+            None => {
+                self.retry_on_park.set(false);
+                Ok(())
+            }
+        }
+    }
+
+    fn release_one(
+        &self,
+        ring: &RefCell<IoUring>,
+        registration: &Rc<Registration>,
+    ) -> Result<(), ReleaseError> {
+        if registration.state() == RegistrationState::Unregistered {
+            return self.remove(registration);
+        }
+        if registration.state() != RegistrationState::ReleaseRequested {
+            return Err(ReleaseError::StateMismatch);
+        }
+
+        #[cfg(test)]
+        if let Some(errno) = self.release_failures.borrow_mut().pop_front() {
+            return Err(ReleaseError::Io(io::Error::from_raw_os_error(errno)));
+        }
+
+        let ring = ring.try_borrow().map_err(|_| ReleaseError::RingBorrowed)?;
+        let result = loop {
+            match ring.submitter().unregister_buf_ring(registration.bgid) {
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                result => break result,
+            }
+        };
+        if let Err(err) = result {
+            // ENOENT proves that the ring no longer owns this BGID.
+            if err.raw_os_error() != Some(libc::ENOENT) {
+                return Err(ReleaseError::Io(err));
+            }
+        }
+        registration.state.set(RegistrationState::Unregistered);
+        drop(ring);
+        self.remove(registration)
+    }
+
+    fn remove(&self, registration: &Rc<Registration>) -> Result<(), ReleaseError> {
+        let mut registrations = self
+            .registrations
+            .try_borrow_mut()
+            .map_err(|_| ReleaseError::RegistryBorrowed)?;
+        let index = registrations
+            .iter()
+            .position(|candidate| Rc::ptr_eq(candidate, registration))
+            .ok_or(ReleaseError::StateMismatch)?;
+        registrations.swap_remove(index);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_len(&self) -> usize {
+        self.registrations.borrow().len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_with_borrowed(&self, f: impl FnOnce()) {
+        let _registrations = self.registrations.borrow_mut();
+        f();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_fail_next_release(&self, errno: i32) {
+        self.release_failures.borrow_mut().push_back(errno);
+    }
+}
 
 fn selected_bid_from_flags(flags: u32) -> io::Result<Bid> {
     io_uring::cqueue::buffer_select(flags).ok_or_else(|| {
@@ -450,21 +753,33 @@ impl Builder {
         b.ring_entries = b.ring_entries.next_power_of_two();
 
         let handle = crate::Handle::current();
-        let inner =
-            InnerBufRing::new(b.bgid, b.ring_entries, b.buf_cnt, b.buf_len, handle.clone())?;
-        handle.with_submitter(|s| inner.register(s))?;
-        Ok(RecvBufRing::new(inner))
+        let storage = Rc::new(BufRingStorage::new(
+            b.bgid,
+            b.ring_entries,
+            b.buf_cnt,
+            b.buf_len,
+        )?);
+        let reservation = handle.reserve_buf_ring(Rc::clone(&storage))?;
+        reservation.register(|submitter| storage.register(submitter))?;
+        let registration = reservation.commit();
+        Ok(RecvBufRing::new(registration, storage))
     }
 }
 
 struct InnerBufRing {
-    handle: Handle,
+    registration: BufRingRegistration,
+    storage: Rc<BufRingStorage>,
+}
 
-    // True only after this instance has successfully registered its BGID with
-    // the kernel. A failed candidate must never unregister another live ring
-    // that happens to use the same BGID.
-    registered: Cell<bool>,
+impl ops::Deref for InnerBufRing {
+    type Target = BufRingStorage;
 
+    fn deref(&self) -> &Self::Target {
+        &self.storage
+    }
+}
+
+pub(crate) struct BufRingStorage {
     // All remaining fields are constant once the struct is instantiated except the Cell fields.
     bgid: Bgid,
 
@@ -484,25 +799,13 @@ struct InnerBufRing {
     // buffers to the ring during init but that's not as interesting.
     local_tail: Cell<u16>,
 
-    // `shared_tail` points to the u16 memory inside the rings that the uring interface uses as the
-    // tail field. It is where the application writes new tail values and the kernel reads the tail
-    // value from time to time. The address could be computed from ring_start when needed. This
-    // might be here for no good reason any more.
-    shared_tail: *const AtomicU16,
-
     // Cached consume head used for recv bundle operations. This tracks the next ring slot expected
     // to be consumed by bundle-aware receives.
     bundle_head: Cell<u16>,
 }
 
-impl InnerBufRing {
-    fn new(
-        bgid: Bgid,
-        ring_entries: u16,
-        buf_cnt: u16,
-        buf_len: usize,
-        handle: Handle,
-    ) -> io::Result<InnerBufRing> {
+impl BufRingStorage {
+    fn new(bgid: Bgid, ring_entries: u16, buf_cnt: u16, buf_len: usize) -> io::Result<Self> {
         // Check that none of the important args are zero and the ring_entries is at least large
         // enough to hold all the buffers and that ring_entries is a power of 2.
         if (buf_cnt == 0)
@@ -532,16 +835,10 @@ impl InnerBufRing {
             bp
         };
 
-        let shared_tail =
-            unsafe { types::BufRingEntry::tail(ring_start.as_ptr() as *const BufRingEntry) }
-                as *const AtomicU16;
-
         let ring_entries_mask = ring_entries - 1;
         assert!((ring_entries & ring_entries_mask) == 0);
 
-        let buf_ring = InnerBufRing {
-            handle,
-            registered: Cell::new(false),
+        let buf_ring = Self {
             bgid,
             ring_entries_mask,
             buf_cnt,
@@ -549,7 +846,6 @@ impl InnerBufRing {
             ring_start,
             buf_list,
             local_tail: Cell::new(0),
-            shared_tail,
             bundle_head: Cell::new(0),
         };
 
@@ -559,13 +855,19 @@ impl InnerBufRing {
     fn register(&self, submitter: &Submitter<'_>) -> io::Result<()> {
         let bgid = self.bgid;
 
-        let res = unsafe {
-            submitter.register_buf_ring_with_flags(
-                self.ring_start.as_ptr() as _,
-                self.ring_entries(),
-                bgid,
-                0,
-            )
+        let res = loop {
+            let result = unsafe {
+                submitter.register_buf_ring_with_flags(
+                    self.ring_start.as_ptr() as _,
+                    self.ring_entries(),
+                    bgid,
+                    0,
+                )
+            };
+            match result {
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                result => break result,
+            }
         };
 
         if let Err(e) = res {
@@ -596,22 +898,12 @@ impl InnerBufRing {
             }
         };
 
-        // From this point on, Drop owns the matching unregister operation. Set
-        // the state before initializing userspace entries so unwinding cannot
-        // leave a successful kernel registration behind.
-        self.registered.set(true);
-
         for bid in 0..self.buf_cnt {
             self.buf_ring_push(bid);
         }
         self.buf_ring_sync();
 
         res
-    }
-
-    fn unregister(&self, submitter: &Submitter<'_>) -> io::Result<()> {
-        let bgid = self.bgid;
-        submitter.unregister_buf_ring(bgid)
     }
 
     // Safety: dropping a duplicate bid is likely to cause undefined behavior
@@ -792,22 +1084,11 @@ impl InnerBufRing {
     // Make 'local_tail' visible to the kernel. Called after buf_ring_push() has been
     // called to fill in new buffers.
     fn buf_ring_sync(&self) {
+        let shared_tail =
+            unsafe { types::BufRingEntry::tail(self.ring_start.as_ptr() as *const BufRingEntry) }
+                as *const AtomicU16;
         unsafe {
-            (*self.shared_tail).store(self.local_tail.get(), atomic::Ordering::Release);
-        }
-    }
-}
-
-impl Drop for InnerBufRing {
-    fn drop(&mut self) {
-        if !self.registered.replace(false) {
-            return;
-        }
-
-        // Best-effort unregister on drop. If this fails we prefer logging over panicking
-        // during teardown; the process can still exit safely.
-        if let Err(err) = self.handle.with_submitter(|s| self.unregister(s)) {
-            warn!(target: "norn_uring::bufring", "unregister.failed: {}", err);
+            (*shared_tail).store(self.local_tail.get(), atomic::Ordering::Release);
         }
     }
 }
@@ -883,8 +1164,13 @@ impl ops::Deref for BufRingBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{selected_bid_from_flags, BundleBids};
+    use super::{selected_bid_from_flags, BundleBids, RecvBufRing};
     use std::io;
+    use std::rc::Rc;
+
+    use norn_executor::park::{Park, ParkMode};
+
+    use crate::Driver;
 
     #[test]
     fn selected_bid_requires_buffer_select_flag() {
@@ -928,5 +1214,112 @@ mod tests {
                 .collect::<Vec<_>>(),
             [3, 4, 9, 8, 1]
         );
+    }
+
+    #[test]
+    fn borrowed_driver_defers_buffer_ring_reclamation() -> io::Result<()> {
+        let mut driver = Driver::new(io_uring::IoUring::builder(), 8)?;
+        let handle = driver.handle();
+        let _guard = driver.enter();
+        let ring = RecvBufRing::builder(31_800)
+            .ring_entries(2)
+            .buf_cnt(2)
+            .buf_len(8)
+            .build()?;
+        let storage = Rc::downgrade(&ring.rc.storage);
+
+        handle.test_with_ring_borrowed_mut(move || drop(ring));
+
+        assert_eq!(handle.test_registered_buf_rings(), 1);
+        assert!(storage.upgrade().is_some());
+
+        driver.park(ParkMode::NoPark)?;
+
+        assert_eq!(handle.test_registered_buf_rings(), 0);
+        assert!(storage.upgrade().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn borrowed_registry_still_records_the_release_request() -> io::Result<()> {
+        let mut driver = Driver::new(io_uring::IoUring::builder(), 8)?;
+        let handle = driver.handle();
+        let _guard = driver.enter();
+        let ring = RecvBufRing::builder(31_802)
+            .ring_entries(2)
+            .buf_cnt(2)
+            .buf_len(8)
+            .build()?;
+        let storage = Rc::downgrade(&ring.rc.storage);
+
+        handle.test_with_buf_ring_registry_borrowed(move || drop(ring));
+
+        assert_eq!(handle.test_registered_buf_rings(), 1);
+        assert!(storage.upgrade().is_some());
+
+        driver.park(ParkMode::NoPark)?;
+
+        assert_eq!(handle.test_registered_buf_rings(), 0);
+        assert!(storage.upgrade().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn failed_unregister_is_retried_without_abandoning_storage() -> io::Result<()> {
+        let mut driver = Driver::new(io_uring::IoUring::builder(), 8)?;
+        let handle = driver.handle();
+        let _guard = driver.enter();
+        let ring = RecvBufRing::builder(31_801)
+            .ring_entries(2)
+            .buf_cnt(2)
+            .buf_len(8)
+            .build()?;
+        let storage = Rc::downgrade(&ring.rc.storage);
+        handle.test_fail_next_buf_ring_release(libc::EIO);
+
+        drop(ring);
+
+        assert_eq!(handle.test_registered_buf_rings(), 1);
+        assert!(storage.upgrade().is_some());
+
+        driver.park(ParkMode::NoPark)?;
+
+        assert_eq!(handle.test_registered_buf_rings(), 0);
+        assert!(storage.upgrade().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn persistent_unregister_failure_waits_for_a_registration_boundary() -> io::Result<()> {
+        let mut driver = Driver::new(io_uring::IoUring::builder(), 8)?;
+        let handle = driver.handle();
+        let _guard = driver.enter();
+        let ring = RecvBufRing::builder(31_803)
+            .ring_entries(2)
+            .buf_cnt(2)
+            .buf_len(8)
+            .build()?;
+        let storage = Rc::downgrade(&ring.rc.storage);
+        handle.test_fail_next_buf_ring_release(libc::EIO);
+        handle.test_fail_next_buf_ring_release(libc::EIO);
+
+        drop(ring);
+        driver.park(ParkMode::NoPark)?;
+        assert!(storage.upgrade().is_some());
+
+        driver.park(ParkMode::NoPark)?;
+        assert!(storage.upgrade().is_some());
+
+        let replacement = RecvBufRing::builder(31_804)
+            .ring_entries(2)
+            .buf_cnt(2)
+            .buf_len(8)
+            .build()?;
+        assert!(storage.upgrade().is_none());
+        assert_eq!(handle.test_registered_buf_rings(), 1);
+
+        drop(replacement);
+        assert_eq!(handle.test_registered_buf_rings(), 0);
+        Ok(())
     }
 }

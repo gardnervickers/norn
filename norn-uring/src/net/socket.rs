@@ -2,8 +2,8 @@
 //!
 //! [Socket] is the core socket type
 //! used by both TCP and UDP sockets
+use io_uring::opcode;
 use io_uring::squeue::Flags;
-use io_uring::{opcode, types};
 use libc::{SOCK_CLOEXEC, SOCK_NONBLOCK};
 use socket2::{Domain, Protocol, SockAddr, Type};
 use std::io;
@@ -34,13 +34,6 @@ fn invalid_zc_notification_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
         "zerocopy send notification completion missing primary send result",
-    )
-}
-
-fn fixed_fd_unsupported_error(context: &'static str) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::Unsupported,
-        format!("fixed descriptors are not supported for {context}"),
     )
 }
 
@@ -75,12 +68,7 @@ fn as_socket_addr_or_peer(
     msg_namelen: libc::socklen_t,
 ) -> io::Result<SocketAddr> {
     if msg_namelen == 0 {
-        let sock = match fd.kind() {
-            crate::fd::FdKind::Fd(fd) => unsafe { socket2::Socket::from_raw_fd(fd.0) },
-            crate::fd::FdKind::Fixed(_) => {
-                return Err(fixed_fd_unsupported_error("peer address lookup"))
-            }
-        };
+        let sock = unsafe { socket2::Socket::from_raw_fd(fd.fd().0) };
         let sock = ManuallyDrop::new(sock);
         return as_socket_addr(&sock.peer_addr()?);
     }
@@ -356,21 +344,16 @@ impl Socket {
     }
 
     pub(crate) fn local_addr(&self) -> io::Result<SocketAddr> {
-        as_socket_addr(&self.as_socket()?.local_addr()?)
+        as_socket_addr(&self.as_socket().local_addr()?)
     }
 
     pub(crate) fn peer_addr(&self) -> io::Result<SocketAddr> {
-        as_socket_addr(&self.as_socket()?.peer_addr()?)
+        as_socket_addr(&self.as_socket().peer_addr()?)
     }
 
-    pub(crate) fn as_socket(&self) -> io::Result<ManuallyDrop<socket2::Socket>> {
-        match self.fd.kind() {
-            crate::fd::FdKind::Fd(fd) => {
-                let sock = unsafe { socket2::Socket::from_raw_fd(fd.0) };
-                Ok(ManuallyDrop::new(sock))
-            }
-            crate::fd::FdKind::Fixed(_) => Err(fixed_fd_unsupported_error("socket2 operations")),
-        }
+    pub(crate) fn as_socket(&self) -> ManuallyDrop<socket2::Socket> {
+        let sock = unsafe { socket2::Socket::from_raw_fd(self.fd.fd().0) };
+        ManuallyDrop::new(sock)
     }
 
     pub(crate) async fn close(self) -> io::Result<()> {
@@ -437,10 +420,7 @@ impl Socket {
     where
         B: StableBuf,
     {
-        let fd = match self.fd.kind() {
-            crate::fd::FdKind::Fd(fd) => fd.0,
-            crate::fd::FdKind::Fixed(_) => return None,
-        };
+        let fd = self.fd.fd().0;
         let (name, namelen) = match addr {
             Some(addr) => {
                 let addr = SockAddr::from(addr);
@@ -475,10 +455,7 @@ impl Socket {
     where
         B: StableBufMut,
     {
-        let fd = match self.fd.kind() {
-            crate::fd::FdKind::Fd(fd) => fd.0,
-            crate::fd::FdKind::Fixed(_) => return None,
-        };
+        let fd = self.fd.fd().0;
         let submitted_len = buf.bytes_remaining();
         let addr = unsafe {
             SockAddr::try_init(|storage, len| {
@@ -644,15 +621,9 @@ where
         };
 
         let msghdr = this.msghdr.as_ptr();
-        Ok(
-            // Finally we create the operation.
-            match this.fd.kind() {
-                crate::fd::FdKind::Fd(fd) => opcode::SendMsg::new(types::Fd(fd.0), msghdr),
-                crate::fd::FdKind::Fixed(fd) => opcode::SendMsg::new(types::Fixed(fd.0), msghdr),
-            }
+        Ok(opcode::SendMsg::new(this.fd.fd(), msghdr)
             .flags(this.flags)
-            .build(),
-        )
+            .build())
     }
 
     fn cleanup(&mut self, _: crate::operation::CQEResult) {}
@@ -726,12 +697,9 @@ where
         };
 
         // Finally we create the operation.
-        Ok(match this.fd.kind() {
-            crate::fd::FdKind::Fd(fd) => opcode::RecvMsg::new(types::Fd(fd.0), msghdr),
-            crate::fd::FdKind::Fixed(fd) => opcode::RecvMsg::new(types::Fixed(fd.0), msghdr),
-        }
-        .flags(this.flags)
-        .build())
+        Ok(opcode::RecvMsg::new(this.fd.fd(), msghdr)
+            .flags(this.flags)
+            .build())
     }
 
     fn cleanup(&mut self, _: crate::operation::CQEResult) {}
@@ -776,7 +744,7 @@ where
 }
 
 #[derive(Debug)]
-pub struct RecvFromRing {
+pub(crate) struct RecvFromRing {
     fd: NornFd,
     ring: RecvBufRing,
     addr: SockAddr,
@@ -812,13 +780,10 @@ unsafe impl Operation for RecvFromRing {
         };
 
         // Finally we create the operation.
-        Ok(match this.fd.kind() {
-            crate::fd::FdKind::Fd(fd) => opcode::RecvMsg::new(types::Fd(fd.0), msghdr),
-            crate::fd::FdKind::Fixed(fd) => opcode::RecvMsg::new(types::Fixed(fd.0), msghdr),
-        }
-        .buf_group(this.ring.bgid())
-        .build()
-        .flags(Flags::BUFFER_SELECT))
+        Ok(opcode::RecvMsg::new(this.fd.fd(), msghdr)
+            .buf_group(this.ring.bgid())
+            .build()
+            .flags(Flags::BUFFER_SELECT))
     }
 
     fn cleanup(&mut self, res: crate::operation::CQEResult) {
@@ -891,7 +856,7 @@ unsafe impl StableBuf for RecvMsgRingBuf {
 }
 
 #[derive(Debug)]
-pub struct RecvFromRingMulti {
+pub(crate) struct RecvFromRingMulti {
     fd: NornFd,
     ring: RecvBufRing,
     addr: SockAddr,
@@ -951,14 +916,7 @@ unsafe impl Operation for RecvFromRingMulti {
             (*msghdr).msg_iovlen = 0;
         };
 
-        Ok(match this.fd.kind() {
-            crate::fd::FdKind::Fd(fd) => {
-                opcode::RecvMsgMulti::new(types::Fd(fd.0), msghdr, this.ring.bgid()).build()
-            }
-            crate::fd::FdKind::Fixed(fd) => {
-                opcode::RecvMsgMulti::new(types::Fixed(fd.0), msghdr, this.ring.bgid()).build()
-            }
-        })
+        Ok(opcode::RecvMsgMulti::new(this.fd.fd(), msghdr, this.ring.bgid()).build())
     }
 
     fn cleanup(&mut self, result: crate::operation::CQEResult) {
@@ -981,7 +939,7 @@ impl Multishot for RecvFromRingMulti {
 }
 
 #[derive(Debug)]
-pub struct RecvRingMulti {
+pub(crate) struct RecvRingMulti {
     fd: NornFd,
     ring: RecvBufRing,
     flags: i32,
@@ -1003,16 +961,9 @@ impl RecvRingMulti {
 unsafe impl Operation for RecvRingMulti {
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
-        Ok(match this.fd.kind() {
-            crate::fd::FdKind::Fd(fd) => opcode::RecvMulti::new(types::Fd(fd.0), this.ring.bgid())
-                .flags(this.flags)
-                .build(),
-            crate::fd::FdKind::Fixed(fd) => {
-                opcode::RecvMulti::new(types::Fixed(fd.0), this.ring.bgid())
-                    .flags(this.flags)
-                    .build()
-            }
-        })
+        Ok(opcode::RecvMulti::new(this.fd.fd(), this.ring.bgid())
+            .flags(this.flags)
+            .build())
     }
 
     fn cleanup(&mut self, result: crate::operation::CQEResult) {
@@ -1035,7 +986,7 @@ impl Multishot for RecvRingMulti {
 }
 
 #[derive(Debug)]
-pub struct RecvRingBundle {
+pub(crate) struct RecvRingBundle {
     fd: NornFd,
     ring: RecvBufRing,
     flags: i32,
@@ -1052,16 +1003,9 @@ impl RecvRingBundle {
 unsafe impl Operation for RecvRingBundle {
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
-        Ok(match this.fd.kind() {
-            crate::fd::FdKind::Fd(fd) => opcode::RecvBundle::new(types::Fd(fd.0), this.ring.bgid())
-                .flags(this.flags)
-                .build(),
-            crate::fd::FdKind::Fixed(fd) => {
-                opcode::RecvBundle::new(types::Fixed(fd.0), this.ring.bgid())
-                    .flags(this.flags)
-                    .build()
-            }
-        })
+        Ok(opcode::RecvBundle::new(this.fd.fd(), this.ring.bgid())
+            .flags(this.flags)
+            .build())
     }
 
     fn cleanup(&mut self, result: crate::operation::CQEResult) {
@@ -1081,7 +1025,7 @@ impl Singleshot for RecvRingBundle {
 }
 
 #[derive(Debug)]
-pub struct RecvRingBundleMulti {
+pub(crate) struct RecvRingBundleMulti {
     fd: NornFd,
     ring: RecvBufRing,
     flags: i32,
@@ -1103,18 +1047,9 @@ impl RecvRingBundleMulti {
 unsafe impl Operation for RecvRingBundleMulti {
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
-        Ok(match this.fd.kind() {
-            crate::fd::FdKind::Fd(fd) => {
-                opcode::RecvMultiBundle::new(types::Fd(fd.0), this.ring.bgid())
-                    .flags(this.flags)
-                    .build()
-            }
-            crate::fd::FdKind::Fixed(fd) => {
-                opcode::RecvMultiBundle::new(types::Fixed(fd.0), this.ring.bgid())
-                    .flags(this.flags)
-                    .build()
-            }
-        })
+        Ok(opcode::RecvMultiBundle::new(this.fd.fd(), this.ring.bgid())
+            .flags(this.flags)
+            .build())
     }
 
     fn cleanup(&mut self, result: crate::operation::CQEResult) {
@@ -1183,41 +1118,20 @@ impl<const MULTI: bool> Accept<MULTI> {
 unsafe impl<const MULTI: bool> Operation for Accept<MULTI> {
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
-        Ok(
-            // Finally we create the operation.
-            match this.fd.kind() {
-                crate::fd::FdKind::Fd(fd) => {
-                    if MULTI {
-                        opcode::AcceptMulti::new(*fd)
-                            .flags(SOCK_NONBLOCK | SOCK_CLOEXEC)
-                            .build()
-                    } else {
-                        opcode::Accept::new(
-                            *fd,
-                            this.addr.as_ptr() as *mut _,
-                            &mut this.addr_len as *mut _,
-                        )
-                        .flags(SOCK_NONBLOCK | SOCK_CLOEXEC)
-                        .build()
-                    }
-                }
-                crate::fd::FdKind::Fixed(fd) => {
-                    if MULTI {
-                        opcode::AcceptMulti::new(*fd)
-                            .flags(SOCK_NONBLOCK | SOCK_CLOEXEC)
-                            .build()
-                    } else {
-                        opcode::Accept::new(
-                            *fd,
-                            this.addr.as_ptr() as *mut _,
-                            &mut this.addr_len as *mut _,
-                        )
-                        .flags(SOCK_NONBLOCK | SOCK_CLOEXEC)
-                        .build()
-                    }
-                }
-            },
-        )
+        let fd = this.fd.fd();
+        if MULTI {
+            Ok(opcode::AcceptMulti::new(fd)
+                .flags(SOCK_NONBLOCK | SOCK_CLOEXEC)
+                .build())
+        } else {
+            Ok(opcode::Accept::new(
+                fd,
+                this.addr.as_ptr() as *mut _,
+                &mut this.addr_len as *mut _,
+            )
+            .flags(SOCK_NONBLOCK | SOCK_CLOEXEC)
+            .build())
+        }
     }
 
     fn cleanup(&mut self, result: crate::operation::CQEResult) {
@@ -1272,14 +1186,12 @@ impl BindSocket {
 unsafe impl Operation for BindSocket {
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
-        Ok(match this.fd.kind() {
-            crate::fd::FdKind::Fd(fd) => {
-                opcode::Bind::new(*fd, this.addr.as_ptr() as *const _, this.addr.len() as _).build()
-            }
-            crate::fd::FdKind::Fixed(fd) => {
-                opcode::Bind::new(*fd, this.addr.as_ptr() as *const _, this.addr.len() as _).build()
-            }
-        })
+        Ok(opcode::Bind::new(
+            this.fd.fd(),
+            this.addr.as_ptr() as *const _,
+            this.addr.len() as _,
+        )
+        .build())
     }
 
     fn cleanup(&mut self, _: crate::operation::CQEResult) {}
@@ -1308,10 +1220,7 @@ impl ListenSocket {
 unsafe impl Operation for ListenSocket {
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
-        Ok(match this.fd.kind() {
-            crate::fd::FdKind::Fd(fd) => opcode::Listen::new(*fd, this.backlog).build(),
-            crate::fd::FdKind::Fixed(fd) => opcode::Listen::new(*fd, this.backlog).build(),
-        })
+        Ok(opcode::Listen::new(this.fd.fd(), this.backlog).build())
     }
 
     fn cleanup(&mut self, _: crate::operation::CQEResult) {}
@@ -1356,20 +1265,7 @@ where
         let this = self;
         let optlen = std::mem::size_of::<T>() as u32;
         let optval = &this.value as *const T as *const libc::c_void;
-        Ok(match this.fd.kind() {
-            crate::fd::FdKind::Fd(fd) => {
-                opcode::SetSockOpt::new(types::Fd(fd.0), this.level, this.optname, optval, optlen)
-                    .build()
-            }
-            crate::fd::FdKind::Fixed(fd) => opcode::SetSockOpt::new(
-                types::Fixed(fd.0),
-                this.level,
-                this.optname,
-                optval,
-                optlen,
-            )
-            .build(),
-        })
+        Ok(opcode::SetSockOpt::new(this.fd.fd(), this.level, this.optname, optval, optlen).build())
     }
 
     fn cleanup(&mut self, _: crate::operation::CQEResult) {}
@@ -1403,16 +1299,12 @@ impl Connect {
 unsafe impl Operation for Connect {
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
-        Ok(match this.fd.kind() {
-            crate::fd::FdKind::Fd(fd) => {
-                opcode::Connect::new(*fd, this.addr.as_ptr() as *mut _, this.addr.len() as _)
-                    .build()
-            }
-            crate::fd::FdKind::Fixed(fd) => {
-                opcode::Connect::new(*fd, this.addr.as_ptr() as *mut _, this.addr.len() as _)
-                    .build()
-            }
-        })
+        Ok(opcode::Connect::new(
+            this.fd.fd(),
+            this.addr.as_ptr() as *mut _,
+            this.addr.len() as _,
+        )
+        .build())
     }
 
     fn cleanup(&mut self, _: crate::operation::CQEResult) {}
@@ -1441,10 +1333,7 @@ impl Shutdown {
 unsafe impl Operation for Shutdown {
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
-        Ok(match this.fd.kind() {
-            crate::fd::FdKind::Fd(fd) => opcode::Shutdown::new(*fd, this.how).build(),
-            crate::fd::FdKind::Fixed(fd) => opcode::Shutdown::new(*fd, this.how).build(),
-        })
+        Ok(opcode::Shutdown::new(this.fd.fd(), this.how).build())
     }
 
     fn cleanup(&mut self, _: crate::operation::CQEResult) {}
@@ -1458,7 +1347,7 @@ impl Singleshot for Shutdown {
     }
 }
 #[derive(Debug)]
-pub struct Recv<B> {
+pub(crate) struct Recv<B> {
     fd: NornFd,
     buf: B,
     flags: i32,
@@ -1489,15 +1378,9 @@ where
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let len = checked_scalar_len(self.submitted_len, "receive buffer length")?;
         let ptr = self.buf.stable_ptr_mut();
-        Ok(
-            // Finally we create the operation.
-            match self.fd.kind() {
-                crate::fd::FdKind::Fd(fd) => opcode::Recv::new(*fd, ptr, len),
-                crate::fd::FdKind::Fixed(fd) => opcode::Recv::new(*fd, ptr, len),
-            }
+        Ok(opcode::Recv::new(self.fd.fd(), ptr, len)
             .flags(self.flags)
-            .build(),
-        )
+            .build())
     }
 
     fn cleanup(&mut self, _: crate::operation::CQEResult) {}
@@ -1526,7 +1409,7 @@ where
 }
 
 #[derive(Debug)]
-pub struct Send<B> {
+pub(crate) struct Send<B> {
     fd: NornFd,
     buf: B,
     flags: i32,
@@ -1550,15 +1433,9 @@ where
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let len = checked_scalar_len(self.buf.bytes_init(), "send buffer length")?;
         let ptr = self.buf.stable_ptr();
-        Ok(
-            // Finally we create the operation.
-            match self.fd.kind() {
-                crate::fd::FdKind::Fd(fd) => opcode::Send::new(*fd, ptr, len),
-                crate::fd::FdKind::Fixed(fd) => opcode::Send::new(*fd, ptr, len),
-            }
+        Ok(opcode::Send::new(self.fd.fd(), ptr, len)
             .flags(self.flags)
-            .build(),
-        )
+            .build())
     }
 
     fn cleanup(&mut self, _: crate::operation::CQEResult) {}
@@ -1606,7 +1483,7 @@ fn complete_send_zc_result(
 }
 
 #[derive(Debug)]
-pub struct SendZc<B> {
+pub(crate) struct SendZc<B> {
     fd: NornFd,
     buf: B,
     flags: i32,
@@ -1637,12 +1514,9 @@ where
         let this = self;
         let ptr = this.buf.stable_ptr();
         let len = this.buf.bytes_init();
-        Ok(match this.fd.kind() {
-            crate::fd::FdKind::Fd(fd) => opcode::SendZc::new(*fd, ptr, len as _),
-            crate::fd::FdKind::Fixed(fd) => opcode::SendZc::new(*fd, ptr, len as _),
-        }
-        .flags(this.flags)
-        .build())
+        Ok(opcode::SendZc::new(this.fd.fd(), ptr, len as _)
+            .flags(this.flags)
+            .build())
     }
 
     fn cleanup(&mut self, _: crate::operation::CQEResult) {}
@@ -1667,7 +1541,7 @@ where
     }
 }
 
-pub struct SendMsgZc<B> {
+pub(crate) struct SendMsgZc<B> {
     fd: NornFd,
     buf: B,
     flags: i32,
@@ -1724,12 +1598,9 @@ where
         }
 
         let msghdr = this.msghdr.as_ptr();
-        Ok(match this.fd.kind() {
-            crate::fd::FdKind::Fd(fd) => opcode::SendMsgZc::new(types::Fd(fd.0), msghdr),
-            crate::fd::FdKind::Fixed(fd) => opcode::SendMsgZc::new(types::Fixed(fd.0), msghdr),
-        }
-        .flags(this.flags as u32)
-        .build())
+        Ok(opcode::SendMsgZc::new(this.fd.fd(), msghdr)
+            .flags(this.flags as u32)
+            .build())
     }
 
     fn cleanup(&mut self, _: crate::operation::CQEResult) {}
@@ -1755,7 +1626,7 @@ where
 }
 
 #[derive(Debug)]
-pub struct Poll<const MULTI: bool> {
+pub(crate) struct Poll<const MULTI: bool> {
     fd: NornFd,
     events: u32,
 }
@@ -1771,14 +1642,9 @@ impl<const MULTI: bool> Poll<MULTI> {
 unsafe impl<const MULTI: bool> Operation for Poll<MULTI> {
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
-        Ok(match this.fd.kind() {
-            crate::fd::FdKind::Fd(fd) => {
-                opcode::PollAdd::new(*fd, this.events).multi(MULTI).build()
-            }
-            crate::fd::FdKind::Fixed(fd) => {
-                opcode::PollAdd::new(*fd, this.events).multi(MULTI).build()
-            }
-        })
+        Ok(opcode::PollAdd::new(this.fd.fd(), this.events)
+            .multi(MULTI)
+            .build())
     }
 
     fn cleanup(&mut self, _: crate::operation::CQEResult) {}
@@ -1865,11 +1731,7 @@ mod tests {
 
     use super::*;
 
-    fn assert_accept_flags(kind: &crate::fd::FdKind) {
-        let crate::fd::FdKind::Fd(fd) = kind else {
-            panic!("accepted socket used a fixed descriptor");
-        };
-
+    fn assert_accept_flags(fd: io_uring::types::Fd) {
         let status = unsafe { libc::fcntl(fd.0, libc::F_GETFL) };
         assert_ne!(status, -1);
         assert_ne!(status & libc::O_NONBLOCK, 0);
@@ -1895,7 +1757,7 @@ mod tests {
             let connector = connect_from_thread(listener.local_addr()?);
 
             let (socket, _) = listener.accept().await?;
-            assert_accept_flags(socket.fd.kind());
+            assert_accept_flags(socket.fd.fd());
 
             connector.join().expect("connector thread panicked")?;
             socket.close().await?;
@@ -1921,7 +1783,7 @@ mod tests {
                     .await
                     .expect("multishot accept ended before yielding")?
             };
-            assert_accept_flags(socket.kind());
+            assert_accept_flags(socket.fd());
 
             connector.join().expect("connector thread panicked")?;
             socket.close().await?;

@@ -430,17 +430,6 @@ where
         this.state.fail_submit(err);
     }
 
-    pub(crate) fn cancel_unfinished(mut self: Pin<&mut Self>) {
-        let this = self.as_mut().project();
-        if let State::Submitted { inner } = this.state {
-            if !*this.completed {
-                let user_data = inner.inner.inner.as_raw_usize();
-                let criteria = CancelBuilder::user_data(user_data as u64);
-                let _ = self.reactor.cancel(criteria, false);
-            }
-        }
-    }
-
     fn poll_submit(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         {
             let mut this = self.as_mut().project();

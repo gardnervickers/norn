@@ -8,9 +8,9 @@ use futures_core::Stream;
 use socket2::{Domain, Type};
 
 use crate::buf::{StableBuf, StableBufMut};
-use crate::bufring::RecvBufRing;
+use crate::bufring::{BufRingBuf, BufRingBufBundle, RecvBufRing};
 use crate::fd::UringFd;
-use crate::net::socket;
+use crate::net::socket::{self, Event};
 use crate::operation::Op;
 
 use super::socket::Accept;
@@ -139,7 +139,7 @@ impl TcpListener {
     }
 
     /// Returns a stream of incoming connections.
-    pub fn incoming(&self) -> Incoming<'_> {
+    pub fn incoming(&self) -> impl Stream<Item = io::Result<TcpSocket>> + '_ {
         Incoming {
             listener: &self.socket,
             current: None,
@@ -170,7 +170,7 @@ pin_project_lite::pin_project! {
     ///
     /// Polling may panic outside the [`Driver`](crate::Driver) context that
     /// owns the listener.
-    pub struct Incoming<'a> {
+    struct Incoming<'a> {
         listener: &'a socket::Socket,
         #[pin]
         current: Option<Op<Accept<true>>>,
@@ -279,12 +279,19 @@ impl TcpSocket {
     ///
     /// This takes ownership of the buffer, and returns future which resolves
     /// to a tuple of the original buffer and the number of bytes read.
-    pub fn recv<B: StableBufMut>(&self, buf: B) -> Op<socket::Recv<B>> {
+    pub fn recv<B: StableBufMut>(
+        &self,
+        buf: B,
+    ) -> impl crate::Request<Output = (io::Result<usize>, B)> {
         self.socket.recv(buf)
     }
 
     /// Recv data into the given buffer with recv flags.
-    pub fn recv_with_flags<B: StableBufMut>(&self, buf: B, flags: i32) -> Op<socket::Recv<B>> {
+    pub fn recv_with_flags<B: StableBufMut>(
+        &self,
+        buf: B,
+        flags: i32,
+    ) -> impl crate::Request<Output = (io::Result<usize>, B)> {
         self.socket.recv_with_flags(buf, flags)
     }
 
@@ -292,12 +299,19 @@ impl TcpSocket {
     ///
     /// This takes ownership of the buffer, and returns a future which resolves
     /// to a tuple of the original buffer and the number of bytes sent.
-    pub fn send<B: StableBuf>(&self, buf: B) -> Op<socket::Send<B>> {
+    pub fn send<B: StableBuf>(
+        &self,
+        buf: B,
+    ) -> impl crate::Request<Output = (io::Result<usize>, B)> {
         self.socket.send(buf)
     }
 
     /// Send data from the given buffer with send flags.
-    pub fn send_with_flags<B: StableBuf>(&self, buf: B, flags: i32) -> Op<socket::Send<B>> {
+    pub fn send_with_flags<B: StableBuf>(
+        &self,
+        buf: B,
+        flags: i32,
+    ) -> impl crate::Request<Output = (io::Result<usize>, B)> {
         self.socket.send_with_flags(buf, flags)
     }
 
@@ -305,7 +319,10 @@ impl TcpSocket {
     ///
     /// This method does not fall back to regular send if zerocopy is unsupported.
     /// Callers should enable `SO_ZEROCOPY` with [`TcpSocket::set_zerocopy`] first.
-    pub fn send_zc<B: StableBuf>(&self, buf: B) -> Op<socket::SendZc<B>> {
+    pub fn send_zc<B: StableBuf>(
+        &self,
+        buf: B,
+    ) -> impl crate::Request<Output = (io::Result<usize>, B)> {
         self.socket.send_zc(buf)
     }
 
@@ -313,26 +330,24 @@ impl TcpSocket {
     ///
     /// This method does not fall back to regular send if zerocopy is unsupported.
     /// Callers should enable `SO_ZEROCOPY` with [`TcpSocket::set_zerocopy`] first.
-    pub fn send_zc_with_flags<B: StableBuf>(&self, buf: B, flags: i32) -> Op<socket::SendZc<B>> {
+    pub fn send_zc_with_flags<B: StableBuf>(
+        &self,
+        buf: B,
+        flags: i32,
+    ) -> impl crate::Request<Output = (io::Result<usize>, B)> {
         self.socket.send_zc_with_flags(buf, flags)
-    }
-
-    /// Send a message from the given buffer with message-style flags.
-    pub fn send_msg<B: StableBuf>(&self, buf: B, flags: i32) -> Op<socket::Send<B>> {
-        self.send_with_flags(buf, flags)
     }
 
     /// Send a message from the given buffer using `io_uring` zerocopy sendmsg.
     ///
     /// This method does not fall back to regular sendmsg if zerocopy is unsupported.
     /// Callers should enable `SO_ZEROCOPY` with [`TcpSocket::set_zerocopy`] first.
-    pub fn send_msg_zc<B: StableBuf>(&self, buf: B, flags: i32) -> Op<socket::SendMsgZc<B>> {
+    pub fn send_msg_zc<B: StableBuf>(
+        &self,
+        buf: B,
+        flags: i32,
+    ) -> impl crate::Request<Output = (io::Result<usize>, B)> {
         self.socket.send_msg_zc(buf, flags)
-    }
-
-    /// Receive a message into the given buffer with message-style flags.
-    pub fn recv_msg<B: StableBufMut>(&self, buf: B, flags: i32) -> Op<socket::Recv<B>> {
-        self.recv_with_flags(buf, flags)
     }
 
     /// Recv data using the given buffer ring.
@@ -344,7 +359,10 @@ impl TcpSocket {
     /// # Panics
     ///
     /// Panics when the buffer ring was registered with another driver.
-    pub fn recv_ring(&self, ring: &RecvBufRing) -> Op<socket::RecvFromRing> {
+    pub fn recv_ring(
+        &self,
+        ring: &RecvBufRing,
+    ) -> impl crate::Request<Output = io::Result<(BufRingBuf, SocketAddr)>> {
         self.socket.recv_from_ring(ring)
     }
 
@@ -353,7 +371,10 @@ impl TcpSocket {
     /// # Panics
     ///
     /// Panics when the buffer ring was registered with another driver.
-    pub fn recv_ring_multi(&self, ring: &RecvBufRing) -> Op<socket::RecvRingMulti> {
+    pub fn recv_ring_multi(
+        &self,
+        ring: &RecvBufRing,
+    ) -> impl Stream<Item = io::Result<BufRingBuf>> {
         self.socket.recv_ring_multi(ring)
     }
 
@@ -362,7 +383,10 @@ impl TcpSocket {
     /// # Panics
     ///
     /// Panics when the buffer ring was registered with another driver.
-    pub fn recv_bundle(&self, ring: &RecvBufRing) -> Op<socket::RecvRingBundle> {
+    pub fn recv_bundle(
+        &self,
+        ring: &RecvBufRing,
+    ) -> impl crate::Request<Output = io::Result<BufRingBufBundle>> {
         self.socket.recv_ring_bundle(ring)
     }
 
@@ -375,7 +399,7 @@ impl TcpSocket {
         &self,
         ring: &RecvBufRing,
         flags: i32,
-    ) -> Op<socket::RecvRingBundle> {
+    ) -> impl crate::Request<Output = io::Result<BufRingBufBundle>> {
         self.socket.recv_ring_bundle_with_flags(ring, flags)
     }
 
@@ -384,7 +408,10 @@ impl TcpSocket {
     /// # Panics
     ///
     /// Panics when the buffer ring was registered with another driver.
-    pub fn recv_bundle_multi(&self, ring: &RecvBufRing) -> Op<socket::RecvRingBundleMulti> {
+    pub fn recv_bundle_multi(
+        &self,
+        ring: &RecvBufRing,
+    ) -> impl Stream<Item = io::Result<BufRingBufBundle>> {
         self.socket.recv_ring_bundle_multi(ring)
     }
 
@@ -397,7 +424,7 @@ impl TcpSocket {
         &self,
         ring: &RecvBufRing,
         flags: i32,
-    ) -> Op<socket::RecvRingBundleMulti> {
+    ) -> impl Stream<Item = io::Result<BufRingBufBundle>> {
         self.socket.recv_ring_bundle_multi_with_flags(ring, flags)
     }
 
@@ -432,12 +459,18 @@ impl TcpSocket {
         self.socket.close().await
     }
 
-    /// Poll readiness on this socket.
+    /// Wait for one readiness event on this socket.
     ///
     /// `events` uses `libc::POLL*` flags such as `POLLIN` and `POLLOUT`.
-    /// When `MULTI` is `true`, the returned operation yields a stream of events.
-    pub fn poll_readiness<const MULTI: bool>(&self, events: u32) -> Op<socket::Poll<MULTI>> {
-        self.socket.poll_readiness(events)
+    pub fn poll_readiness(&self, events: u32) -> impl crate::Request<Output = io::Result<Event>> {
+        self.socket.poll_readiness::<false>(events)
+    }
+
+    /// Return a stream of readiness events for this socket.
+    ///
+    /// `events` uses `libc::POLL*` flags such as `POLLIN` and `POLLOUT`.
+    pub fn poll_readiness_multi(&self, events: u32) -> impl Stream<Item = io::Result<Event>> {
+        self.socket.poll_readiness::<true>(events)
     }
 
     /// Set value for the `SO_RCVBUF` option on this socket.
@@ -662,7 +695,7 @@ impl ReadyStream {
             ready!(self.as_mut().poll_ready(cx, flags))?;
             log::trace!(target: LOG, "poll_op.ready");
             let this = self.as_mut().project();
-            let sock = this.inner.as_socket()?;
+            let sock = this.inner.as_socket();
             match f(sock) {
                 Ok(res) => {
                     log::trace!(target: LOG, "poll_op.success");

@@ -57,6 +57,7 @@
     rust_2018_idioms,
     rustdoc::bare_urls,
     rustdoc::broken_intra_doc_links,
+    unnameable_types,
     unreachable_pub,
     clippy::doc_markdown,
     clippy::missing_errors_doc,

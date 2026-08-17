@@ -345,6 +345,8 @@ Result:
 - `PollSet` is not a win for this fixed eight-connection benchmark. It was
   slower than scan at 64 requests and roughly tied with the noisy 512-request
   results.
+- `norn-util` and the `coord=pollset` benchmark path were later removed. These
+  measurements are retained as the evidence for that cleanup.
 - The direct scan helper remains the best coordination shape measured so far,
   but the 512-request coordination delta is small enough that future runtime
   optimization work should use repeated runs.

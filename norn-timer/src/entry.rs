@@ -3,31 +3,30 @@ use std::future::Future;
 use std::marker::PhantomPinned;
 use std::pin::Pin;
 use std::ptr;
+use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use cordyceps::{list, Linked};
 
-use crate::error;
-
-pub(crate) trait TimerList {
-    fn remove(&self, entry: ptr::NonNull<Entry>);
-
-    fn add(&self, entry: Pin<&mut Entry>, duration: Duration);
-
-    fn add_at(&self, entry: Pin<&mut Entry>, deadline: u64);
-}
+use crate::{error, wheels::Wheels};
 
 pin_project_lite::pin_project! {
-    pub(crate) struct Sleep<T: TimerList> {
-        timer: T,
+    /// Future returned by [`crate::Handle::sleep`] and
+    /// [`crate::Handle::sleep_until`].
+    ///
+    /// This future resolves once the specified duration has elapsed, or with
+    /// [`crate::Error::Shutdown`] if the time driver shuts down first.
+    #[must_use = "futures do nothing unless you `.await` or poll them"]
+    pub struct Sleep {
+        wheels: Rc<Wheels>,
         #[pin]
         entry: Entry,
         duration: Duration,
         deadline: Option<u64>,
     }
 
-    impl<T> PinnedDrop for Sleep<T> where T: TimerList {
+    impl PinnedDrop for Sleep {
         fn drop(this: Pin<&mut Self>) {
             let mut me = this.project();
             if me.entry.is_registered() {
@@ -35,17 +34,20 @@ pin_project_lite::pin_project! {
                 // construct a `NonNull` from a pinned reference.
                 unsafe {
                     let entry = ptr::NonNull::from(Pin::into_inner_unchecked(me.entry.as_mut()));
-                    me.timer.remove(entry);
+                    me.wheels.remove(entry);
                 }
             }
         }
     }
 }
 
-impl<T> Future for Sleep<T>
-where
-    T: TimerList,
-{
+impl std::fmt::Debug for Sleep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Sleep").finish()
+    }
+}
+
+impl Future for Sleep {
     type Output = Result<(), error::Error>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -58,9 +60,9 @@ where
                     debug_assert!(!me.entry.is_registered());
 
                     if let Some(deadline) = *me.deadline {
-                        me.timer.add_at(me.entry.as_mut(), deadline);
+                        me.wheels.add_at(me.entry.as_mut(), deadline);
                     } else {
-                        me.timer.add(me.entry.as_mut(), *me.duration);
+                        me.wheels.add(me.entry.as_mut(), *me.duration);
                     }
                     continue;
                 }
@@ -87,22 +89,19 @@ where
     }
 }
 
-impl<T> Sleep<T>
-where
-    T: TimerList,
-{
-    pub(crate) fn new(timer: T, duration: Duration) -> Self {
+impl Sleep {
+    pub(crate) fn new(wheels: Rc<Wheels>, duration: Duration) -> Self {
         Self {
-            timer,
+            wheels,
             entry: Entry::new(),
             duration,
             deadline: None,
         }
     }
 
-    pub(crate) fn new_at(timer: T, deadline: u64) -> Self {
+    pub(crate) fn new_at(wheels: Rc<Wheels>, deadline: u64) -> Self {
         Self {
-            timer,
+            wheels,
             entry: Entry::new(),
             duration: Duration::ZERO,
             deadline: Some(deadline),
@@ -115,14 +114,14 @@ where
     /// and reset the timer entry. Future calls to [`Sleep::poll`] will then
     /// re-register the sleep using its initial relative duration or absolute
     /// deadline.
-    pub(crate) fn reset(&mut self) {
+    pub fn reset(&mut self) {
         self.reset_entry();
     }
 
     fn reset_entry(&mut self) {
         if self.entry.is_registered() {
             let entry = ptr::NonNull::from(&mut self.entry);
-            self.timer.remove(entry);
+            self.wheels.remove(entry);
         }
         debug_assert!(!self.entry.is_registered());
         self.entry.state.set(State::Unregistered);

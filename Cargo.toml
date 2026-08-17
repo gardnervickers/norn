@@ -10,7 +10,6 @@ members = [
     "norn-task",
     "norn-timer",
     "norn-uring",
-    "norn-util",
 ]
 default-members = [
     "norn-channel",
@@ -19,7 +18,6 @@ default-members = [
     "norn-task",
     "norn-timer",
     "norn-uring",
-    "norn-util",
 ]
 
 [workspace.dependencies]

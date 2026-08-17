@@ -2,13 +2,13 @@
 use std::io;
 use std::net::SocketAddr;
 
+use futures_core::Stream;
 use socket2::{Domain, Type};
 
 use crate::buf::{StableBuf, StableBufMut};
-use crate::bufring::{BufRingBuf, RecvBufRing};
+use crate::bufring::{BufRingBuf, BufRingBufBundle, RecvBufRing};
 use crate::fd::UringFd;
-use crate::net::socket;
-use crate::operation::Op;
+use crate::net::socket::{self, Event, RecvMsgRingBuf};
 
 /// A UDP socket.
 ///
@@ -265,12 +265,18 @@ impl UdpSocket {
         self.inner.recv_from_ring(ring).await
     }
 
-    /// Poll readiness on this socket.
+    /// Wait for one readiness event on this socket.
     ///
     /// `events` uses `libc::POLL*` flags such as `POLLIN` and `POLLOUT`.
-    /// When `MULTI` is `true`, the returned operation yields a stream of events.
-    pub fn poll_readiness<const MULTI: bool>(&self, events: u32) -> Op<socket::Poll<MULTI>> {
-        self.inner.poll_readiness(events)
+    pub fn poll_readiness(&self, events: u32) -> impl crate::Request<Output = io::Result<Event>> {
+        self.inner.poll_readiness::<false>(events)
+    }
+
+    /// Return a stream of readiness events for this socket.
+    ///
+    /// `events` uses `libc::POLL*` flags such as `POLLIN` and `POLLOUT`.
+    pub fn poll_readiness_multi(&self, events: u32) -> impl Stream<Item = io::Result<Event>> {
+        self.inner.poll_readiness::<true>(events)
     }
 
     /// Receives datagrams from this socket using a multishot recvmsg operation backed by the
@@ -281,7 +287,10 @@ impl UdpSocket {
     /// # Panics
     ///
     /// Panics when the buffer ring was registered with another driver.
-    pub fn recv_from_ring_multi(&self, ring: &RecvBufRing) -> Op<socket::RecvFromRingMulti> {
+    pub fn recv_from_ring_multi(
+        &self,
+        ring: &RecvBufRing,
+    ) -> impl Stream<Item = io::Result<(RecvMsgRingBuf, SocketAddr)>> {
         self.inner.recv_from_ring_multi(ring)
     }
 
@@ -291,7 +300,10 @@ impl UdpSocket {
     /// # Panics
     ///
     /// Panics when the buffer ring was registered with another driver.
-    pub fn recv_ring_multi(&self, ring: &RecvBufRing) -> Op<socket::RecvRingMulti> {
+    pub fn recv_ring_multi(
+        &self,
+        ring: &RecvBufRing,
+    ) -> impl Stream<Item = io::Result<BufRingBuf>> {
         self.inner.recv_ring_multi(ring)
     }
 
@@ -300,7 +312,10 @@ impl UdpSocket {
     /// # Panics
     ///
     /// Panics when the buffer ring was registered with another driver.
-    pub fn recv_bundle(&self, ring: &RecvBufRing) -> Op<socket::RecvRingBundle> {
+    pub fn recv_bundle(
+        &self,
+        ring: &RecvBufRing,
+    ) -> impl crate::Request<Output = io::Result<BufRingBufBundle>> {
         self.inner.recv_ring_bundle(ring)
     }
 
@@ -313,7 +328,7 @@ impl UdpSocket {
         &self,
         ring: &RecvBufRing,
         flags: i32,
-    ) -> Op<socket::RecvRingBundle> {
+    ) -> impl crate::Request<Output = io::Result<BufRingBufBundle>> {
         self.inner.recv_ring_bundle_with_flags(ring, flags)
     }
 
@@ -322,7 +337,10 @@ impl UdpSocket {
     /// # Panics
     ///
     /// Panics when the buffer ring was registered with another driver.
-    pub fn recv_bundle_multi(&self, ring: &RecvBufRing) -> Op<socket::RecvRingBundleMulti> {
+    pub fn recv_bundle_multi(
+        &self,
+        ring: &RecvBufRing,
+    ) -> impl Stream<Item = io::Result<BufRingBufBundle>> {
         self.inner.recv_ring_bundle_multi(ring)
     }
 
@@ -335,7 +353,7 @@ impl UdpSocket {
         &self,
         ring: &RecvBufRing,
         flags: i32,
-    ) -> Op<socket::RecvRingBundleMulti> {
+    ) -> impl Stream<Item = io::Result<BufRingBufBundle>> {
         self.inner.recv_ring_bundle_multi_with_flags(ring, flags)
     }
 

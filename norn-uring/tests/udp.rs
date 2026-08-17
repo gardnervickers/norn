@@ -417,7 +417,8 @@ fn recv_msg_ring_buf_can_be_sent_directly() -> Result<(), Box<dyn std::error::Er
             .0?;
 
         let mut recv = pin!(server.recv_from_ring_multi(&ring));
-        let (buf, peer) = recv.next().await.expect("multishot stream ended")?;
+        let (buf, peer): (norn_uring::net::RecvMsgRingBuf, std::net::SocketAddr) =
+            recv.next().await.expect("multishot stream ended")?;
         assert_eq!(&buf[..], b"echo");
 
         let (res, buf) = server.send_to(buf, peer).await;
@@ -641,13 +642,26 @@ fn poll_readiness_smoke() -> Result<(), Box<dyn std::error::Error>> {
         let s1 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
         let s2 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
 
-        let writable = s1.poll_readiness::<false>(libc::POLLOUT as u32).await?;
+        let writable = s1.poll_readiness(libc::POLLOUT as u32).await?;
         assert!(writable.is_writeable() || writable.is_error());
 
         s1.send_to(Bytes::from_static(b"x"), s2.local_addr()?)
             .await
             .0?;
-        let readable = s2.poll_readiness::<false>(libc::POLLIN as u32).await?;
+        let readable = s2.poll_readiness(libc::POLLIN as u32).await?;
+        assert!(readable.is_readable());
+
+        let (res, _) = s2.recv_from(BytesMut::with_capacity(16)).await;
+        res?;
+
+        s1.send_to(Bytes::from_static(b"y"), s2.local_addr()?)
+            .await
+            .0?;
+        let mut readiness = pin!(s2.poll_readiness_multi(libc::POLLIN as u32));
+        let readable = readiness
+            .next()
+            .await
+            .expect("multishot readiness stream ended")?;
         assert!(readable.is_readable());
 
         let (res, _) = s2.recv_from(BytesMut::with_capacity(16)).await;

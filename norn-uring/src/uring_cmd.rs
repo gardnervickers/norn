@@ -4,7 +4,7 @@ use std::io;
 
 use io_uring::opcode;
 
-use crate::fd::{FdKind, NornFd, UringFd};
+use crate::fd::{NornFd, UringFd};
 use crate::operation::{CQEResult, Operation, Singleshot};
 
 /// The inline payload for a 16-byte `io_uring` device command.
@@ -123,11 +123,8 @@ where
 {
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let command = self.command.encode()?;
-        let mut builder = match self.fd.kind() {
-            FdKind::Fd(fd) => opcode::UringCmd16::new(*fd, command.command_op),
-            FdKind::Fixed(fd) => opcode::UringCmd16::new(*fd, command.command_op),
-        }
-        .cmd(command.data);
+        let mut builder =
+            opcode::UringCmd16::new(self.fd.fd(), command.command_op).cmd(command.data);
         if let Some(address) = command.address {
             builder = builder.addr(Some(address));
         }

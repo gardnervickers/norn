@@ -6,6 +6,6 @@ mod socket;
 mod tcp;
 mod udp;
 
-pub use socket::Event;
+pub use socket::{Event, RecvMsgRingBuf};
 pub use tcp::{TcpListener, TcpSocket, TcpStream, TcpStreamReader, TcpStreamWriter};
 pub use udp::UdpSocket;

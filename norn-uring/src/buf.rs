@@ -44,17 +44,6 @@ pub unsafe trait StableBuf: Unpin + 'static {
     {
         BufCursor::new(self)
     }
-
-    /// Limit the number of initialized bytes.
-    ///
-    /// [`BufLimit`] is a wrapper around a [`StableBuf`] which limits
-    /// the number of initialized bytes.
-    fn limit(self, limit: usize) -> BufLimit<Self>
-    where
-        Self: Sized,
-    {
-        BufLimit::new(self, limit)
-    }
 }
 
 /// A buffer that exposes a stable, exclusively writable memory region to an
@@ -422,37 +411,6 @@ where
 
     fn bytes_init(&self) -> usize {
         self.buf.bytes_init().saturating_sub(self.pos)
-    }
-}
-
-/// [`BufLimit`] is a wrapper around a [`StableBuf`] which limits
-/// the number of initialized bytes.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct BufLimit<B> {
-    buf: B,
-    limit: usize,
-}
-
-impl<B> BufLimit<B>
-where
-    B: StableBuf,
-{
-    /// Create a new [`BufLimit`] from a [`StableBuf`].
-    pub fn new(buf: B, limit: usize) -> Self {
-        Self { buf, limit }
-    }
-}
-
-unsafe impl<B> StableBuf for BufLimit<B>
-where
-    B: StableBuf,
-{
-    fn stable_ptr(&self) -> *const u8 {
-        self.buf.stable_ptr()
-    }
-
-    fn bytes_init(&self) -> usize {
-        cmp::min(self.buf.bytes_init(), self.limit)
     }
 }
 

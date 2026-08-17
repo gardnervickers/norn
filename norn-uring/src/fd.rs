@@ -7,11 +7,9 @@
 //!
 //! Essentially we need a reference counted file descriptor.
 //!
-//! Additionally, io-uring supports two types of file descriptors,
-//! regular file descriptors and fixed file descriptors.
 use std::cell::Cell;
 use std::io;
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::RawFd;
 use std::rc::Rc;
 
 use io_uring::{opcode, types};
@@ -62,8 +60,8 @@ impl UringFd {
         }
     }
 
-    pub(crate) fn kind(&self) -> &FdKind {
-        self.inner.kind()
+    pub(crate) fn fd(&self) -> types::Fd {
+        self.inner.fd()
     }
 
     pub(crate) fn handle(&self) -> &Handle {
@@ -101,43 +99,28 @@ pub(crate) struct NornFd {
 
 #[derive(Debug)]
 struct Inner {
-    kind: FdKind,
+    fd: types::Fd,
     handle: Option<Handle>,
     closed: Cell<bool>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum FdKind {
-    Fd(types::Fd),
-    #[allow(dead_code)]
-    Fixed(types::Fixed),
 }
 
 impl NornFd {
     /// Create a new [`NornFd`] from a regular file descriptor.
     pub(crate) fn from_fd(fd: RawFd) -> Self {
-        let raw = fd.as_raw_fd();
-        Self::new(FdKind::Fd(types::Fd(raw)))
+        Self::new(types::Fd(fd))
     }
 
     pub(crate) fn from_fd_on(fd: RawFd, handle: Handle) -> Self {
-        let raw = fd.as_raw_fd();
-        Self::new_with_handle(FdKind::Fd(types::Fd(raw)), Some(handle))
+        Self::new_with_handle(types::Fd(fd), Some(handle))
     }
 
-    /// Create a new [`NornFd`] from a fixed file descriptor.
-    #[allow(dead_code)]
-    pub(crate) fn from_fixed(fixed: types::Fixed) -> Self {
-        Self::new(FdKind::Fixed(fixed))
+    fn new(fd: types::Fd) -> Self {
+        Self::new_with_handle(fd, Handle::try_current())
     }
 
-    fn new(kind: FdKind) -> Self {
-        Self::new_with_handle(kind, Handle::try_current())
-    }
-
-    fn new_with_handle(kind: FdKind, handle: Option<Handle>) -> Self {
+    fn new_with_handle(fd: types::Fd, handle: Option<Handle>) -> Self {
         let inner = Inner {
-            kind,
+            fd,
             handle,
             closed: Cell::new(false),
         };
@@ -145,8 +128,8 @@ impl NornFd {
         Self { inner }
     }
 
-    pub(crate) fn kind(&self) -> &'_ FdKind {
-        &self.inner.kind
+    pub(crate) fn fd(&self) -> types::Fd {
+        self.inner.fd
     }
 
     pub(crate) async fn close(&self) -> io::Result<()> {
@@ -160,11 +143,7 @@ impl NornFd {
             ));
         }
         if let Some(handle) = &self.inner.handle {
-            let result = handle
-                .submit(CloseFd {
-                    fd: self.inner.kind,
-                })
-                .await;
+            let result = handle.submit(CloseFd { fd: self.inner.fd }).await;
             self.inner.finish_tracked_close(result)
         } else {
             self.inner.close_direct_and_invalidate()
@@ -177,7 +156,7 @@ impl Drop for Inner {
         if !self.closed.get() {
             // Best-effort close on drop. Errors are logged because drop cannot report them.
             if let Some(handle) = &self.handle {
-                self.finish_drop_close(handle.close_fd(&self.kind));
+                self.finish_drop_close(handle.close_fd(self.fd));
             } else if let Err(err) = self.close_direct_and_invalidate() {
                 warn!(target: "norn_uring::fd", "direct_close.failed: {err}");
             }
@@ -226,44 +205,30 @@ impl Inner {
 
     fn close_direct_and_invalidate(&self) -> io::Result<()> {
         let result = self.close_direct();
-        if matches!(self.kind, FdKind::Fd(_)) {
-            // On Linux a close error does not preserve ownership of the descriptor number.
-            self.closed.set(true);
-        }
+        // On Linux a close error does not preserve ownership of the descriptor number.
+        self.closed.set(true);
         result
     }
 
     fn close_direct(&self) -> io::Result<()> {
-        match self.kind {
-            FdKind::Fd(fd) => {
-                let res = unsafe { libc::close(fd.0) };
-                if res == 0 {
-                    Ok(())
-                } else {
-                    Err(io::Error::last_os_error())
-                }
-            }
-            FdKind::Fixed(_) => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "cannot directly close fixed descriptor",
-            )),
+        let res = unsafe { libc::close(self.fd.0) };
+        if res == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
         }
     }
 }
 
 struct CloseFd {
-    fd: FdKind,
+    fd: types::Fd,
 }
 
 // Safety: the SQE contains only the copied descriptor value; completion owns
 // no borrowed memory, and cleanup closes a successfully returned descriptor.
 unsafe impl Operation for CloseFd {
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
-        Ok(match self.fd {
-            FdKind::Fd(fd) => opcode::Close::new(types::Fd(fd.0)),
-            FdKind::Fixed(fd) => opcode::Close::new(types::Fixed(fd.0)),
-        }
-        .build())
+        Ok(opcode::Close::new(self.fd).build())
     }
 
     fn cleanup(&mut self, _: crate::operation::CQEResult) {}
@@ -326,21 +291,15 @@ mod tests {
 
     #[test]
     fn close_completion_distinguishes_submission_from_kernel_errors() {
-        let synthetic = CloseFd {
-            fd: FdKind::Fd(types::Fd(-1)),
-        }
-        .complete(crate::operation::CQEResult::synthetic(Err(
-            io::Error::from_raw_os_error(libc::EIO),
-        )));
+        let synthetic = CloseFd { fd: types::Fd(-1) }.complete(
+            crate::operation::CQEResult::synthetic(Err(io::Error::from_raw_os_error(libc::EIO))),
+        );
         assert!(matches!(
             synthetic,
             CloseResult::NeverSubmitted(err) if err.raw_os_error() == Some(libc::EIO)
         ));
 
-        let kernel = CloseFd {
-            fd: FdKind::Fd(types::Fd(-1)),
-        }
-        .complete(crate::operation::CQEResult::new(
+        let kernel = CloseFd { fd: types::Fd(-1) }.complete(crate::operation::CQEResult::new(
             Err(io::Error::from_raw_os_error(libc::EIO)),
             0,
         ));

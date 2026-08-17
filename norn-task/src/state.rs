@@ -289,7 +289,7 @@ impl State {
     }
 }
 
-#[must_use = "this `ShutdownResult` must be handled"]
+#[must_use = "this `PreparePollResult` must be handled"]
 #[derive(Debug, Copy, Clone)]
 pub(crate) enum PreparePollResult {
     Ok,
@@ -297,7 +297,7 @@ pub(crate) enum PreparePollResult {
     Cancelled,
 }
 
-#[must_use = "this `AbortResult` must be handled"]
+#[must_use = "this `CompletePollResult` must be handled"]
 #[derive(Debug, Copy, Clone)]
 pub(crate) enum CompletePollResult {
     NotifiedDuringPoll,

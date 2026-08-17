@@ -5,7 +5,7 @@ use std::os::fd::RawFd;
 use std::path::Path;
 
 use crate::buf::{set_init_checked, StableBuf, StableBufMut};
-use crate::fd::{FdKind, NornFd, UringFd};
+use crate::fd::{NornFd, UringFd};
 use crate::fixedbuf::FixedBuf;
 use crate::fs::opts;
 use crate::operation::{CQEResult, Operation, Singleshot};
@@ -634,12 +634,9 @@ where
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let len = usize_to_u32(self.submitted_len, "read buffer length")?;
         let buf = self.buf.stable_ptr_mut();
-        Ok(match self.fd.kind() {
-            FdKind::Fd(fd) => opcode::Read::new(*fd, buf, len),
-            FdKind::Fixed(fd) => opcode::Read::new(*fd, buf, len),
-        }
-        .offset(self.offset)
-        .build())
+        Ok(opcode::Read::new(self.fd.fd(), buf, len)
+            .offset(self.offset)
+            .build())
     }
 
     fn cleanup(&mut self, _: CQEResult) {}
@@ -687,12 +684,9 @@ unsafe impl<B: 'static> Operation for ReadFixedAt<B> {
         let ptr = self.buf.fixed_ptr_mut();
         let len = self.buf.read_capacity_u32();
         let index = self.buf.kernel_index();
-        Ok(match self.fd.kind() {
-            FdKind::Fd(fd) => opcode::ReadFixed::new(*fd, ptr, len, index),
-            FdKind::Fixed(fd) => opcode::ReadFixed::new(*fd, ptr, len, index),
-        }
-        .offset(self.offset)
-        .build())
+        Ok(opcode::ReadFixed::new(self.fd.fd(), ptr, len, index)
+            .offset(self.offset)
+            .build())
     }
 
     fn cleanup(&mut self, _: CQEResult) {}
@@ -736,12 +730,9 @@ where
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let len = usize_to_u32(self.buf.bytes_init(), "write buffer length")?;
         let buf = self.buf.stable_ptr();
-        Ok(match self.fd.kind() {
-            FdKind::Fd(fd) => opcode::Write::new(*fd, buf, len),
-            FdKind::Fixed(fd) => opcode::Write::new(*fd, buf, len),
-        }
-        .offset(self.offset)
-        .build())
+        Ok(opcode::Write::new(self.fd.fd(), buf, len)
+            .offset(self.offset)
+            .build())
     }
 
     fn cleanup(&mut self, _: CQEResult) {}
@@ -781,12 +772,9 @@ unsafe impl<B: 'static> Operation for WriteFixedAt<B> {
         let ptr = self.buf.fixed_ptr();
         let len = self.buf.write_len_u32();
         let index = self.buf.kernel_index();
-        Ok(match self.fd.kind() {
-            FdKind::Fd(fd) => opcode::WriteFixed::new(*fd, ptr, len, index),
-            FdKind::Fixed(fd) => opcode::WriteFixed::new(*fd, ptr, len, index),
-        }
-        .offset(self.offset)
-        .build())
+        Ok(opcode::WriteFixed::new(self.fd.fd(), ptr, len, index)
+            .offset(self.offset)
+            .build())
     }
 
     fn cleanup(&mut self, _: CQEResult) {}
@@ -840,12 +828,9 @@ where
 
         let ptr = this.iovecs.as_ptr();
         let len = this.iovecs.len() as u32;
-        Ok(match this.fd.kind() {
-            FdKind::Fd(fd) => opcode::Readv::new(*fd, ptr, len),
-            FdKind::Fixed(fd) => opcode::Readv::new(*fd, ptr, len),
-        }
-        .offset(this.offset)
-        .build())
+        Ok(opcode::Readv::new(this.fd.fd(), ptr, len)
+            .offset(this.offset)
+            .build())
     }
 
     fn cleanup(&mut self, _: CQEResult) {}
@@ -929,12 +914,9 @@ where
 
         let ptr = this.iovecs.as_ptr();
         let len = this.iovecs.len() as u32;
-        Ok(match this.fd.kind() {
-            FdKind::Fd(fd) => opcode::Writev::new(*fd, ptr, len),
-            FdKind::Fixed(fd) => opcode::Writev::new(*fd, ptr, len),
-        }
-        .offset(this.offset)
-        .build())
+        Ok(opcode::Writev::new(this.fd.fd(), ptr, len)
+            .offset(this.offset)
+            .build())
     }
 
     fn cleanup(&mut self, _: CQEResult) {}
@@ -976,12 +958,9 @@ impl Advise {
 // advisory SQE until completion.
 unsafe impl Operation for Advise {
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
-        Ok(match self.fd.kind() {
-            FdKind::Fd(fd) => opcode::Fadvise::new(*fd, self.len, self.advice),
-            FdKind::Fixed(fd) => opcode::Fadvise::new(*fd, self.len, self.advice),
-        }
-        .offset(self.offset)
-        .build())
+        Ok(opcode::Fadvise::new(self.fd.fd(), self.len, self.advice)
+            .offset(self.offset)
+            .build())
     }
 
     fn cleanup(&mut self, _: CQEResult) {}
@@ -1027,11 +1006,7 @@ where
 {
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let ptr = self.buf.stable_ptr_mut() as *mut libc::c_void;
-        Ok(match self.fd.kind() {
-            FdKind::Fd(fd) => opcode::FGetXattr::new(*fd, self.name.as_ptr(), ptr, self.len),
-            FdKind::Fixed(fd) => opcode::FGetXattr::new(*fd, self.name.as_ptr(), ptr, self.len),
-        }
-        .build())
+        Ok(opcode::FGetXattr::new(self.fd.fd(), self.name.as_ptr(), ptr, self.len).build())
     }
 
     fn cleanup(&mut self, _: CQEResult) {}
@@ -1093,12 +1068,11 @@ where
 {
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let ptr = self.value.stable_ptr() as *const libc::c_void;
-        Ok(match self.fd.kind() {
-            FdKind::Fd(fd) => opcode::FSetXattr::new(*fd, self.name.as_ptr(), ptr, self.len),
-            FdKind::Fixed(fd) => opcode::FSetXattr::new(*fd, self.name.as_ptr(), ptr, self.len),
-        }
-        .flags(self.flags)
-        .build())
+        Ok(
+            opcode::FSetXattr::new(self.fd.fd(), self.name.as_ptr(), ptr, self.len)
+                .flags(self.flags)
+                .build(),
+        )
     }
 
     fn cleanup(&mut self, _: CQEResult) {}
@@ -1129,12 +1103,7 @@ impl Sync {
 // Safety: `NornFd` retains the descriptor; the SQE references no memory.
 unsafe impl Operation for Sync {
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
-        Ok(match self.fd.kind() {
-            FdKind::Fd(fd) => opcode::Fsync::new(*fd),
-            FdKind::Fixed(fd) => opcode::Fsync::new(*fd),
-        }
-        .flags(self.flags)
-        .build())
+        Ok(opcode::Fsync::new(self.fd.fd()).flags(self.flags).build())
     }
 
     fn cleanup(&mut self, _: CQEResult) {}
@@ -1168,13 +1137,10 @@ impl SyncRange {
 // Safety: `NornFd` retains the descriptor; the SQE references no memory.
 unsafe impl Operation for SyncRange {
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
-        Ok(match self.fd.kind() {
-            FdKind::Fd(fd) => opcode::SyncFileRange::new(*fd, self.len),
-            FdKind::Fixed(fd) => opcode::SyncFileRange::new(*fd, self.len),
-        }
-        .offset(self.offset)
-        .flags(self.flags)
-        .build())
+        Ok(opcode::SyncFileRange::new(self.fd.fd(), self.len)
+            .offset(self.offset)
+            .flags(self.flags)
+            .build())
     }
 
     fn cleanup(&mut self, _: CQEResult) {}
@@ -1209,13 +1175,10 @@ impl Fallocate {
 // Safety: `NornFd` retains the descriptor; the SQE references no memory.
 unsafe impl Operation for Fallocate {
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
-        Ok(match self.fd.kind() {
-            FdKind::Fd(fd) => opcode::Fallocate::new(*fd, self.len),
-            FdKind::Fixed(fd) => opcode::Fallocate::new(*fd, self.len),
-        }
-        .offset(self.offset)
-        .mode(self.mode)
-        .build())
+        Ok(opcode::Fallocate::new(self.fd.fd(), self.len)
+            .offset(self.offset)
+            .mode(self.mode)
+            .build())
     }
 
     fn cleanup(&mut self, _: CQEResult) {}
@@ -1243,11 +1206,7 @@ impl Truncate {
 // Safety: `NornFd` retains the descriptor; the SQE references no memory.
 unsafe impl Operation for Truncate {
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
-        Ok(match self.fd.kind() {
-            FdKind::Fd(fd) => opcode::Ftruncate::new(*fd, self.len),
-            FdKind::Fixed(fd) => opcode::Ftruncate::new(*fd, self.len),
-        }
-        .build())
+        Ok(opcode::Ftruncate::new(self.fd.fd(), self.len).build())
     }
 
     fn cleanup(&mut self, _: CQEResult) {}
@@ -1288,20 +1247,13 @@ impl SpliceOp {
 unsafe impl Operation for SpliceOp {
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
-        Ok(match (*this.fd_in.kind(), *this.fd_out.kind()) {
-            (FdKind::Fd(fd_in), FdKind::Fd(fd_out)) => {
-                opcode::Splice::new(fd_in, this.off_in, fd_out, this.off_out, this.len)
-            }
-            (FdKind::Fd(fd_in), FdKind::Fixed(fd_out)) => {
-                opcode::Splice::new(fd_in, this.off_in, fd_out, this.off_out, this.len)
-            }
-            (FdKind::Fixed(fd_in), FdKind::Fd(fd_out)) => {
-                opcode::Splice::new(fd_in, this.off_in, fd_out, this.off_out, this.len)
-            }
-            (FdKind::Fixed(fd_in), FdKind::Fixed(fd_out)) => {
-                opcode::Splice::new(fd_in, this.off_in, fd_out, this.off_out, this.len)
-            }
-        }
+        Ok(opcode::Splice::new(
+            this.fd_in.fd(),
+            this.off_in,
+            this.fd_out.fd(),
+            this.off_out,
+            this.len,
+        )
         .flags(this.flags)
         .build())
     }
@@ -1340,16 +1292,11 @@ impl TeeOp {
 unsafe impl Operation for TeeOp {
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
-        Ok(match (*this.fd_in.kind(), *this.fd_out.kind()) {
-            (FdKind::Fd(fd_in), FdKind::Fd(fd_out)) => opcode::Tee::new(fd_in, fd_out, this.len),
-            (FdKind::Fd(fd_in), FdKind::Fixed(fd_out)) => opcode::Tee::new(fd_in, fd_out, this.len),
-            (FdKind::Fixed(fd_in), FdKind::Fd(fd_out)) => opcode::Tee::new(fd_in, fd_out, this.len),
-            (FdKind::Fixed(fd_in), FdKind::Fixed(fd_out)) => {
-                opcode::Tee::new(fd_in, fd_out, this.len)
-            }
-        }
-        .flags(this.flags)
-        .build())
+        Ok(
+            opcode::Tee::new(this.fd_in.fd(), this.fd_out.fd(), this.len)
+                .flags(this.flags)
+                .build(),
+        )
     }
 
     fn cleanup(&mut self, _: CQEResult) {}

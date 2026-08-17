@@ -8,7 +8,7 @@ use proptest::prelude::*;
 use crate::entry;
 use crate::wheels::Wheels;
 
-fn new_sleep(wheels: &Rc<Wheels>, dur: Duration) -> Pin<Box<entry::Sleep<Rc<Wheels>>>> {
+fn new_sleep(wheels: &Rc<Wheels>, dur: Duration) -> Pin<Box<entry::Sleep>> {
     Box::pin(entry::Sleep::new(wheels.clone(), dur))
 }
 

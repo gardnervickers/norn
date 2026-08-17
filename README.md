@@ -18,7 +18,6 @@ polled, scheduled, and woken on the runtime thread that owns them.
 | [`norn-uring`](norn-uring/) | A Linux-only `io_uring` driver with filesystem, TCP, UDP, registered-buffer, and device-command APIs. |
 | [`norn-channel`](norn-channel/) | Bounded cross-thread channels that keep receive-side waking on the destination runtime thread. |
 | [`norn-nursery`](norn-nursery/) | Scoped local concurrency for child futures that may borrow from their environment. |
-| [`norn-util`](norn-util/) | Utilities for embedding and polling sets of local tasks. |
 
 There is no top-level `norn` runtime crate. Applications select the layers they
 need and place them under `norn-executor::LocalExecutor`. For example, the timer
@@ -46,10 +45,10 @@ completion while the executor is parked.
 
 ## Platform support
 
-`norn-task`, `norn-executor`, `norn-timer`, `norn-channel`, `norn-nursery`, and
-`norn-util` are platform-independent Rust crates. `norn-uring` and its I/O APIs
-are compiled only on Linux. The workspace is structured so the non-`io_uring`
-crates can still be built on macOS.
+`norn-task`, `norn-executor`, `norn-timer`, `norn-channel`, and `norn-nursery`
+are platform-independent Rust crates. `norn-uring` and its I/O APIs are compiled
+only on Linux. The workspace is structured so the non-`io_uring` crates can
+still be built on macOS.
 
 ## Examples
 

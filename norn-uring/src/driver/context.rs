@@ -35,6 +35,8 @@ impl DriverContext {
 }
 
 #[derive(Debug)]
+// This type is exposed only as `Park::ContextGuard`; callers never construct it.
+#[allow(unnameable_types)]
 pub struct DriverContextGuard;
 
 impl Drop for DriverContextGuard {

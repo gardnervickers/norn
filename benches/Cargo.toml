@@ -11,7 +11,6 @@ norn-task = { path = "../norn-task" }
 norn-channel = { path = "../norn-channel" }
 norn-executor = { path = "../norn-executor" }
 norn-timer = { path = "../norn-timer" }
-norn-util = { path = "../norn-util" }
 norn-kv = { path = "../examples/norn-kv" }
 
 [target.'cfg(target_os = "linux")'.dependencies]

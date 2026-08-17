@@ -21,6 +21,8 @@ pub use timeout::{
 mod private {
     use super::*;
 
+    // Public solely so it can seal `Request`; the private module prevents external use.
+    #[allow(unnameable_types)]
     pub trait Chainable: Future {
         fn reactor(&self) -> &crate::Handle;
         /// Wait until batch preparation can proceed without consuming entries.
@@ -32,7 +34,6 @@ mod private {
         fn cancel_unsubmitted(self: Pin<&mut Self>);
         fn finish_submit(self: Pin<&mut Self>);
         fn fail_submit(self: Pin<&mut Self>, err: &SubmitError);
-        fn cancel_unfinished(self: Pin<&mut Self>);
     }
 }
 
@@ -474,10 +475,6 @@ where
     fn fail_submit(self: Pin<&mut Self>, err: &SubmitError) {
         Op::fail_submit(self, err);
     }
-
-    fn cancel_unfinished(self: Pin<&mut Self>) {
-        Op::cancel_unfinished(self);
-    }
 }
 
 impl<A, B> private::Chainable for Then<A, B>
@@ -568,20 +565,6 @@ where
         left.as_mut().fail_submit(err);
         right.as_mut().fail_submit(err);
         *submitted = true;
-    }
-
-    fn cancel_unfinished(self: Pin<&mut Self>) {
-        let this = self.project();
-        let ThenStateProj::Pending {
-            mut left,
-            mut right,
-            ..
-        } = this.state.project()
-        else {
-            return;
-        };
-        left.as_mut().cancel_unfinished();
-        right.as_mut().cancel_unfinished();
     }
 }
 
@@ -674,20 +657,6 @@ where
         right.as_mut().fail_submit(err);
         *submitted = true;
     }
-
-    fn cancel_unfinished(self: Pin<&mut Self>) {
-        let this = self.project();
-        let ThenAuxStateProj::Pending {
-            mut left,
-            mut right,
-            ..
-        } = this.state.project()
-        else {
-            return;
-        };
-        left.as_mut().cancel_unfinished();
-        right.as_mut().cancel_unfinished();
-    }
 }
 
 impl<R, F, U> private::Chainable for Map<R, F>
@@ -717,10 +686,6 @@ where
 
     fn fail_submit(self: Pin<&mut Self>, err: &SubmitError) {
         self.project().inner.fail_submit(err);
-    }
-
-    fn cancel_unfinished(self: Pin<&mut Self>) {
-        self.project().inner.cancel_unfinished();
     }
 }
 

@@ -380,16 +380,6 @@ impl private::Chainable for Timeout {
             }
         }
     }
-
-    fn cancel_unfinished(self: Pin<&mut Self>) {
-        let this = self.project();
-        match this.control.target.state.lifecycle.get() {
-            TimeoutLifecycle::Prepared => this.control.target.state.mark_canceled_before_submit(),
-            TimeoutLifecycle::Queued => {}
-            TimeoutLifecycle::Submitted => this.inner.cancel_unfinished(),
-            TimeoutLifecycle::CanceledBeforeSubmit | TimeoutLifecycle::Complete => {}
-        }
-    }
 }
 
 impl crate::Handle {
@@ -560,10 +550,6 @@ impl private::Chainable for LinkedTimeout {
                 panic!("cannot fail linked timeout submission more than once")
             }
         }
-    }
-
-    fn cancel_unfinished(self: Pin<&mut Self>) {
-        self.project().inner.cancel_unfinished();
     }
 }
 
@@ -860,12 +846,6 @@ impl private::Chainable for TimeoutRemove {
             inner.fail_submit(err);
         }
     }
-
-    fn cancel_unfinished(self: Pin<&mut Self>) {
-        if let Some(inner) = self.project().inner.as_pin_mut() {
-            inner.cancel_unfinished();
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -1042,12 +1022,6 @@ impl private::Chainable for TimeoutUpdate {
     fn fail_submit(self: Pin<&mut Self>, err: &SubmitError) {
         if let Some(inner) = self.project().inner.as_pin_mut() {
             inner.fail_submit(err);
-        }
-    }
-
-    fn cancel_unfinished(self: Pin<&mut Self>) {
-        if let Some(inner) = self.project().inner.as_pin_mut() {
-            inner.cancel_unfinished();
         }
     }
 }

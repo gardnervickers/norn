@@ -60,6 +60,20 @@ fn panic_during_poll_abort() {
 }
 
 #[test]
+fn panic_payload_round_trips_through_join_handle() {
+    let spawner = super::TestSpawner::new();
+    let handle = spawner.spawn(async {
+        panic::panic_any(String::from("boom"));
+    });
+
+    spawner.next().unwrap().run();
+    let error = handle.now_or_never().unwrap().unwrap_err();
+    let payload = error.into_panic().expect("expected a panic payload");
+
+    assert_eq!(*payload.downcast::<String>().unwrap(), "boom");
+}
+
+#[test]
 fn panic_during_unbind_preserves_registered_reference() {
     let tasks = Rc::new(TaskSet::new());
     let scheduler = PanicOnUnbind {
