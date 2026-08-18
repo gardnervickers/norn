@@ -1695,3 +1695,447 @@ and all per-buffer `Rc` clones, keeps allocated bytes essentially constant as
 bundle width grows, and reduces tail publication from N release stores to one.
 Median latency remains within 0.4% of baseline at every width, including the
 single-buffer case.
+
+## 2026-08-18: Deterministic executor and completion quanta
+
+Goal: prevent continuously runnable tasks, a continuously notified root, and a
+continuous CQE stream from starving one another. Scheduling decisions use task
+poll and CQE counts rather than elapsed time.
+
+### Design
+
+- `norn_executor::Config::task_poll_budget` bounds runnable polls before the
+  executor revisits the root future and calls the `Park` layer. The default is
+  32.
+- `DriverOptions::completion_drain_budget` continues to configure the normal
+  CQE quantum, but now defaults to 32. Shutdown draining remains exhaustive.
+- SQ-full, CQ-full, and submission-backpressure conditions may hand control to
+  the driver before the task quantum expires.
+- A partial CQ backlog no longer makes `Driver::needs_park()` true by itself.
+  The task quantum provides the deterministic driver-entry bound without
+  interrupting runnable work for every individual CQE.
+
+Tests with task budgets 2 and 5 prove that a notified root and a lower `Park`
+layer receive control after exactly that many runnable polls. A real-io_uring
+test preloads 33 CQEs and proves the default normal park drains 32, the next
+park drains the remainder, an explicit `None` remains exhaustive, and shutdown
+drains past a configured quantum.
+
+### Environment and methodology
+
+- Machine: AMD Ryzen 9 5950X, Linux 6.18.39, CPU 15 pinned; SMT sibling CPU 31.
+- Governor: `performance`.
+- Toolchain: Rust 1.97.1.
+- Baseline: `a1c91dd735c3c2ef29ae2618f50b0c5b2a9f53ae`, plus the
+  benchmark-only executor task-yield case.
+- Results are medians of five process-isolated runs. One 15.579 ms noop sample
+  was excluded after deviating by more than 11% from six surrounding
+  13.86-13.99 ms runs.
+
+### Task-quantum selection
+
+The executor benchmark spawns 128 tasks which each self-wake 32 times through
+`LocalExecutor<SpinPark>`.
+
+| task budget | median ns/iteration | delta from unbounded |
+| ---: | ---: | ---: |
+| unbounded | 36,197 | baseline |
+| 32 | 37,925 | +4.77% |
+| 64 | 38,109 | +5.28% |
+| 128 | 38,051 | +5.12% |
+
+The cost is dominated by count tracking in this deliberately tiny task-poll
+workload rather than the number of handoffs. Budget 32 gives the tightest bound
+for the lowest measured median. A counted `for`-loop variant regressed to
+39,339 ns, 8.68% above baseline, and was rejected.
+
+### io_uring guardrails
+
+| workload | unbounded median | final median | delta |
+| --- | ---: | ---: | ---: |
+| 64 tasks, about 100k sequential NOPs | 13.906 ms | 14.094 ms | +1.35% |
+| SQ backpressure, ring depth 2, 4,096 NOPs | 2.113 ms | 2.089 ms | -1.12% |
+
+An initial candidate retained the old bounded-drain behavior where any pending
+CQE made `needs_park()` true. Its first four common-path NOP results were
+54.639-55.958 ms, approximately four times baseline, because small CQE batches
+repeatedly interrupted runnable work. That interaction was rejected and
+removed before the final measurements above.
+
+Decision: retain task and normal-CQE defaults of 32. The final io_uring guards
+remain within 1.4% of baseline, while the maximum uninterrupted work is now
+defined by counts and covered by deterministic tests.
+
+## 2026-08-18: Skip cancellation after terminal completion
+
+Goal: avoid issuing `ASYNC_CANCEL` when an operation's terminal CQE has already
+been reaped but its result has not yet been consumed by the application.
+
+The benchmark submits 16 NOPs without consuming their results, waits for an
+`IO_DRAIN` NOP to prove their terminal CQEs have been reaped, and then drops the
+operations. It uses a plain 32-entry ring and one fixed bencher iteration per
+process. Runs were pinned to CPU 15 on the same Ryzen 9 5950X host and Rust
+1.97.1 toolchain used above.
+
+| implementation | process medians (ns/iteration) | median | delta |
+| --- | --- | ---: | ---: |
+| cancel every unconsumed submission | 46,563; 46,934; 46,753; 47,249; 47,464 | 46,934 | baseline |
+| cancel only before terminal CQE | 21,085; 20,168; 20,669; 20,879; 21,105 | 20,879 | -55.5% |
+
+The terminal state is the kernel-ownership boundary: after the final CQE, the
+operation allocation can clean up queued results without another kernel
+request. A nonterminal multishot operation still requests cancellation after a
+`MORE` CQE. Tests cover both the terminal and nonterminal cases.
+
+The redundant requests also leave numeric `user_data` cancellations queued
+after the completed operation allocation is released. During benchmark design,
+an `IO_DRAIN` operation allocated immediately after the drops reused one of
+those addresses and became entangled with the stale cancellation. Avoiding the
+request after terminal completion removes that address-reuse hazard.
+
+Decision: retain. The operation drop path now checks terminal kernel completion
+before requesting cancellation.
+
+## 2026-08-18: Cheap `Driver::needs_park`
+
+Goal: remove io_uring shared-queue synchronization from the executor's
+per-runnable-task handoff without weakening submission backpressure or the
+deterministic task quantum.
+
+`Driver::needs_park()` previously borrowed the ring, split it, and inspected
+the SQ and CQ after every runnable task poll. It now reads only the
+backpressure waiter count. A registered waiter proves that an operation has
+already observed a full SQ and needs the driver to submit queued work. All
+other driver work remains bounded by the executor's 32-poll task quantum.
+
+### Environment and methodology
+
+- Machine: AMD Ryzen 9 5950X, Linux 6.18.39, CPU 15 pinned; SMT sibling CPU 31.
+- Governor: `performance`.
+- Toolchain: Rust 1.97.1.
+- Results are medians of five process-isolated runs.
+
+| workload | queue-check median | waiter-only median | delta |
+| --- | ---: | ---: | ---: |
+| 64 tasks, about 100k sequential NOPs | 14.048 ms | 13.885 ms | -1.16% |
+| SQ backpressure, ring depth 2, 4,096 NOPs | 2.095 ms | 2.104 ms | +0.45% |
+
+Raw common-path values were `13,936,042`, `14,022,554`, `14,048,164`,
+`14,055,197`, and `14,059,694 ns/iteration` before; and `13,976,059`,
+`13,885,264`, `13,823,249`, `14,124,316`, and
+`13,739,399 ns/iteration` after.
+
+Raw backpressure values were `2,073,677`, `2,097,036`, `2,084,704`,
+`2,094,730`, and `2,105,797 ns/iteration` before; and `2,097,997`,
+`2,104,235`, `2,128,031`, `2,100,471`, and `2,115,645 ns/iteration` after.
+
+Decision: retain. The common workload improves by 1.16%; the 0.45%
+backpressure movement is within run variance, and the full tiny-ring workload
+continues to make progress through the explicit waiter signal.
+
+## 2026-08-18: `FutureCell` task-state borrow discipline
+
+Goal: reduce per-poll task dispatch cost while preserving panic capture,
+cancellation, shutdown-during-poll, destructor re-entry, pinning, and escaped
+waker behavior.
+
+### Profile and design
+
+The repository's 1 kHz pprof harness collected 250 baseline samples from
+`bench_task_yield/tasks=128/yields=32`. `FutureCell` polling was the largest
+runtime-owned cumulative stack at 46%; queue pop was 18%, task vtable lookup
+10.4%, and wake/state update 8.8%. Queue-layout and vtable-inline variants were
+already measured and rejected in earlier work.
+
+`FutureCell` previously wrapped its state and future/output union in a
+`RefCell`, paying dynamic borrow checks on every poll and lifecycle transition.
+The task state machine already supplies the stronger borrow discipline:
+polling requires exclusive `RUNNING` state, cancellation/destruction of a
+running task is deferred, and user destructors run only after Rust references
+to storage are released. The retained implementation makes that contract
+explicit around an `UnsafeCell`. Its post-change profile contains no `RefCell`
+borrow frames.
+
+Profiles:
+
+- Baseline: `/tmp/norn-task-next-profile-2026-08-18/`.
+- Candidate: `/tmp/norn-task-next-profile-2026-08-18-candidate/`.
+
+### Environment and focused result
+
+- Machine: AMD Ryzen 9 5950X, Linux 6.18.39, CPU 15 pinned; SMT sibling CPU 31.
+- Governor: `performance`.
+- Toolchain: Rust 1.97.1.
+- Five process-isolated runs; lower latency is better.
+
+| implementation | process medians (ns/iteration) | median | delta |
+| --- | --- | ---: | ---: |
+| `RefCell` | 38,110; 37,857; 38,711; 38,302; 38,851 | 38,302 | baseline |
+| task-state-guarded `UnsafeCell` | 36,287; 36,730; 36,285; 36,269; 36,999 | 36,287 | -5.26% |
+
+The complete `task_state` matrix improved in all nine cases in one adaptive
+harness run. Depending on task and yield count, reductions ranged from 4.1% to
+7.4%. The 128-task, 32-yield guard moved from 38,770 ns to 36,898 ns (-4.83%)
+in that separate matrix run.
+
+The repeated join guard improved from an 80 ns median (`80`, `83`, `80`, `80`,
+`81`) to 78 ns (`79`, `76`, `78`, `80`, `78`), or -2.5%. Spawn guards showed
+no regression in their adaptive matrix run.
+
+### Correctness
+
+All 31 `norn-task` unit tests and its doc tests passed under Miri, including
+shutdown during poll, destructor re-entry, panic, cancellation, pinning, and
+escaped-waker cases. The full workspace test suite, strict Clippy, strict
+rustdoc, formatting, and diff checks also pass.
+
+Decision: retain. The focused scheduler improvement exceeds 5%, every task
+state guard improves, and Miri validates the explicit unsafe lifecycle path.
+
+## 2026-08-18: Transfer the runnable reference on reschedule
+
+Goal: eliminate the compensating task-ref clone and drop when a task wakes
+itself during its poll.
+
+Before this change, `complete_poll_and_clone` incremented the task refcount,
+constructed the next `Runnable`, and allowed the currently executing
+`Runnable` to decrement the same refcount on return. The preceding profile
+attributed 9.63% of samples to that `TaskRef::drop`/`drop_ref` path.
+
+The poll vtable now takes ownership of the current `TaskRef`. When a wake was
+observed during polling, it moves that existing reference into the next
+`Runnable`; all complete, pending, cancelled, and unwind paths still drop it
+normally. A scheduler-panic regression proves that ownership of the transferred
+reference is released exactly once during unwinding.
+
+### Environment and focused result
+
+- Machine: AMD Ryzen 9 5950X, Linux 6.18.39, CPU 15 pinned; SMT sibling CPU 31.
+- Governor: `performance`.
+- Toolchain: Rust 1.97.1.
+- Baseline includes the retained task-state-guarded `FutureCell` change.
+- Five process-isolated runs; lower latency is better.
+
+| implementation | process medians (ns/iteration) | median | delta |
+| --- | --- | ---: | ---: |
+| clone next ref, drop current ref | 36,287; 36,730; 36,285; 36,269; 36,999 | 36,287 | baseline |
+| transfer current runnable ref | 33,682; 33,391; 33,041; 32,986; 33,262 | 33,262 | -8.34% |
+
+Across the adaptive `task_state` matrix, eight cases improved by 0.5% to 4.2%
+and the remaining 128-task/1-yield case moved from 4,616 ns to 4,621 ns
+(+0.1%). The repeated join guard's prior 78 ns median moved to 75 ns in the
+matrix run. Spawn 1 was unchanged at 34 ns; spawn 128 and 1,024 improved from
+4,723 and 37,898 ns to 4,585 and 36,836 ns.
+
+The post-change 1 kHz profile contains no per-poll `TaskRef::drop` or
+`State::drop_ref` stack. Its flamegraph and protobuf profile are under
+`/tmp/norn-runnable-ref-transfer-2026-08-18/profile/`.
+
+All 32 `norn-task` unit tests and doc tests pass under Miri. The full workspace
+test suite, strict Clippy, strict rustdoc, formatting, and diff checks also
+pass.
+
+Decision: retain. The isolated reschedule change improves the focused workload
+by 8.34% and removes the profiled refcount work. Combined with the preceding
+`FutureCell` change, the focused median moved from 38,302 ns to 33,262 ns, a
+13.16% cumulative reduction.
+
+## 2026-08-18: Borrow the executor handle for free `spawn`
+
+Goal: remove executor-handle reference-count traffic from the free
+`norn_executor::spawn` convenience function.
+
+The post-reschedule task profile attributed roughly 15% of samples to
+`norn_executor::spawn` and teardown of its cloned `Rc<TaskQueue::Shared>`.
+`Handle::current()` must continue returning an owned handle, but the free
+`spawn` function only needs the handle for the duration of one call. The
+retained implementation borrows the handle from thread-local executor context
+for that call, avoiding one `TaskQueue` clone and drop per spawned task.
+
+An isolated benchmark was added because the existing `schedule_task` benchmark
+calls `TaskQueue::spawn` directly and cannot measure this path.
+
+### Environment and focused result
+
+- Machine: AMD Ryzen 9 5950X, Linux 6.18.39, CPU 15 pinned; SMT sibling CPU 31.
+- Governor: `performance`.
+- Toolchain: Rust 1.97.1.
+- Five process-isolated runs; lower latency is better.
+
+| implementation | process medians (ns/iteration) | median | delta |
+| --- | --- | ---: | ---: |
+| clone TLS handle per spawn | 40,945; 41,153; 41,098; 40,686; 40,923 | 40,945 | baseline |
+| borrow TLS handle per spawn | 39,889; 39,434; 39,903; 39,961; 40,334 | 39,903 | -2.54% |
+
+The existing 128-task, 32-yield guard moved from a 33,262 ns baseline median
+to 33,787 ns (`33,594`, `34,243`, `33,629`, `33,787`, `34,024`), or +1.58%.
+A subsequent full-matrix run measured that case at 33,271 ns, consistent with
+the baseline and indicating that the repeated-run movement was noise.
+
+The candidate profile contains no executor `Handle` clone/drop stack; the
+remaining `Rc<TaskQueue::Shared>` work belongs to the scheduler reference held
+by each task. The flamegraph and protobuf profile are under
+`/tmp/norn-borrowed-spawn-handle-2026-08-18/profile/`.
+
+All `norn-executor` unit and doc tests pass under Miri.
+
+Decision: retain. The change is localized to the free `spawn` wrapper, keeps
+the owned `Handle::current()` API unchanged, and improves its isolated workload
+by 2.54% without a repeatable guardrail regression.
+
+## 2026-08-18: Direct terminal CQE for singleshot operations
+
+Goal: avoid the generic multi-completion iterator when an ordinary singleshot
+operation has exactly one terminal CQE.
+
+The post-executor profile attributed 6.55% of samples to
+`SubmittedOp::try_complete` and its `CompletionQueueIntoIter`/`Option::IntoIter`
+chain. The retained path detects the inline one-completion case, removes that
+completion directly, and calls `Singleshot::complete`. Operations such as
+zero-copy sends that produce multiple CQEs continue through the existing
+ordered `update`/`complete` loop.
+
+### Environment and focused result
+
+- Machine: AMD Ryzen 9 5950X, Linux 6.18.39, CPU 15 pinned; SMT sibling CPU 31.
+- Governor: `performance`.
+- Toolchain: Rust 1.97.1.
+- Five process-isolated runs; lower latency is better.
+
+| implementation | process medians (ns/iteration) | median | delta |
+| --- | --- | ---: | ---: |
+| generic completion iterator | 13,994,265; 14,029,486; 13,970,310; 14,055,069; 14,162,506 | 14,029,486 | baseline |
+| direct inline terminal CQE | 13,310,145; 13,520,497; 13,817,174; 13,370,338; 13,607,313 | 13,520,497 | -3.63% |
+
+The candidate profile no longer contains `SubmittedOp::try_complete`,
+`CompletionQueueIntoIter`, or `Option::IntoIter` frames. Baseline and candidate
+profiles are under `/tmp/norn-next-noop-profile-2026-08-18/` and
+`/tmp/norn-single-cqe-fast-path-2026-08-18/profile/`, respectively.
+
+The full `norn-uring` suite passes, including zero-copy send and multishot
+integration tests. New isolated regressions cover both the direct terminal-CQE
+case and ordered multi-CQE singleshot fallback; both pass under Miri. Running
+the entire operation-test module under Miri remains unsupported because some
+existing tests create a real io_uring instance.
+
+Decision: retain. A small branch removes a measured generic-iterator cost from
+the dominant singleshot case, improves the common noop workload by 3.63%, and
+leaves multi-CQE behavior covered by its original path.
+
+## 2026-08-18: Real QD32 file-read operation-header follow-up
+
+Goal: determine whether operation-header completion and waker bookkeeping is a
+material optimization target in real fd-bound I/O after the synthetic noop
+improvements.
+
+### Environment and baseline
+
+- Machine: AMD Ryzen 9 5950X, Linux 6.18.44, CPU 15 pinned; SMT sibling CPU 31.
+- Governor: `performance`.
+- Toolchain: Rust 1.97.1.
+- Workload: ordinary O_DIRECT 4 KiB reads, queue depth 32, 16,384 operations.
+- Five process-isolated runs; lower latency is better.
+
+Command:
+
+```text
+taskset -c 15 cargo bench -q -p benches --bench fixed_buffers -- 'fixed_file_io/mode=ordinary/direction=read/storage=aligned_heap/block=4096/qd=32/ops=16384'
+```
+
+Process medians were `34,848,689`, `35,149,891`, `35,214,317`, `34,938,243`,
+and `34,888,970 ns/iteration`; median `34,938,243 ns/iteration`. Peak-to-peak
+process variation was 1.05%, although each adaptive harness run reported wider
+within-process variation from the underlying file-I/O workload.
+
+### Profile result
+
+The 1 kHz profile does not support replacing the operation header's `RefCell`s:
+
+- `CompletionQueue::push`: 0.13% cumulative.
+- `Header::set_waker`: 0.11% cumulative.
+- `SubmittedOp::try_complete`: 0.10% cumulative.
+- `Driver::drain_normal`: 0.60% cumulative in its largest stack.
+- `Op<ReadAt>::poll`: 0.48% cumulative in its largest stack.
+
+The largest workload-owned stack was 51.09% in the inlined root future around
+the benchmark's `FuturesUnordered` orchestration and inline aligned buffers.
+No individual Norn operation-header or driver mechanism reached 1%.
+
+The flamegraph and protobuf profile are under
+`/tmp/norn-real-file-q32-profile-2026-08-18/fixed_buffers/`.
+
+Decision: retain no implementation. Even removing all measured completion and
+waker bookkeeping would be below the benchmark's process-level resolution, so
+adding unsafe lifecycle code here is not justified. A future runtime profile
+should use a socket workload or heap-backed application buffers rather than
+optimize this fixed-buffer comparison harness.
+
+## 2026-08-18: Normal TCP request/response profile
+
+Goal: profile steady-state socket I/O with heap-backed buffers and determine
+whether the remaining readiness, completion, or driver paths contain a
+material runtime optimization.
+
+### Environment and initial baseline
+
+- Machine: AMD Ryzen 9 5950X, Linux 6.18.44, CPU 15 pinned; SMT sibling CPU 31.
+- Governor: `performance`.
+- Toolchain: Rust 1.97.1.
+- Workload: Norn normal receive mode, 8 loopback connections, 512 requests per
+  connection, 1,024-byte payloads.
+- Lower latency is better.
+
+The initial five process medians were `50,759,916`, `48,190,110`, `48,335,889`,
+`50,881,683`, and `47,906,132 ns/iteration`. The 6.2% peak-to-peak spread was
+too large for small runtime claims. Its profile also attributed roughly 25% of
+samples to byte-by-byte payload validation in the timed loop.
+
+### Disabled trace-call experiment
+
+The initial profile attributed 2.46% cumulatively to `log::max_level` beneath
+`ReadyStream::poll_op`. Removing the TCP readiness loop's trace calls was
+tested with saved exact baseline and candidate binaries in seven alternating
+pairs.
+
+Baseline medians were `50,496,114`, `50,932,699`, `51,118,981`, `50,544,201`,
+`50,601,010`, `50,653,420`, and `50,575,644 ns/iteration`; median
+`50,601,010 ns/iteration`. Candidate medians were `50,555,723`, `50,419,534`,
+`50,605,884`, `50,878,443`, `50,670,736`, `50,961,395`, and
+`50,554,278 ns/iteration`; median `50,605,884 ns/iteration`, or +0.01%.
+
+Decision: reject. The trace calls were restored. The profile frame was
+cumulative/inlined attribution rather than measurable disabled-log overhead.
+
+### Benchmark correction
+
+For normal heap-buffer mode, one complete untimed request/response round now
+validates every received byte before `Bencher::iter`. Timed iterations retain
+all byte-count and I/O-result assertions but do not rescan every payload. Other
+receive modes retain their existing timed validation.
+
+Five corrected process medians were `48,923,209`, `48,723,247`, `48,657,361`,
+`48,781,869`, and `48,667,475 ns/iteration`; median `48,723,247 ns/iteration`,
+with 0.55% peak-to-peak variation. This corrected baseline is suitable for
+changes larger than roughly 1%.
+
+The corrected profile remained distributed. Its largest Norn-owned stacks
+were `Driver::park_with_completion_budget` at 7.30%, `Driver::drain_normal` at
+5.02%, readiness-operation completion at 4.67%, and the inline multishot
+completion pop at 3.35%. Benchmark coordination through `FuturesUnordered`
+remained larger than any individual Norn mechanism.
+
+### Direct inline completion take
+
+The inline completion representation was changed from `One(CQEResult)` to
+`One(Option<CQEResult>)`, allowing `pop_front` to take the common single pending
+CQE without replacing the entire storage enum. FIFO overflow, retained
+high-water storage, and operation-allocation size were preserved.
+
+Candidate process medians were `48,867,285`, `48,704,495`, `48,720,589`,
+`48,889,065`, and `48,998,906 ns/iteration`; median `48,867,285 ns/iteration`,
+or +0.30% against the corrected baseline.
+
+Decision: reject. The completion representation was restored. The benchmark
+correction is retained; no runtime implementation from this TCP pass is kept.
+Profiles and saved comparison binaries are under
+`/tmp/norn-tcp-normal-profile-2026-08-18/`.

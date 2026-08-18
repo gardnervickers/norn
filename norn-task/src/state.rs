@@ -120,16 +120,6 @@ impl State {
         CompletePollResult::Ok
     }
 
-    /// Conclude polling for a task and clone the task ref if it must be rescheduled.
-    #[inline]
-    pub(crate) fn complete_poll_and_clone(&mut self) -> CompletePollResult {
-        let res = self.complete_poll();
-        if matches!(res, CompletePollResult::NotifiedDuringPoll) {
-            self.clone_ref();
-        }
-        res
-    }
-
     /// Conclude a poll that returned ready.
     ///
     /// The task remains marked as running until [`State::complete_task`] records

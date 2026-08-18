@@ -30,9 +30,15 @@ impl Context {
 
     /// Returns a reference to the current executor.
     pub(crate) fn handle() -> Option<Handle> {
-        CURRENT.with(|c| {
-            // Safety: See [`Context::enter`].
-            unsafe { (*c.handle.get()).clone() }
+        Self::with_handle(Clone::clone)
+    }
+
+    /// Invoke `f` with the current executor handle without cloning it.
+    pub(crate) fn with_handle<T>(f: impl FnOnce(&Handle) -> T) -> Option<T> {
+        CURRENT.with(|current| {
+            // Safety: the slot is thread-local. The context guard cannot clear
+            // it until this closure returns, and `f` receives shared access.
+            unsafe { (&*current.handle.get()).as_ref().map(f) }
         })
     }
 }

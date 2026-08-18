@@ -174,7 +174,8 @@ where
         ManuallyDrop::new(Waker::from_raw(raw))
     }
 
-    unsafe fn poll(ptr: NonNull<header::Header>) {
+    unsafe fn poll(taskref: TaskRef) {
+        let ptr = taskref.0;
         let this = Self::from_raw_header(ptr);
         // First, we set the poll state.
         let state = this.as_ref().state();
@@ -202,11 +203,7 @@ where
                     }
                     PollResult::Complete
                 } else {
-                    match this
-                        .as_ref()
-                        .state()
-                        .update(state::State::complete_poll_and_clone)
-                    {
+                    match this.as_ref().state().update(state::State::complete_poll) {
                         state::CompletePollResult::NotifiedDuringPoll => PollResult::Notified,
                         state::CompletePollResult::Cancelled => {
                             this.as_ref().future_cell().cancel();
@@ -224,8 +221,10 @@ where
             }
             PollResult::Done => {}
             PollResult::Notified => {
-                let taskref = TaskRef::from_ptr(ptr);
                 let scheduler = this.as_ref().scheduler();
+                // Transfer the runnable's existing task reference back to the
+                // scheduler. `schedule` owns it even if it unwinds, so this
+                // path needs no compensating clone and drop.
                 scheduler.schedule(crate::Runnable::from(taskref));
             }
         }
@@ -380,7 +379,8 @@ impl TaskRef {
     pub(crate) fn run(self) {
         // Safety: The task is valid as long as we have a TaskRef.
         unsafe {
-            (self.vtable().poll)(self.0);
+            let poll = self.vtable().poll;
+            poll(self);
         }
     }
 
@@ -457,7 +457,7 @@ pub(crate) struct VTable {
     pub(crate) dealloc: unsafe fn(NonNull<header::Header>),
     pub(crate) abort: unsafe fn(NonNull<header::Header>),
     pub(crate) drop_join_handle: unsafe fn(NonNull<header::Header>),
-    pub(crate) poll: unsafe fn(NonNull<header::Header>),
+    pub(crate) poll: unsafe fn(TaskRef),
     pub(crate) try_read_output: unsafe fn(NonNull<header::Header>, *mut (), &Waker),
     pub(crate) shutdown: unsafe fn(NonNull<header::Header>),
 }

@@ -38,9 +38,12 @@
     clippy::missing_safety_doc
 )]
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::pin::pin;
 
 use norn_task::JoinHandle;
+
+const DEFAULT_TASK_POLL_BUDGET: NonZeroUsize = NonZeroUsize::new(32).unwrap();
 
 mod context;
 /// Parking abstractions and built-in park implementations.
@@ -54,13 +57,33 @@ pub struct LocalExecutor<P: park::Park> {
     /// Task queue contains tasks which are ready to be executed.
     taskqueue: norn_task::TaskQueue,
     park: P,
+    config: Config,
     root_notifier: Option<wakerfn::RootNotifier<P::Unparker>>,
+}
+
+/// Configuration for [`LocalExecutor`] scheduling.
+///
+/// The default task-poll budget is 32.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Config {
+    /// Maximum number of runnable task polls before control returns to the
+    /// root future and the [`park::Park`] layer.
+    pub task_poll_budget: NonZeroUsize,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            task_poll_budget: DEFAULT_TASK_POLL_BUDGET,
+        }
+    }
 }
 
 impl<P: park::Park> std::fmt::Debug for LocalExecutor<P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LocalExecutor")
             .field("taskqueue", &self.taskqueue)
+            .field("config", &self.config)
             .finish()
     }
 }
@@ -69,12 +92,20 @@ impl<P: park::Park> LocalExecutor<P> {
     /// Construct a new [`LocalExecutor`] with the given [`park::Park`].
     ///
     /// The [`LocalExecutor`] will use the given [`park::Park`] to block the
-    /// driver thread when there are no tasks ready to be executed.
+    /// driver thread when there are no tasks ready to be executed. Scheduling
+    /// uses [`Config::default`].
     pub fn new(park: P) -> Self {
+        Self::new_with_config(park, Config::default())
+    }
+
+    /// Construct a new [`LocalExecutor`] with the given [`park::Park`] and
+    /// scheduling configuration.
+    pub fn new_with_config(park: P, config: Config) -> Self {
         let root_notifier = Some(wakerfn::root_notifier(park.unparker()));
         Self {
             taskqueue: norn_task::TaskQueue::new(),
             park,
+            config,
             root_notifier,
         }
     }
@@ -132,8 +163,14 @@ impl<P: park::Park> LocalExecutor<P> {
                 return Ok(result);
             }
             let mut has_remaining_tasks = false;
+            let mut task_polls_remaining = self.config.task_poll_budget.get();
             while let Some(next) = self.taskqueue.next() {
                 next.run();
+                task_polls_remaining -= 1;
+                if task_polls_remaining == 0 {
+                    has_remaining_tasks = self.taskqueue.runnable() > 0;
+                    break;
+                }
                 if self.park.needs_park() {
                     has_remaining_tasks = self.taskqueue.runnable() > 0;
                     break;
@@ -188,7 +225,7 @@ pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
 where
     F: Future + 'static,
 {
-    Handle::current().spawn(future)
+    context::Context::with_handle(|handle| handle.spawn(future)).expect("executor not set")
 }
 
 impl<P: park::Park> Drop for LocalExecutor<P> {
@@ -201,7 +238,7 @@ impl<P: park::Park> Drop for LocalExecutor<P> {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::future;
     use std::io;
     use std::rc::Rc;
@@ -214,6 +251,75 @@ mod tests {
 
     use super::*;
 
+    struct SelfWaker {
+        polls: Rc<Cell<usize>>,
+    }
+
+    impl Future for SelfWaker {
+        type Output = ();
+
+        fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<()> {
+            self.polls.set(self.polls.get() + 1);
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+
+    struct CountedReady {
+        polls: Rc<Cell<usize>>,
+    }
+
+    impl Future for CountedReady {
+        type Output = ();
+
+        fn poll(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> Poll<()> {
+            self.polls.set(self.polls.get() + 1);
+            Poll::Ready(())
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct NoopUnparker;
+
+    impl park::Unpark for NoopUnparker {
+        fn unpark(&self) {}
+    }
+
+    #[derive(Debug)]
+    struct ReadyOnPark {
+        ready: Rc<Cell<bool>>,
+        root_waker: Rc<RefCell<Option<Waker>>>,
+        modes: Rc<RefCell<Vec<park::ParkMode>>>,
+    }
+
+    impl park::Park for ReadyOnPark {
+        type Unparker = NoopUnparker;
+        type Guard = ();
+
+        fn park(&mut self, mode: park::ParkMode) -> io::Result<()> {
+            self.modes.borrow_mut().push(mode);
+            self.ready.set(true);
+            self.root_waker
+                .borrow_mut()
+                .take()
+                .expect("root waker not registered")
+                .wake();
+            Ok(())
+        }
+
+        fn enter(&self) -> Self::Guard {}
+
+        fn unparker(&self) -> Self::Unparker {
+            NoopUnparker
+        }
+
+        fn needs_park(&self) -> bool {
+            false
+        }
+
+        fn shutdown(&mut self) {}
+    }
+
     #[test]
     fn block_on() {
         let mut executor = LocalExecutor::new(SpinPark);
@@ -221,6 +327,70 @@ mod tests {
         let res = executor.block_on(async { 1 + 1 });
         assert_eq!(res, 2);
         assert!(executor.root_notifier.is_some());
+    }
+
+    #[test]
+    fn task_poll_budget_bounds_root_starvation() {
+        for budget in [2, 5] {
+            let polls = Rc::new(Cell::new(0));
+            let observed_polls = Rc::clone(&polls);
+            let config = Config {
+                task_poll_budget: NonZeroUsize::new(budget).unwrap(),
+            };
+            let mut executor = LocalExecutor::new_with_config(SpinPark, config);
+
+            executor.block_on(async move {
+                spawn(SelfWaker {
+                    polls: Rc::clone(&observed_polls),
+                })
+                .detach();
+                spawn(CountedReady {
+                    polls: Rc::clone(&observed_polls),
+                })
+                .await
+                .unwrap();
+            });
+
+            assert_eq!(polls.get(), budget);
+        }
+    }
+
+    #[test]
+    fn task_poll_budget_hands_control_to_park() {
+        for budget in [2, 5] {
+            let polls = Rc::new(Cell::new(0));
+            let ready = Rc::new(Cell::new(false));
+            let root_waker = Rc::new(RefCell::new(None));
+            let modes = Rc::new(RefCell::new(Vec::new()));
+            let park = ReadyOnPark {
+                ready: Rc::clone(&ready),
+                root_waker: Rc::clone(&root_waker),
+                modes: Rc::clone(&modes),
+            };
+            let config = Config {
+                task_poll_budget: NonZeroUsize::new(budget).unwrap(),
+            };
+            let mut executor = LocalExecutor::new_with_config(park, config);
+            let mut spawned = false;
+
+            executor.block_on(future::poll_fn(|cx| {
+                if ready.get() {
+                    return Poll::Ready(());
+                }
+                *root_waker.borrow_mut() = Some(cx.waker().clone());
+                if !spawned {
+                    spawn(SelfWaker {
+                        polls: Rc::clone(&polls),
+                    })
+                    .detach();
+                    spawned = true;
+                }
+                Poll::Pending
+            }));
+
+            assert_eq!(polls.get(), budget);
+            assert_eq!(&*modes.borrow(), &[park::ParkMode::NoPark]);
+        }
     }
 
     #[test]

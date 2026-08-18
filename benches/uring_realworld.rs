@@ -642,6 +642,7 @@ async fn norn_tcp_echo_server(
     payload_len: usize,
     recv_mode: TcpRecvMode,
     coord_mode: TcpCoordMode,
+    validate_payload: bool,
 ) -> io::Result<()> {
     let unordered: FuturesUnordered<OwnedPendingIo> = FuturesUnordered::new();
     let mut scan: Vec<OwnedPendingIo> = Vec::with_capacity(connections);
@@ -654,6 +655,7 @@ async fn norn_tcp_echo_server(
                 socket,
                 requests_per_connection,
                 payload_len,
+                validate_payload,
             )),
             TcpRecvMode::BufRing
             | TcpRecvMode::BufRingLinked
@@ -709,12 +711,15 @@ async fn norn_tcp_echo_connection_normal(
     socket: NornTcpSocket,
     requests: usize,
     payload_len: usize,
+    validate_payload: bool,
 ) -> io::Result<()> {
     let mut stream = pin!(socket.into_stream());
     let mut buf = vec![0; payload_len];
     for _ in 0..requests {
         tcp_read_exact(stream.as_mut(), &mut buf).await?;
-        assert!(buf.iter().all(|byte| *byte == 0x5A));
+        if validate_payload {
+            assert!(buf.iter().all(|byte| *byte == 0x5A));
+        }
         tcp_write_all(stream.as_mut(), &buf).await?;
     }
     Ok(())
@@ -801,6 +806,7 @@ async fn norn_tcp_request_response_clients(
     payload_len: usize,
     recv_mode: TcpRecvMode,
     coord_mode: TcpCoordMode,
+    validate_payload: bool,
 ) -> io::Result<()> {
     let unordered: FuturesUnordered<OwnedPendingIo> = FuturesUnordered::new();
     let mut scan: Vec<OwnedPendingIo> = Vec::with_capacity(connections);
@@ -811,6 +817,7 @@ async fn norn_tcp_request_response_clients(
                 server_addr,
                 requests_per_connection,
                 payload_len,
+                validate_payload,
             )),
             TcpRecvMode::BufRing
             | TcpRecvMode::BufRingLinked
@@ -841,6 +848,7 @@ async fn norn_tcp_request_response_client_normal(
     server_addr: std::net::SocketAddr,
     requests: usize,
     payload_len: usize,
+    validate_payload: bool,
 ) -> io::Result<()> {
     let socket = NornTcpSocket::connect(server_addr).await?;
     socket.set_nodelay(true).await?;
@@ -850,7 +858,9 @@ async fn norn_tcp_request_response_client_normal(
     for _ in 0..requests {
         tcp_write_all(stream.as_mut(), &send_buf).await?;
         tcp_read_exact(stream.as_mut(), &mut recv_buf).await?;
-        assert!(recv_buf.iter().all(|byte| *byte == 0x5A));
+        if validate_payload {
+            assert!(recv_buf.iter().all(|byte| *byte == 0x5A));
+        }
     }
     Ok(())
 }
@@ -1050,33 +1060,40 @@ impl TcpRequestResponseBench {
             (listener, server_addr)
         });
 
+        if self.recv_mode == TcpRecvMode::Normal {
+            ex.block_on(norn_tcp_request_response_roundtrip(
+                &listener,
+                NornTcpRoundtripConfig {
+                    server_addr,
+                    connections: self.connections,
+                    requests_per_connection: self.requests_per_connection,
+                    payload_len: self.payload_len,
+                    recv_mode: self.recv_mode,
+                    coord_mode: self.coord_mode,
+                    validate_payload: true,
+                },
+            ));
+        }
+
         b.iter(|| {
             let connections = self.connections;
             let requests_per_connection = self.requests_per_connection;
             let payload_len = self.payload_len;
             let recv_mode = self.recv_mode;
             let coord_mode = self.coord_mode;
-            ex.block_on(async {
-                futures::try_join!(
-                    norn_tcp_echo_server(
-                        &listener,
-                        connections,
-                        requests_per_connection,
-                        payload_len,
-                        recv_mode,
-                        coord_mode,
-                    ),
-                    norn_tcp_request_response_clients(
-                        server_addr,
-                        connections,
-                        requests_per_connection,
-                        payload_len,
-                        recv_mode,
-                        coord_mode,
-                    )
-                )
-                .unwrap();
-            });
+            let validate_payload = recv_mode != TcpRecvMode::Normal;
+            ex.block_on(norn_tcp_request_response_roundtrip(
+                &listener,
+                NornTcpRoundtripConfig {
+                    server_addr,
+                    connections,
+                    requests_per_connection,
+                    payload_len,
+                    recv_mode,
+                    coord_mode,
+                    validate_payload,
+                },
+            ));
         });
 
         ex.block_on(async {
@@ -1120,6 +1137,44 @@ impl TcpRequestResponseBench {
             });
         });
     }
+}
+
+#[derive(Clone, Copy)]
+struct NornTcpRoundtripConfig {
+    server_addr: std::net::SocketAddr,
+    connections: usize,
+    requests_per_connection: usize,
+    payload_len: usize,
+    recv_mode: TcpRecvMode,
+    coord_mode: TcpCoordMode,
+    validate_payload: bool,
+}
+
+async fn norn_tcp_request_response_roundtrip(
+    listener: &NornTcpListener,
+    config: NornTcpRoundtripConfig,
+) {
+    futures::try_join!(
+        norn_tcp_echo_server(
+            listener,
+            config.connections,
+            config.requests_per_connection,
+            config.payload_len,
+            config.recv_mode,
+            config.coord_mode,
+            config.validate_payload,
+        ),
+        norn_tcp_request_response_clients(
+            config.server_addr,
+            config.connections,
+            config.requests_per_connection,
+            config.payload_len,
+            config.recv_mode,
+            config.coord_mode,
+            config.validate_payload,
+        )
+    )
+    .unwrap();
 }
 
 async fn file_write_read_worker(

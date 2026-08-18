@@ -5,7 +5,7 @@ use std::task::{Context, Poll};
 
 use bencher::{Bencher, TestDesc, TestDescAndFn, TestFn};
 use norn_executor::park::SpinPark;
-use norn_executor::LocalExecutor;
+use norn_executor::{spawn, LocalExecutor};
 
 mod support;
 
@@ -49,6 +49,53 @@ impl std::future::Future for YieldOnce {
     }
 }
 
+struct TaskYieldBench;
+
+impl bencher::TDynBenchFn for TaskYieldBench {
+    fn run(&self, b: &mut Bencher) {
+        let mut executor = LocalExecutor::new(SpinPark);
+        b.iter(|| {
+            executor.block_on(async {
+                let mut handles = Vec::with_capacity(128);
+                for _ in 0..128 {
+                    handles.push(spawn(run_yields(32)));
+                }
+                for handle in handles {
+                    handle.await.unwrap();
+                }
+            });
+            black_box(())
+        });
+    }
+}
+
+async fn run_yields(yields: usize) {
+    for _ in 0..yields {
+        YieldOnce(false).await;
+    }
+}
+
+struct ExecutorSpawnBench(usize);
+
+impl bencher::TDynBenchFn for ExecutorSpawnBench {
+    fn run(&self, b: &mut Bencher) {
+        let mut executor = LocalExecutor::new(SpinPark);
+        let tasks = self.0;
+        b.iter(|| {
+            executor.block_on(async {
+                let mut handles = Vec::with_capacity(tasks);
+                for _ in 0..tasks {
+                    handles.push(spawn(std::future::ready(())));
+                }
+                for handle in handles {
+                    handle.await.unwrap();
+                }
+            });
+            black_box(())
+        });
+    }
+}
+
 fn benches() -> Vec<TestDescAndFn> {
     vec![
         TestDescAndFn {
@@ -64,6 +111,20 @@ fn benches() -> Vec<TestDescAndFn> {
                 ignore: false,
             },
             testfn: TestFn::DynBenchFn(Box::new(BlockOnYieldBench)),
+        },
+        TestDescAndFn {
+            desc: TestDesc {
+                name: Cow::from("bench_task_yield/tasks=128/yields=32"),
+                ignore: false,
+            },
+            testfn: TestFn::DynBenchFn(Box::new(TaskYieldBench)),
+        },
+        TestDescAndFn {
+            desc: TestDesc {
+                name: Cow::from("bench_executor_spawn/tasks=1024"),
+                ignore: false,
+            },
+            testfn: TestFn::DynBenchFn(Box::new(ExecutorSpawnBench(1024))),
         },
     ]
 }

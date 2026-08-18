@@ -1,5 +1,9 @@
+use std::cell::Cell;
+use std::future::Future;
 use std::panic::{self, AssertUnwindSafe};
+use std::pin::Pin;
 use std::rc::Rc;
+use std::task::{Context, Poll};
 
 use futures::FutureExt;
 
@@ -9,6 +13,37 @@ use super::{TestFuture, TestState};
 
 struct PanicOnUnbind {
     _tasks: Rc<TaskSet>,
+}
+
+struct PanicOnSchedule {
+    tasks: Rc<TaskSet>,
+}
+
+impl Schedule for PanicOnSchedule {
+    fn schedule(&self, _runnable: Runnable) {
+        panic!("schedule panic");
+    }
+
+    fn unbind(&self, registered: &RegisteredTask) {
+        unsafe { self.tasks.remove(registered) };
+    }
+}
+
+struct WakeAndPending(Rc<Cell<usize>>);
+
+impl Future for WakeAndPending {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    }
+}
+
+impl Drop for WakeAndPending {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() + 1);
+    }
 }
 
 impl Schedule for PanicOnUnbind {
@@ -87,5 +122,26 @@ fn panic_during_unbind_preserves_registered_reference() {
 
     drop(handle);
     tasks.shutdown();
+    assert_eq!(Rc::strong_count(&tasks), 1);
+}
+
+#[test]
+fn panic_during_reschedule_drops_transferred_runnable_reference_once() {
+    let tasks = Rc::new(TaskSet::new());
+    let future_drops = Rc::new(Cell::new(0));
+    let scheduler = PanicOnSchedule {
+        tasks: Rc::clone(&tasks),
+    };
+    // Safety: the future and its output are both 'static.
+    let (runnable, handle) =
+        unsafe { tasks.bind(WakeAndPending(Rc::clone(&future_drops)), scheduler) };
+
+    let panic = panic::catch_unwind(AssertUnwindSafe(|| runnable.unwrap().run()));
+    assert!(panic.is_err());
+    assert_eq!(future_drops.get(), 0);
+
+    drop(handle);
+    tasks.shutdown();
+    assert_eq!(future_drops.get(), 1);
     assert_eq!(Rc::strong_count(&tasks), 1);
 }

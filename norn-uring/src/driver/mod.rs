@@ -37,13 +37,10 @@ mod unpark;
 
 const LOG: &str = "norn_uring::driver";
 
-/// True if the `needs_park` check should check the submission and completion queues.
-///
-/// This will have a perf impact on each poll, but may ensure better overall performance.
-const NEEDS_PARK_CHECK_RINGS: bool = true;
-
 /// Number of CQEs copied out of the ring at once while draining.
 const COMPLETION_DRAIN_BATCH: usize = 32;
+
+const DEFAULT_COMPLETION_DRAIN_BUDGET: NonZeroUsize = NonZeroUsize::new(32).unwrap();
 
 /// Maximum time each shutdown cancellation attempt waits for the kernel.
 ///
@@ -52,18 +49,24 @@ const COMPLETION_DRAIN_BATCH: usize = 32;
 const SHUTDOWN_CANCEL_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Options controlling normal [`Driver`] operation.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DriverOptions {
     /// Maximum number of completion queue entries handled by one normal park.
     ///
-    /// The default, `None`, drains all ready completions and preserves the
-    /// driver's existing behavior. Setting a nonzero limit can improve
-    /// cooperative scheduling fairness when completions arrive faster than
-    /// application tasks consume them.
+    /// The default is 32. Setting this to `None` drains all ready completions
+    /// and can starve application tasks when completions arrive continuously.
     ///
     /// Shutdown always drains completions exhaustively, regardless of this
     /// option.
     pub completion_drain_budget: Option<NonZeroUsize>,
+}
+
+impl Default for DriverOptions {
+    fn default() -> Self {
+        Self {
+            completion_drain_budget: Some(DEFAULT_COMPLETION_DRAIN_BUDGET),
+        }
+    }
 }
 
 /// [`Driver`] provides a [`Park`] implementation which will drive
@@ -835,8 +838,7 @@ impl Park for Driver {
     }
 
     fn needs_park(&self) -> bool {
-        self.shared
-            .needs_park(self.options.completion_drain_budget.is_some())
+        self.shared.needs_park()
     }
 
     fn shutdown(&mut self) {
@@ -1346,24 +1348,12 @@ impl Shared {
             .push_back((limit, expected_remaining));
     }
 
-    fn needs_park(&self, completion_drain_is_bounded: bool) -> bool {
-        // First check if there are any waiters, this is a cheap check
-        // compared to checking the ring.
-        if self.backpressure.waiters() > 0 {
-            return true;
-        }
-        if NEEDS_PARK_CHECK_RINGS {
-            let mut ring = self.ring.borrow_mut();
-            let (_, sq, cq) = ring.split();
-            sq.is_full()
-                || if completion_drain_is_bounded {
-                    !cq.is_empty()
-                } else {
-                    cq.is_full()
-                }
-        } else {
-            false
-        }
+    fn needs_park(&self) -> bool {
+        // A registered waiter proves that an operation observed a full SQ and
+        // needs the driver to submit queued work. The executor task quantum
+        // bounds all other driver work without inspecting the shared SQ/CQ
+        // indices after every task poll.
+        self.backpressure.waiters() > 0
     }
 
     /// Drain the completion queue into the provided buffer.
@@ -1711,26 +1701,25 @@ mod tests {
     }
 
     #[test]
-    fn completion_drain_budget_is_opt_in() {
-        const BUDGET: usize = 2;
-        const TOTAL: usize = BUDGET + 1;
+    fn completion_drain_budget_is_configurable() {
+        const DEFAULT_BUDGET: usize = DEFAULT_COMPLETION_DRAIN_BUDGET.get();
 
-        let mut unbounded = Driver::new(io_uring::IoUring::builder(), 4).unwrap();
-        preload_nop_completions(&unbounded, TOTAL);
-        unbounded.park(ParkMode::NoPark).unwrap();
-        assert_eq!(unbounded.shared.ring.borrow_mut().completion().len(), 0);
-
-        let options = DriverOptions {
-            completion_drain_budget: NonZeroUsize::new(BUDGET),
-        };
-        let mut bounded =
-            Driver::new_with_options(io_uring::IoUring::builder(), 4, options).unwrap();
-        preload_nop_completions(&bounded, TOTAL);
+        let mut bounded = Driver::new(io_uring::IoUring::builder(), 64).unwrap();
+        preload_nop_completions(&bounded, DEFAULT_BUDGET + 1);
         bounded.park(ParkMode::NoPark).unwrap();
         assert_eq!(bounded.shared.ring.borrow_mut().completion().len(), 1);
-        assert!(bounded.needs_park());
+        assert!(!bounded.needs_park());
         bounded.park(ParkMode::NoPark).unwrap();
         assert_eq!(bounded.shared.ring.borrow_mut().completion().len(), 0);
+
+        let options = DriverOptions {
+            completion_drain_budget: None,
+        };
+        let mut unbounded =
+            Driver::new_with_options(io_uring::IoUring::builder(), 4, options).unwrap();
+        preload_nop_completions(&unbounded, 3);
+        unbounded.park(ParkMode::NoPark).unwrap();
+        assert_eq!(unbounded.shared.ring.borrow_mut().completion().len(), 0);
     }
 
     #[test]

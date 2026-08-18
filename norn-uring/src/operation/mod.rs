@@ -181,7 +181,7 @@ pin_project_lite::pin_project! {
             let this = me.project();
             match this.state {
                 State::Submitted { inner } => {
-                    if !*this.completed {
+                    if !*this.completed && inner.needs_cancel() {
                         let user_data = inner.inner.inner.as_raw_usize();
                         let criteria = CancelBuilder::user_data(user_data as u64);
                         let _ = this.reactor.cancel(criteria, false);
@@ -611,6 +611,15 @@ pub(crate) struct SubmittedOp<T> {
     inner: TypedHandle<T>,
 }
 
+impl<T> SubmittedOp<T> {
+    fn needs_cancel(&self) -> bool {
+        // A terminal CQE ends kernel ownership. Cancelling after that point is
+        // redundant, and the allocation's numeric user_data may be reused
+        // before a queued cancellation reaches the kernel.
+        !self.inner.inner.is_complete()
+    }
+}
+
 impl<T> SubmittedOp<T>
 where
     T: Operation + 'static,
@@ -622,8 +631,15 @@ where
         if !self.inner.is_complete() {
             return None;
         }
-        let results = self.inner.take_completions();
+        let mut results = self.inner.take_completions();
         let mut data = unsafe { self.inner.try_take() }.expect("operation already completed");
+        if results.len() == 1 {
+            let result = results
+                .pop_front()
+                .expect("completion queue length changed");
+            assert!(!result.more());
+            return Some(data.complete(result));
+        }
         let last_idx = results.len() - 1;
         for (idx, result) in results.into_iter().enumerate() {
             if idx == last_idx {
@@ -770,6 +786,30 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct TestSingleshot(Vec<u32>);
+
+    unsafe impl Operation for TestSingleshot {
+        fn cleanup(&mut self, _: CQEResult) {}
+
+        fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+            unimplemented!()
+        }
+    }
+
+    impl Singleshot for TestSingleshot {
+        type Output = Vec<u32>;
+
+        fn update(&mut self, result: CQEResult) {
+            self.0.push(result.into_result().unwrap());
+        }
+
+        fn complete(mut self, result: CQEResult) -> Self::Output {
+            self.0.push(result.into_result().unwrap());
+            self.0
+        }
+    }
+
     fn more_flag() -> u32 {
         (0..=u32::MAX)
             .find(|flags| io_uring::cqueue::more(*flags))
@@ -827,6 +867,53 @@ mod tests {
         assert_eq!(submitted.try_next(), Some(30));
         assert_eq!(submitted.try_next(), None);
         assert!(submitted.inner.is_complete());
+    }
+
+    #[test]
+    fn singleshot_consumes_one_terminal_completion_directly() {
+        let typed = TypedHandle::new(TestSingleshot::default());
+        typed.untyped().complete(CQEResult::new(Ok(30), 0));
+        let mut submitted = SubmittedOp { inner: typed };
+
+        assert_eq!(submitted.try_complete(), Some(vec![30]));
+    }
+
+    #[test]
+    fn singleshot_preserves_multiple_completion_order() {
+        let typed = TypedHandle::new(TestSingleshot::default());
+        let kernel_ref = typed.untyped().into_raw_usize();
+        for (value, flags) in [(10, more_flag()), (20, more_flag()), (30, 0)] {
+            let handle = unsafe { RawOpRef::from_raw_usize(kernel_ref) };
+            handle.complete(CQEResult::new(Ok(value), flags));
+        }
+        let mut submitted = SubmittedOp { inner: typed };
+
+        assert_eq!(submitted.try_complete(), Some(vec![10, 20, 30]));
+    }
+
+    #[test]
+    fn submitted_op_needs_cancel_until_terminal_completion() {
+        let typed = TypedHandle::new(TestOp::default());
+        let completion = typed.untyped();
+        let submitted = SubmittedOp { inner: typed };
+
+        assert!(submitted.needs_cancel());
+        completion.complete(CQEResult::new(Ok(0), 0));
+        assert!(!submitted.needs_cancel());
+    }
+
+    #[test]
+    fn multishot_more_completion_still_needs_cancel() {
+        let typed = TypedHandle::new(TestMultishot);
+        let completion = typed.untyped();
+        let submitted = SubmittedOp { inner: typed };
+
+        completion
+            .clone()
+            .complete(CQEResult::new(Ok(10), more_flag()));
+        assert!(submitted.needs_cancel());
+        completion.complete(CQEResult::new(Ok(20), 0));
+        assert!(!submitted.needs_cancel());
     }
 
     #[test]

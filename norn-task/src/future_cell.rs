@@ -6,7 +6,7 @@
 //!
 //! [`Future`]: std::future::Future
 use std::any::Any;
-use std::cell::RefCell;
+use std::cell::UnsafeCell;
 use std::future::Future;
 use std::panic;
 use std::pin::Pin;
@@ -19,7 +19,11 @@ pub(crate) struct FutureCell<F>
 where
     F: Future,
 {
-    inner: RefCell<Inner<F>>,
+    // Task state is the borrow discipline for this cell: only the running task
+    // may poll, and cancellation/destruction of a running task is deferred.
+    // Methods release Rust references before invoking user destructors, while
+    // the `Dropping` state makes destructor re-entry leave storage untouched.
+    inner: UnsafeCell<Inner<F>>,
 }
 
 impl<F> FutureCell<F>
@@ -28,7 +32,7 @@ where
 {
     pub(crate) fn new(future: F) -> Self {
         Self {
-            inner: RefCell::new(Inner::new(future)),
+            inner: UnsafeCell::new(Inner::new(future)),
         }
     }
 
@@ -58,7 +62,9 @@ where
             State::FutureResult => self.drop_output(),
             State::Empty | State::Dropping => return,
         }
-        let this = &mut *self.inner.borrow_mut();
+        // Safety: no future/output borrow crosses user destructor execution,
+        // and `Dropping` makes destructor re-entry a no-op.
+        let this = unsafe { &mut *self.inner.get() };
         this.state = State::Empty;
     }
 
@@ -68,7 +74,9 @@ where
     /// If the future has not been polled to completion, or if it has been destroyed,
     /// this method will panic.
     pub(crate) fn take_output(&self) -> Result<F::Output, TaskError> {
-        let this = &mut *self.inner.borrow_mut();
+        // Safety: task state permits output access only after polling has
+        // finished, and the single-thread task contract excludes concurrency.
+        let this = unsafe { &mut *self.inner.get() };
         if this.state != State::FutureResult {
             panic!("future not polled to completion");
         }
@@ -78,15 +86,20 @@ where
 
     /// Perform the poll operation on the future.
     ///
+    /// # Safety
+    ///
+    /// The caller must hold the task's exclusive running state for the entire
+    /// poll. Cancellation and destruction must be deferred until this method
+    /// returns.
+    ///
     /// # Panic
     /// This method will panic if the future has already been polled to completion,
     /// or has been dropped.
     ///
     pub(crate) unsafe fn poll(&self, cx: Context<'_>) -> Poll<()> {
-        let result = {
-            let this = &mut *self.inner.borrow_mut();
-            unsafe { this.poll(cx) }
-        };
+        // Safety: the caller guarantees exclusive access while the task is
+        // running. `Inner::poll` catches unwinding from the user future.
+        let result = unsafe { (&mut *self.inner.get()).poll(cx) };
 
         match result {
             Poll::Ready(result) => {
@@ -99,7 +112,9 @@ where
     }
 
     fn begin_drop(&self) -> State {
-        let this = &mut *self.inner.borrow_mut();
+        // Safety: task state serializes lifecycle transitions. This method
+        // never invokes user code while the mutable access is live.
+        let this = unsafe { &mut *self.inner.get() };
         let state = this.state;
         if matches!(state, State::Future | State::FutureResult) {
             this.state = State::Dropping;
@@ -108,27 +123,27 @@ where
     }
 
     fn drop_future(&self) {
-        let storage = {
-            let this = &mut *self.inner.borrow_mut();
-            &mut this.storage as *mut Storage<F>
-        };
+        // Take only a raw pointer across user destructor execution so
+        // re-entrant lifecycle calls do not alias a live Rust reference.
+        let storage = unsafe { &raw mut (*self.inner.get()).storage };
         abort_on_panic(|| unsafe {
             ManuallyDrop::drop(&mut (*storage).future);
         });
     }
 
     fn drop_output(&self) {
-        let storage = {
-            let this = &mut *self.inner.borrow_mut();
-            &mut this.storage as *mut Storage<F>
-        };
+        // See `drop_future`: `Dropping` prevents re-entry from touching the
+        // storage while its destructor is running.
+        let storage = unsafe { &raw mut (*self.inner.get()).storage };
         abort_on_panic(|| unsafe {
             ManuallyDrop::drop(&mut (*storage).output);
         });
     }
 
     fn finish_result(&self, result: Result<F::Output, TaskError>) {
-        let this = &mut *self.inner.borrow_mut();
+        // Safety: the preceding poll/drop transition owns the lifecycle and
+        // left the cell in `Dropping` without retaining a reference.
+        let this = unsafe { &mut *self.inner.get() };
         debug_assert_eq!(this.state, State::Dropping);
         unsafe {
             ptr::write(&mut this.storage.output, ManuallyDrop::new(result));
