@@ -46,7 +46,7 @@
 //! attach timeouts to. [`Operation`], [`Op`], [`Singleshot`], [`Multishot`],
 //! and [`CQEResult`] form the lower-level interface for implementing custom
 //! `io_uring` operations. Implementing [`Operation`] is unsafe; its rustdoc
-//! states the address-stability, kernel-ownership, and cleanup requirements.
+//! states the address-stability, kernel-ownership, and reaping requirements.
 //!
 //! [`Park`]: norn_executor::park::Park
 //! [io_uring]: https://kernel.dk/io_uring.pdf

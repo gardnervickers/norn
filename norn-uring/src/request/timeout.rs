@@ -324,8 +324,6 @@ impl private::Chainable for Timeout {
                 let can_continue = this.inner.prepare_batch(batch);
                 if can_continue {
                     this.control.target.state.mark_queued();
-                } else {
-                    this.control.target.state.mark_complete();
                 }
                 can_continue
             }
@@ -370,7 +368,6 @@ impl private::Chainable for Timeout {
         match this.control.target.state.lifecycle.get() {
             TimeoutLifecycle::Queued => {
                 this.inner.fail_submit(err);
-                this.control.target.state.mark_complete();
             }
             TimeoutLifecycle::CanceledBeforeSubmit => {}
             TimeoutLifecycle::Prepared
@@ -401,21 +398,15 @@ struct TimeoutOp {
 // The lifecycle only permits changing it before the entry is submitted, and
 // every timeout/control handle retains `state` through terminal completion.
 unsafe impl Operation for TimeoutOp {
+    type Completion = io::Result<TimeoutOutcome>;
+
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         Ok(io_uring::opcode::Timeout::new(self.state.timespec.as_ptr())
             .flags(io_uring::types::TimeoutFlags::ETIME_SUCCESS)
             .build())
     }
 
-    fn cleanup(&mut self, _: CQEResult) {
-        self.state.mark_complete();
-    }
-}
-
-impl Singleshot for TimeoutOp {
-    type Output = io::Result<TimeoutOutcome>;
-
-    fn complete(self, result: CQEResult) -> Self::Output {
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
         self.state.mark_complete();
         match result.into_result() {
             Err(err) if err.raw_os_error() == Some(libc::ETIME) => Ok(TimeoutOutcome::Expired),
@@ -426,6 +417,14 @@ impl Singleshot for TimeoutOp {
                 format!("standalone timeout completed with unexpected result {result}"),
             )),
         }
+    }
+}
+
+impl Singleshot for TimeoutOp {
+    type Output = io::Result<TimeoutOutcome>;
+
+    fn complete(self, completion: Self::Completion) -> Self::Output {
+        completion
     }
 }
 
@@ -508,8 +507,6 @@ impl private::Chainable for LinkedTimeout {
         let can_continue = this.inner.prepare_batch(batch);
         if can_continue {
             this.control.target.state.mark_queued();
-        } else {
-            this.control.target.state.mark_complete();
         }
         can_continue
     }
@@ -517,7 +514,6 @@ impl private::Chainable for LinkedTimeout {
     fn cancel_unsubmitted(self: Pin<&mut Self>) {
         let this = self.project();
         this.inner.cancel_unsubmitted();
-        this.control.target.state.mark_complete();
     }
 
     fn finish_submit(self: Pin<&mut Self>) {
@@ -541,7 +537,6 @@ impl private::Chainable for LinkedTimeout {
         match this.control.target.state.lifecycle.get() {
             TimeoutLifecycle::Queued => {
                 this.inner.fail_submit(err);
-                this.control.target.state.mark_complete();
             }
             TimeoutLifecycle::Complete => {}
             TimeoutLifecycle::Prepared
@@ -562,21 +557,23 @@ struct LinkTimeoutOp {
 // lifetime of the linked request. Resets mutate it only before submission or
 // use a separate `TimeoutUpdateOp` after submission.
 unsafe impl Operation for LinkTimeoutOp {
+    type Completion = io::Result<()>;
+
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         Ok(io_uring::opcode::LinkTimeout::new(self.state.timespec.as_ptr()).build())
     }
 
-    fn cleanup(&mut self, _: CQEResult) {
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
         self.state.mark_complete();
+        result.into_result().map(drop)
     }
 }
 
 impl Singleshot for LinkTimeoutOp {
     type Output = io::Result<()>;
 
-    fn complete(self, result: CQEResult) -> Self::Output {
-        self.state.mark_complete();
-        result.into_result().map(drop)
+    fn complete(self, completion: Self::Completion) -> Self::Output {
+        completion
     }
 }
 
@@ -857,18 +854,22 @@ struct TimeoutRemoveOp {
 // `OpTarget` prevents that identity from being reused until this request's
 // terminal completion has been reaped.
 unsafe impl Operation for TimeoutRemoveOp {
+    type Completion = io::Result<bool>;
+
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         Ok(io_uring::opcode::TimeoutRemove::new(self.target.user_data()).build())
     }
 
-    fn cleanup(&mut self, _: CQEResult) {}
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+        control_result("timeout removal", result)
+    }
 }
 
 impl Singleshot for TimeoutRemoveOp {
     type Output = io::Result<bool>;
 
-    fn complete(self, result: CQEResult) -> Self::Output {
-        control_result("timeout removal", result)
+    fn complete(self, completion: Self::Completion) -> Self::Output {
+        completion
     }
 }
 
@@ -931,6 +932,8 @@ impl TimeoutUpdate {
                 this.inner.set(Some(Op::new(
                     TimeoutUpdateOp {
                         target: this.target.operation.clone(),
+                        state: Rc::clone(&this.target.state),
+                        duration: *this.duration,
                         timespec: (*this.duration).into(),
                         kind: this.target.kind,
                     },
@@ -968,9 +971,6 @@ impl Future for TimeoutUpdate {
             .expect("initialized update missing operation");
         match Future::poll(inner, cx) {
             Poll::Ready(output) => {
-                if matches!(output, Ok(true)) {
-                    this.target.state.duration.set(*this.duration);
-                }
                 *this.done = true;
                 Poll::Ready(output)
             }
@@ -1000,6 +1000,8 @@ impl private::Chainable for TimeoutUpdate {
             this.inner.set(Some(Op::new(
                 TimeoutUpdateOp {
                     target: target.operation,
+                    state: Rc::clone(&target.state),
+                    duration,
                     timespec: duration.into(),
                     kind: target.kind,
                 },
@@ -1029,6 +1031,8 @@ impl private::Chainable for TimeoutUpdate {
 #[derive(Debug)]
 struct TimeoutUpdateOp {
     target: OpTarget,
+    state: Rc<TimeoutState>,
+    duration: Duration,
     timespec: io_uring::types::Timespec,
     kind: TimeoutKind,
 }
@@ -1037,6 +1041,8 @@ struct TimeoutUpdateOp {
 // remains alive through terminal completion. `OpTarget` keeps the target's
 // `user_data` identity allocated for the same period.
 unsafe impl Operation for TimeoutUpdateOp {
+    type Completion = io::Result<bool>;
+
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let flags = match self.kind {
             TimeoutKind::Standalone => io_uring::types::TimeoutFlags::empty(),
@@ -1049,14 +1055,20 @@ unsafe impl Operation for TimeoutUpdateOp {
         )
     }
 
-    fn cleanup(&mut self, _: CQEResult) {}
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+        let completion = control_result("timeout update", result);
+        if matches!(&completion, Ok(true)) {
+            self.state.duration.set(self.duration);
+        }
+        completion
+    }
 }
 
 impl Singleshot for TimeoutUpdateOp {
     type Output = io::Result<bool>;
 
-    fn complete(self, result: CQEResult) -> Self::Output {
-        control_result("timeout update", result)
+    fn complete(self, completion: Self::Completion) -> Self::Output {
+        completion
     }
 }
 
@@ -1093,18 +1105,22 @@ mod tests {
     struct Nop;
 
     unsafe impl Operation for Nop {
+        type Completion = CQEResult;
+
         fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
             Ok(io_uring::opcode::Nop::new().build())
         }
 
-        fn cleanup(&mut self, _: CQEResult) {}
+        unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+            result
+        }
     }
 
     impl Singleshot for Nop {
         type Output = io::Result<()>;
 
-        fn complete(self, result: CQEResult) -> Self::Output {
-            result.into_result().map(drop)
+        fn complete(self, completion: Self::Completion) -> Self::Output {
+            completion.into_result().map(drop)
         }
     }
 
@@ -1112,18 +1128,22 @@ mod tests {
     struct ConfigureFails;
 
     unsafe impl Operation for ConfigureFails {
+        type Completion = CQEResult;
+
         fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
             Err(io::Error::from_raw_os_error(libc::EINVAL))
         }
 
-        fn cleanup(&mut self, _: CQEResult) {}
+        unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+            result
+        }
     }
 
     impl Singleshot for ConfigureFails {
         type Output = io::Result<()>;
 
-        fn complete(self, result: CQEResult) -> Self::Output {
-            result.into_result().map(drop)
+        fn complete(self, completion: Self::Completion) -> Self::Output {
+            completion.into_result().map(drop)
         }
     }
 
@@ -1134,6 +1154,74 @@ mod tests {
             Poll::Ready(output) => output,
             Poll::Pending => panic!("future should complete locally"),
         }
+    }
+
+    #[test]
+    fn timeout_reap_reconciles_lifecycle_before_completion_consumption() {
+        let standalone_state = Rc::new(TimeoutState::new(Duration::from_secs(1)));
+        standalone_state.mark_submitted();
+        let mut standalone = TimeoutOp {
+            state: Rc::clone(&standalone_state),
+        };
+
+        // Safety: each value models the unique terminal CQE for its operation.
+        let standalone_completion = unsafe {
+            standalone.reap(CQEResult::new(
+                Err(io::Error::from_raw_os_error(libc::ETIME)),
+                0,
+            ))
+        };
+        assert_eq!(standalone_state.lifecycle.get(), TimeoutLifecycle::Complete);
+        assert_eq!(standalone_completion.unwrap(), TimeoutOutcome::Expired);
+
+        let linked_state = Rc::new(TimeoutState::new(Duration::from_secs(1)));
+        linked_state.mark_submitted();
+        let mut linked = LinkTimeoutOp {
+            state: Rc::clone(&linked_state),
+        };
+
+        // Safety: this models the unique terminal CQE for this LinkTimeoutOp.
+        let linked_completion = unsafe { linked.reap(CQEResult::new(Ok(0), 0)) };
+        assert_eq!(linked_state.lifecycle.get(), TimeoutLifecycle::Complete);
+        linked_completion.unwrap();
+    }
+
+    #[test]
+    fn timeout_update_reap_updates_cached_duration_only_on_success() {
+        let driver = crate::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let timeout = driver.handle().timeout(Duration::from_secs(60));
+        let target = timeout.control.target.clone();
+        target.state.mark_submitted();
+
+        let updated = Duration::from_millis(25);
+        let mut successful = TimeoutUpdateOp {
+            target: target.operation.clone(),
+            state: Rc::clone(&target.state),
+            duration: updated,
+            timespec: updated.into(),
+            kind: target.kind,
+        };
+        // Safety: this models the unique terminal CQE for this update operation.
+        assert!(unsafe { successful.reap(CQEResult::new(Ok(0), 0)) }.unwrap());
+        assert_eq!(target.state.duration.get(), updated);
+
+        let rejected = Duration::from_secs(5);
+        let mut unsuccessful = TimeoutUpdateOp {
+            target: target.operation.clone(),
+            state: Rc::clone(&target.state),
+            duration: rejected,
+            timespec: rejected.into(),
+            kind: target.kind,
+        };
+        // Safety: this models the unique terminal CQE for this update operation.
+        assert!(!unsafe {
+            unsuccessful.reap(CQEResult::new(
+                Err(io::Error::from_raw_os_error(libc::ENOENT)),
+                0,
+            ))
+        }
+        .unwrap());
+        assert_eq!(target.state.duration.get(), updated);
     }
 
     #[test]

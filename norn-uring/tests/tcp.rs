@@ -323,6 +323,47 @@ fn recv_bundle_recycles_compact_and_materialized_buffers() -> Result<(), Box<dyn
 }
 
 #[test]
+fn recv_bundle_shared_ring_handles_reverse_poll_order() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let (first_server, first_client) = connected_pair().await?;
+        let (second_server, second_client) = connected_pair().await?;
+        let ring = RecvBufRing::builder(11).buf_cnt(8).buf_len(256).build()?;
+
+        let mut first_recv = pin!(first_server.recv_bundle(&ring));
+        let mut second_recv = pin!(second_server.recv_bundle(&ring));
+        assert!(futures_util::poll!(&mut first_recv).is_pending());
+        assert!(futures_util::poll!(&mut second_recv).is_pending());
+
+        first_client.send(b"first".to_vec()).await.0?;
+        second_client.send(b"second".to_vec()).await.0?;
+
+        // Consume the application futures in the opposite order from their
+        // submissions. Ownership must already have been reconciled by reap.
+        let second = match second_recv.await {
+            Ok(bundle) => bundle,
+            Err(err) if util::recv_bundle_unsupported(&err) => return Ok(()),
+            Err(err) => return Err(err.into()),
+        };
+        let first = first_recv.await?;
+        assert_eq!(
+            second.iter().flatten().copied().collect::<Vec<_>>(),
+            b"second"
+        );
+        assert_eq!(
+            first.iter().flatten().copied().collect::<Vec<_>>(),
+            b"first"
+        );
+
+        drop((first, second));
+        first_server.close().await?;
+        first_client.close().await?;
+        second_server.close().await?;
+        second_client.close().await?;
+        Ok(())
+    })
+}
+
+#[test]
 fn send_zc_smoke() -> Result<(), Box<dyn std::error::Error>> {
     util::with_test_env(|| async {
         let (server, client) = connected_pair().await?;

@@ -141,14 +141,16 @@ impl bencher::TDynBenchFn for LaggedBurstBench {
 struct DrainNop;
 
 unsafe impl norn_uring::Operation for DrainNop {
+    type Completion = norn_uring::CQEResult;
+
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         Ok(io_uring::opcode::Nop::new()
             .build()
             .flags(io_uring::squeue::Flags::IO_DRAIN))
     }
 
-    fn cleanup(&mut self, result: norn_uring::CQEResult) {
-        result.into_result().unwrap();
+    unsafe fn reap(&mut self, result: norn_uring::CQEResult) -> Self::Completion {
+        result
     }
 }
 
@@ -195,6 +197,8 @@ impl MultishotTimeout {
 }
 
 unsafe impl norn_uring::Operation for MultishotTimeout {
+    type Completion = norn_uring::CQEResult;
+
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         Ok(io_uring::opcode::Timeout::new(&*self.interval)
             .count(self.repeats)
@@ -202,8 +206,8 @@ unsafe impl norn_uring::Operation for MultishotTimeout {
             .build())
     }
 
-    fn cleanup(&mut self, result: norn_uring::CQEResult) {
-        validate_timeout_result(result, true);
+    unsafe fn reap(&mut self, result: norn_uring::CQEResult) -> Self::Completion {
+        result
     }
 }
 

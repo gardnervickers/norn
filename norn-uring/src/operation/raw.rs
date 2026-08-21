@@ -2,17 +2,46 @@
 //! track an in-flight request. This module is pretty much
 //! entirely unsafe.
 
-use std::cell::UnsafeCell;
+use std::cell::RefCell;
 use std::ptr::NonNull;
 use std::{io, mem};
 
 use crate::operation::header::{Header, VTable};
+use crate::operation::queue::CompletionQueue;
 use crate::operation::Operation;
 
+#[inline]
+fn abort_on_panic<R>(f: impl FnOnce() -> R) -> R {
+    struct Bomb;
+
+    impl Drop for Bomb {
+        fn drop(&mut self) {
+            std::process::abort();
+        }
+    }
+
+    let bomb = Bomb;
+    let result = f();
+    mem::forget(bomb);
+    result
+}
+
 #[repr(C)]
-pub(crate) struct RawOp<T> {
+pub(crate) struct RawOp<T>
+where
+    T: Operation,
+{
     header: Header,
-    data: UnsafeCell<Option<T>>,
+    state: RefCell<RawState<T>>,
+}
+
+pub(crate) struct RawState<T>
+where
+    T: Operation,
+{
+    // Drop queued owned completions before the operation data that reaped them.
+    pub(crate) completions: CompletionQueue<T::Completion>,
+    pub(crate) data: Option<T>,
 }
 
 impl<T> RawOp<T>
@@ -22,14 +51,17 @@ where
     const VTABLE: VTable = VTable {
         drop_ref: Self::drop_ref,
         clone_ref: Self::clone_ref,
-        complete: Self::complete,
+        reap: Self::reap,
     };
 
     pub(crate) fn allocate(data: T) -> NonNull<Header> {
         let header = Header::new(&Self::VTABLE);
         let raw = RawOp {
             header,
-            data: UnsafeCell::new(Some(data)),
+            state: RefCell::new(RawState {
+                completions: CompletionQueue::new(),
+                data: Some(data),
+            }),
         };
         let ptr = Box::into_raw(Box::new(raw));
         // Safety: `ptr` is a valid pointer to a `Header`. RawOp is also
@@ -50,27 +82,22 @@ where
     /// # Safety
     /// This should only ever be called when the reference count is 0.
     unsafe fn destroy(ptr: NonNull<Header>) {
-        let mut raw = Self::from_raw_header(ptr);
+        let raw = Self::from_raw_header(ptr);
         // The refcount should be 0 now, so we are the only owner. We can
         // thus borrow mutably.
-        let this = raw.as_mut();
+        let mut this = Box::from_raw(raw.as_ptr());
         debug_assert!(this.header.refcount() == 0);
 
-        if let Some(mut data) = this.data_mut().take() {
-            let completions = this.header.completions_mut().get_mut();
-            for result in mem::take(completions) {
-                data.cleanup(result);
-            }
-        } else if !this.header.completions().borrow().is_empty() {
-            panic!("operation state cone without waiting for all completions");
+        let state = this.state.get_mut();
+        while let Some(completion) = state.completions.pop_front() {
+            drop(completion);
         }
-        // Safety: We can cast to Box<RawTask> because we allocated it with Box::new,
-        // and Header is the first field in RawTask (which is repr(C)).
-        drop(Box::from_raw(this as *mut Self));
+        debug_assert!(state.completions.is_empty());
+        drop(this);
     }
 
-    pub(crate) unsafe fn data_mut(&mut self) -> &mut Option<T> {
-        &mut *self.data.get()
+    pub(crate) fn state(&self) -> &RefCell<RawState<T>> {
+        &self.state
     }
 
     unsafe fn clone_ref(ptr: NonNull<Header>) {
@@ -78,22 +105,29 @@ where
         this.as_ref().header.inc_refcount();
     }
 
-    unsafe fn complete(ptr: NonNull<Header>, result: CQEResult) -> bool {
+    unsafe fn reap(ptr: NonNull<Header>, result: CQEResult) {
         let more = result.more();
         let this = Self::from_raw_header(ptr);
-        let header = &this.as_ref().header;
-        assert!(!header.is_complete());
-        {
-            let mut completions = header.completions().borrow_mut();
-            completions.push(result);
-        }
+        let this = this.as_ref();
+        let header = &this.header;
+        abort_on_panic(|| {
+            assert!(!header.is_complete());
+            let mut state = this.state.borrow_mut();
+            let data = state
+                .data
+                .as_mut()
+                .expect("operation data missing while reaping completion");
+            // Safety: this vtable is reached through the exact RawOpRef retained for the kernel
+            // CQE or synthetic failure, and the runtime invokes it exactly once for that result.
+            let completion = unsafe { data.reap(result) };
+            state.completions.push(completion);
+        });
         if !more {
             header.set_complete();
         }
         if let Some(waker) = header.take_waker() {
             waker.wake();
         }
-        true
     }
 
     #[inline]
@@ -105,8 +139,7 @@ where
 /// The result value and flags from one `io_uring` completion queue entry.
 ///
 /// Values of this type are created by the runtime and passed to
-/// [`Operation`](crate::Operation), [`Singleshot`](crate::Singleshot), and
-/// [`Multishot`](crate::Multishot) implementations.
+/// [`Operation::reap`](crate::Operation::reap).
 #[derive(Debug)]
 pub struct CQEResult {
     pub(crate) result: io::Result<u32>,
@@ -137,7 +170,8 @@ impl CQEResult {
         }
     }
 
-    pub(crate) fn is_synthetic(&self) -> bool {
+    /// Return whether this completion was generated before the kernel saw the operation.
+    pub fn is_synthetic(&self) -> bool {
         self.source == CompletionSource::Synthetic
     }
 
@@ -200,7 +234,15 @@ impl RawOpRef {
         self.inner
     }
 
-    pub(crate) fn complete(self, result: CQEResult) -> bool {
+    /// Reap one completion belonging to this exact operation.
+    ///
+    /// # Safety
+    ///
+    /// `result` must be the unique raw or synthetic completion produced for the
+    /// operation referenced by `self`, and it must not have been reaped before.
+    /// Supplying another operation's completion can manufacture ownership of
+    /// resources that this operation does not own.
+    pub(crate) unsafe fn reap(self, result: CQEResult) {
         let more = result.more();
         let inner = self.inner;
         if more {
@@ -211,7 +253,9 @@ impl RawOpRef {
             mem::forget(self);
         }
         let header = unsafe { inner.as_ref() };
-        unsafe { (header.vtable.complete)(inner, result) }
+        // Safety: upheld by this method's caller; `inner` is retained by `self`
+        // (or deliberately retained above for a non-terminal completion).
+        unsafe { (header.vtable.reap)(inner, result) }
     }
 
     fn as_raw(&self) -> *const () {
