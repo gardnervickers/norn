@@ -50,6 +50,27 @@ fn invalid_zc_notification_error() -> io::Error {
     )
 }
 
+fn validate_recv_bundle_flags(flags: i32) -> io::Result<()> {
+    if flags & libc::MSG_TRUNC != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "MSG_TRUNC is unsupported for receive bundles because the completion byte count does not identify how many buffers were selected",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_recv_multi_bundle_flags(flags: i32) -> io::Result<()> {
+    validate_recv_bundle_flags(flags)?;
+    if flags & libc::MSG_WAITALL != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "MSG_WAITALL is unsupported for multishot receive bundles",
+        ));
+    }
+    Ok(())
+}
+
 fn complete_recv_buffer<B>(
     buf: &mut B,
     submitted_len: usize,
@@ -1024,6 +1045,7 @@ unsafe impl Operation for RecvRingBundle {
     type Completion = io::Result<BufRingBufBundle>;
 
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+        validate_recv_bundle_flags(self.flags)?;
         let this = self;
         Ok(opcode::RecvBundle::new(this.fd.fd(), this.ring.bgid())
             .flags(this.flags)
@@ -1064,6 +1086,7 @@ unsafe impl Operation for RecvRingBundleMulti {
     type Completion = io::Result<BufRingBufBundle>;
 
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+        validate_recv_multi_bundle_flags(self.flags)?;
         let this = self;
         Ok(opcode::RecvMultiBundle::new(this.fd.fd(), this.ring.bgid())
             .flags(this.flags)
@@ -1878,6 +1901,34 @@ mod tests {
             2
         );
         assert_eq!(buf.len(), 1);
+    }
+
+    #[test]
+    fn recv_bundle_flag_validation_matches_single_and_multishot_contracts() {
+        for flags in [
+            0,
+            libc::MSG_WAITALL,
+            libc::MSG_PEEK,
+            libc::MSG_WAITALL | libc::MSG_PEEK,
+        ] {
+            validate_recv_bundle_flags(flags).unwrap();
+
+            let err = validate_recv_bundle_flags(flags | libc::MSG_TRUNC).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+            assert!(err.to_string().contains("MSG_TRUNC"));
+        }
+
+        for flags in [0, libc::MSG_PEEK] {
+            validate_recv_multi_bundle_flags(flags).unwrap();
+        }
+        for flags in [libc::MSG_WAITALL, libc::MSG_WAITALL | libc::MSG_PEEK] {
+            let err = validate_recv_multi_bundle_flags(flags).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+            assert!(err.to_string().contains("MSG_WAITALL"));
+        }
+        let err =
+            validate_recv_multi_bundle_flags(libc::MSG_TRUNC | libc::MSG_WAITALL).unwrap_err();
+        assert!(err.to_string().contains("MSG_TRUNC"));
     }
 
     fn build_test_ring(driver: &crate::Driver, bgid: u16) -> io::Result<RecvBufRing> {

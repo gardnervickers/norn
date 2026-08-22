@@ -324,6 +324,12 @@ impl UdpSocket {
     /// # Panics
     ///
     /// Panics when the buffer ring was registered with another driver.
+    ///
+    /// # Errors
+    ///
+    /// The request resolves with [`io::ErrorKind::InvalidInput`] when `flags`
+    /// contains `MSG_TRUNC`, because its result does not identify the number of
+    /// buffers selected by a bundle receive.
     pub fn recv_bundle_with_flags(
         &self,
         ring: &RecvBufRing,
@@ -349,6 +355,13 @@ impl UdpSocket {
     /// # Panics
     ///
     /// Panics when the buffer ring was registered with another driver.
+    ///
+    /// # Errors
+    ///
+    /// The stream yields [`io::ErrorKind::InvalidInput`] and terminates when
+    /// `flags` contains `MSG_TRUNC` or `MSG_WAITALL`. `MSG_TRUNC` does not
+    /// identify the number of selected buffers, and multishot receives do not
+    /// support `MSG_WAITALL`.
     pub fn recv_bundle_multi_with_flags(
         &self,
         ring: &RecvBufRing,
