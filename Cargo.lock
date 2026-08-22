@@ -1067,8 +1067,11 @@ version = "0.1.0"
 dependencies = [
  "futures-util",
  "io-uring",
+ "libc",
+ "norn-channel",
  "norn-executor",
  "norn-uring",
+ "smallvec",
  "thiserror",
 ]
 

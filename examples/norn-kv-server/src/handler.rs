@@ -50,8 +50,16 @@ impl MemoryHandler {
         request: Request<'_>,
         out: &mut ResponseEncoder<'_>,
     ) -> Result<ConnectionAction, EncodeError> {
-        let header = request.header();
-        match request.command() {
+        self.execute_command(request.header(), request.command(), out)
+    }
+
+    pub(crate) fn execute_command(
+        &self,
+        header: crate::protocol::RequestHeader,
+        command: Command<'_>,
+        out: &mut ResponseEncoder<'_>,
+    ) -> Result<ConnectionAction, EncodeError> {
+        match command {
             Command::Get { key, quiet } => {
                 let store = self.store.borrow();
                 if let Some(entry) = store.get(key) {
