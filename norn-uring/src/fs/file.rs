@@ -563,7 +563,7 @@ unsafe impl Operation for Open {
 
     unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
         let fd = result.into_result()?;
-        // Safety: a successful `OpenAt2` CQE transfers ownership of a newly opened fd.
+        // Safety: a successful `OpenAt2` CQE transfers ownership of a newly opened file descriptor.
         Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
     }
 }

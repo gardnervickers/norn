@@ -4,12 +4,11 @@ use std::task::Waker;
 
 use super::CQEResult;
 
-/// Header is the first field in every operation. It is the handle
-/// through which the reactor completes operations.
+/// The header is the first field in every operation. The reactor uses it to
+/// route completions without knowing the operation's concrete type.
 ///
-/// There will be multiple references to the header outstanding, so
-/// it is important that all fields in the header support interior
-/// mutability.
+/// Multiple references to the header may be outstanding, so all state uses
+/// interior mutability.
 pub(crate) struct Header {
     refcount: Cell<usize>,
     waker: RefCell<Option<Waker>>,
@@ -20,36 +19,35 @@ pub(crate) struct Header {
 pub(crate) struct VTable {
     /// Called when a handle to the [`Header`] is dropped.
     ///
-    /// This should call [`Header::dec_refcount`] and obey
-    /// the return value. Only dropping the operation if
-    /// the last reference was dropped.
+    /// The implementation must call [`Header::dec_refcount`] and destroy the
+    /// operation only when the last reference is dropped.
     ///
-    /// # Safety:
-    /// Callers must ensure that the pointer is valid and points
-    /// to a valid [`Header`].
+    /// # Safety
+    ///
+    /// The pointer must reference a live [`Header`].
     pub(crate) drop_ref: unsafe fn(NonNull<Header>),
 
     /// Called when a handle to the [`Header`] is cloned.
     ///
-    /// This should call [`Header::inc_refcount`].
+    /// The implementation must call [`Header::inc_refcount`].
     ///
-    /// # Safety:
-    /// Callers must ensure that the pointer is valid and points
-    /// to a valid [`Header`].
+    /// # Safety
+    ///
+    /// The pointer must reference a live [`Header`].
     pub(crate) clone_ref: unsafe fn(NonNull<Header>),
 
-    /// Called when a completion is received for the operation.
+    /// Called when a kernel or synthetic completion is reaped for the operation.
     ///
-    /// Note that an operation may receive multiple completions.
-    /// The `CQEResult` more flag will be set to indicate if there
-    /// are additional completions.
+    /// An operation may receive multiple completions. [`CQEResult::more`]
+    /// reports whether another completion will follow.
     ///
-    /// If `CQEResult::more` returns false, ensure that `Header::set_complete`
-    /// is called.
+    /// If [`CQEResult::more`] returns false, the implementation must call
+    /// [`Header::set_complete`] after queuing the owned completion.
     ///
-    /// # Safety:
-    /// Callers must ensure that the pointer is valid and points
-    /// to a valid [`Header`].
+    /// # Safety
+    ///
+    /// The pointer must reference the operation that produced `result`, and the
+    /// completion must not have been reaped before.
     pub(crate) reap: unsafe fn(NonNull<Header>, result: CQEResult),
 }
 
@@ -87,8 +85,6 @@ impl Header {
     }
 
     /// Returns true if there are no more completions to be received.
-    ///
-    /// This should be called
     pub(crate) fn is_complete(&self) -> bool {
         self.complete.get()
     }
@@ -96,7 +92,9 @@ impl Header {
     /// Set the complete flag.
     ///
     /// # Safety
-    /// This should **only** be called if `CQEResult::more` returns false.
+    ///
+    /// The terminal completion must already be queued, and [`CQEResult::more`]
+    /// must have returned false for it.
     pub(crate) unsafe fn set_complete(&self) {
         self.complete.set(true);
     }

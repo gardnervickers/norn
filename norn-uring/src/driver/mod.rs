@@ -173,9 +173,9 @@ pub(super) enum Status {
     Closing,
     /// The driver is waiting for all admitted operations to become terminal.
     DrainingOperations,
-    /// Operation completions have been reaped and cleanup-generated work is being flushed.
+    /// Operation completions have been reaped and resource-release work is being flushed.
     ClosingResources,
-    /// The driver is waiting for cleanup-generated work to become terminal.
+    /// The driver is waiting for resource-release work to become terminal.
     DrainingResources,
     /// The driver has shutdown and will not accept new requests.
     Shutdown,
@@ -907,8 +907,8 @@ impl Driver {
                 }
                 Status::ClosingResources => {
                     // Reaping the first barrier can destroy RawOps. Their destructors may
-                    // enqueue close SQEs or other cleanup work after that barrier, so flush
-                    // the complete userspace SQ before ordering a final drain behind it.
+                    // enqueue close SQEs or other resource-release work after that barrier,
+                    // so flush the complete userspace SQ before ordering a final drain behind it.
                     if let Err(err) = self.shared.submit_all_pending() {
                         self.retry_shutdown("submit_cleanup", &err);
                         continue;
@@ -1489,7 +1489,7 @@ mod tests {
                 LongLivedIo::Read { .. } => LongLivedCompletion::Read(result.into_result()),
                 LongLivedIo::Accept(_) => {
                     LongLivedCompletion::Accept(result.into_result().map(|fd| {
-                        // Safety: a successful accept CQE transfers ownership of this fd.
+                        // Safety: a successful accept CQE transfers ownership of this descriptor.
                         unsafe { OwnedFd::from_raw_fd(fd as i32) }
                     }))
                 }

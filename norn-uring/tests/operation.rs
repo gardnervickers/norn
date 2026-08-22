@@ -9,8 +9,9 @@ mod util;
 #[derive(Debug)]
 struct PublicNop;
 
-// Safety: NOP has no referenced resources and produces exactly one terminal
-// completion. The reaped value owns everything represented by the CQE.
+// Safety: NOP references no resources and produces one terminal CQE. Returning
+// `CQEResult` from `reap` preserves the result and flags without claiming
+// ownership.
 unsafe impl Operation for PublicNop {
     type Completion = CQEResult;
 

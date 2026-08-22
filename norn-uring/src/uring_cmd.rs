@@ -84,11 +84,11 @@ impl Command16 {
 /// - the command produces exactly one terminal completion and does not enable a
 ///   multishot mode;
 /// - [`UringCommand16::reap`] returns an owned value that safely releases every
-///   resource represented by the CQE when dropped, including for synthetic
-///   configuration or submission failures; and
+///   resource represented by the completion when dropped, including when configuration,
+///   submission, or cancellation before submission produces a synthetic failure; and
 /// - [`UringCommand16::reap`] does not unwind.
 pub unsafe trait UringCommand16: Sized + 'static {
-    /// The owned interpretation of the command's terminal CQE.
+    /// The owned value produced from the command's terminal completion.
     type Completion: 'static;
 
     /// The result produced from the command's terminal completion.
@@ -101,16 +101,17 @@ pub unsafe trait UringCommand16: Sized + 'static {
     /// Returns an error if a valid command payload cannot be constructed.
     fn encode(&mut self) -> io::Result<Command16>;
 
-    /// Convert the raw terminal CQE into an owned completion. A panic from this method aborts the
-    /// process because the dequeued CQE cannot be replayed.
+    /// Convert the command's terminal completion into an owned value.
+    ///
+    /// A panic from this method aborts the process because the completion cannot be safely
+    /// replayed.
     ///
     /// # Safety
     ///
-    /// `result` must be the unique terminal completion produced for this exact command and must
-    /// not have been passed to another reaper.
+    /// `result` must be an unreaped kernel or synthetic completion produced for this command.
     unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion;
 
-    /// Convert the owned completion into this command's output.
+    /// Convert the owned completion into the command's output.
     fn complete(self, completion: Self::Completion) -> Self::Output;
 }
 
@@ -126,7 +127,8 @@ impl<C> CommandOp<C> {
 }
 
 // Safety: `NornFd` retains the target descriptor and `UringCommand16` supplies
-// the lifetime, single-completion, and reap contract for the encoded payload.
+// the lifetime, single-completion, and completion-ownership contracts for the
+// encoded payload.
 unsafe impl<C> Operation for CommandOp<C>
 where
     C: UringCommand16,
@@ -147,7 +149,7 @@ where
     }
 
     unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
-        // Safety: CommandOp receives the completion for this exact encoded command once.
+        // Safety: `CommandOp` forwards this command's unreaped terminal completion.
         unsafe { self.command.reap(result) }
     }
 }

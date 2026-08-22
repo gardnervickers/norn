@@ -23,7 +23,7 @@ use crate::error::SubmitError;
 /// # Safety
 ///
 /// Implementing this trait asserts that every entry returned by [`Operation::configure`]
-/// remains valid for the complete lifetime of the kernel operation. In particular:
+/// remains valid for the entire lifetime of the kernel operation. In particular:
 ///
 /// - every pointer, file descriptor, fixed-resource index, and other resource referenced by
 ///   the entry must remain valid for every access the opcode permits, through the terminal CQE;
@@ -35,9 +35,10 @@ use crate::error::SubmitError;
 ///   CQE or kernel access associated with the operation;
 /// - requesting cancellation does not end the operation's lifetime. All referenced resources
 ///   must remain valid until the original operation produces its terminal CQE;
-/// - [`Operation::reap`] must convert every CQE into an owned completion that accounts for all
-///   resources created, selected, or otherwise transferred by the kernel. Dropping that value
-///   must release those resources without consulting the operation again; and
+/// - [`Operation::reap`] must convert every kernel CQE or synthetic completion into an owned
+///   value that accounts for all resources created, selected, or otherwise transferred by the
+///   kernel. Dropping that value must release those resources without consulting the operation
+///   again; and
 /// - [`Operation::reap`] must not unwind. A CQE cannot be replayed after it has been removed from
 ///   the kernel completion queue.
 ///
@@ -47,10 +48,10 @@ use crate::error::SubmitError;
 /// completion handler. The runtime overwrites the SQE's `user_data` field for its own tracking
 /// and cannot verify any of the requirements above.
 pub unsafe trait Operation {
-    /// The owned interpretation of one CQE.
+    /// The owned value produced from one completion.
     ///
     /// Values are queued until application code consumes them. If the request is abandoned,
-    /// they are instead dropped in CQE order while the operation is destroyed.
+    /// they are instead dropped in completion order while the operation is destroyed.
     type Completion: 'static;
 
     /// Configure a new [`io_uring::squeue::Entry`] for this operation.
@@ -68,21 +69,22 @@ pub unsafe trait Operation {
     /// queue entry. The runtime delivers this through the normal completion path.
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry>;
 
-    /// Convert one raw CQE into an owned completion.
+    /// Convert one kernel or synthetic completion into an owned value.
     ///
-    /// The runtime invokes this exactly once for each CQE, before exposing terminal state or
-    /// waking application code. It may be called multiple times for a multishot operation. A panic
-    /// from this method aborts the process because the dequeued CQE cannot be replayed.
+    /// The runtime invokes this exactly once for each kernel CQE or synthetic completion, before
+    /// exposing terminal state or waking application code. It may be called multiple times for a
+    /// multishot operation. A panic from this method aborts the process because the completion
+    /// cannot be safely replayed.
     ///
-    /// Configuration, submission, and pre-submission cancellation failures are represented by a
-    /// synthetic error completion. Implementations can distinguish those from kernel CQEs with
-    /// [`CQEResult::is_synthetic`].
+    /// Configuration failures, submission failures, and cancellation before submission are
+    /// represented by synthetic error completions. Implementations can distinguish them from
+    /// kernel CQEs with [`CQEResult::is_synthetic`].
     ///
     /// # Safety
     ///
-    /// `result` must be the unique raw or synthetic completion produced for this exact operation,
-    /// and it must not have been passed to another reaper. Supplying a completion from a different
-    /// operation can cause the implementation to claim resources that it does not own.
+    /// `result` must be an unreaped kernel or synthetic completion produced for this operation.
+    /// Supplying a completion from a different operation can cause the implementation to claim
+    /// resources that it does not own.
     unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion;
 }
 
@@ -91,10 +93,12 @@ pub trait Singleshot: Operation {
     /// The value returned once the final completion is observed.
     type Output;
 
-    /// Convert the terminal owned completion into the request output.
+    /// Convert the terminal completion into the request's output.
     fn complete(self, completion: Self::Completion) -> Self::Output;
 
-    /// Consume an owned non-terminal completion.
+    /// Handle a non-terminal completion.
+    ///
+    /// The default implementation panics.
     fn update(&mut self, _completion: Self::Completion) {
         panic!("unhandled non-terminal completion for singleshot operation")
     }
@@ -108,8 +112,7 @@ pub trait Multishot: Operation {
     /// Handle a non-terminal completion.
     fn update(&mut self, completion: Self::Completion) -> Self::Item;
 
-    /// Called when the final completion for this operation is received.
-    ///
+    /// Convert the terminal completion into an optional final item.
     fn complete(self, completion: Self::Completion) -> Option<Self::Item>
     where
         Self: Sized,
@@ -306,7 +309,7 @@ where
             }
         };
         let result = CQEResult::synthetic(Err(io::Error::from_raw_os_error(libc::ECANCELED)));
-        // Safety: this synthetic cancellation belongs to the exact prepared
+        // Safety: this synthetic cancellation belongs to the prepared
         // operation retained by `handle`, and it is produced only on this state transition.
         unsafe { handle.untyped().reap(result) };
         *self = State::Submitted {
@@ -333,8 +336,8 @@ where
             State::Waiting { mut handle } => {
                 let handle = handle.take().expect("handle missing");
                 let result = CQEResult::synthetic(Err(err.to_io_error()));
-                // Safety: submission failed for the exact operation retained by
-                // `handle`, so this is its unique synthetic terminal completion.
+                // Safety: submission failed for the operation retained by
+                // `handle`, so this is its unreaped synthetic terminal completion.
                 unsafe { handle.untyped().reap(result) };
                 State::Submitted {
                     inner: SubmittedOp { inner: handle },
@@ -513,7 +516,7 @@ where
     }
 }
 
-/// [`TypedHandle`] is a reference to an operation that is in progress.
+/// A typed reference to an operation in progress.
 pub(crate) struct TypedHandle<T> {
     inner: RawOpRef,
     _marker: std::marker::PhantomData<T>,
@@ -531,10 +534,7 @@ where
         }
     }
 
-    /// Returns an untyped [`Handle`] to this operation.
-    ///
-    /// The untyped handle can be used to complete the operation
-    /// without knowing the type of the operation.
+    /// Return an untyped [`RawOpRef`] for this operation.
     #[inline]
     pub(crate) fn untyped(&self) -> RawOpRef {
         self.inner.clone()
@@ -586,12 +586,11 @@ where
     }
 }
 
-/// Complete an operations.
+/// Reap one operation completion.
 ///
-/// ### Safety
+/// # Safety
 ///
-/// This should only be called by the reactor when it reaps a completion. It should not
-/// be called multiple times for the same completion.
+/// `entry` must be an unreaped CQE whose `user_data` retains the operation that produced it.
 #[inline]
 pub(crate) unsafe fn reap_operation(entry: &io_uring::cqueue::Entry) {
     assert!(entry.user_data() > 1024);
@@ -691,7 +690,7 @@ mod tests {
         let op = TypedHandle::new(TestOp::default());
         let handle = op.untyped();
 
-        // Safety: this is the unique terminal completion modeled for `handle`.
+        // Safety: the test supplies `handle`'s unreaped terminal completion.
         unsafe { handle.reap(CQEResult::new(Ok(0), 0)) };
 
         assert!(op.is_complete());
@@ -704,8 +703,8 @@ mod tests {
         let handle = op.untyped();
 
         let handle_usize = handle.into_raw_usize();
-        // Safety: `handle_usize` retains this operation's kernel reference, and
-        // this test supplies its unique terminal completion exactly once.
+        // Safety: `handle_usize` retains the operation's kernel reference, and
+        // the test supplies its unreaped terminal completion.
         unsafe {
             RawOpRef::from_raw_usize(handle_usize).reap(CQEResult::new(Ok(0), 0));
         }
@@ -869,7 +868,7 @@ mod tests {
     fn multishot_completions_are_fifo() {
         let typed = TypedHandle::new(TestMultishot);
         let more = more_flag();
-        // Safety: these are the ordered, unique completions modeled for `typed`.
+        // Safety: the test supplies each modeled CQE once, in completion order.
         unsafe {
             typed.untyped().reap(CQEResult::new(Ok(10), more));
             typed.untyped().reap(CQEResult::new(Ok(20), more));
@@ -888,7 +887,7 @@ mod tests {
     #[test]
     fn singleshot_consumes_one_terminal_completion_directly() {
         let typed = TypedHandle::new(TestSingleshot::default());
-        // Safety: this is the unique terminal completion modeled for `typed`.
+        // Safety: the test supplies `typed`'s unreaped terminal completion.
         unsafe { typed.untyped().reap(CQEResult::new(Ok(30), 0)) };
         let mut submitted = SubmittedOp { inner: typed };
 
@@ -900,7 +899,7 @@ mod tests {
         let typed = TypedHandle::new(TestSingleshot::default());
         let kernel_ref = typed.untyped().into_raw_usize();
         for (value, flags) in [(10, more_flag()), (20, more_flag()), (30, 0)] {
-            // Safety: `kernel_ref` retains this exact operation across MORE
+            // Safety: `kernel_ref` retains this operation across MORE
             // completions, and each modeled CQE is reaped once in order.
             unsafe {
                 RawOpRef::from_raw_usize(kernel_ref).reap(CQEResult::new(Ok(value), flags));
@@ -918,7 +917,7 @@ mod tests {
         let submitted = SubmittedOp { inner: typed };
 
         assert!(submitted.needs_cancel());
-        // Safety: this is the unique terminal completion for `completion`.
+        // Safety: the test supplies `completion`'s unreaped terminal completion.
         unsafe { completion.reap(CQEResult::new(Ok(0), 0)) };
         assert!(!submitted.needs_cancel());
     }
@@ -929,8 +928,8 @@ mod tests {
         let completion = typed.untyped();
         let submitted = SubmittedOp { inner: typed };
 
-        // Safety: these are the unique non-terminal and terminal completions
-        // modeled for this exact multishot operation.
+        // Safety: the test supplies this operation's MORE and terminal
+        // completions once, in completion order.
         unsafe {
             completion.clone().reap(CQEResult::new(Ok(10), more_flag()));
         }
@@ -981,7 +980,7 @@ mod tests {
         let typed = TypedHandle::new(ReapTrackedMultishot(Rc::clone(&cleaned)));
         let kernel_ref = typed.untyped().into_raw_usize();
         for value in [10, 20] {
-            // Safety: `kernel_ref` retains this exact operation across MORE
+            // Safety: `kernel_ref` retains this operation across MORE
             // completions, and each modeled completion is reaped once.
             unsafe {
                 RawOpRef::from_raw_usize(kernel_ref).reap(CQEResult::new(Ok(value), more_flag()));
@@ -991,8 +990,8 @@ mod tests {
         drop(typed);
         assert!(cleaned.borrow().is_empty());
 
-        // Safety: this is the unique terminal completion for the operation
-        // retained by `kernel_ref`.
+        // Safety: the test supplies the unreaped terminal completion retained
+        // by `kernel_ref`.
         unsafe {
             RawOpRef::from_raw_usize(kernel_ref).reap(CQEResult::new(Ok(30), 0));
         }
@@ -1008,8 +1007,8 @@ mod tests {
         typed.register_waker(&waker);
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            // Safety: this is the unique modeled MORE completion for the
-            // operation retained by `kernel_ref`.
+            // Safety: the test supplies the unreaped MORE completion retained
+            // by `kernel_ref`.
             unsafe {
                 RawOpRef::from_raw_usize(kernel_ref).reap(CQEResult::new(Ok(10), more_flag()));
             }
@@ -1019,8 +1018,8 @@ mod tests {
 
         assert_eq!(typed.inner.header().refcount(), 2);
 
-        // Safety: this is the unique terminal completion for the operation
-        // retained by `kernel_ref`.
+        // Safety: the test supplies the unreaped terminal completion retained
+        // by `kernel_ref`.
         unsafe {
             RawOpRef::from_raw_usize(kernel_ref).reap(CQEResult::new(Ok(20), 0));
         }
@@ -1045,8 +1044,8 @@ mod tests {
         });
         submitted.borrow().inner.register_waker(&waker);
 
-        // Safety: this is the unique modeled MORE completion for the operation
-        // retained by `kernel_ref`.
+        // Safety: the test supplies the unreaped MORE completion retained by
+        // `kernel_ref`.
         unsafe {
             RawOpRef::from_raw_usize(kernel_ref).reap(CQEResult::new(Ok(10), more_flag()));
         }
@@ -1055,8 +1054,8 @@ mod tests {
         assert_eq!(observed.get(), Some(10));
         assert_eq!(submitted.borrow().inner.inner.header().refcount(), 2);
 
-        // Safety: this is the unique terminal completion for the operation
-        // retained by `kernel_ref`.
+        // Safety: the test supplies the unreaped terminal completion retained
+        // by `kernel_ref`.
         unsafe {
             RawOpRef::from_raw_usize(kernel_ref).reap(CQEResult::new(Ok(20), 0));
         }
@@ -1090,7 +1089,7 @@ mod tests {
             .inner
             .register_waker(&waker);
 
-        // Safety: this is the unique terminal completion modeled for `terminal_ref`.
+        // Safety: the test supplies `terminal_ref`'s unreaped terminal completion.
         unsafe { terminal_ref.reap(CQEResult::new(Ok(30), 0)) };
         clear_wake_action();
 
@@ -1106,7 +1105,7 @@ mod tests {
         typed.register_waker(&waker);
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            // Safety: this is the unique terminal completion modeled for `terminal_ref`.
+            // Safety: the test supplies `terminal_ref`'s unreaped terminal completion.
             unsafe { terminal_ref.reap(CQEResult::new(Ok(30), 0)) };
         }));
         assert!(result.is_err());
@@ -1139,7 +1138,7 @@ mod tests {
             }
 
             let typed = TypedHandle::new(PanickingReap);
-            // Safety: this is the unique terminal completion modeled for `typed`.
+            // Safety: the test supplies `typed`'s unreaped terminal completion.
             unsafe { typed.untyped().reap(CQEResult::new(Ok(0), 0)) };
             unreachable!("panicking reap must abort")
         }
@@ -1318,8 +1317,8 @@ mod tests {
             updates: Rc::clone(&updates),
             complete: Rc::clone(&complete),
         });
-        // Safety: this is the unique terminal cancellation completion modeled
-        // for `typed`.
+        // Safety: the test supplies `typed`'s unreaped terminal cancellation
+        // completion.
         unsafe {
             typed.untyped().reap(CQEResult::new(
                 Err(io::Error::from_raw_os_error(libc::ECANCELED)),

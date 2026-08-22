@@ -363,7 +363,7 @@ fn dropping_unconsumed_ring_completion_recycles_selected_buffer(
 
         // The CQE has been reaped into an owned buffer, but the receive future
         // has never been polled to consume it. Dropping the future must return
-        // that sole slot to the ring.
+        // the ring's only slot.
         drop(first_receive);
 
         sender

@@ -1164,7 +1164,7 @@ mod tests {
             state: Rc::clone(&standalone_state),
         };
 
-        // Safety: each value models the unique terminal CQE for its operation.
+        // Safety: the test supplies the operation's unreaped terminal CQE.
         let standalone_completion = unsafe {
             standalone.reap(CQEResult::new(
                 Err(io::Error::from_raw_os_error(libc::ETIME)),
@@ -1180,7 +1180,7 @@ mod tests {
             state: Rc::clone(&linked_state),
         };
 
-        // Safety: this models the unique terminal CQE for this LinkTimeoutOp.
+        // Safety: the test supplies this `LinkTimeoutOp`'s unreaped terminal CQE.
         let linked_completion = unsafe { linked.reap(CQEResult::new(Ok(0), 0)) };
         assert_eq!(linked_state.lifecycle.get(), TimeoutLifecycle::Complete);
         linked_completion.unwrap();
@@ -1201,7 +1201,7 @@ mod tests {
             timespec: updated.into(),
             kind: target.kind,
         };
-        // Safety: this models the unique terminal CQE for this update operation.
+        // Safety: the test supplies this update operation's unreaped terminal CQE.
         assert!(unsafe { successful.reap(CQEResult::new(Ok(0), 0)) }.unwrap());
         assert_eq!(target.state.duration.get(), updated);
 
@@ -1213,7 +1213,7 @@ mod tests {
             timespec: rejected.into(),
             kind: target.kind,
         };
-        // Safety: this models the unique terminal CQE for this update operation.
+        // Safety: the test supplies this update operation's unreaped terminal CQE.
         assert!(!unsafe {
             unsuccessful.reap(CQEResult::new(
                 Err(io::Error::from_raw_os_error(libc::ENOENT)),

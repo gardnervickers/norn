@@ -227,9 +227,9 @@ impl Inner {
 }
 
 struct CloseFd {
-    // The close request, rather than the caller, owns the descriptor while the
-    // copied integer is visible to the kernel. This prevents dropping a
-    // canceled close future from queuing a second close for the same number.
+    // The operation retains the descriptor while its copied integer is visible
+    // to the kernel. If the caller drops both the close future and `NornFd`,
+    // this prevents `Inner::drop` from queuing a second close for that number.
     inner: Rc<Inner>,
 }
 
@@ -238,17 +238,17 @@ fn classify_close_completion(result: crate::operation::CQEResult) -> CloseResult
     match result.into_result() {
         Ok(_) => CloseResult::Closed,
         Err(err) if synthetic => CloseResult::NeverSubmitted(err),
-        // Cancellation proves that the close request did not execute. Once its
-        // terminal CQE has arrived, a direct fallback can safely consume the
-        // descriptor without racing the original SQE.
+        // A canceled close CQE means the request did not execute. Once that
+        // terminal CQE arrives, the descriptor can be closed directly without
+        // racing the original SQE.
         Err(err) if err.raw_os_error() == Some(libc::ECANCELED) => CloseResult::Canceled(err),
         Err(err) => CloseResult::KernelError(err),
     }
 }
 
-// Safety: `inner` keeps the descriptor owned until the terminal CQE. Reaping
-// immediately reconciles whether the kernel consumed that ownership; the
-// queued completion contains no descriptor resource of its own.
+// Safety: `inner` retains the descriptor through the terminal CQE. `reap`
+// records a successful kernel close or closes directly after a synthetic or
+// canceled request, so the queued result owns no descriptor.
 unsafe impl Operation for CloseFd {
     type Completion = io::Result<()>;
 
@@ -368,7 +368,7 @@ mod tests {
         drop(fd);
         assert_open(read_end);
 
-        // Safety: this models the unique terminal CQE for this CloseFd.
+        // Safety: the test supplies this `CloseFd`'s unreaped terminal CQE.
         unsafe {
             close.reap(crate::operation::CQEResult::new(
                 Err(io::Error::from_raw_os_error(libc::ECANCELED)),
@@ -402,7 +402,7 @@ mod tests {
         // reuse before the queued typed completion is observed or dropped.
         assert_eq!(unsafe { libc::close(read_end) }, 0);
         assert_eq!(unsafe { libc::dup2(write_end, read_end) }, read_end);
-        // Safety: this models the unique terminal CQE for this CloseFd.
+        // Safety: the test supplies this `CloseFd`'s unreaped terminal CQE.
         let completion = unsafe { close.reap(crate::operation::CQEResult::new(Ok(0), 0)) };
         drop(completion);
         drop(close);

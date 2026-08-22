@@ -313,19 +313,15 @@ operation is unpolled, queued, submitted, cancelled, or completion-pending.
 The internal operation is based on `NornFd`, keeping the lifecycle reusable if
 fixed operations are later exposed for pipes or sockets.
 
-## Raw-operation soundness prerequisite
+## Raw-operation soundness
 
-`Operation` is currently a safe public trait, while `Handle::submit` is safe.
-That lets safe downstream code construct arbitrary pointer-bearing SQEs and
-bypass the ownership represented by `StableBuf` or `FixedBuf`. The registered
-buffer API cannot make a sound claim while this escape exists.
-
-As part of this feature, `Operation` becomes an `unsafe trait`. Its safety
+`Operation` is an unsafe public trait, while `Handle::submit` is safe. Its
 contract requires every pointer, file descriptor, kernel index, and referenced
 resource in the configured SQE to remain valid and correctly aliased through
-all terminal CQEs and cleanup. Every built-in implementation becomes an
-audited `unsafe impl`. This preserves low-level customization without pretending
-raw io_uring submission is a safe extension point.
+the terminal CQE. It also requires `Operation::reap` to convert each kernel or
+synthetic completion into an owned value that accounts for every resource
+transferred by that completion. Built-in operations uphold the same contract
+through audited `unsafe impl` blocks.
 
 ## Registration lifetime and panic safety
 

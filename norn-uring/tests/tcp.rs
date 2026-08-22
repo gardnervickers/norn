@@ -337,8 +337,8 @@ fn recv_bundle_shared_ring_handles_reverse_poll_order() -> Result<(), Box<dyn st
         first_client.send(b"first".to_vec()).await.0?;
         second_client.send(b"second".to_vec()).await.0?;
 
-        // Consume the application futures in the opposite order from their
-        // submissions. Ownership must already have been reconciled by reap.
+        // Poll the receive futures in the opposite order from submission.
+        // Reaping must reconcile ownership before either future is polled.
         let second = match second_recv.await {
             Ok(bundle) => bundle,
             Err(err) if util::recv_bundle_unsupported(&err) => return Ok(()),

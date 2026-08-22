@@ -18,9 +18,9 @@ use crate::operation::{CQEResult, Multishot, Op, Operation, Singleshot};
 
 fn reap_owned_fd(result: CQEResult) -> io::Result<OwnedFd> {
     result.into_result().map(|fd| {
-        // Safety: successful socket and accept CQEs transfer ownership of a
-        // newly created descriptor. io_uring reports the signed descriptor as
-        // a non-negative result before CQEResult stores it as u32.
+        // Safety: successful `Socket` and `Accept` CQEs return a newly owned
+        // descriptor. `reap_operation` converts only non-negative `i32` results
+        // to `u32`.
         unsafe { OwnedFd::from_raw_fd(fd as i32) }
     })
 }
@@ -538,8 +538,8 @@ struct OpenSocket {
     protocol: Option<Protocol>,
 }
 
-// Safety: the socket SQE contains only copied scalar arguments. Reaping wraps
-// a returned descriptor in direct-close RAII before application code can run.
+// Safety: the socket SQE contains only copied scalar arguments. `reap` converts
+// every returned descriptor to `OwnedFd` before waking application code.
 unsafe impl Operation for OpenSocket {
     type Completion = io::Result<OwnedFd>;
 
@@ -784,9 +784,9 @@ impl RecvFromRing {
     }
 }
 
-// Safety: `NornFd` and `RecvBufRing` retain the socket and registered buffer group;
-// inline recvmsg metadata remains pinned, and reaping immediately takes
-// ownership of each selected buffer.
+// Safety: `NornFd` and `RecvBufRing` retain the socket and registered buffer
+// group; inline recvmsg metadata remains pinned, and `reap` converts every
+// selected buffer into an owned completion before waking application code.
 unsafe impl Operation for RecvFromRing {
     type Completion = io::Result<BufRingBuf>;
 
@@ -922,7 +922,8 @@ impl RecvFromRingMulti {
 }
 
 // Safety: `NornFd` and `RecvBufRing` retain all referenced resources through the
-// multishot terminal CQE; each selected buffer is either yielded or cleaned up.
+// multishot terminal CQE. Each selected buffer is held by an owned completion
+// until it is yielded or dropped.
 unsafe impl Operation for RecvFromRingMulti {
     type Completion = io::Result<BufRingBuf>;
 
@@ -973,7 +974,8 @@ impl RecvRingMulti {
 }
 
 // Safety: `NornFd` and `RecvBufRing` retain all referenced resources through the
-// multishot terminal CQE; each selected buffer is either yielded or cleaned up.
+// multishot terminal CQE. Each selected buffer is held by an owned completion
+// until it is yielded or dropped.
 unsafe impl Operation for RecvRingMulti {
     type Completion = io::Result<BufRingBuf>;
 
@@ -1015,8 +1017,9 @@ impl RecvRingBundle {
     }
 }
 
-// Safety: `NornFd` and `RecvBufRing` retain the descriptor and registered group;
-// completion ownership accounts for every selected buffer in the bundle.
+// Safety: `NornFd` and `RecvBufRing` retain the descriptor and registered group.
+// `reap` converts every selected bundle into an owned completion before waking
+// application code.
 unsafe impl Operation for RecvRingBundle {
     type Completion = io::Result<BufRingBufBundle>;
 
@@ -1055,7 +1058,8 @@ impl RecvRingBundleMulti {
 }
 
 // Safety: `NornFd` and `RecvBufRing` retain resources through the multishot
-// terminal CQE; yielded and unconsumed bundles are returned by completion logic.
+// terminal CQE. Each selected bundle is held by an owned completion until it is
+// yielded or dropped.
 unsafe impl Operation for RecvRingBundleMulti {
     type Completion = io::Result<BufRingBufBundle>;
 
@@ -1127,8 +1131,8 @@ impl<const MULTI: bool> Accept<MULTI> {
 }
 
 // Safety: `NornFd` retains the listener and the pinned socket-address storage
-// remains valid for every CQE; reaping wraps every accepted descriptor in
-// direct-close RAII before it can be queued.
+// remains valid for every CQE. `reap` converts every accepted descriptor to
+// `OwnedFd` before waking application code.
 unsafe impl<const MULTI: bool> Operation for Accept<MULTI> {
     type Completion = io::Result<OwnedFd>;
 

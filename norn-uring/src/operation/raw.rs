@@ -1,6 +1,4 @@
-//! Contains the raw operation handle which is used to
-//! track an in-flight request. This module is pretty much
-//! entirely unsafe.
+//! Type-erased storage and reference-counted handles for in-flight operations.
 
 use std::cell::RefCell;
 use std::ptr::NonNull;
@@ -80,7 +78,8 @@ where
     /// Destroy the [`RawOp`] and its associated data.
     ///
     /// # Safety
-    /// This should only ever be called when the reference count is 0.
+    ///
+    /// The reference count must be zero.
     unsafe fn destroy(ptr: NonNull<Header>) {
         let raw = Self::from_raw_header(ptr);
         // The refcount should be 0 now, so we are the only owner. We can
@@ -117,8 +116,8 @@ where
                 .data
                 .as_mut()
                 .expect("operation data missing while reaping completion");
-            // Safety: this vtable is reached through the exact RawOpRef retained for the kernel
-            // CQE or synthetic failure, and the runtime invokes it exactly once for that result.
+            // Safety: the caller associates this unreaped kernel or synthetic completion with
+            // `ptr`'s operation.
             let completion = unsafe { data.reap(result) };
             state.completions.push(completion);
         });
@@ -136,10 +135,9 @@ where
     }
 }
 
-/// The result value and flags from one `io_uring` completion queue entry.
+/// The result value and flags for one kernel or runtime-synthesized completion.
 ///
-/// Values of this type are created by the runtime and passed to
-/// [`Operation::reap`](crate::Operation::reap).
+/// Values are created by the runtime and passed to [`Operation::reap`].
 #[derive(Debug)]
 pub struct CQEResult {
     pub(crate) result: io::Result<u32>,
@@ -170,7 +168,7 @@ impl CQEResult {
         }
     }
 
-    /// Return whether this completion was generated before the kernel saw the operation.
+    /// Return whether the runtime generated this completion without submitting the operation.
     pub fn is_synthetic(&self) -> bool {
         self.source == CompletionSource::Synthetic
     }
@@ -179,7 +177,8 @@ impl CQEResult {
     ///
     /// # Errors
     ///
-    /// Returns the error reported by the kernel or by request submission.
+    /// Returns the error reported by the kernel or generated while preparing, submitting, or
+    /// canceling the operation.
     pub fn into_result(self) -> io::Result<u32> {
         self.result
     }
@@ -190,6 +189,8 @@ impl CQEResult {
     }
 
     /// Return the raw CQE flags supplied by the kernel.
+    ///
+    /// Synthetic completions have no CQE flags and return zero.
     pub fn flags(&self) -> u32 {
         self.flags
     }
@@ -209,8 +210,7 @@ impl CQEResult {
     }
 }
 
-/// [`RawOpHandle`] is a reference to an operation that is in
-/// progress.
+/// A reference-counted handle to an in-flight operation.
 pub(crate) struct RawOpRef {
     inner: NonNull<Header>,
 }
@@ -234,14 +234,13 @@ impl RawOpRef {
         self.inner
     }
 
-    /// Reap one completion belonging to this exact operation.
+    /// Reap one completion belonging to this operation.
     ///
     /// # Safety
     ///
-    /// `result` must be the unique raw or synthetic completion produced for the
-    /// operation referenced by `self`, and it must not have been reaped before.
-    /// Supplying another operation's completion can manufacture ownership of
-    /// resources that this operation does not own.
+    /// `result` must be an unreaped kernel or synthetic completion produced for the operation
+    /// referenced by `self`. Supplying another operation's completion can manufacture ownership
+    /// of resources that this operation does not own.
     pub(crate) unsafe fn reap(self, result: CQEResult) {
         let more = result.more();
         let inner = self.inner;
@@ -266,10 +265,10 @@ impl RawOpRef {
         sptr::Strict::expose_addr(self.as_raw())
     }
 
-    /// Returns the inner pointer.
+    /// Return the inner pointer without decrementing the reference count.
     ///
-    /// This will **not** decrement the reference count. It is the callers responsibility
-    /// to ensure that the returned pointer is passed to `Handle::from_raw` later.
+    /// The caller is responsible for eventually passing the pointer to
+    /// [`RawOpRef::from_raw`].
     #[inline]
     pub(crate) fn into_raw(self) -> *const () {
         let raw = self.inner.as_ptr();
@@ -277,32 +276,33 @@ impl RawOpRef {
         raw as *const ()
     }
 
-    /// Creates a new [Handle] from a raw pointer.
+    /// Create a [`RawOpRef`] from a pointer returned by [`RawOpRef::into_raw`].
     ///
-    /// ### Safety
-    /// The caller must ensure that the pointer was previously obtained from a call
-    /// to [`Handle::into_raw`]. The caller must also ensure that the allocation backing
-    /// the operation referenced by this [Handle] has not been dropped.
+    /// # Safety
+    ///
+    /// The allocation referenced by `ptr` must still be live, and `ptr` must represent an
+    /// outstanding reference produced by [`RawOpRef::into_raw`].
     #[inline]
     unsafe fn from_raw(ptr: *const ()) -> Self {
         let inner = NonNull::new_unchecked(ptr as *mut Header);
         RawOpRef { inner }
     }
 
-    /// Returns a usize representing the raw pointer for the operation.
+    /// Return the operation pointer as a `usize` without decrementing the reference count.
     ///
-    /// This consumes the [Handle] and does not decrement the reference count.
+    /// The caller is responsible for eventually passing the value to
+    /// [`RawOpRef::from_raw_usize`].
     #[inline]
     pub(crate) fn into_raw_usize(self) -> usize {
         sptr::Strict::expose_addr(self.into_raw())
     }
 
-    /// Creates a new [Handle] from a usize representing a raw pointer.
+    /// Create a [`RawOpRef`] from a value returned by [`RawOpRef::into_raw_usize`].
     ///
-    /// ### Safety
-    /// The caller must ensure that the pointer was previously obtained from a call
-    /// to [`Handle::into_raw`]. The caller must also ensure that the allocation backing
-    /// the operation referenced by this [Handle] has not been dropped.
+    /// # Safety
+    ///
+    /// The allocation referenced by `addr` must still be live, and `addr` must represent an
+    /// outstanding reference produced by [`RawOpRef::into_raw_usize`].
     #[inline]
     pub(crate) unsafe fn from_raw_usize(addr: usize) -> Self {
         let ptr = sptr::from_exposed_addr(addr);

@@ -59,9 +59,9 @@ pub unsafe trait StableBuf: Unpin + 'static {
 ///   [`StableBufMut::bytes_remaining`] consecutive bytes. This non-null and
 ///   alignment requirement also applies when `bytes_remaining()` is zero.
 /// - The pointer, allocation, and writable length reported for an operation
-///   remain unchanged from operation configuration until its terminal
-///   completion or cleanup. Moving the owning buffer value during that interval
-///   must not move, free, or shrink the exposed region.
+///   remain unchanged from operation configuration until its terminal completion
+///   has been reaped. Moving the owning buffer value during that interval must
+///   not move, free, or shrink the exposed region.
 /// - While an operation owns the buffer, no independent alias may read from or
 ///   write to the exposed region. In particular, an implementation backed by
 ///   shared or interior-mutable storage must prevent access through every other

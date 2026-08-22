@@ -41,11 +41,11 @@ impl Notify {
     /// Returns a [`Notified`] which can be used to wait on this [`Notify`].
     ///
     /// Tasks waiting on a [`Notified`] will be woken when [`Notify::notify`]
-    /// is called. Calling [`Notify::notify(n)`] guarantees that n tasks will
-    /// both be woken up and complete their wait.
+    /// is called. Calling [`Notify::notify`] with `n` guarantees that `n`
+    /// waiters are woken and allowed to complete.
     ///
-    /// If a woken Notified instance is dropped, it's notification will be
-    /// passed on to the next Notified in the queue.
+    /// If a woken [`Notified`] is dropped, its notification is passed to the
+    /// next waiter in the queue.
     pub(crate) fn wait(&self) -> Notified<'_> {
         Notified {
             notify: self,
