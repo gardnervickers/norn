@@ -3,6 +3,9 @@
 //! Copied from the test code here
 //! <https://github.com/tokio-rs/io-uring/blob/master/io-uring-test/src/tests/register_buf_ring.rs>
 
+#[cfg(test)]
+mod tracker;
+
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::rc::Rc;
 use std::sync::atomic::{self, AtomicU16};
