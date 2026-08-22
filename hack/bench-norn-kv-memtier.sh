@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export LC_ALL=C
 
 pipeline="${1:-32}"
 server_cpu="${NORN_KV_SERVER_CPU:-0}"
+workers="${NORN_KV_WORKERS:-1}"
+worker_cpus="${NORN_KV_WORKER_CPUS:-$server_cpu}"
+pair_capacity="${NORN_KV_PAIR_CAPACITY:-1024}"
 client_cpus="${NORN_KV_CLIENT_CPUS:-8-15,24-31}"
 address="${NORN_KV_ADDRESS:-127.0.0.1:11211}"
 server_kind="${NORN_KV_SERVER_KIND:-norn}"
@@ -44,6 +48,14 @@ if ! [[ "$pipeline" =~ ^[1-9][0-9]*$ ]]; then
     echo "pipeline must be a positive integer" >&2
     exit 1
 fi
+if ! [[ "$workers" =~ ^[1-9][0-9]*$ ]]; then
+    echo "NORN_KV_WORKERS must be a positive integer" >&2
+    exit 1
+fi
+if ! [[ "$pair_capacity" =~ ^[1-9][0-9]*$ ]]; then
+    echo "NORN_KV_PAIR_CAPACITY must be a positive integer" >&2
+    exit 1
+fi
 
 mkdir -p "$log_dir"
 server_log="$log_dir/server.log"
@@ -65,10 +77,17 @@ if [[ "$server_kind" == norn ]]; then
         --ring-entries 256
         --max-connections 4096
     )
+    if (( workers > 1 )); then
+        server_args+=(
+            --workers "$workers"
+            --worker-cpus "$worker_cpus"
+            --pair-capacity "$pair_capacity"
+        )
+    fi
     if [[ -n "$recv_mode" ]]; then
         server_args+=(--recv-mode "$recv_mode")
     fi
-    taskset -c "$server_cpu" "$server_bin" \
+    taskset -c "$worker_cpus" "$server_bin" \
         "${server_args[@]}" \
         >"$server_log" 2>&1 &
 else
@@ -143,14 +162,26 @@ taskset -c "$client_cpus" memtier_benchmark \
 {
     if [[ "$server_kind" == norn ]]; then
         reported_recv_mode="${recv_mode:-exact}"
+        reported_workers="$workers"
+        reported_worker_cpus="$worker_cpus"
+        if (( workers > 1 )); then
+            reported_pair_capacity="$pair_capacity"
+        else
+            reported_pair_capacity="not-applicable"
+        fi
     else
         reported_recv_mode="not-applicable"
+        reported_workers="not-applicable"
+        reported_worker_cpus="not-applicable"
+        reported_pair_capacity="not-applicable"
     fi
     echo "benchmark_timestamp=$timestamp"
     echo "server_kind=$server_kind server_cpu=$server_cpu client_cpus=$client_cpus address=$address recv_mode=$reported_recv_mode"
+    echo "workers=$reported_workers worker_cpus=$reported_worker_cpus pair_capacity=$reported_pair_capacity"
     echo "threads=$threads clients_per_thread=$clients_per_thread pipeline=$pipeline"
     echo "ratio=$ratio key_range=$key_minimum..=$key_maximum key_pattern=$key_pattern"
     echo "data_size_list=$data_size_list warmup_requests=$warmup_requests requests=$requests trials=$trials"
+    echo "throughput_source=exact_completed_operations_over_external_memtier_process_wall_elapsed"
 } | tee "$summary_log"
 
 for trial in $(seq 1 "$trials"); do
@@ -163,11 +194,13 @@ for trial in $(seq 1 "$trials"); do
         --requests="$warmup_requests" \
         >"$warmup_log" 2>&1
 
+    trial_started_ns="$(date +%s%N)"
     taskset -c "$client_cpus" memtier_benchmark \
         "${mixed[@]}" \
         --requests="$requests" \
         --json-out-file="$trial_json" \
         >"$trial_log" 2>&1
+    trial_finished_ns="$(date +%s%N)"
 
     expected_requests=$((threads * clients_per_thread * requests))
     actual_requests="$(jq -r '."ALL STATS".Totals.Count' "$trial_json")"
@@ -178,11 +211,28 @@ for trial in $(seq 1 "$trials"); do
         exit 1
     fi
 
-    ops="$(jq -r '."ALL STATS".Totals."Ops/sec"' "$trial_json")"
+    memtier_json_reported_ops="$(jq -r '."ALL STATS".Totals."Ops/sec"' "$trial_json")"
+    final_progress="$(tr '\r' '\n' <"$trial_log" | \
+        awk '/\[RUN #1 100%.*[[:space:]]0 threads:/{last=$0} END{print last}')"
+    progress_ops="$(printf '%s\n' "$final_progress" | \
+        sed -n 's/.*(avg: *\([0-9][0-9]*\)) ops\/sec.*/\1/p')"
+    if ! [[ "$progress_ops" =~ ^[1-9][0-9]*$ ]]; then
+        echo "trial $trial did not report a final memtier progress rate" >&2
+        exit 1
+    fi
+    trial_elapsed_ns=$((trial_finished_ns - trial_started_ns))
+    if (( trial_elapsed_ns <= 0 )); then
+        echo "trial $trial reported a non-positive process elapsed time" >&2
+        exit 1
+    fi
+    process_wall_seconds="$(awk -v elapsed_ns="$trial_elapsed_ns" \
+        'BEGIN { printf "%.6f", elapsed_ns / 1000000000 }')"
+    ops="$(awk -v count="$actual_requests" -v elapsed_ns="$trial_elapsed_ns" \
+        'BEGIN { printf "%.2f", count * 1000000000 / elapsed_ns }')"
     p50="$(jq -r '."ALL STATS".Totals."Percentile Latencies"."p50.00"' "$trial_json")"
     p99="$(jq -r '."ALL STATS".Totals."Percentile Latencies"."p99.00"' "$trial_json")"
     p999="$(jq -r '."ALL STATS".Totals."Percentile Latencies"."p99.90"' "$trial_json")"
-    echo "trial=$trial ops_per_sec=$ops p50_ms=$p50 p99_ms=$p99 p999_ms=$p999 requests=$actual_requests misses=$misses connection_errors=$connection_errors" | tee -a "$summary_log"
+    echo "trial=$trial ops_per_sec=$ops memtier_progress_mean_client_ops_per_sec=$progress_ops memtier_json_reported_ops_per_sec=$memtier_json_reported_ops memtier_process_wall_seconds=$process_wall_seconds memtier_process_wall_ns=$trial_elapsed_ns p50_ms=$p50 p99_ms=$p99 p999_ms=$p999 requests=$actual_requests misses=$misses connection_errors=$connection_errors" | tee -a "$summary_log"
 done
 
 if [[ "$server_kind" == norn ]]; then

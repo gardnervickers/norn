@@ -1,11 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export LC_ALL=C
 
 pipeline="${1:-1}"
 pairs="${2:-7}"
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
 log_dir="${NORN_KV_PAIRED_LOG_DIR:-benches/logs/norn-kv-paired-${timestamp}-p${pipeline}}"
 memcached_bin="${NORN_KV_MEMCACHED_BIN:-memcached}"
+
+summary_ops() {
+    awk '/^trial=1 / {
+        for (field = 1; field <= NF; field++) {
+            if ($field ~ /^ops_per_sec=/) {
+                split($field, parts, "=");
+                print parts[2];
+                exit;
+            }
+        }
+    }' "$1"
+}
 
 if ! [[ "$pipeline" =~ ^[1-9][0-9]*$ ]]; then
     echo "pipeline must be a positive integer" >&2
@@ -60,10 +73,17 @@ for pair in $(seq 1 "$pairs"); do
             ./hack/bench-norn-kv-memtier.sh "$pipeline"
     done
 
-    norn_json="$log_dir/pair-$pair-norn/trial-1.json"
-    memcached_json="$log_dir/pair-$pair-memcached/trial-1.json"
-    norn_ops="$(jq -r '."ALL STATS".Totals."Ops/sec"' "$norn_json")"
-    memcached_ops="$(jq -r '."ALL STATS".Totals."Ops/sec"' "$memcached_json")"
+    norn_dir="$log_dir/pair-$pair-norn"
+    memcached_dir="$log_dir/pair-$pair-memcached"
+    norn_json="$norn_dir/trial-1.json"
+    memcached_json="$memcached_dir/trial-1.json"
+    norn_ops="$(summary_ops "$norn_dir/summary.log")"
+    memcached_ops="$(summary_ops "$memcached_dir/summary.log")"
+    if ! [[ "$norn_ops" =~ ^[1-9][0-9]*([.][0-9]+)?$ && \
+            "$memcached_ops" =~ ^[1-9][0-9]*([.][0-9]+)?$ ]]; then
+        echo "pair $pair did not report valid global throughput" >&2
+        exit 1
+    fi
     norn_p99="$(jq -r '."ALL STATS".Totals."Percentile Latencies"."p99.00"' "$norn_json")"
     memcached_p99="$(jq -r '."ALL STATS".Totals."Percentile Latencies"."p99.00"' "$memcached_json")"
     delta="$(awk -v norn="$norn_ops" -v memcached="$memcached_ops" 'BEGIN { printf "%.2f", (norn / memcached - 1) * 100 }')"
