@@ -535,10 +535,11 @@ impl<T> ShardedLocal<T> {
             return Some(value);
         }
 
-        // A producer that observed the old `true` state published before this
-        // clear, so the second pop observes its message. A producer that
-        // publishes after the clear performs the remote notification.
-        lane.notified.store(false, Ordering::Release);
+        // Pair the clear with the producer's release swap. If that producer
+        // armed the lane first, this acquire makes its queued message visible
+        // to the second pop. If the clear wins, the producer observes `false`
+        // and sends a fresh remote notification.
+        lane.notified.swap(false, Ordering::AcqRel);
         lane.queue.pop()
     }
 
@@ -575,7 +576,25 @@ where
     T: Send + 'static,
 {
     fn wake_if_ready(&self) {
-        if self.queues.iter().any(|lane| !lane.queue.is_empty()) || self.shared.is_disconnected() {
+        let mut ready = false;
+        for lane in &self.queues {
+            if !lane.queue.is_empty() {
+                ready = true;
+                continue;
+            }
+
+            // A producer can publish a value, have it consumed, and only then
+            // arm the lane. Its remote notification reaches this empty-lane
+            // path, which must disarm that stale publication before the next
+            // send. Recheck after the acquire-release swap so a concurrent
+            // producer either becomes visible here or observes the clear and
+            // emits another notification. Visit every lane even after finding
+            // one ready so stale arms cannot survive behind unrelated work.
+            lane.notified.swap(false, Ordering::AcqRel);
+            ready |= !lane.queue.is_empty();
+        }
+
+        if ready || self.shared.is_disconnected() {
             if let Some(waker) = self.waker.borrow_mut().take() {
                 waker.wake();
             }
@@ -1000,10 +1019,12 @@ impl Error for TryRecvError {}
 
 #[cfg(test)]
 mod tests {
-    use std::sync::mpsc as std_mpsc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::{mpsc as std_mpsc, Arc};
+    use std::task::Wake;
     use std::thread;
 
-    use norn_executor::park::{SpinPark, ThreadPark};
+    use norn_executor::park::{Park, ParkMode, SpinPark, ThreadPark};
     use norn_executor::LocalExecutor;
 
     use super::*;
@@ -1366,6 +1387,70 @@ mod tests {
         });
 
         producer.join().unwrap();
+    }
+
+    #[test]
+    fn sharded_late_notification_arm_is_disarmed() {
+        #[derive(Default)]
+        struct WakeCount(AtomicUsize);
+
+        impl Wake for WakeCount {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let (builder, endpoint) = endpoint();
+        let (senders, receiver) = bounded_sharded(&endpoint, 2, 2);
+        let mut driver = builder.build(SpinPark);
+        let mut receiver = receiver.attach(&driver.handle());
+        let wake_count = Arc::new(WakeCount::default());
+        let waker = Waker::from(Arc::clone(&wake_count));
+        let mut context = Context::from_waker(&waker);
+
+        // Split one successful send around its notification arm. The receiver
+        // consumes the value and starts waiting before the producer publishes
+        // the arm, reproducing the late-arm race without scheduler timing.
+        senders[0].lane.queue.push(1).unwrap();
+        assert_eq!(receiver.try_recv(), Ok(1));
+        assert_eq!(receiver.poll_recv(&mut context), Poll::Pending);
+        assert!(!senders[0].lane.notified.swap(true, Ordering::AcqRel));
+        senders[0].shared.remote.notify();
+
+        // The late notification finds an empty queue. It must still clear the
+        // stale lane arm so the next ordinary send can notify this waiter.
+        driver.park(ParkMode::NoPark).unwrap();
+        assert_eq!(wake_count.0.load(Ordering::Relaxed), 0);
+        assert!(!senders[0].lane.notified.load(Ordering::Acquire));
+
+        senders[0].try_send(2).unwrap();
+        driver.park(ParkMode::NoPark).unwrap();
+        assert_eq!(wake_count.0.load(Ordering::Relaxed), 1);
+        assert_eq!(receiver.poll_recv(&mut context), Poll::Ready(Some(2)));
+
+        // A ready lane must not short-circuit stale-arm cleanup on another
+        // lane: all lanes share the same coalesced remote notification.
+        senders[1].lane.queue.push(3).unwrap();
+        assert_eq!(receiver.try_recv(), Ok(3));
+        assert_eq!(receiver.poll_recv(&mut context), Poll::Pending);
+        assert!(!senders[1].lane.notified.swap(true, Ordering::AcqRel));
+        senders[1].shared.remote.notify();
+        senders[0].try_send(4).unwrap();
+
+        driver.park(ParkMode::NoPark).unwrap();
+        assert_eq!(wake_count.0.load(Ordering::Relaxed), 2);
+        assert!(!senders[1].lane.notified.load(Ordering::Acquire));
+        assert_eq!(receiver.poll_recv(&mut context), Poll::Ready(Some(4)));
+        assert_eq!(receiver.poll_recv(&mut context), Poll::Pending);
+
+        senders[1].try_send(5).unwrap();
+        driver.park(ParkMode::NoPark).unwrap();
+        assert_eq!(wake_count.0.load(Ordering::Relaxed), 3);
+        assert_eq!(receiver.poll_recv(&mut context), Poll::Ready(Some(5)));
     }
 
     #[test]
