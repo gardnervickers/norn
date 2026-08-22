@@ -812,6 +812,7 @@ unsafe impl Operation for RecvFromRing {
     type Completion = io::Result<BufRingBuf>;
 
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+        self.ring.ensure_accepting_receives()?;
         let this = self;
 
         // Next we initialize the msghdr.
@@ -949,6 +950,7 @@ unsafe impl Operation for RecvFromRingMulti {
     type Completion = io::Result<BufRingBuf>;
 
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+        self.ring.ensure_accepting_receives()?;
         let this = self;
         let msghdr = this.msghdr.as_mut_ptr();
         unsafe {
@@ -1001,6 +1003,7 @@ unsafe impl Operation for RecvRingMulti {
     type Completion = io::Result<BufRingBuf>;
 
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+        self.ring.ensure_accepting_receives()?;
         let this = self;
         Ok(opcode::RecvMulti::new(this.fd.fd(), this.ring.bgid())
             .flags(this.flags)
@@ -1046,6 +1049,7 @@ unsafe impl Operation for RecvRingBundle {
 
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         validate_recv_bundle_flags(self.flags)?;
+        self.ring.ensure_accepting_receives()?;
         let this = self;
         Ok(opcode::RecvBundle::new(this.fd.fd(), this.ring.bgid())
             .flags(this.flags)
@@ -1087,6 +1091,7 @@ unsafe impl Operation for RecvRingBundleMulti {
 
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         validate_recv_multi_bundle_flags(self.flags)?;
+        self.ring.ensure_accepting_receives()?;
         let this = self;
         Ok(opcode::RecvMultiBundle::new(this.fd.fd(), this.ring.bgid())
             .flags(this.flags)
