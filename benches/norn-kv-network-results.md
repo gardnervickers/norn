@@ -911,30 +911,145 @@ the deliberately simple in-memory table and copying response values, while
 the isolated runtime/code-generation change was neutral. Preserve this path
 as the one-worker control and evaluate one-runtime-per-core sharding next.
 
+## One-runtime-per-core sharding
+
+The final sharded mode gives every worker a dedicated OS thread, local
+executor, io_uring, `SO_REUSEPORT` listener, receive ring, and in-memory shard;
+the retained benchmarks pin those threads to distinct physical cores. Stable
+key hashing selects the owner. Local commands execute in place; remote
+commands and replies cross only as owned `Send` values over fixed-lane bounded
+channels. A 32-slot per-connection reply window restores request order across
+local and remote completions, while paired request/reply credits bound the
+cross-worker backlog. Sockets, tasks, and wakers remain worker-local.
+
+Correctness coverage includes fixed ownership vectors, topology routing,
+owned-envelope transfer, reversed completions, quiet commands and quit behind
+a remote head, window wrap and stale replies, disconnect tombstones, duplicate
+responses, FIFO credit waiters, a two-worker pipelined loopback test, and
+repeated shutdown. Every retained benchmark below also completed its exact
+request, GET, and SET counts with zero misses, connection errors, or unexpected
+server failures.
+
+### Sharded-channel lost-wake fix
+
+Stress exposed a late notification-arm race in `bounded_sharded`: a receiver
+could consume a published value before the producer armed the lane, then an
+empty-lane notification could leave that stale arm set and suppress a later
+wake. Commit `551d491` clears the arm with an acquire-release swap, rechecks
+the queue, and visits every lane during notification delivery so unrelated
+ready work cannot hide a stale arm. A deterministic split-publication test
+covers both forms of the race. The fixed server then completed 100 fresh
+process waves of 524,288 operations each, **52,428,800 operations total**,
+without a timeout, miss, connection error, or unexpected server failure. Raw
+stress artifact: `/tmp/norn-kv-reply-window-channel-fixed-stress-v3/`.
+
+### Global-wall metric correction
+
+The preliminary scaling runner treated memtier's final zero-thread progress
+average as global throughput. That value reflects client runtimes; JSON
+`Totals.Ops/sec` is derived from memtier's merged client statistics and
+likewise diverges under completion skew. Neither is an honest whole-invocation
+rate when clients finish at different times. Final sharding results therefore
+use exactly completed operations divided by externally
+measured memtier process wall time. The terminal progress average and JSON rate
+remain diagnostics only.
+
+External wall time includes memtier startup, its approximately one-second
+progress/termination cadence, and teardown. The 32,000,000-operation runs
+reduce that fixed cost, but otherwise similar four-worker trials still fall
+into roughly 17.05- and 18.05-second buckets. The primary rates can consequently
+differ by about 5.6% even when active server throughput is unchanged; medians
+are decision-grade for broad scaling, not fine-grained deltas. The superseded
+preliminary rates remain under `/tmp/norn-kv-connections-per-core-p32/`.
+
+### Pair capacity and final scaling
+
+An alternating, same-binary two-worker comparison isolated the directed-pair
+capacity at 64 total connections:
+
+| Pair capacity | Median process-wall ops/s | Median p50 | Median p99 | Median p99.9 |
+| ---: | ---: | ---: | ---: | ---: |
+| 256 | 652,594.31 | 2.959 ms | 4.967 ms | 7.687 ms |
+| 1,024 | **1,141,510.73** | **1.575 ms** | **3.559 ms** | **6.223 ms** |
+
+Capacity 1,024 improved the median by **74.92%**. Its three within-pair gains
+were 74.919%, 59.946%, and 85.100%, so this is a causal capacity result rather
+than a build or source change. Raw artifact:
+`/tmp/norn-kv-2w64-pair-capacity-p32/`.
+
+The final capacity-1,024 matrix used three position-balanced rounds, 32
+connections per worker, and 32,000,000 measured operations per run:
+
+| Workers | Connections | Median process-wall ops/s | Median p50 | Median p99 | Median p99.9 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 32 | 1,229,748.37 | 0.775 ms | 1.439 ms | 1.623 ms |
+| 2 | 64 | 1,102,187.54 | 1.543 ms | 3.583 ms | 6.183 ms |
+| 4 | 128 | **1,876,902.02** | 1.807 ms | 3.871 ms | 14.359 ms |
+
+Two workers did not beat the one-worker control. Four workers improved median
+global-wall throughput by **52.62%** over one worker and **70.29%** over two,
+at the cost of materially higher latency, especially p99.9. The corresponding
+memtier progress and JSON diagnostics for four workers were 2,144,754 and
+2,315,890 ops/s; they are intentionally not used as the primary rate. Raw
+matrix: `/tmp/norn-kv-cap1024-scaling-p32/`.
+
+### Four-worker profile and decision
+
+A 997 Hz `cycles:u` profile of the final geometry captured 60,952 samples with
+none lost and represented all four workers. Perf's first-to-last sample span
+was 17.050621 seconds; 32,000,000 operations over that active span is
+1,876,764 ops/s, within 0.01% of the unprofiled four-worker median. The
+profiled invocation's lower 1,772,519.50 process-wall ops/s came from a
+1.002777-second idle/client tail, not material profiler slowdown.
+
+The largest flat user-cycle costs were libc `memmove` (29.03%),
+`MemoryHandler::execute_command` (13.66%), libc `memcmp` (8.52%), connection
+serving (7.95%), task polling (4.38%), and allocator internals (approximately
+10%). Named channel/router leaves account for approximately 7-8%. The profile
+uses user cycles and cannot quantify kernel networking work. Raw profile:
+`/tmp/norn-kv-sharded-4w-cap1024-profile/`.
+
+Decision: retain the four-worker architecture, the lost-wake fix, and pair
+capacity 1,024; stop this KV/channel optimization loop. Remaining large
+opportunities require changing response/request buffer ownership or the
+deliberately simple store. Further networking work should start with a
+storage-neutral workload and a kernel-inclusive profile rather than extending
+this result.
+
 ## Cumulative result
 
-- Accepted change: shared provided-buffer multishot receive, direct complete
+- Accepted changes: shared provided-buffer multishot receive, direct complete
   frame parsing, split-frame carry storage, ordered response batching, and a
   bounded nonblocking drain of up to 16 already-ready receive completions
-  before each send.
-- Primary exact baseline: 109,065.37 median ops/s and 1.295 ms median p99 for
-  the external 90/10 mixed workload at the initial pipeline-4 comparison.
+  before each send; plus the fixed-worker sharded mode, ordered reply windows,
+  paired credits, and the sharded-channel notification fix.
+- Historical single-worker baseline: 109,065.37 memtier-reported median ops/s
+  and 1.295 ms median p99 for the external 90/10 mixed workload at the initial
+  pipeline-4 comparison.
 - At p4, the retained drain path reaches 369,670.82 median ops/s and 0.543 ms
-  median p99: **+238.94%** throughput and **58.1% lower** p99 versus that exact
-  baseline.
-- At the final p32 operating knee, the bounded, modular retained Norn path
-  reaches **1,269,848.32 median ops/s**, 0.767 ms median p50, and 1.447 ms
-  median p99. The matched one-worker
-  memcached reference reaches 692,869.55 ops/s, 1.463 ms p50, and 1.783 ms p99.
-  Norn is **83.27% faster**, with **47.57% lower p50** and **18.84% lower p99**.
+  median p99: **+238.94%** throughput and **58.1% lower** p99 versus that
+  historical baseline.
+- In the historical matched p32 comparison, the bounded, modular one-worker
+  Norn path reaches **1,269,848.32 median ops/s**, 0.767 ms median p50, and
+  1.447 ms median p99. The matched one-worker memcached reference reaches
+  692,869.55 ops/s, 1.463 ms p50, and 1.783 ms p99. On those memtier-reported
+  rates, Norn is **83.27% faster**, with **47.57% lower p50** and **18.84%
+  lower p99**.
+  This comparison predates the global-wall correction and remains a matched
+  historical result rather than the final sharding throughput source.
+- Under the corrected primary metric, the final one-worker control reaches
+  1,229,748.37 median process-wall ops/s and four workers reach
+  **1,876,902.02**, a **52.62%** increase. The four-worker latency cost is
+  explicit: 1.807 ms p50, 3.871 ms p99, and 14.359 ms p99.9.
 - Non-pipelined guardrail: the receive drain changes the prior multishot p1
   median by -1.18%, below the materiality threshold, with the same 0.327 ms
   median p99.
-- Confidence: high. Both the original external comparison and the subsequent
-  bounded-module guardrail use five pinned trials, identical requests and
-  client placement, 8,000,000 verified operations, zero misses, and no
-  client/server errors. Results apply to this local loopback host and
-  toolchain.
+- Confidence: high for the broad conclusions. The historical comparison uses
+  five pinned matched trials; the final sharding result uses three
+  position-balanced 32,000,000-operation runs, exact external process-wall
+  timing, zero misses/errors, and frozen binaries, sources, runners, and raw
+  output. One-second client-tail quantization limits fine comparisons. Results
+  apply to this local loopback host and toolchain.
 - The NOOP screens remain valid control measurements, but their earlier
   application-level multishot rejection is superseded.
 - Stop reason: the external workload exercises realistic request bodies, hot
@@ -942,6 +1057,8 @@ as the one-worker control and evaluate one-runtime-per-core sharding next.
   isolated screens exhausted the material networking candidates on this host:
   custom key comparison, boxed keys, alternate hashing, scatter/gather sends,
   `SEND_ZC`, ring-size changes, receive bundles, and drain-cap tuning were all
-  neutral, slower, or invalid under the kernel ownership contract. Further
-  work should preserve this single-core control while evaluating Norn runtime
-  optimizations and one-runtime-per-core sharding.
+  neutral, slower, or invalid under the kernel ownership contract. Sharding
+  now provides a retained throughput mode, while the final profile points to
+  application data movement, lookup, comparison, and allocation rather than a
+  remaining isolated channel/runtime change. Stop this loop and preserve the
+  one-worker control plus the four-worker result.
