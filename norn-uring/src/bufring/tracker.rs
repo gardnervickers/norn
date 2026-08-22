@@ -154,6 +154,10 @@ pub(super) struct PublicationTracker {
     slots: Box<[PublicationSlot]>,
     head: Bid,
     tail: Bid,
+    // Assigned to the next buffer returned to the ring. It advances once per
+    // publication and is never reused, so an old token cannot match a later
+    // availability period for the same BID.
+    next_ticket: u64,
     poisoned: bool,
 }
 
@@ -182,6 +186,7 @@ impl PublicationTracker {
             slots,
             head: 0,
             tail: buf_count - 1,
+            next_ticket: u64::from(buf_count),
             poisoned: false,
         }
     }
@@ -331,6 +336,81 @@ impl PublicationTracker {
         })
     }
 
+    /// Republish one returned buffer after validating its ownership ticket.
+    pub(super) fn return_one(&mut self, token: BufferToken) -> Result<(), TrackerError> {
+        self.ensure_healthy()?;
+        let Some(next_ticket) = self.next_ticket.checked_add(1) else {
+            return self.fail(TrackerError::TicketOverflow);
+        };
+        if let Some(error) = self.return_error(token) {
+            return self.fail(error);
+        }
+
+        self.append_owned(token.bid, self.next_ticket);
+        self.next_ticket = next_ticket;
+        Ok(())
+    }
+
+    /// Republish a returned bundle after validating every ownership ticket.
+    pub(super) fn return_bundle(&mut self, claim: &BundleClaim) -> Result<(), TrackerError> {
+        self.ensure_healthy()?;
+        if usize::from(claim.buf_count) != self.slots.len() {
+            return self.fail(TrackerError::WrongTracker {
+                claim_buf_count: claim.buf_count,
+                tracker_buf_count: self.slots.len(),
+            });
+        }
+        let Some(next_ticket) = self.next_ticket.checked_add(claim.len() as u64) else {
+            return self.fail(TrackerError::TicketOverflow);
+        };
+
+        // Validate the whole bundle before publishing any part of it. Tickets
+        // make duplicate BIDs fail this preflight without transient state.
+        if let Some(error) = claim.iter().find_map(|token| self.return_error(token)) {
+            return self.fail(error);
+        }
+
+        let start_ticket = self.next_ticket;
+        for (index, token) in claim.iter().enumerate() {
+            self.append_owned(token.bid, start_ticket + index as u64);
+        }
+        self.next_ticket = next_ticket;
+        Ok(())
+    }
+
+    fn return_error(&self, token: BufferToken) -> Option<TrackerError> {
+        match self.slots.get(usize::from(token.bid)) {
+            None => Some(TrackerError::InvalidBid {
+                bid: token.bid,
+                buf_count: self.slots.len(),
+            }),
+            Some(slot) if slot.state != SlotState::Owned || slot.ticket != token.ticket => {
+                Some(TrackerError::StaleReturn {
+                    bid: token.bid,
+                    ticket: token.ticket,
+                })
+            }
+            Some(_) => None,
+        }
+    }
+
+    fn append_owned(&mut self, bid: Bid, ticket: u64) {
+        let old_tail = self.tail;
+        let slot = &mut self.slots[usize::from(bid)];
+        debug_assert_eq!(slot.state, SlotState::Owned);
+        slot.ticket = ticket;
+        slot.prev = old_tail;
+        slot.next = NO_BID;
+        slot.state = SlotState::Published;
+
+        if old_tail == NO_BID {
+            self.head = bid;
+        } else {
+            self.slots[usize::from(old_tail)].next = bid;
+        }
+        self.tail = bid;
+    }
+
     fn ensure_healthy(&self) -> Result<(), TrackerError> {
         if self.poisoned {
             Err(TrackerError::Poisoned)
@@ -354,33 +434,39 @@ impl ClaimedBids {
 /// A contradiction between kernel completion accounting and live publication
 /// ownership. Every variant other than `Poisoned` is the first error that
 /// causes the tracker to enter its permanent fail-closed state.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, thiserror::Error, PartialEq, Eq)]
 pub(super) enum TrackerError {
+    #[error("buffer publication tracker is poisoned")]
     Poisoned,
-    InvalidBid {
-        bid: Bid,
-        buf_count: usize,
-    },
-    InvalidBundleCount {
-        count: usize,
-        buf_count: usize,
-    },
-    BidNotPublished {
-        bid: Bid,
-    },
-    BrokenLink {
-        bid: Bid,
-    },
+    #[error("buffer id {bid} is outside ring bounds ({buf_count})")]
+    InvalidBid { bid: Bid, buf_count: usize },
+    #[error("bundle claims {count} buffers from a {buf_count}-buffer ring")]
+    InvalidBundleCount { count: usize, buf_count: usize },
+    #[error("buffer id {bid} has no live publication")]
+    BidNotPublished { bid: Bid },
+    #[error("publication links are inconsistent at buffer id {bid}")]
+    BrokenLink { bid: Bid },
+    #[error(
+        "buffer ids {previous} and {next} are not adjacent publications (expected ticket {expected}, found {actual})"
+    )]
     TicketGap {
         previous: Bid,
         next: Bid,
         expected: u64,
         actual: u64,
     },
-    BundleExhausted {
-        first: Bid,
-        count: usize,
+    #[error("bundle beginning at buffer id {first} has fewer than {count} live publications")]
+    BundleExhausted { first: Bid, count: usize },
+    #[error("buffer id {bid} return does not own publication ticket {ticket}")]
+    StaleReturn { bid: Bid, ticket: u64 },
+    #[error(
+        "bundle from a {claim_buf_count}-buffer tracker was returned to a {tracker_buf_count}-buffer tracker"
+    )]
+    WrongTracker {
+        claim_buf_count: u16,
+        tracker_buf_count: usize,
     },
+    #[error("buffer publication ticket space exhausted")]
     TicketOverflow,
 }
 
@@ -442,6 +528,81 @@ mod tests {
         ));
         assert!(tracker.is_poisoned());
         assert_eq!(tracker.claim_one(0), Err(TrackerError::Poisoned));
+    }
+
+    #[test]
+    fn sparse_return_order_becomes_the_next_bundle_order() {
+        let mut tracker = PublicationTracker::new(3);
+        let initial = tracker.claim_bundle(0, 3).unwrap();
+        let tokens = initial.iter().collect::<Vec<_>>();
+
+        tracker.return_one(tokens[2]).unwrap();
+        tracker.return_one(tokens[0]).unwrap();
+        tracker.return_one(tokens[1]).unwrap();
+        let recycled = tracker.claim_bundle(2, 3).unwrap();
+
+        assert_eq!(bids(&recycled), [2, 0, 1]);
+        assert_eq!(
+            recycled.iter().map(BufferToken::ticket).collect::<Vec<_>>(),
+            [3, 4, 5]
+        );
+    }
+
+    #[test]
+    fn stale_return_after_reselection_poisons_without_returning_current_owner() {
+        let mut tracker = PublicationTracker::new(1);
+        let stale = tracker.claim_one(0).unwrap();
+        tracker.return_one(stale).unwrap();
+        let current = tracker.claim_one(0).unwrap();
+
+        let error = tracker.return_one(stale).unwrap_err();
+
+        assert_eq!(error, TrackerError::StaleReturn { bid: 0, ticket: 0 });
+        assert!(tracker.is_poisoned());
+        assert_eq!(tracker.return_one(current), Err(TrackerError::Poisoned));
+        assert_eq!(tracker.slots[0].state, SlotState::Owned);
+        assert_eq!(tracker.slots[0].ticket, current.ticket());
+    }
+
+    #[test]
+    fn duplicate_bundle_return_is_fail_closed() {
+        let mut tracker = PublicationTracker::new(2);
+        let claim = tracker.claim_bundle(0, 2).unwrap();
+        tracker.return_bundle(&claim).unwrap();
+
+        let error = tracker.return_bundle(&claim).unwrap_err();
+
+        assert!(matches!(error, TrackerError::StaleReturn { .. }));
+        assert!(tracker.is_poisoned());
+    }
+
+    #[test]
+    fn malformed_batch_is_rejected_before_any_publication() {
+        let mut tracker = PublicationTracker::new(2);
+        let mut claim = tracker.claim_bundle(0, 2).unwrap();
+        claim.bids = ClaimedBids::Sparse(SmallVec::from_slice(&[0, 0]));
+
+        let error = tracker.return_bundle(&claim).unwrap_err();
+
+        assert_eq!(error, TrackerError::StaleReturn { bid: 0, ticket: 1 });
+        assert!(tracker.is_poisoned());
+        assert_eq!(tracker.slots[0].state, SlotState::Owned);
+        assert_eq!(tracker.slots[1].state, SlotState::Owned);
+        assert_eq!(tracker.head, NO_BID);
+        assert_eq!(tracker.tail, NO_BID);
+    }
+
+    #[test]
+    fn ticket_overflow_poison_does_not_publish_the_owner() {
+        let mut tracker = PublicationTracker::new(1);
+        let token = tracker.claim_one(0).unwrap();
+        tracker.next_ticket = u64::MAX;
+
+        assert_eq!(tracker.return_one(token), Err(TrackerError::TicketOverflow));
+        assert!(tracker.is_poisoned());
+        assert_eq!(tracker.slots[0].state, SlotState::Owned);
+        assert_eq!(tracker.head, NO_BID);
+        assert_eq!(tracker.tail, NO_BID);
     }
 
     #[test]
