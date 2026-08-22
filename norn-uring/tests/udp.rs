@@ -606,6 +606,43 @@ fn connected_send_recv_bundle_multi() -> Result<(), Box<dyn std::error::Error>> 
     })
 }
 
+#[test]
+fn bundle_receive_rejects_invalid_flags_without_consuming_a_ring_buffer(
+) -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let ring = RecvBufRing::builder(13).buf_cnt(1).buf_len(128).build()?;
+        let s1 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let s2 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        s1.connect(s2.local_addr()?).await?;
+        s2.connect(s1.local_addr()?).await?;
+
+        let err = s2
+            .recv_bundle_with_flags(&ring, libc::MSG_TRUNC)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+        for flags in [libc::MSG_TRUNC, libc::MSG_WAITALL] {
+            let mut recv = pin!(s2.recv_bundle_multi_with_flags(&ring, flags));
+            let err = recv
+                .next()
+                .await
+                .expect("configuration failure must produce one stream item")
+                .unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(recv.next().await.is_none());
+        }
+
+        let payload = Bytes::from_static(b"ring-still-usable");
+        s1.send(payload.clone()).await.0?;
+        let (buf, peer) = s2.recv_from_ring(&ring).await?;
+        assert_eq!(peer, s1.local_addr()?);
+        assert_eq!(&buf[..], payload.as_ref());
+
+        Ok(())
+    })
+}
+
 struct UdpEchoServer {
     socket: UdpSocket,
 }
