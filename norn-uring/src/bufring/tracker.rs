@@ -6,11 +6,10 @@ use super::Bid;
 
 const NO_BID: Bid = Bid::MAX;
 
-/// The identity of one exact publication of a buffer ID.
+/// An ownership token for one publication of a buffer ID.
 ///
-/// A BID can be returned to the kernel and selected again many times. The
-/// ticket prevents an owner from an earlier publication from returning a later
-/// incarnation of the same BID.
+/// A BID may be returned and published again many times. The ticket prevents a
+/// stale owner from returning a later publication of the same BID.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct BufferToken {
     bid: Bid,
@@ -28,7 +27,7 @@ impl BufferToken {
     }
 }
 
-/// A nonempty, ordered range of buffers claimed by one bundle CQE.
+/// A nonempty ordered sequence of buffer publications claimed by one bundle CQE.
 ///
 /// Tickets in a bundle are consecutive by construction. Keeping only the
 /// first ticket lets the common numerically-contiguous BID case remain compact.
@@ -115,12 +114,12 @@ enum SlotState {
     Returning,
 }
 
-/// One live publication record per BID.
+/// The current publication record for one BID.
 ///
-/// `ticket` is retained while owned so a return can prove that it refers to
-/// the exact publication which was claimed. Links contain only unresolved
-/// publications and are ordered by ticket, though removed publications can
-/// leave ticket gaps between adjacent links.
+/// The ticket remains while the buffer is owned so its return can be matched
+/// to the publication that was claimed. Links contain only published,
+/// unclaimed entries and remain ordered by ticket, though removed publications
+/// can leave ticket gaps between adjacent links.
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 struct PublicationSlot {
@@ -199,7 +198,7 @@ impl PublicationTracker {
     ///
     /// Consecutive linked nodes are insufficient: a previously claimed scalar
     /// buffer can leave two unrelated publications adjacent in the live list.
-    /// Exact ticket adjacency prevents a bundle from crossing that gap.
+    /// Consecutive ticket values prevent a bundle from crossing that gap.
     pub(super) fn claim_bundle(
         &mut self,
         first_bid: Bid,
@@ -319,7 +318,7 @@ impl PublicationTracker {
         })
     }
 
-    /// Append a fresh publication for an exactly matching owner.
+    /// Append a fresh publication for an owner whose ticket still matches.
     pub(super) fn return_one(&mut self, token: BufferToken) -> Result<(), TrackerError> {
         self.ensure_healthy()?;
         let Some(next_ticket) = self.next_ticket.checked_add(1) else {
@@ -424,8 +423,8 @@ impl ClaimedBids {
 }
 
 /// A contradiction between kernel completion accounting and live publication
-/// ownership. Every variant other than `Poisoned` is the first error which
-/// caused the tracker to enter its permanent fail-closed state.
+/// ownership. Every variant other than `Poisoned` is the first error that
+/// causes the tracker to enter its permanent fail-closed state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum TrackerError {
     Poisoned,

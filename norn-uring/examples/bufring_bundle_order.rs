@@ -3,8 +3,14 @@
 //! This intentionally bypasses Norn's operation and buffer-ring accounting. It
 //! checks whether normal (non-`IOSQE_ASYNC`) receive completions expose buffer
 //! selections in the same global order in which one shared buffer ring is
-//! consumed. The oversized `MSG_TRUNC` edge case is opt-in because it probes a
-//! deliberately inconsistent byte-count/buffer-count boundary.
+//! consumed. The oversized `MSG_TRUNC` edge case is opt-in because a truncated
+//! result does not reveal how many buffers the kernel selected.
+//!
+//! Run with:
+//!
+//! ```text
+//! cargo run -p norn-uring --example bufring_bundle_order -- --iterations N [--msg-trunc]
+//! ```
 
 #[cfg(not(target_os = "linux"))]
 fn main() {

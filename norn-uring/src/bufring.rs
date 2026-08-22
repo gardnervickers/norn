@@ -1,7 +1,7 @@
 //! Support for io_uring registered buffer rings.
 //!
-//! Copied from the test code here
-//! <https://github.com/tokio-rs/io-uring/blob/master/io-uring-test/src/tests/register_buf_ring.rs>
+//! The original registration setup was derived from the `io-uring` crate's
+//! [registered buffer ring test](https://github.com/tokio-rs/io-uring/blob/master/io-uring-test/src/tests/register_buf_ring.rs).
 
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::rc::Rc;
@@ -21,6 +21,10 @@ use tracker::{BufferToken, BundleClaim, PublicationTracker, TrackerError};
 
 /// [`RecvBufRing`] is a reference counted buffer ring which can be registered
 /// with `io_uring` to provide buffers for read operations.
+///
+/// Clones may be shared by receive operations on the same driver. Publication
+/// ownership is tracked ring-wide, so completions may be reaped in a different
+/// order from kernel buffer selection.
 ///
 /// # Example
 ///
@@ -106,9 +110,10 @@ impl RecvBufRing {
 
 /// [`BufRingBuf`] is a reference to a buffer in a buffer ring.
 ///
-/// It is reference counted and will be returned to the buffer ring when dropped.
-/// Users should be careful to drop the buffer as soon as possible to avoid
-/// exhausting the buffer ring.
+/// The value retains its ring and normally republishes its selected buffer when
+/// dropped. If ownership accounting has quarantined the ring, the buffer
+/// remains unavailable instead. Users should drop the buffer as soon as
+/// possible to avoid exhausting the buffer ring.
 ///
 /// The buffer implements [`StableBuf`], so it can be moved directly into send
 /// operations. The selected buffer ID remains unavailable to receive operations
@@ -122,7 +127,9 @@ pub struct BufRingBuf {
 /// [`BufRingBufBundle`] is a collection of one or more buffers selected from a buffer ring.
 ///
 /// This is primarily used by recv bundle operations that may consume multiple provided buffers
-/// for a single completion.
+/// for a single completion. Dropping the bundle normally republishes every
+/// selected buffer. If ownership accounting has quarantined the ring, those
+/// buffers remain unavailable instead.
 pub struct BufRingBufBundle {
     bufgroup: Option<RecvBufRing>,
     claim: Option<BundleClaim>,
@@ -749,9 +756,8 @@ pub(crate) struct BufRingStorage {
     // selected BID into an owned token.
     buf_list: Vec<KernelBuffer>,
 
-    // `local_tail` is the copy of the tail index that we update when a buffer is dropped and
-    // therefore its buffer id is released and added back to the ring. It also serves for adding
-    // buffers to the ring during init but that's not as interesting.
+    // The next unpublished ring-tail value. It advances during initial
+    // publication and when authenticated owners return buffers.
     local_tail: Cell<u16>,
 
     // Ring-global ownership and publication order. CQEs may arrive in a
@@ -762,8 +768,8 @@ pub(crate) struct BufRingStorage {
 
 impl BufRingStorage {
     fn new(bgid: Bgid, ring_entries: u16, buf_cnt: u16, buf_len: usize) -> io::Result<Self> {
-        // Check that none of the important args are zero and the ring_entries is at least large
-        // enough to hold all the buffers and that ring_entries is a power of 2.
+        // The ring must have room for every buffer, and its entry count must be
+        // a nonzero power of two. Buffer lengths are published as u32 values.
         if (buf_cnt == 0)
             || (buf_cnt > ring_entries)
             || (buf_len == 0)
@@ -783,14 +789,7 @@ impl BufRingStorage {
         // https://man7.org/linux/man-pages/man2/mmap.2.html
         let ring_start = AnonymousMmap::new(ring_size)?;
 
-        // Probably some functional way to do this.
-        let buf_list: Vec<KernelBuffer> = {
-            let mut bp = Vec::with_capacity(buf_cnt as _);
-            for _ in 0..buf_cnt {
-                bp.push(KernelBuffer::new(buf_len));
-            }
-            bp
-        };
+        let buf_list = (0..buf_cnt).map(|_| KernelBuffer::new(buf_len)).collect();
 
         let ring_entries_mask = ring_entries - 1;
         assert!((ring_entries & ring_entries_mask) == 0);
@@ -928,9 +927,7 @@ impl BufRingStorage {
     // Returns the buffer the uring interface picked from the buf_ring for the completion result
     // represented by the res and flags.
     fn get_buf(&self, buf_ring: RecvBufRing, res: u32, flags: u32) -> io::Result<BufRingBuf> {
-        // This fn does the odd thing of having self as the RecvBufRing and taking an argument that
-        // is the same RecvBufRing but wrapped in Rc<_> so the wrapped buf_ring can be passed to the
-        // outgoing GBuf.
+        // Claim the selected buffer and retain `buf_ring` in the returned owner.
         let bid = match selected_bid_from_flags(flags) {
             Ok(bid) => bid,
             Err(error) if res == 0 => return Err(error),
@@ -1001,9 +998,8 @@ impl BufRingStorage {
         self.ring_entries_mask
     }
 
-    // Push the `bid` buffer to the buf_ring tail.
-    // This test version does not safeguard against a duplicate
-    // `bid` being pushed.
+    // Append `bid` at the local tail. The publication tracker must authenticate
+    // the buffer before this method is called.
     fn buf_ring_push(&self, bid: Bid) {
         assert!(bid < self.buf_cnt);
 

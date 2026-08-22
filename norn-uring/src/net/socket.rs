@@ -2022,9 +2022,9 @@ mod tests {
             let (later_socket, mut later_writer) = connected_socket_with_writer().await?;
             let (third_socket, mut third_writer) = connected_socket_with_writer().await?;
 
-            // Make the first receive reserve the first publication, but keep it
-            // pending. The completed NOPs drive the ring while FIONREAD proves
-            // that the kernel consumed the byte before the later receive starts.
+            // Make the first receive consume the first published buffer without
+            // completing. Completed NOPs drive the ring while FIONREAD confirms
+            // consumption before the later receive starts.
             waitall_writer.write_all(&[0xaa])?;
             wait_for_socket_bytes(&waitall_socket, 1)?;
             let mut waitall_receive =
