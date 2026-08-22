@@ -1062,6 +1062,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "norn-kv-server"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "io-uring",
+ "norn-executor",
+ "norn-uring",
+ "thiserror",
+]
+
+[[package]]
 name = "norn-nursery"
 version = "0.1.0"
 dependencies = [

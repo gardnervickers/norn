@@ -1,0 +1,22 @@
+[package]
+name = "norn-kv-server"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+futures-util = "0.3"
+norn-executor = { path = "../../norn-executor" }
+thiserror.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7"
+norn-uring = { path = "../../norn-uring" }
+
+[[bin]]
+name = "norn-kv-server"
+path = "src/main.rs"
+
+[[bin]]
+name = "norn-kv-loadgen"
+path = "src/bin/network-loadgen.rs"

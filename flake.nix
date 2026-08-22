@@ -64,6 +64,9 @@
           nativeBuildInputs = [
             pkgs.cargo-udeps
             pkgs.cargo-outdated
+            pkgs.jq
+            pkgs.memcached
+            pkgs.memtier-benchmark
             rust-toolchain-nightly
           ];
         };
