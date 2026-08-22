@@ -3,7 +3,7 @@
 //! Copied from the test code here
 //! <https://github.com/tokio-rs/io-uring/blob/master/io-uring-test/src/tests/register_buf_ring.rs>
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::rc::Rc;
 use std::sync::atomic::{self, AtomicU16};
 use std::{fmt, io, ops, ptr};
@@ -792,7 +792,9 @@ pub(crate) struct BufRingStorage {
     // the buffers being made available to the uring interface for this buf group id.
     ring_start: AnonymousMmap,
 
-    buf_list: Vec<Vec<u8>>,
+    // The kernel writes through pointers published to the buffer ring while the
+    // storage is shared through `Rc`.
+    buf_list: Vec<KernelBuffer>,
 
     // `local_tail` is the copy of the tail index that we update when a buffer is dropped and
     // therefore its buffer id is released and added back to the ring. It also serves for adding
@@ -806,11 +808,12 @@ pub(crate) struct BufRingStorage {
 
 impl BufRingStorage {
     fn new(bgid: Bgid, ring_entries: u16, buf_cnt: u16, buf_len: usize) -> io::Result<Self> {
-        // Check that none of the important args are zero and the ring_entries is at least large
-        // enough to hold all the buffers and that ring_entries is a power of 2.
+        // The ring must have room for every buffer, and its entry count must be
+        // a nonzero power of two. Buffer lengths are published as u32 values.
         if (buf_cnt == 0)
             || (buf_cnt > ring_entries)
             || (buf_len == 0)
+            || (buf_len > u32::MAX as usize)
             || ((ring_entries & (ring_entries - 1)) != 0)
         {
             return Err(io::Error::from(io::ErrorKind::InvalidInput));
@@ -826,14 +829,7 @@ impl BufRingStorage {
         // https://man7.org/linux/man-pages/man2/mmap.2.html
         let ring_start = AnonymousMmap::new(ring_size)?;
 
-        // Probably some functional way to do this.
-        let buf_list: Vec<Vec<u8>> = {
-            let mut bp = Vec::with_capacity(buf_cnt as _);
-            for _ in 0..buf_cnt {
-                bp.push(vec![0; buf_len]);
-            }
-            bp
-        };
+        let buf_list = (0..buf_cnt).map(|_| KernelBuffer::new(buf_len)).collect();
 
         let ring_entries_mask = ring_entries - 1;
         assert!((ring_entries & ring_entries_mask) == 0);
@@ -1093,6 +1089,24 @@ impl BufRingStorage {
     }
 }
 
+struct KernelBuffer {
+    bytes: Box<UnsafeCell<[u8]>>,
+}
+
+impl KernelBuffer {
+    fn new(len: usize) -> Self {
+        let bytes = Box::into_raw(vec![0; len].into_boxed_slice());
+        // Safety: `UnsafeCell` has the same layout as its contents, including
+        // dynamically sized slices, so this preserves the allocation metadata.
+        let bytes = unsafe { Box::from_raw(bytes as *mut UnsafeCell<[u8]>) };
+        Self { bytes }
+    }
+
+    fn as_ptr(&self) -> *const u8 {
+        self.bytes.get().cast::<u8>()
+    }
+}
+
 /// An anonymous region of page-aligned, zero-filled memory mapped using
 /// `mmap(2)` with no file backing.
 struct AnonymousMmap {
@@ -1164,7 +1178,7 @@ impl ops::Deref for BufRingBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{selected_bid_from_flags, BundleBids, RecvBufRing};
+    use super::{selected_bid_from_flags, BufRingStorage, BundleBids, RecvBufRing};
     use std::io;
     use std::rc::Rc;
 
@@ -1176,6 +1190,15 @@ mod tests {
     fn selected_bid_requires_buffer_select_flag() {
         let err = selected_bid_from_flags(0).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn buffer_length_must_fit_the_kernel_ring_entry() {
+        let error = BufRingStorage::new(0, 1, 1, u32::MAX as usize + 1)
+            .err()
+            .expect("oversized buffer length must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]
