@@ -863,6 +863,54 @@ rejected NOOP candidate was removed. GET and SET each ran three 1,000-warmup /
   validated every response header and empty success body. No server or load
   generator errors occurred.
 
+## Final single-core ceiling audit
+
+Before moving the active example back to a networking-only target, the final
+in-memory path was rebuilt and measured again at the p32 operating point. Five
+trials completed 8,000,000 requests with zero misses or connection errors:
+
+| Trial | Ops/s | p50 | p99 | p99.9 |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 1,329,876.76 | 0.743 ms | 1.407 ms | 1.535 ms |
+| 2 | 1,320,066.66 | 0.751 ms | 1.383 ms | 1.575 ms |
+| 3 | 1,323,353.05 | 0.751 ms | 1.407 ms | 1.671 ms |
+| 4 | 1,328,958.84 | 0.751 ms | 1.399 ms | 1.543 ms |
+| 5 | 1,331,658.77 | 0.751 ms | 1.375 ms | 1.535 ms |
+
+The median is **1,328,958.84 ops/s**, 0.751 ms p50, and 1.399 ms p99.
+The exact restored network-only source then reproduced the result at
+1,331,352.95 median ops/s across three trials. Its p1 guardrail reached
+112,246.15 median ops/s, 0.287 ms p50, and 0.319 ms p99. Raw summaries are
+`/tmp/norn-network-baseline-31d2f09/`,
+`/tmp/norn-network-restored-p32/`, and
+`/tmp/norn-network-restored-p1/`. The restored executable is byte-identical
+to the preserved historical network binary, SHA-256
+`fc0a87711f30576107129160305bd2c6db1ba6ce32fe0f5a417fe9bc1cf97929`.
+
+A 16,000,000-request p32 user-cycle profile captured 12,282 samples with none
+lost. The largest flat costs were libc `memcmp` (29.44%),
+`MemoryHandler::handle` (28.13%), libc `memmove` (15.38%), frame decoding
+(3.96%), frame processing (3.31%), `MemoryStore::set` (3.30%), request decoding
+(3.19%), response encoding (2.52%), and hashing (4.68% combined). The visible
+socket/runtime path was already small: `send_all` was 0.95%, multishot receive
+polling 0.59%, completion draining 0.15%, buffer return 0.14%, and completion
+queue insertion 0.11%. This profile used the semantically identical combined
+binary immediately before the disk code was removed; the binary and perf-data
+SHA-256 values are recorded under `/tmp/norn-network-profile-31d2f09-v2/`.
+
+Thin LTO was the last low-complexity runtime screen. Three fresh-process
+alternating pairs changed throughput by +0.81%, -2.55%, and +2.98%; the paired
+median was **+0.81%**, below the 5% retention threshold. Every side completed
+1,600,000 requests with zero misses or errors. The candidate executable
+SHA-256 was
+`5e7b7368ae215660cb6e801464314d8935f977693d256f84604119dfb874bb44`;
+raw results and the exact runner are in `/tmp/norn-network-thin-lto-pairs/`.
+
+Decision: stop the single-core runtime loop. The remaining large costs are
+the deliberately simple in-memory table and copying response values, while
+the isolated runtime/code-generation change was neutral. Preserve this path
+as the one-worker control and evaluate one-runtime-per-core sharding next.
+
 ## Cumulative result
 
 - Accepted change: shared provided-buffer multishot receive, direct complete
