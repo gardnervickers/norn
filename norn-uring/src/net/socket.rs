@@ -161,7 +161,19 @@ impl Socket {
         domain: Domain,
         socket_type: Type,
     ) -> io::Result<Self> {
+        Self::bind_with_reuse_port(addr, domain, socket_type, false).await
+    }
+
+    pub(crate) async fn bind_with_reuse_port(
+        addr: SocketAddr,
+        domain: Domain,
+        socket_type: Type,
+        reuse_port: bool,
+    ) -> io::Result<Self> {
         let socket = Self::open(domain, socket_type, None).await?;
+        if reuse_port {
+            socket.set_reuse_port(true).await?;
+        }
         let op = BindSocket::new(socket.fd.lease(), addr);
         socket.fd.submit(op).await?;
         Ok(socket)
@@ -416,6 +428,12 @@ impl Socket {
     pub(crate) async fn set_reuse_address(&self, reuse: bool) -> io::Result<()> {
         let reuse = if reuse { 1 } else { 0 };
         self.set_sock_opt(libc::SOL_SOCKET, libc::SO_REUSEADDR, reuse)
+            .await
+    }
+
+    async fn set_reuse_port(&self, reuse: bool) -> io::Result<()> {
+        let reuse = if reuse { 1 } else { 0 };
+        self.set_sock_opt(libc::SOL_SOCKET, libc::SO_REUSEPORT, reuse)
             .await
     }
 

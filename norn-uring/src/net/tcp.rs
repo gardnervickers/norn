@@ -24,6 +24,14 @@ pub struct TcpListener {
     socket: socket::Socket,
 }
 
+/// Options applied while binding a [`TcpListener`].
+///
+/// The default options preserve the behavior of [`TcpListener::bind`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TcpListenerOptions {
+    reuse_port: bool,
+}
+
 /// A TCP socket.
 ///
 /// [`TcpSocket`] provides a low-level interface for configuring a socket
@@ -68,6 +76,23 @@ impl std::fmt::Debug for TcpStream {
     }
 }
 
+impl TcpListenerOptions {
+    /// Create listener options with all optional behavior disabled.
+    pub const fn new() -> Self {
+        Self { reuse_port: false }
+    }
+
+    /// Configure whether `SO_REUSEPORT` is enabled before binding.
+    ///
+    /// Every listener sharing an address must enable this option. The kernel
+    /// distributes new connections among the listeners that share the address.
+    #[must_use]
+    pub const fn reuse_port(mut self, reuse_port: bool) -> Self {
+        self.reuse_port = reuse_port;
+        self
+    }
+}
+
 impl TcpListener {
     /// Wrap a driver-bound descriptor as a TCP listener.
     ///
@@ -100,7 +125,31 @@ impl TcpListener {
     ///
     /// Panics if called outside an active [`Driver`](crate::Driver) context.
     pub async fn bind(addr: SocketAddr, backlog: u32) -> io::Result<TcpListener> {
-        let inner = socket::Socket::bind(addr, Domain::for_address(addr), Type::STREAM).await?;
+        Self::bind_with_options(addr, backlog, TcpListenerOptions::default()).await
+    }
+
+    /// Creates a TCP listener with options applied before the socket is bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the socket cannot be created or configured, or if
+    /// it cannot be bound or placed in listening mode.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called outside an active [`Driver`](crate::Driver) context.
+    pub async fn bind_with_options(
+        addr: SocketAddr,
+        backlog: u32,
+        options: TcpListenerOptions,
+    ) -> io::Result<TcpListener> {
+        let inner = socket::Socket::bind_with_reuse_port(
+            addr,
+            Domain::for_address(addr),
+            Type::STREAM,
+            options.reuse_port,
+        )
+        .await?;
         inner.listen(backlog).await?;
         Ok(TcpListener { socket: inner })
     }
