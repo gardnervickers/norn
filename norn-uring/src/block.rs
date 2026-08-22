@@ -56,6 +56,7 @@ impl Discard {
 // Safety: discard encodes only two copied integers, references no userspace
 // memory, and produces one terminal completion.
 unsafe impl UringCommand16 for Discard {
+    type Completion = CQEResult;
     type Output = io::Result<()>;
 
     fn encode(&mut self) -> io::Result<Command16> {
@@ -64,8 +65,12 @@ unsafe impl UringCommand16 for Discard {
         Ok(Command16::new(BLOCK_URING_CMD_DISCARD, data).with_address(self.offset))
     }
 
-    fn complete(self, result: CQEResult) -> Self::Output {
-        result.into_result().map(drop)
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+        result
+    }
+
+    fn complete(self, completion: Self::Completion) -> Self::Output {
+        completion.into_result().map(drop)
     }
 }
 

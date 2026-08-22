@@ -2,10 +2,13 @@
 
 use std::future::Future;
 use std::pin::pin;
-use std::task::Poll;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::task::{Context, Poll, Wake, Waker};
 
 use bytes::{Bytes, BytesMut};
 use futures_util::future::poll_fn;
+use futures_util::task::AtomicWaker;
 use futures_util::StreamExt;
 use norn_uring::bufring::{BufRingBufBundle, RecvBufRing};
 use norn_uring::net::UdpSocket;
@@ -291,6 +294,85 @@ fn send_recv_ring() -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(s1.local_addr()?, addr);
         // Assert that the message is correct
         assert_eq!(b"hello", &buf[..5]);
+
+        Ok(())
+    })
+}
+
+#[test]
+fn dropping_unconsumed_ring_completion_recycles_selected_buffer(
+) -> Result<(), Box<dyn std::error::Error>> {
+    struct CompletionSignal {
+        complete: AtomicBool,
+        waiter: AtomicWaker,
+    }
+
+    impl CompletionSignal {
+        fn new() -> Self {
+            Self {
+                complete: AtomicBool::new(false),
+                waiter: AtomicWaker::new(),
+            }
+        }
+
+        fn poll(&self, cx: &mut Context<'_>) -> Poll<()> {
+            self.waiter.register(cx.waker());
+            if self.complete.load(Ordering::Acquire) {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }
+
+        fn wake(&self) {
+            self.complete.store(true, Ordering::Release);
+            self.waiter.wake();
+        }
+    }
+
+    impl Wake for CompletionSignal {
+        fn wake(self: Arc<Self>) {
+            CompletionSignal::wake(&self);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            CompletionSignal::wake(self);
+        }
+    }
+
+    util::with_test_env(|| async {
+        let ring = RecvBufRing::builder(12).buf_cnt(1).buf_len(128).build()?;
+        let sender = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let receiver = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let receiver_addr = receiver.local_addr()?;
+
+        let mut first_receive = Box::pin(receiver.recv_from_ring(&ring));
+        let signal = Arc::new(CompletionSignal::new());
+        let receive_waker = Waker::from(Arc::clone(&signal));
+        let mut receive_context = Context::from_waker(&receive_waker);
+        assert!(first_receive
+            .as_mut()
+            .poll(&mut receive_context)
+            .is_pending());
+
+        sender
+            .send_to(Bytes::from_static(b"first"), receiver_addr)
+            .await
+            .0?;
+        poll_fn(|cx| signal.poll(cx)).await;
+
+        // The CQE has been reaped into an owned buffer, but the receive future
+        // has never been polled to consume it. Dropping the future must return
+        // the ring's only slot.
+        drop(first_receive);
+
+        sender
+            .send_to(Bytes::from_static(b"second"), receiver_addr)
+            .await
+            .0?;
+        let (buf, peer) = receiver.recv_from_ring(&ring).await?;
+        assert_eq!(peer, sender.local_addr()?);
+        assert_eq!(&buf[..], b"second");
 
         Ok(())
     })

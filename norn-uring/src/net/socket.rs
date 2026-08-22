@@ -9,12 +9,25 @@ use socket2::{Domain, Protocol, SockAddr, Type};
 use std::io;
 use std::mem::{ManuallyDrop, MaybeUninit};
 use std::net::SocketAddr;
-use std::os::fd::FromRawFd;
+use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
 
 use crate::buf::{set_init_checked, StableBuf, StableBufMut};
 use crate::bufring::{BufRingBuf, BufRingBufBundle, RecvBufRing};
 use crate::fd::{NornFd, UringFd};
-use crate::operation::{Multishot, Op, Operation, Singleshot};
+use crate::operation::{CQEResult, Multishot, Op, Operation, Singleshot};
+
+fn reap_owned_fd(result: CQEResult) -> io::Result<OwnedFd> {
+    result.into_result().map(|fd| {
+        // Safety: successful `Socket` and `Accept` CQEs return a newly owned
+        // descriptor. `reap_operation` converts only non-negative `i32` results
+        // to `u32`.
+        unsafe { OwnedFd::from_raw_fd(fd as i32) }
+    })
+}
+
+fn bind_owned_fd(fd: OwnedFd) -> NornFd {
+    NornFd::from_fd(fd.into_raw_fd())
+}
 
 fn invalid_socket_addr_error() -> io::Error {
     io::Error::new(
@@ -525,9 +538,11 @@ struct OpenSocket {
     protocol: Option<Protocol>,
 }
 
-// Safety: the socket SQE contains only copied scalar arguments; cleanup closes
-// a descriptor returned by an unconsumed successful CQE.
+// Safety: the socket SQE contains only copied scalar arguments. `reap` converts
+// every returned descriptor to `OwnedFd` before waking application code.
 unsafe impl Operation for OpenSocket {
+    type Completion = io::Result<OwnedFd>;
+
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let ty: i32 = self.socket_type.into();
         let ty = ty | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC;
@@ -539,19 +554,16 @@ unsafe impl Operation for OpenSocket {
         .build())
     }
 
-    fn cleanup(&mut self, result: crate::operation::CQEResult) {
-        if let Ok(res) = result.result {
-            NornFd::from_fd(res as i32);
-        }
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+        reap_owned_fd(result)
     }
 }
 
 impl Singleshot for OpenSocket {
     type Output = io::Result<NornFd>;
 
-    fn complete(self, result: crate::operation::CQEResult) -> Self::Output {
-        let fd = result.result?;
-        Ok(NornFd::from_fd(fd as i32))
+    fn complete(self, completion: Self::Completion) -> Self::Output {
+        completion.map(bind_owned_fd)
     }
 }
 
@@ -587,6 +599,8 @@ unsafe impl<B> Operation for SendTo<B>
 where
     B: StableBuf,
 {
+    type Completion = CQEResult;
+
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
 
@@ -626,7 +640,9 @@ where
             .build())
     }
 
-    fn cleanup(&mut self, _: crate::operation::CQEResult) {}
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+        result
+    }
 }
 
 impl<B> Singleshot for SendTo<B>
@@ -676,6 +692,8 @@ unsafe impl<B> Operation for RecvFrom<B>
 where
     B: StableBufMut,
 {
+    type Completion = CQEResult;
+
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
 
@@ -702,7 +720,9 @@ where
             .build())
     }
 
-    fn cleanup(&mut self, _: crate::operation::CQEResult) {}
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+        result
+    }
 }
 
 impl<B> Singleshot for RecvFrom<B>
@@ -764,9 +784,12 @@ impl RecvFromRing {
     }
 }
 
-// Safety: `NornFd` and `RecvBufRing` retain the socket and registered buffer group;
-// inline recvmsg metadata remains pinned, and cleanup returns selected buffers.
+// Safety: `NornFd` and `RecvBufRing` retain the socket and registered buffer
+// group; inline recvmsg metadata remains pinned, and `reap` converts every
+// selected buffer into an owned completion before waking application code.
 unsafe impl Operation for RecvFromRing {
+    type Completion = io::Result<BufRingBuf>;
+
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
 
@@ -786,20 +809,18 @@ unsafe impl Operation for RecvFromRing {
             .flags(Flags::BUFFER_SELECT))
     }
 
-    fn cleanup(&mut self, res: crate::operation::CQEResult) {
-        if let Ok(n) = res.result {
-            drop(self.ring.get_buf(n, res.flags));
-        }
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+        let (result, flags) = result.into_parts();
+        result.and_then(|n| self.ring.get_buf(n, flags))
     }
 }
 
 impl Singleshot for RecvFromRing {
     type Output = io::Result<(BufRingBuf, SocketAddr)>;
 
-    fn complete(self, result: crate::operation::CQEResult) -> Self::Output {
+    fn complete(self, completion: Self::Completion) -> Self::Output {
         let mut this = self;
-        let n = result.result?;
-        let buf = this.ring.get_buf(n, result.flags)?;
+        let buf = completion?;
         // Safety: the msghdr was initialized when the sqe was configured.
         let msg_namelen = unsafe { this.msghdr.assume_init_ref().msg_namelen };
         // Safety: the kernel wrote at most `msg_namelen` bytes into `addr`.
@@ -877,10 +898,9 @@ impl RecvFromRingMulti {
 
     fn recv_item(
         &mut self,
-        result: crate::operation::CQEResult,
+        completion: io::Result<BufRingBuf>,
     ) -> io::Result<(RecvMsgRingBuf, SocketAddr)> {
-        let n = result.result?;
-        let buf = self.ring.get_buf(n, result.flags)?;
+        let buf = completion?;
         let msghdr = unsafe { self.msghdr.assume_init_ref() };
         let recvmsg = io_uring::types::RecvMsgOut::parse(&buf, msghdr).map_err(|_| {
             io::Error::new(
@@ -902,8 +922,11 @@ impl RecvFromRingMulti {
 }
 
 // Safety: `NornFd` and `RecvBufRing` retain all referenced resources through the
-// multishot terminal CQE; each selected buffer is either yielded or cleaned up.
+// multishot terminal CQE. Each selected buffer is held by an owned completion
+// until it is yielded or dropped.
 unsafe impl Operation for RecvFromRingMulti {
+    type Completion = io::Result<BufRingBuf>;
+
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
         let msghdr = this.msghdr.as_mut_ptr();
@@ -919,22 +942,21 @@ unsafe impl Operation for RecvFromRingMulti {
         Ok(opcode::RecvMsgMulti::new(this.fd.fd(), msghdr, this.ring.bgid()).build())
     }
 
-    fn cleanup(&mut self, result: crate::operation::CQEResult) {
-        if let Ok(n) = result.result {
-            drop(self.ring.get_buf(n, result.flags));
-        }
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+        let (result, flags) = result.into_parts();
+        result.and_then(|n| self.ring.get_buf(n, flags))
     }
 }
 
 impl Multishot for RecvFromRingMulti {
     type Item = io::Result<(RecvMsgRingBuf, SocketAddr)>;
 
-    fn update(&mut self, result: crate::operation::CQEResult) -> Self::Item {
-        self.recv_item(result)
+    fn update(&mut self, completion: Self::Completion) -> Self::Item {
+        self.recv_item(completion)
     }
 
-    fn complete(mut self, result: crate::operation::CQEResult) -> Option<Self::Item> {
-        Some(self.recv_item(result))
+    fn complete(mut self, completion: Self::Completion) -> Option<Self::Item> {
+        Some(self.recv_item(completion))
     }
 }
 
@@ -949,16 +971,14 @@ impl RecvRingMulti {
     pub(crate) fn new(fd: NornFd, ring: RecvBufRing, flags: i32) -> Self {
         Self { fd, ring, flags }
     }
-
-    fn to_item(&self, result: crate::operation::CQEResult) -> io::Result<BufRingBuf> {
-        let n = result.result?;
-        self.ring.get_buf(n, result.flags)
-    }
 }
 
 // Safety: `NornFd` and `RecvBufRing` retain all referenced resources through the
-// multishot terminal CQE; each selected buffer is either yielded or cleaned up.
+// multishot terminal CQE. Each selected buffer is held by an owned completion
+// until it is yielded or dropped.
 unsafe impl Operation for RecvRingMulti {
+    type Completion = io::Result<BufRingBuf>;
+
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
         Ok(opcode::RecvMulti::new(this.fd.fd(), this.ring.bgid())
@@ -966,22 +986,21 @@ unsafe impl Operation for RecvRingMulti {
             .build())
     }
 
-    fn cleanup(&mut self, result: crate::operation::CQEResult) {
-        if let Ok(n) = result.result {
-            drop(self.ring.get_buf(n, result.flags));
-        }
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+        let (result, flags) = result.into_parts();
+        result.and_then(|n| self.ring.get_buf(n, flags))
     }
 }
 
 impl Multishot for RecvRingMulti {
     type Item = io::Result<BufRingBuf>;
 
-    fn update(&mut self, result: crate::operation::CQEResult) -> Self::Item {
-        self.to_item(result)
+    fn update(&mut self, completion: Self::Completion) -> Self::Item {
+        completion
     }
 
-    fn complete(self, result: crate::operation::CQEResult) -> Option<Self::Item> {
-        Some(self.to_item(result))
+    fn complete(self, completion: Self::Completion) -> Option<Self::Item> {
+        Some(completion)
     }
 }
 
@@ -998,9 +1017,12 @@ impl RecvRingBundle {
     }
 }
 
-// Safety: `NornFd` and `RecvBufRing` retain the descriptor and registered group;
-// completion ownership accounts for every selected buffer in the bundle.
+// Safety: `NornFd` and `RecvBufRing` retain the descriptor and registered group.
+// `reap` converts every selected bundle into an owned completion before waking
+// application code.
 unsafe impl Operation for RecvRingBundle {
+    type Completion = io::Result<BufRingBufBundle>;
+
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
         Ok(opcode::RecvBundle::new(this.fd.fd(), this.ring.bgid())
@@ -1008,19 +1030,17 @@ unsafe impl Operation for RecvRingBundle {
             .build())
     }
 
-    fn cleanup(&mut self, result: crate::operation::CQEResult) {
-        if let Ok(n) = result.result {
-            drop(self.ring.get_buf_bundle(n, result.flags));
-        }
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+        let (result, flags) = result.into_parts();
+        result.and_then(|n| self.ring.get_buf_bundle(n, flags))
     }
 }
 
 impl Singleshot for RecvRingBundle {
     type Output = io::Result<BufRingBufBundle>;
 
-    fn complete(self, result: crate::operation::CQEResult) -> Self::Output {
-        let n = result.result?;
-        self.ring.get_buf_bundle(n, result.flags)
+    fn complete(self, completion: Self::Completion) -> Self::Output {
+        completion
     }
 }
 
@@ -1035,16 +1055,14 @@ impl RecvRingBundleMulti {
     pub(crate) fn new(fd: NornFd, ring: RecvBufRing, flags: i32) -> Self {
         Self { fd, ring, flags }
     }
-
-    fn to_item(&self, result: crate::operation::CQEResult) -> io::Result<BufRingBufBundle> {
-        let n = result.result?;
-        self.ring.get_buf_bundle(n, result.flags)
-    }
 }
 
 // Safety: `NornFd` and `RecvBufRing` retain resources through the multishot
-// terminal CQE; yielded and unconsumed bundles are returned by completion logic.
+// terminal CQE. Each selected bundle is held by an owned completion until it is
+// yielded or dropped.
 unsafe impl Operation for RecvRingBundleMulti {
+    type Completion = io::Result<BufRingBufBundle>;
+
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
         Ok(opcode::RecvMultiBundle::new(this.fd.fd(), this.ring.bgid())
@@ -1052,22 +1070,21 @@ unsafe impl Operation for RecvRingBundleMulti {
             .build())
     }
 
-    fn cleanup(&mut self, result: crate::operation::CQEResult) {
-        if let Ok(n) = result.result {
-            drop(self.ring.get_buf_bundle(n, result.flags));
-        }
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+        let (result, flags) = result.into_parts();
+        result.and_then(|n| self.ring.get_buf_bundle(n, flags))
     }
 }
 
 impl Multishot for RecvRingBundleMulti {
     type Item = io::Result<BufRingBufBundle>;
 
-    fn update(&mut self, result: crate::operation::CQEResult) -> Self::Item {
-        self.to_item(result)
+    fn update(&mut self, completion: Self::Completion) -> Self::Item {
+        completion
     }
 
-    fn complete(self, result: crate::operation::CQEResult) -> Option<Self::Item> {
-        Some(self.to_item(result))
+    fn complete(self, completion: Self::Completion) -> Option<Self::Item> {
+        Some(completion)
     }
 }
 
@@ -1114,8 +1131,11 @@ impl<const MULTI: bool> Accept<MULTI> {
 }
 
 // Safety: `NornFd` retains the listener and the pinned socket-address storage
-// remains valid for every CQE; cleanup closes unconsumed accepted descriptors.
+// remains valid for every CQE. `reap` converts every accepted descriptor to
+// `OwnedFd` before waking application code.
 unsafe impl<const MULTI: bool> Operation for Accept<MULTI> {
+    type Completion = io::Result<OwnedFd>;
+
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
         let fd = this.fd.fd();
@@ -1134,36 +1154,33 @@ unsafe impl<const MULTI: bool> Operation for Accept<MULTI> {
         }
     }
 
-    fn cleanup(&mut self, result: crate::operation::CQEResult) {
-        if let Ok(fd) = result.result {
-            NornFd::from_fd(fd as i32);
-        }
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+        reap_owned_fd(result)
     }
 }
 
 impl Singleshot for Accept<false> {
     type Output = io::Result<(NornFd, SocketAddr)>;
 
-    fn complete(self, result: crate::operation::CQEResult) -> Self::Output {
+    fn complete(self, completion: Self::Completion) -> Self::Output {
         let mut this = self;
-        let fd = result.result?;
+        let fd = completion?;
         // Safety: the kernel wrote at most `addr_len` bytes into `addr`.
         unsafe { this.addr.set_length(this.addr_len) };
         let addr = as_socket_addr(&this.addr)?;
-        Ok((NornFd::from_fd(fd as i32), addr))
+        Ok((bind_owned_fd(fd), addr))
     }
 }
 
 impl Multishot for Accept<true> {
     type Item = io::Result<NornFd>;
 
-    fn update(&mut self, result: crate::operation::CQEResult) -> Self::Item {
-        let fd = result.result?;
-        Ok(NornFd::from_fd(fd as i32))
+    fn update(&mut self, completion: Self::Completion) -> Self::Item {
+        completion.map(bind_owned_fd)
     }
 
-    fn complete(self, result: crate::operation::CQEResult) -> Option<Self::Item> {
-        Some(result.result.map(|fd| NornFd::from_fd(fd as i32)))
+    fn complete(self, completion: Self::Completion) -> Option<Self::Item> {
+        Some(completion.map(bind_owned_fd))
     }
 }
 
@@ -1184,6 +1201,8 @@ impl BindSocket {
 // Safety: `NornFd` retains the socket and the owned address storage remains
 // live and pinned through completion.
 unsafe impl Operation for BindSocket {
+    type Completion = CQEResult;
+
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
         Ok(opcode::Bind::new(
@@ -1194,7 +1213,9 @@ unsafe impl Operation for BindSocket {
         .build())
     }
 
-    fn cleanup(&mut self, _: crate::operation::CQEResult) {}
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+        result
+    }
 }
 
 impl Singleshot for BindSocket {
@@ -1218,12 +1239,16 @@ impl ListenSocket {
 
 // Safety: `NornFd` retains the only resource referenced by this SQE.
 unsafe impl Operation for ListenSocket {
+    type Completion = CQEResult;
+
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
         Ok(opcode::Listen::new(this.fd.fd(), this.backlog).build())
     }
 
-    fn cleanup(&mut self, _: crate::operation::CQEResult) {}
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+        result
+    }
 }
 
 impl Singleshot for ListenSocket {
@@ -1261,6 +1286,8 @@ unsafe impl<T> Operation for SetSockOpt<T>
 where
     T: Copy,
 {
+    type Completion = CQEResult;
+
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
         let optlen = std::mem::size_of::<T>() as u32;
@@ -1268,7 +1295,9 @@ where
         Ok(opcode::SetSockOpt::new(this.fd.fd(), this.level, this.optname, optval, optlen).build())
     }
 
-    fn cleanup(&mut self, _: crate::operation::CQEResult) {}
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+        result
+    }
 }
 
 impl<T> Singleshot for SetSockOpt<T>
@@ -1297,6 +1326,8 @@ impl Connect {
 // Safety: `NornFd` retains the socket and the owned address storage remains
 // live and pinned through completion.
 unsafe impl Operation for Connect {
+    type Completion = CQEResult;
+
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
         Ok(opcode::Connect::new(
@@ -1307,7 +1338,9 @@ unsafe impl Operation for Connect {
         .build())
     }
 
-    fn cleanup(&mut self, _: crate::operation::CQEResult) {}
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+        result
+    }
 }
 
 impl Singleshot for Connect {
@@ -1331,12 +1364,16 @@ impl Shutdown {
 
 // Safety: `NornFd` retains the only resource referenced by this SQE.
 unsafe impl Operation for Shutdown {
+    type Completion = CQEResult;
+
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
         Ok(opcode::Shutdown::new(this.fd.fd(), this.how).build())
     }
 
-    fn cleanup(&mut self, _: crate::operation::CQEResult) {}
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+        result
+    }
 }
 
 impl Singleshot for Shutdown {
@@ -1375,6 +1412,8 @@ unsafe impl<B> Operation for Recv<B>
 where
     B: StableBufMut,
 {
+    type Completion = CQEResult;
+
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let len = checked_scalar_len(self.submitted_len, "receive buffer length")?;
         let ptr = self.buf.stable_ptr_mut();
@@ -1383,7 +1422,9 @@ where
             .build())
     }
 
-    fn cleanup(&mut self, _: crate::operation::CQEResult) {}
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+        result
+    }
 }
 
 impl<B> Singleshot for Recv<B>
@@ -1430,6 +1471,8 @@ unsafe impl<B> Operation for Send<B>
 where
     B: StableBuf,
 {
+    type Completion = CQEResult;
+
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let len = checked_scalar_len(self.buf.bytes_init(), "send buffer length")?;
         let ptr = self.buf.stable_ptr();
@@ -1438,7 +1481,9 @@ where
             .build())
     }
 
-    fn cleanup(&mut self, _: crate::operation::CQEResult) {}
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+        result
+    }
 }
 
 impl<B> Singleshot for Send<B>
@@ -1510,6 +1555,8 @@ unsafe impl<B> Operation for SendZc<B>
 where
     B: StableBuf,
 {
+    type Completion = CQEResult;
+
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
         let ptr = this.buf.stable_ptr();
@@ -1519,7 +1566,9 @@ where
             .build())
     }
 
-    fn cleanup(&mut self, _: crate::operation::CQEResult) {}
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+        result
+    }
 }
 
 impl<B> Singleshot for SendZc<B>
@@ -1578,6 +1627,8 @@ unsafe impl<B> Operation for SendMsgZc<B>
 where
     B: StableBuf,
 {
+    type Completion = CQEResult;
+
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
 
@@ -1603,7 +1654,9 @@ where
             .build())
     }
 
-    fn cleanup(&mut self, _: crate::operation::CQEResult) {}
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+        result
+    }
 }
 
 impl<B> Singleshot for SendMsgZc<B>
@@ -1640,6 +1693,8 @@ impl<const MULTI: bool> Poll<MULTI> {
 // Safety: `NornFd` retains the descriptor through the single or multishot
 // terminal CQE; the SQE references no userspace memory.
 unsafe impl<const MULTI: bool> Operation for Poll<MULTI> {
+    type Completion = CQEResult;
+
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
         Ok(opcode::PollAdd::new(this.fd.fd(), this.events)
@@ -1647,7 +1702,9 @@ unsafe impl<const MULTI: bool> Operation for Poll<MULTI> {
             .build())
     }
 
-    fn cleanup(&mut self, _: crate::operation::CQEResult) {}
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+        result
+    }
 }
 
 impl Multishot for Poll<true> {
@@ -1730,6 +1787,24 @@ mod tests {
     use norn_executor::LocalExecutor;
 
     use super::*;
+
+    #[test]
+    fn unconsumed_reaped_descriptor_closes_directly() {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+
+        let completion = reap_owned_fd(CQEResult::new(Ok(fds[0] as u32), 0)).unwrap();
+        drop(completion);
+
+        let mut pollfd = libc::pollfd {
+            fd: fds[1],
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut pollfd, 1, 0) }, 1);
+        assert_ne!(pollfd.revents & libc::POLLERR, 0);
+        assert_eq!(unsafe { libc::close(fds[1]) }, 0);
+    }
 
     fn assert_accept_flags(fd: io_uring::types::Fd) {
         let status = unsafe { libc::fcntl(fd.0, libc::F_GETFL) };

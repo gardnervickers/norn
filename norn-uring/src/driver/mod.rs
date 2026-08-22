@@ -18,7 +18,7 @@ use crate::bufring::{
     ReserveError as ReserveBufRingError,
 };
 use crate::error::SubmitError;
-use crate::operation::{complete_operation, ConfiguredEntry, Op, Operation};
+use crate::operation::{reap_operation, ConfiguredEntry, Op, Operation};
 use crate::registered_buffers::Registry as RegisteredBuffers;
 pub(crate) use crate::registered_buffers::{
     Generation as FixedBufGeneration, Release as FixedBufRelease,
@@ -173,9 +173,9 @@ pub(super) enum Status {
     Closing,
     /// The driver is waiting for all admitted operations to become terminal.
     DrainingOperations,
-    /// Operation completions have been reaped and cleanup-generated work is being flushed.
+    /// Operation completions have been reaped and resource-release work is being flushed.
     ClosingResources,
-    /// The driver is waiting for cleanup-generated work to become terminal.
+    /// The driver is waiting for resource-release work to become terminal.
     DrainingResources,
     /// The driver has shutdown and will not accept new requests.
     Shutdown,
@@ -737,7 +737,7 @@ impl Driver {
                 }
                 // Safety: This is being called on a completion queue entry which has been generated
                 // by a prior submission.
-                unsafe { complete_operation(cqe) }
+                unsafe { reap_operation(cqe) }
             }
             total_drained += nr_drained;
             if !has_more || total_drained >= max {
@@ -907,8 +907,8 @@ impl Driver {
                 }
                 Status::ClosingResources => {
                     // Reaping the first barrier can destroy RawOps. Their destructors may
-                    // enqueue close SQEs or other cleanup work after that barrier, so flush
-                    // the complete userspace SQ before ordering a final drain behind it.
+                    // enqueue close SQEs or other resource-release work after that barrier,
+                    // so flush the complete userspace SQ before ordering a final drain behind it.
                     if let Err(err) = self.shared.submit_all_pending() {
                         self.retry_shutdown("submit_cleanup", &err);
                         continue;
@@ -1405,7 +1405,7 @@ impl Drop for Driver {
 mod tests {
     use std::future::Future;
     use std::net::TcpListener;
-    use std::os::fd::AsRawFd;
+    use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
     use std::os::unix::net::UnixStream;
     use std::rc::Rc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1453,6 +1453,11 @@ mod tests {
         dropped: Arc<AtomicBool>,
     }
 
+    enum LongLivedCompletion {
+        Read(io::Result<u32>),
+        Accept(io::Result<OwnedFd>),
+    }
+
     impl Drop for LongLivedOp {
         fn drop(&mut self) {
             self.dropped.store(true, Ordering::Release);
@@ -1460,6 +1465,8 @@ mod tests {
     }
 
     unsafe impl Operation for LongLivedOp {
+        type Completion = LongLivedCompletion;
+
         fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
             Ok(match &mut self.io {
                 LongLivedIo::Read { reader, buf, .. } => opcode::Read::new(
@@ -1477,11 +1484,14 @@ mod tests {
             })
         }
 
-        fn cleanup(&mut self, result: CQEResult) {
-            if matches!(self.io, LongLivedIo::Accept(_)) {
-                if let Ok(fd) = result.result {
-                    // Safety: a successful accept completion returns a newly owned fd.
-                    unsafe { libc::close(fd as i32) };
+        unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+            match &self.io {
+                LongLivedIo::Read { .. } => LongLivedCompletion::Read(result.into_result()),
+                LongLivedIo::Accept(_) => {
+                    LongLivedCompletion::Accept(result.into_result().map(|fd| {
+                        // Safety: a successful accept CQE transfers ownership of this descriptor.
+                        unsafe { OwnedFd::from_raw_fd(fd as i32) }
+                    }))
                 }
             }
         }
@@ -1490,8 +1500,11 @@ mod tests {
     impl Singleshot for LongLivedOp {
         type Output = io::Result<u32>;
 
-        fn complete(self, result: CQEResult) -> Self::Output {
-            result.result
+        fn complete(self, completion: Self::Completion) -> Self::Output {
+            match completion {
+                LongLivedCompletion::Read(result) => result,
+                LongLivedCompletion::Accept(result) => result.map(|fd| fd.into_raw_fd() as u32),
+            }
         }
     }
 
@@ -1819,11 +1832,15 @@ mod tests {
         struct NopOp;
 
         unsafe impl Operation for NopOp {
+            type Completion = CQEResult;
+
             fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
                 Ok(io_uring::opcode::Nop::new().build())
             }
 
-            fn cleanup(&mut self, _: CQEResult) {}
+            unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+                result
+            }
         }
 
         impl Singleshot for NopOp {
@@ -1883,12 +1900,16 @@ mod tests {
 
         // Safety: RawOp keeps the timeout storage stable until the terminal CQE.
         unsafe impl Operation for PendingFdOp {
+            type Completion = CQEResult;
+
             fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
                 let _ = self.fd.fd();
                 Ok(opcode::Timeout::new(&self.timeout).build())
             }
 
-            fn cleanup(&mut self, _: CQEResult) {}
+            unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+                result
+            }
         }
 
         impl Singleshot for PendingFdOp {
@@ -1916,13 +1937,17 @@ mod tests {
         // Safety: RawOp keeps the timeout storage stable until the terminal CQE.
         // The operation also retains a registered fixed buffer during that period.
         unsafe impl Operation for PendingFixedBufOp {
+            type Completion = CQEResult;
+
             fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
                 let _ = self.fd.fd();
                 let _ = self.buf.index();
                 Ok(opcode::Timeout::new(&self.timeout).build())
             }
 
-            fn cleanup(&mut self, _: CQEResult) {}
+            unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+                result
+            }
         }
 
         impl Singleshot for PendingFixedBufOp {
@@ -2009,11 +2034,15 @@ mod tests {
 
         // Safety: RawOp keeps the timeout storage stable until the terminal CQE.
         unsafe impl Operation for PendingFdOp {
+            type Completion = CQEResult;
+
             fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
                 Ok(opcode::Timeout::new(&self.timeout).build())
             }
 
-            fn cleanup(&mut self, _: CQEResult) {}
+            unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+                result
+            }
         }
 
         impl Singleshot for PendingFdOp {
@@ -2102,11 +2131,15 @@ mod tests {
             struct NopOp;
 
             unsafe impl Operation for NopOp {
+                type Completion = CQEResult;
+
                 fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
                     Ok(opcode::Nop::new().build())
                 }
 
-                fn cleanup(&mut self, _: CQEResult) {}
+                unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+                    result
+                }
             }
 
             impl Singleshot for NopOp {
@@ -2169,11 +2202,15 @@ mod tests {
         struct NopOp;
 
         unsafe impl Operation for NopOp {
+            type Completion = CQEResult;
+
             fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
                 Ok(io_uring::opcode::Nop::new().build())
             }
 
-            fn cleanup(&mut self, _: CQEResult) {}
+            unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+                result
+            }
         }
 
         impl Singleshot for NopOp {
@@ -2198,11 +2235,15 @@ mod tests {
         struct NopOp;
 
         unsafe impl Operation for NopOp {
+            type Completion = CQEResult;
+
             fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
                 Ok(io_uring::opcode::Nop::new().build())
             }
 
-            fn cleanup(&mut self, _: CQEResult) {}
+            unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+                result
+            }
         }
 
         impl Singleshot for NopOp {
@@ -2242,11 +2283,15 @@ mod tests {
         struct NopOp;
 
         unsafe impl Operation for NopOp {
+            type Completion = CQEResult;
+
             fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
                 Ok(io_uring::opcode::Nop::new().build())
             }
 
-            fn cleanup(&mut self, _: CQEResult) {}
+            unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+                result
+            }
         }
 
         impl Singleshot for NopOp {

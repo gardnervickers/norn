@@ -1,7 +1,7 @@
 use io_uring::types::FsyncFlags;
 use io_uring::{opcode, types};
 use std::io;
-use std::os::fd::RawFd;
+use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::path::Path;
 
 use crate::buf::{set_init_checked, StableBuf, StableBufMut};
@@ -551,27 +551,28 @@ impl Open {
 }
 
 // Safety: the owned CString and inline `OpenHow` keep both SQE pointers valid;
-// cleanup closes a descriptor returned by an unconsumed successful CQE.
+// a successful CQE is converted into an owned descriptor before it is queued.
 unsafe impl Operation for Open {
+    type Completion = io::Result<OwnedFd>;
+
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
         let ptr = this.path.as_ptr();
         Ok(opcode::OpenAt2::new(types::Fd(libc::AT_FDCWD), ptr, &this.how).build())
     }
 
-    fn cleanup(&mut self, result: CQEResult) {
-        if let Ok(res) = result.result {
-            drop(NornFd::from_fd(res as _));
-        }
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+        let fd = result.into_result()?;
+        // Safety: a successful `OpenAt2` CQE transfers ownership of a newly opened file descriptor.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
     }
 }
 
 impl Singleshot for Open {
     type Output = io::Result<NornFd>;
 
-    fn complete(self, result: CQEResult) -> Self::Output {
-        let res = result.result?;
-        Ok(NornFd::from_fd(res as _))
+    fn complete(self, result: Self::Completion) -> Self::Output {
+        Ok(NornFd::from_fd(result?.into_raw_fd()))
     }
 }
 
@@ -631,6 +632,8 @@ unsafe impl<B> Operation for ReadAt<B>
 where
     B: StableBufMut,
 {
+    type Completion = CQEResult;
+
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let len = usize_to_u32(self.submitted_len, "read buffer length")?;
         let buf = self.buf.stable_ptr_mut();
@@ -639,7 +642,9 @@ where
             .build())
     }
 
-    fn cleanup(&mut self, _: CQEResult) {}
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+        result
+    }
 }
 
 impl<B> Singleshot for ReadAt<B>
@@ -680,6 +685,8 @@ impl<B: 'static> ReadFixedAt<B> {
 // Safety: `FixedBuf` owns the registered slot until the terminal CQE and the
 // same-driver check is performed before this operation is constructed.
 unsafe impl<B: 'static> Operation for ReadFixedAt<B> {
+    type Completion = CQEResult;
+
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let ptr = self.buf.fixed_ptr_mut();
         let len = self.buf.read_capacity_u32();
@@ -689,7 +696,9 @@ unsafe impl<B: 'static> Operation for ReadFixedAt<B> {
             .build())
     }
 
-    fn cleanup(&mut self, _: CQEResult) {}
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+        result
+    }
 }
 
 impl<B: 'static> Singleshot for ReadFixedAt<B> {
@@ -727,6 +736,8 @@ unsafe impl<B> Operation for WriteAt<B>
 where
     B: StableBuf,
 {
+    type Completion = CQEResult;
+
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let len = usize_to_u32(self.buf.bytes_init(), "write buffer length")?;
         let buf = self.buf.stable_ptr();
@@ -735,7 +746,9 @@ where
             .build())
     }
 
-    fn cleanup(&mut self, _: CQEResult) {}
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+        result
+    }
 }
 
 impl<B> Singleshot for WriteAt<B>
@@ -768,6 +781,8 @@ impl<B: 'static> WriteFixedAt<B> {
 // Safety: `FixedBuf` owns the initialized registered payload until the
 // terminal CQE and the same-driver check happens before construction.
 unsafe impl<B: 'static> Operation for WriteFixedAt<B> {
+    type Completion = CQEResult;
+
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let ptr = self.buf.fixed_ptr();
         let len = self.buf.write_len_u32();
@@ -777,7 +792,9 @@ unsafe impl<B: 'static> Operation for WriteFixedAt<B> {
             .build())
     }
 
-    fn cleanup(&mut self, _: CQEResult) {}
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+        result
+    }
 }
 
 impl<B: 'static> Singleshot for WriteFixedAt<B> {
@@ -815,6 +832,8 @@ unsafe impl<B> Operation for ReadVectoredAt<B>
 where
     B: StableBufMut,
 {
+    type Completion = CQEResult;
+
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
         this.iovecs.clear();
@@ -833,7 +852,9 @@ where
             .build())
     }
 
-    fn cleanup(&mut self, _: CQEResult) {}
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+        result
+    }
 }
 
 impl<B> Singleshot for ReadVectoredAt<B>
@@ -901,6 +922,8 @@ unsafe impl<B> Operation for WriteVectoredAt<B>
 where
     B: StableBuf,
 {
+    type Completion = CQEResult;
+
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
         this.iovecs.clear();
@@ -919,7 +942,9 @@ where
             .build())
     }
 
-    fn cleanup(&mut self, _: CQEResult) {}
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+        result
+    }
 }
 
 impl<B> Singleshot for WriteVectoredAt<B>
@@ -957,13 +982,17 @@ impl Advise {
 // Safety: `NornFd` retains the only resource referenced by this pointer-free
 // advisory SQE until completion.
 unsafe impl Operation for Advise {
+    type Completion = CQEResult;
+
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         Ok(opcode::Fadvise::new(self.fd.fd(), self.len, self.advice)
             .offset(self.offset)
             .build())
     }
 
-    fn cleanup(&mut self, _: CQEResult) {}
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+        result
+    }
 }
 
 impl Singleshot for Advise {
@@ -1004,12 +1033,16 @@ unsafe impl<B> Operation for FileGetXattr<B>
 where
     B: StableBufMut,
 {
+    type Completion = CQEResult;
+
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let ptr = self.buf.stable_ptr_mut() as *mut libc::c_void;
         Ok(opcode::FGetXattr::new(self.fd.fd(), self.name.as_ptr(), ptr, self.len).build())
     }
 
-    fn cleanup(&mut self, _: CQEResult) {}
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+        result
+    }
 }
 
 impl<B> Singleshot for FileGetXattr<B>
@@ -1066,6 +1099,8 @@ unsafe impl<B> Operation for FileSetXattr<B>
 where
     B: StableBuf,
 {
+    type Completion = CQEResult;
+
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let ptr = self.value.stable_ptr() as *const libc::c_void;
         Ok(
@@ -1075,7 +1110,9 @@ where
         )
     }
 
-    fn cleanup(&mut self, _: CQEResult) {}
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+        result
+    }
 }
 
 impl<B> Singleshot for FileSetXattr<B>
@@ -1102,11 +1139,15 @@ impl Sync {
 
 // Safety: `NornFd` retains the descriptor; the SQE references no memory.
 unsafe impl Operation for Sync {
+    type Completion = CQEResult;
+
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         Ok(opcode::Fsync::new(self.fd.fd()).flags(self.flags).build())
     }
 
-    fn cleanup(&mut self, _: CQEResult) {}
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+        result
+    }
 }
 
 impl Singleshot for Sync {
@@ -1136,6 +1177,8 @@ impl SyncRange {
 
 // Safety: `NornFd` retains the descriptor; the SQE references no memory.
 unsafe impl Operation for SyncRange {
+    type Completion = CQEResult;
+
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         Ok(opcode::SyncFileRange::new(self.fd.fd(), self.len)
             .offset(self.offset)
@@ -1143,7 +1186,9 @@ unsafe impl Operation for SyncRange {
             .build())
     }
 
-    fn cleanup(&mut self, _: CQEResult) {}
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+        result
+    }
 }
 
 impl Singleshot for SyncRange {
@@ -1174,6 +1219,8 @@ impl Fallocate {
 
 // Safety: `NornFd` retains the descriptor; the SQE references no memory.
 unsafe impl Operation for Fallocate {
+    type Completion = CQEResult;
+
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         Ok(opcode::Fallocate::new(self.fd.fd(), self.len)
             .offset(self.offset)
@@ -1181,7 +1228,9 @@ unsafe impl Operation for Fallocate {
             .build())
     }
 
-    fn cleanup(&mut self, _: CQEResult) {}
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+        result
+    }
 }
 
 impl Singleshot for Fallocate {
@@ -1205,11 +1254,15 @@ impl Truncate {
 
 // Safety: `NornFd` retains the descriptor; the SQE references no memory.
 unsafe impl Operation for Truncate {
+    type Completion = CQEResult;
+
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         Ok(opcode::Ftruncate::new(self.fd.fd(), self.len).build())
     }
 
-    fn cleanup(&mut self, _: CQEResult) {}
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+        result
+    }
 }
 
 impl Singleshot for Truncate {
@@ -1245,6 +1298,8 @@ impl SpliceOp {
 // Safety: both `NornFd` values retain the copied descriptors used by the SQE;
 // no userspace memory is referenced.
 unsafe impl Operation for SpliceOp {
+    type Completion = CQEResult;
+
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
         Ok(opcode::Splice::new(
@@ -1258,7 +1313,9 @@ unsafe impl Operation for SpliceOp {
         .build())
     }
 
-    fn cleanup(&mut self, _: CQEResult) {}
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+        result
+    }
 }
 
 impl Singleshot for SpliceOp {
@@ -1290,6 +1347,8 @@ impl TeeOp {
 // Safety: both `NornFd` values retain the copied descriptors used by the SQE;
 // no userspace memory is referenced.
 unsafe impl Operation for TeeOp {
+    type Completion = CQEResult;
+
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
         Ok(
@@ -1299,7 +1358,9 @@ unsafe impl Operation for TeeOp {
         )
     }
 
-    fn cleanup(&mut self, _: CQEResult) {}
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+        result
+    }
 }
 
 impl Singleshot for TeeOp {

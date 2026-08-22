@@ -143,8 +143,11 @@ impl NornFd {
             ));
         }
         if let Some(handle) = &self.inner.handle {
-            let result = handle.submit(CloseFd { fd: self.inner.fd }).await;
-            self.inner.finish_tracked_close(result)
+            handle
+                .submit(CloseFd {
+                    inner: Rc::clone(&self.inner),
+                })
+                .await
         } else {
             self.inner.close_direct_and_invalidate()
         }
@@ -167,6 +170,7 @@ impl Drop for Inner {
 enum CloseResult {
     Closed,
     NeverSubmitted(io::Error),
+    Canceled(io::Error),
     KernelError(io::Error),
 }
 
@@ -177,7 +181,9 @@ impl Inner {
                 self.closed.set(true);
                 Ok(())
             }
-            CloseResult::NeverSubmitted(_submit_err) => self.close_direct_and_invalidate(),
+            CloseResult::NeverSubmitted(_submit_err) | CloseResult::Canceled(_submit_err) => {
+                self.close_direct_and_invalidate()
+            }
             CloseResult::KernelError(err) => {
                 // Linux invalidates the descriptor when processing Close even if it reports a
                 // later error. Retrying by integer fd could close an unrelated reused fd.
@@ -221,29 +227,46 @@ impl Inner {
 }
 
 struct CloseFd {
-    fd: types::Fd,
+    // The operation retains the descriptor while its copied integer is visible
+    // to the kernel. If the caller drops both the close future and `NornFd`,
+    // this prevents `Inner::drop` from queuing a second close for that number.
+    inner: Rc<Inner>,
 }
 
-// Safety: the SQE contains only the copied descriptor value; completion owns
-// no borrowed memory, and cleanup closes a successfully returned descriptor.
+fn classify_close_completion(result: crate::operation::CQEResult) -> CloseResult {
+    let synthetic = result.is_synthetic();
+    match result.into_result() {
+        Ok(_) => CloseResult::Closed,
+        Err(err) if synthetic => CloseResult::NeverSubmitted(err),
+        // A canceled close CQE means the request did not execute. Once that
+        // terminal CQE arrives, the descriptor can be closed directly without
+        // racing the original SQE.
+        Err(err) if err.raw_os_error() == Some(libc::ECANCELED) => CloseResult::Canceled(err),
+        Err(err) => CloseResult::KernelError(err),
+    }
+}
+
+// Safety: `inner` retains the descriptor through the terminal CQE. `reap`
+// records a successful kernel close or closes directly after a synthetic or
+// canceled request, so the queued result owns no descriptor.
 unsafe impl Operation for CloseFd {
+    type Completion = io::Result<()>;
+
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
-        Ok(opcode::Close::new(self.fd).build())
+        Ok(opcode::Close::new(self.inner.fd).build())
     }
 
-    fn cleanup(&mut self, _: crate::operation::CQEResult) {}
+    unsafe fn reap(&mut self, result: crate::operation::CQEResult) -> Self::Completion {
+        self.inner
+            .finish_tracked_close(classify_close_completion(result))
+    }
 }
 
 impl Singleshot for CloseFd {
-    type Output = CloseResult;
+    type Output = io::Result<()>;
 
-    fn complete(self, result: crate::operation::CQEResult) -> Self::Output {
-        let synthetic = result.is_synthetic();
-        match result.into_result() {
-            Ok(_) => CloseResult::Closed,
-            Err(err) if synthetic => CloseResult::NeverSubmitted(err),
-            Err(err) => CloseResult::KernelError(err),
-        }
+    fn complete(self, completion: Self::Completion) -> Self::Output {
+        completion
     }
 }
 
@@ -291,15 +314,24 @@ mod tests {
 
     #[test]
     fn close_completion_distinguishes_submission_from_kernel_errors() {
-        let synthetic = CloseFd { fd: types::Fd(-1) }.complete(
-            crate::operation::CQEResult::synthetic(Err(io::Error::from_raw_os_error(libc::EIO))),
-        );
+        let synthetic = classify_close_completion(crate::operation::CQEResult::synthetic(Err(
+            io::Error::from_raw_os_error(libc::EIO),
+        )));
         assert!(matches!(
             synthetic,
             CloseResult::NeverSubmitted(err) if err.raw_os_error() == Some(libc::EIO)
         ));
 
-        let kernel = CloseFd { fd: types::Fd(-1) }.complete(crate::operation::CQEResult::new(
+        let canceled = classify_close_completion(crate::operation::CQEResult::new(
+            Err(io::Error::from_raw_os_error(libc::ECANCELED)),
+            0,
+        ));
+        assert!(matches!(
+            canceled,
+            CloseResult::Canceled(err) if err.raw_os_error() == Some(libc::ECANCELED)
+        ));
+
+        let kernel = classify_close_completion(crate::operation::CQEResult::new(
             Err(io::Error::from_raw_os_error(libc::EIO)),
             0,
         ));
@@ -323,6 +355,63 @@ mod tests {
         assert_pipe_reader_closed(write_end);
         drop(fd);
         unsafe { libc::close(write_end) };
+    }
+
+    #[test]
+    fn close_operation_owns_descriptor_until_reap() {
+        let [read_end, write_end] = pipe();
+        let fd = NornFd::from_fd(read_end);
+        let mut close = CloseFd {
+            inner: Rc::clone(&fd.inner),
+        };
+
+        drop(fd);
+        assert_open(read_end);
+
+        // Safety: the test supplies this `CloseFd`'s unreaped terminal CQE.
+        unsafe {
+            close.reap(crate::operation::CQEResult::new(
+                Err(io::Error::from_raw_os_error(libc::ECANCELED)),
+                0,
+            ))
+        }
+        .unwrap();
+        assert_pipe_reader_closed(write_end);
+
+        drop(close);
+        unsafe { libc::close(write_end) };
+    }
+
+    #[test]
+    fn unconsumed_successful_close_cannot_close_reused_descriptor() {
+        crate::test_util::run_isolated(
+            "fd::tests::unconsumed_successful_close_cannot_close_reused_descriptor",
+            unconsumed_successful_close_cannot_close_reused_descriptor_isolated,
+        );
+    }
+
+    fn unconsumed_successful_close_cannot_close_reused_descriptor_isolated() {
+        let [read_end, write_end] = pipe();
+        let fd = NornFd::from_fd(read_end);
+        let mut close = CloseFd {
+            inner: Rc::clone(&fd.inner),
+        };
+        drop(fd);
+
+        // Model the kernel consuming the close, followed by descriptor-number
+        // reuse before the queued typed completion is observed or dropped.
+        assert_eq!(unsafe { libc::close(read_end) }, 0);
+        assert_eq!(unsafe { libc::dup2(write_end, read_end) }, read_end);
+        // Safety: the test supplies this `CloseFd`'s unreaped terminal CQE.
+        let completion = unsafe { close.reap(crate::operation::CQEResult::new(Ok(0), 0)) };
+        drop(completion);
+        drop(close);
+
+        assert_open(read_end);
+        unsafe {
+            libc::close(read_end);
+            libc::close(write_end);
+        }
     }
 
     #[test]

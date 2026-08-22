@@ -65,7 +65,8 @@ The project is intentionally not general-purpose today; APIs are still in flux i
   - `Unsubmitted` (waiting for SQ space),
   - `Submitted` (awaiting completions).
 - Dropping submitted `Op` attempts cancellation (`cancel(user_data)`).
-- `Operation::cleanup` is used for resource cleanup of dropped/unconsumed completions.
+- `Operation::reap` converts each kernel or synthetic completion into an owned
+  value; dropping an unconsumed value releases any resources represented by it.
 - `UnsubmittedOp` currently expects push success and can panic if polled during shutdown.
 
 ### FD and buffer lifetime constraints

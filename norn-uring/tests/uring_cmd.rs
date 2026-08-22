@@ -15,14 +15,19 @@ struct TestCommand;
 // completion. The unassigned command operation exercises the public extension
 // path without introducing command-specific resources.
 unsafe impl UringCommand16 for TestCommand {
+    type Completion = CQEResult;
     type Output = io::Result<u32>;
 
     fn encode(&mut self) -> io::Result<Command16> {
         Ok(Command16::new(u32::MAX, [0; 16]))
     }
 
-    fn complete(self, result: CQEResult) -> Self::Output {
-        result.into_result()
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+        result
+    }
+
+    fn complete(self, completion: Self::Completion) -> Self::Output {
+        completion.into_result()
     }
 }
 

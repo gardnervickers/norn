@@ -82,11 +82,15 @@ impl Command16 {
 ///   device UAPI through the terminal CQE;
 /// - kernel access to encoded memory obeys Rust's aliasing rules;
 /// - the command produces exactly one terminal completion and does not enable a
-///   multishot mode; and
-/// - [`UringCommand16::cleanup`] correctly releases resources represented by an
-///   unconsumed completion, including synthetic configuration or submission
-///   failures.
+///   multishot mode;
+/// - [`UringCommand16::reap`] returns an owned value that safely releases every
+///   resource represented by the completion when dropped, including when configuration,
+///   submission, or cancellation before submission produces a synthetic failure; and
+/// - [`UringCommand16::reap`] does not unwind.
 pub unsafe trait UringCommand16: Sized + 'static {
+    /// The owned value produced from the command's terminal completion.
+    type Completion: 'static;
+
     /// The result produced from the command's terminal completion.
     type Output;
 
@@ -97,11 +101,18 @@ pub unsafe trait UringCommand16: Sized + 'static {
     /// Returns an error if a valid command payload cannot be constructed.
     fn encode(&mut self) -> io::Result<Command16>;
 
-    /// Convert the terminal completion into this command's output.
-    fn complete(self, result: CQEResult) -> Self::Output;
+    /// Convert the command's terminal completion into an owned value.
+    ///
+    /// A panic from this method aborts the process because the completion cannot be safely
+    /// replayed.
+    ///
+    /// # Safety
+    ///
+    /// `result` must be an unreaped kernel or synthetic completion produced for this command.
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion;
 
-    /// Release resources represented by an unconsumed completion.
-    fn cleanup(&mut self, _result: CQEResult) {}
+    /// Convert the owned completion into the command's output.
+    fn complete(self, completion: Self::Completion) -> Self::Output;
 }
 
 struct CommandOp<C> {
@@ -116,11 +127,14 @@ impl<C> CommandOp<C> {
 }
 
 // Safety: `NornFd` retains the target descriptor and `UringCommand16` supplies
-// the lifetime, single-completion, and cleanup contract for the encoded payload.
+// the lifetime, single-completion, and completion-ownership contracts for the
+// encoded payload.
 unsafe impl<C> Operation for CommandOp<C>
 where
     C: UringCommand16,
 {
+    type Completion = C::Completion;
+
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let command = self.command.encode()?;
         let mut builder =
@@ -134,8 +148,9 @@ where
         Ok(builder.build())
     }
 
-    fn cleanup(&mut self, result: CQEResult) {
-        self.command.cleanup(result);
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+        // Safety: `CommandOp` forwards this command's unreaped terminal completion.
+        unsafe { self.command.reap(result) }
     }
 }
 
@@ -145,8 +160,8 @@ where
 {
     type Output = C::Output;
 
-    fn complete(self, result: CQEResult) -> Self::Output {
-        self.command.complete(result)
+    fn complete(self, completion: Self::Completion) -> Self::Output {
+        self.command.complete(completion)
     }
 }
 
@@ -172,6 +187,7 @@ mod tests {
     struct TestCommand;
 
     unsafe impl UringCommand16 for TestCommand {
+        type Completion = CQEResult;
         type Output = io::Result<u32>;
 
         fn encode(&mut self) -> io::Result<Command16> {
@@ -180,8 +196,12 @@ mod tests {
                 .with_fixed_buffer(11))
         }
 
-        fn complete(self, result: CQEResult) -> Self::Output {
-            result.into_result()
+        unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+            result
+        }
+
+        fn complete(self, completion: Self::Completion) -> Self::Output {
+            completion.into_result()
         }
     }
 

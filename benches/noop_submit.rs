@@ -100,14 +100,16 @@ async fn drop_terminal_noops(n: usize) {
 struct DrainNop;
 
 unsafe impl norn_uring::Operation for DrainNop {
+    type Completion = norn_uring::CQEResult;
+
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         Ok(io_uring::opcode::Nop::new()
             .build()
             .flags(io_uring::squeue::Flags::IO_DRAIN))
     }
 
-    fn cleanup(&mut self, result: norn_uring::CQEResult) {
-        result.into_result().unwrap();
+    unsafe fn reap(&mut self, result: norn_uring::CQEResult) -> Self::Completion {
+        result
     }
 }
 

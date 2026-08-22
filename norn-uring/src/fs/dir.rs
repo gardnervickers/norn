@@ -213,6 +213,8 @@ impl UnlinkAt {
 
 // Safety: the owned CString keeps the pathname pointer live through completion.
 unsafe impl Operation for UnlinkAt {
+    type Completion = crate::operation::CQEResult;
+
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
         let ptr = this.path.as_ptr();
@@ -221,7 +223,9 @@ unsafe impl Operation for UnlinkAt {
             .build())
     }
 
-    fn cleanup(&mut self, _: crate::operation::CQEResult) {}
+    unsafe fn reap(&mut self, result: crate::operation::CQEResult) -> Self::Completion {
+        result
+    }
 }
 
 impl Singleshot for UnlinkAt {
@@ -249,6 +253,8 @@ impl MkDirAt {
 
 // Safety: the owned CString keeps the pathname pointer live through completion.
 unsafe impl Operation for MkDirAt {
+    type Completion = crate::operation::CQEResult;
+
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
         let ptr = this.path.as_ptr();
@@ -257,7 +263,9 @@ unsafe impl Operation for MkDirAt {
             .build())
     }
 
-    fn cleanup(&mut self, _: crate::operation::CQEResult) {}
+    unsafe fn reap(&mut self, result: crate::operation::CQEResult) -> Self::Completion {
+        result
+    }
 }
 
 impl Singleshot for MkDirAt {
@@ -287,6 +295,8 @@ impl RenameAt {
 // Safety: both pathname pointers refer to owned CStrings retained by the
 // operation through its terminal CQE.
 unsafe impl Operation for RenameAt {
+    type Completion = crate::operation::CQEResult;
+
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
         Ok(opcode::RenameAt::new(
@@ -299,7 +309,9 @@ unsafe impl Operation for RenameAt {
         .build())
     }
 
-    fn cleanup(&mut self, _: crate::operation::CQEResult) {}
+    unsafe fn reap(&mut self, result: crate::operation::CQEResult) -> Self::Completion {
+        result
+    }
 }
 
 impl Singleshot for RenameAt {
@@ -327,6 +339,8 @@ impl SymlinkAt {
 // Safety: both pathname pointers refer to owned CStrings retained by the
 // operation through its terminal CQE.
 unsafe impl Operation for SymlinkAt {
+    type Completion = crate::operation::CQEResult;
+
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
         Ok(opcode::SymlinkAt::new(
@@ -337,7 +351,9 @@ unsafe impl Operation for SymlinkAt {
         .build())
     }
 
-    fn cleanup(&mut self, _: crate::operation::CQEResult) {}
+    unsafe fn reap(&mut self, result: crate::operation::CQEResult) -> Self::Completion {
+        result
+    }
 }
 
 impl Singleshot for SymlinkAt {
@@ -367,6 +383,8 @@ impl LinkAt {
 // Safety: both pathname pointers refer to owned CStrings retained by the
 // operation through its terminal CQE.
 unsafe impl Operation for LinkAt {
+    type Completion = crate::operation::CQEResult;
+
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
         Ok(opcode::LinkAt::new(
@@ -379,7 +397,9 @@ unsafe impl Operation for LinkAt {
         .build())
     }
 
-    fn cleanup(&mut self, _: crate::operation::CQEResult) {}
+    unsafe fn reap(&mut self, result: crate::operation::CQEResult) -> Self::Completion {
+        result
+    }
 }
 
 impl Singleshot for LinkAt {
@@ -411,6 +431,8 @@ impl Statx {
 // Safety: the owned path and pinned inline output remain live until completion;
 // the output is read only after a successful terminal CQE.
 unsafe impl Operation for Statx {
+    type Completion = crate::operation::CQEResult;
+
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
         Ok(opcode::Statx::new(
@@ -423,7 +445,9 @@ unsafe impl Operation for Statx {
         .build())
     }
 
-    fn cleanup(&mut self, _: crate::operation::CQEResult) {}
+    unsafe fn reap(&mut self, result: crate::operation::CQEResult) -> Self::Completion {
+        result
+    }
 }
 
 impl Singleshot for Statx {
@@ -475,12 +499,16 @@ unsafe impl<B> Operation for PathGetXattr<B>
 where
     B: crate::buf::StableBufMut,
 {
+    type Completion = crate::operation::CQEResult;
+
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let value = self.buf.stable_ptr_mut() as *mut libc::c_void;
         Ok(opcode::GetXattr::new(self.name.as_ptr(), value, self.path.as_ptr(), self.len).build())
     }
 
-    fn cleanup(&mut self, _: crate::operation::CQEResult) {}
+    unsafe fn reap(&mut self, result: crate::operation::CQEResult) -> Self::Completion {
+        result
+    }
 }
 
 impl<B> Singleshot for PathGetXattr<B>
@@ -541,6 +569,8 @@ unsafe impl<B> Operation for PathSetXattr<B>
 where
     B: crate::buf::StableBuf,
 {
+    type Completion = crate::operation::CQEResult;
+
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let value = self.value.stable_ptr() as *const libc::c_void;
         Ok(
@@ -550,7 +580,9 @@ where
         )
     }
 
-    fn cleanup(&mut self, _: crate::operation::CQEResult) {}
+    unsafe fn reap(&mut self, result: crate::operation::CQEResult) -> Self::Completion {
+        result
+    }
 }
 
 impl<B> Singleshot for PathSetXattr<B>

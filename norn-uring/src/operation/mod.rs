@@ -1,9 +1,11 @@
+use std::cell::RefMut;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{ready, Context, Poll, Waker};
 use std::{io, mem};
 
 mod header;
+mod queue;
 mod raw;
 
 use io_uring::types::CancelBuilder;
@@ -15,14 +17,13 @@ use smallvec::SmallVec;
 
 use crate::driver::{PushFuture, TryPush};
 use crate::error::SubmitError;
-use header::CompletionQueue;
 
 /// Low-level request customization for advanced `io_uring` users.
 ///
 /// # Safety
 ///
 /// Implementing this trait asserts that every entry returned by [`Operation::configure`]
-/// remains valid for the complete lifetime of the kernel operation. In particular:
+/// remains valid for the entire lifetime of the kernel operation. In particular:
 ///
 /// - every pointer, file descriptor, fixed-resource index, and other resource referenced by
 ///   the entry must remain valid for every access the opcode permits, through the terminal CQE;
@@ -33,10 +34,13 @@ use header::CompletionQueue;
 ///   first CQE without `IORING_CQE_F_MORE` as terminal, so the entry must not permit any later
 ///   CQE or kernel access associated with the operation;
 /// - requesting cancellation does not end the operation's lifetime. All referenced resources
-///   must remain valid until the original operation produces its terminal CQE; and
-/// - [`Operation::cleanup`] must correctly dispose of resources represented by each unconsumed
-///   CQE. It may be called more than once and must handle success, failure, and cancellation
-///   results without double-freeing or otherwise invalidating resources.
+///   must remain valid until the original operation produces its terminal CQE;
+/// - [`Operation::reap`] must convert every kernel CQE or synthetic completion into an owned
+///   value that accounts for all resources created, selected, or otherwise transferred by the
+///   kernel. Dropping that value must release those resources without consulting the operation
+///   again; and
+/// - [`Operation::reap`] must not unwind. A CQE cannot be replayed after it has been removed from
+///   the kernel completion queue.
 ///
 /// The runtime places the operation at a stable address before calling
 /// [`Operation::configure`] and does not move it while the entry may be submitted or accessed by
@@ -44,6 +48,12 @@ use header::CompletionQueue;
 /// completion handler. The runtime overwrites the SQE's `user_data` field for its own tracking
 /// and cannot verify any of the requirements above.
 pub unsafe trait Operation {
+    /// The owned value produced from one completion.
+    ///
+    /// Values are queued until application code consumes them. If the request is abandoned,
+    /// they are instead dropped in completion order while the operation is destroyed.
+    type Completion: 'static;
+
     /// Configure a new [`io_uring::squeue::Entry`] for this operation.
     ///
     /// Configuration failures are delivered through the operation's normal completion path;
@@ -59,18 +69,23 @@ pub unsafe trait Operation {
     /// queue entry. The runtime delivers this through the normal completion path.
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry>;
 
-    /// Release resources represented by an unconsumed completion.
+    /// Convert one kernel or synthetic completion into an owned value.
     ///
-    /// When an application drops a submitted operation, the runtime continues reaping its
-    /// completions. Once the terminal completion has been reaped, this method is called once
-    /// for each completion the application did not consume, in completion order. It can
-    /// therefore be called multiple times for one operation. It is also called with a synthetic
-    /// error completion when configuration or submission fails; in either case the kernel never
-    /// saw the entry.
+    /// The runtime invokes this exactly once for each kernel CQE or synthetic completion, before
+    /// exposing terminal state or waking application code. It may be called multiple times for a
+    /// multishot operation. A panic from this method aborts the process because the completion
+    /// cannot be safely replayed.
     ///
-    /// Implementations should use this hook to release per-completion resources created or
-    /// selected by the kernel, such as provided buffers or file descriptors.
-    fn cleanup(&mut self, result: CQEResult);
+    /// Configuration failures, submission failures, and cancellation before submission are
+    /// represented by synthetic error completions. Implementations can distinguish them from
+    /// kernel CQEs with [`CQEResult::is_synthetic`].
+    ///
+    /// # Safety
+    ///
+    /// `result` must be an unreaped kernel or synthetic completion produced for this operation.
+    /// Supplying a completion from a different operation can cause the implementation to claim
+    /// resources that it does not own.
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion;
 }
 
 /// A singleshot request that resolves to one final output.
@@ -78,12 +93,14 @@ pub trait Singleshot: Operation {
     /// The value returned once the final completion is observed.
     type Output;
 
-    /// Complete can be called multiple times in the case of a multi-shot operation.
-    fn complete(self, result: CQEResult) -> Self::Output;
+    /// Convert the terminal completion into the request's output.
+    fn complete(self, completion: Self::Completion) -> Self::Output;
 
-    /// Called when a cqe with the more flag set is received.
-    fn update(&mut self, result: CQEResult) {
-        panic!("unhandled update called on a singleshot operation: {result:?}. Implement update.")
+    /// Handle a non-terminal completion.
+    ///
+    /// The default implementation panics.
+    fn update(&mut self, _completion: Self::Completion) {
+        panic!("unhandled non-terminal completion for singleshot operation")
     }
 }
 
@@ -93,17 +110,14 @@ pub trait Multishot: Operation {
     type Item;
 
     /// Handle a non-terminal completion.
-    fn update(&mut self, result: CQEResult) -> Self::Item;
+    fn update(&mut self, completion: Self::Completion) -> Self::Item;
 
-    /// Called when the final completion for this operation is received.
-    ///
-    /// The final completion is identified by `!result.more()`.
-    fn complete(self, result: CQEResult) -> Option<Self::Item>
+    /// Convert the terminal completion into an optional final item.
+    fn complete(self, completion: Self::Completion) -> Option<Self::Item>
     where
         Self: Sized,
     {
-        debug_assert!(!result.more());
-        let _ = result;
+        let _ = completion;
         None
     }
 }
@@ -173,7 +187,6 @@ pin_project_lite::pin_project! {
         submit: Option<PushFuture>,
         state: State<T>,
         reactor: crate::Handle,
-        completed: bool,
     }
 
     impl<T> PinnedDrop for Op<T> where T: 'static {
@@ -181,7 +194,7 @@ pin_project_lite::pin_project! {
             let this = me.project();
             match this.state {
                 State::Submitted { inner } => {
-                    if !*this.completed && inner.needs_cancel() {
+                    if inner.needs_cancel() {
                         let user_data = inner.inner.inner.as_raw_usize();
                         let criteria = CancelBuilder::user_data(user_data as u64);
                         let _ = this.reactor.cancel(criteria, false);
@@ -240,9 +253,11 @@ where
                 mut error,
             } => {
                 let handle = handle.take().expect("handle missing");
-                handle.untyped().complete(CQEResult::synthetic(Err(error
-                    .take()
-                    .expect("configuration error missing"))));
+                let result =
+                    CQEResult::synthetic(Err(error.take().expect("configuration error missing")));
+                // Safety: this synthetic completion was created once for the
+                // operation retained by `handle`; no SQE reached the kernel.
+                unsafe { handle.untyped().reap(result) };
                 *self = State::Submitted {
                     inner: SubmittedOp { inner: handle },
                 };
@@ -293,11 +308,10 @@ where
                 return false;
             }
         };
-        handle
-            .untyped()
-            .complete(CQEResult::synthetic(Err(io::Error::from_raw_os_error(
-                libc::ECANCELED,
-            ))));
+        let result = CQEResult::synthetic(Err(io::Error::from_raw_os_error(libc::ECANCELED)));
+        // Safety: this synthetic cancellation belongs to the prepared
+        // operation retained by `handle`, and it is produced only on this state transition.
+        unsafe { handle.untyped().reap(result) };
         *self = State::Submitted {
             inner: SubmittedOp { inner: handle },
         };
@@ -321,9 +335,10 @@ where
         *self = match state {
             State::Waiting { mut handle } => {
                 let handle = handle.take().expect("handle missing");
-                handle
-                    .untyped()
-                    .complete(CQEResult::synthetic(Err(err.to_io_error())));
+                let result = CQEResult::synthetic(Err(err.to_io_error()));
+                // Safety: submission failed for the operation retained by
+                // `handle`, so this is its unreaped synthetic terminal completion.
+                unsafe { handle.untyped().reap(result) };
                 State::Submitted {
                     inner: SubmittedOp { inner: handle },
                 }
@@ -358,12 +373,12 @@ where
     }
 
     fn prepare(data: T) -> (TypedHandle<T>, io::Result<ConfiguredEntry>) {
-        let mut handle = TypedHandle::new(data);
-        // Safety: The handle was just created and no other references to its operation data
-        // exist. `RawOp` keeps the data at a stable address until the operation completes.
-        let data = unsafe { handle.data_mut().expect("operation already completed") };
+        let handle = TypedHandle::new(data);
+        let mut data = handle.data_mut().expect("operation already completed");
 
-        let entry = T::configure(data).map(|entry| ConfiguredEntry::new(handle.untyped(), entry));
+        let entry =
+            T::configure(&mut data).map(|entry| ConfiguredEntry::new(handle.untyped(), entry));
+        drop(data);
         (handle, entry)
     }
 
@@ -375,7 +390,6 @@ where
                 entry: Some(entry),
             },
             reactor,
-            completed: false,
         }
     }
 
@@ -389,7 +403,6 @@ where
                 error: Some(error),
             },
             reactor,
-            completed: false,
         }
     }
 
@@ -406,18 +419,12 @@ where
         batch: &mut SmallVec<[ConfiguredEntry; 4]>,
     ) -> bool {
         let this = self.as_mut().project();
-        let can_continue = this.state.prepare_batch(batch);
-        if !can_continue {
-            *this.completed = true;
-        }
-        can_continue
+        this.state.prepare_batch(batch)
     }
 
     pub(crate) fn cancel_unsubmitted(mut self: Pin<&mut Self>) {
         let this = self.as_mut().project();
-        if this.state.cancel_unsubmitted() {
-            *this.completed = true;
-        }
+        let _ = this.state.cancel_unsubmitted();
     }
 
     pub(crate) fn finish_submit(mut self: Pin<&mut Self>) {
@@ -438,7 +445,6 @@ where
                 let can_continue = this.state.prepare_batch(&mut batch);
                 debug_assert!(!can_continue);
                 debug_assert!(batch.is_empty());
-                *this.completed = true;
             }
             if this.submit.is_none() && matches!(this.state, State::Prepared { .. }) {
                 let entry = this
@@ -480,7 +486,6 @@ where
             unreachable!("operation not submitted");
         };
         if let Some(result) = inner.try_complete() {
-            *this.completed = true;
             return Poll::Ready(result);
         }
         inner.inner.register_waker(cx.waker());
@@ -504,7 +509,6 @@ where
             return Poll::Ready(Some(result));
         }
         if inner.inner.is_complete() {
-            *this.completed = true;
             return Poll::Ready(None);
         }
         inner.inner.register_waker(cx.waker());
@@ -512,7 +516,7 @@ where
     }
 }
 
-/// [`TypedHandle`] is a reference to an operation that is in progress.
+/// A typed reference to an operation in progress.
 pub(crate) struct TypedHandle<T> {
     inner: RawOpRef,
     _marker: std::marker::PhantomData<T>,
@@ -530,23 +534,25 @@ where
         }
     }
 
-    /// Returns an untyped [`Handle`] to this operation.
-    ///
-    /// The untyped handle can be used to complete the operation
-    /// without knowing the type of the operation.
+    /// Return an untyped [`RawOpRef`] for this operation.
     #[inline]
     pub(crate) fn untyped(&self) -> RawOpRef {
         self.inner.clone()
     }
 
-    fn take_completions(&self) -> CompletionQueue {
-        let mut completions = self.inner.header().completions().borrow_mut();
-        mem::take(&mut *completions)
+    fn raw(&self) -> &raw::RawOp<T> {
+        // Safety: `inner` retains the allocation and every `RawOp<T>` begins with its Header.
+        unsafe { raw::RawOp::<T>::from_raw_header(self.inner.inner()).as_ref() }
     }
 
-    fn pop_completion(&self) -> Option<CQEResult> {
-        let mut completions = self.inner.header().completions().borrow_mut();
-        completions.pop_front()
+    fn pop_completion(&self) -> Option<(T::Completion, bool)> {
+        let mut state = self.raw().state().borrow_mut();
+        let completion = state.completions.pop_front()?;
+        // The terminal CQE is the final entry for an operation. Before it has
+        // arrived every queued completion is non-terminal; after it arrives,
+        // only the queue tail can be terminal.
+        let more = !self.is_complete() || !state.completions.is_empty();
+        Some((completion, more))
     }
 
     /// Returns true if this operation is complete.
@@ -555,29 +561,23 @@ where
     }
 
     /// Returns a mutable reference to the data associated with this operation.
-    unsafe fn data_mut(&mut self) -> Option<&mut T> {
-        unsafe {
-            let mut raw = raw::RawOp::<T>::from_raw_header(self.inner.inner());
-            let opref = raw.as_mut();
-            opref.data_mut().as_mut()
-        }
+    fn data_mut(&self) -> Option<RefMut<'_, T>> {
+        let state = self.raw().state().borrow_mut();
+        state.data.as_ref()?;
+        Some(RefMut::map(state, |state| {
+            state.data.as_mut().expect("operation data disappeared")
+        }))
     }
 
     /// Attempt to take the data from this operation.
     ///
     /// This will succeed if the operation is complete.
     ///
-    /// # Safety
-    /// Callers must ensure that there are no other references to the data (such as `Self::data_mut`).
-    unsafe fn try_take(&self) -> Option<T> {
+    fn try_take(&self) -> Option<T> {
         if !self.is_complete() {
             return None;
         }
-        unsafe {
-            let mut raw = raw::RawOp::<T>::from_raw_header(self.inner.inner());
-            let opref = raw.as_mut();
-            opref.data_mut().take()
-        }
+        self.raw().state().borrow_mut().data.take()
     }
 
     fn register_waker(&self, waker: &Waker) {
@@ -586,14 +586,13 @@ where
     }
 }
 
-/// Complete an operations.
+/// Reap one operation completion.
 ///
-/// ### Safety
+/// # Safety
 ///
-/// This should only be called by the reactor when it reaps a completion. It should not
-/// be called multiple times for the same completion.
+/// `entry` must be an unreaped CQE whose `user_data` retains the operation that produced it.
 #[inline]
-pub(crate) unsafe fn complete_operation(entry: &io_uring::cqueue::Entry) {
+pub(crate) unsafe fn reap_operation(entry: &io_uring::cqueue::Entry) {
     assert!(entry.user_data() > 1024);
     let handle = RawOpRef::from_raw_usize(entry.user_data() as usize);
     let result = entry.result();
@@ -603,7 +602,9 @@ pub(crate) unsafe fn complete_operation(entry: &io_uring::cqueue::Entry) {
         Err(io::Error::from_raw_os_error(-result))
     };
     let result = CQEResult::new(result, entry.flags());
-    handle.complete(result);
+    // Safety: `handle` was reconstructed from this CQE's runtime-owned
+    // `user_data`; draining the CQ invokes this path exactly once per entry.
+    unsafe { handle.reap(result) };
 }
 
 #[must_use = "futures do nothing unless you `.await` or poll them"]
@@ -631,38 +632,30 @@ where
         if !self.inner.is_complete() {
             return None;
         }
-        let mut results = self.inner.take_completions();
-        let mut data = unsafe { self.inner.try_take() }.expect("operation already completed");
-        if results.len() == 1 {
-            let result = results
-                .pop_front()
-                .expect("completion queue length changed");
-            assert!(!result.more());
-            return Some(data.complete(result));
-        }
-        let last_idx = results.len() - 1;
-        for (idx, result) in results.into_iter().enumerate() {
-            if idx == last_idx {
-                assert!(!result.more());
-                return Some(data.complete(result));
-            } else {
-                assert!(result.more());
-                data.update(result);
+        let mut data = self.inner.try_take().expect("operation already completed");
+        loop {
+            let (completion, more) = self
+                .inner
+                .pop_completion()
+                .expect("terminal operation missing completion");
+            if more {
+                data.update(completion);
+                continue;
             }
+            return Some(data.complete(completion));
         }
-        panic!("no final completion");
     }
 
     fn try_next(&mut self) -> Option<T::Item>
     where
         T: Multishot,
     {
-        let completion = self.inner.pop_completion()?;
-        if completion.more() {
-            let data = unsafe { self.inner.data_mut() }.expect("operation already completed");
+        let (completion, more) = self.inner.pop_completion()?;
+        if more {
+            let mut data = self.inner.data_mut().expect("operation already completed");
             return Some(data.update(completion));
         }
-        let data = unsafe { self.inner.try_take() }.expect("operation already completed");
+        let data = self.inner.try_take().expect("operation already completed");
         data.complete(completion)
     }
 }
@@ -678,10 +671,13 @@ mod tests {
     use super::*;
 
     #[derive(Debug, Default)]
-    struct TestOp(Vec<CQEResult>);
+    struct TestOp(Vec<u32>);
     unsafe impl Operation for TestOp {
-        fn cleanup(&mut self, result: CQEResult) {
-            self.0.push(result);
+        type Completion = CQEResult;
+
+        unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+            self.0.push(*result.result.as_ref().unwrap());
+            result
         }
 
         fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
@@ -691,26 +687,30 @@ mod tests {
 
     #[test]
     fn complete_op() {
-        let mut op = TypedHandle::new(TestOp::default());
+        let op = TypedHandle::new(TestOp::default());
         let handle = op.untyped();
 
-        handle.complete(CQEResult::new(Ok(0), 0));
+        // Safety: the test supplies `handle`'s unreaped terminal completion.
+        unsafe { handle.reap(CQEResult::new(Ok(0), 0)) };
 
         assert!(op.is_complete());
-        unsafe { assert!(op.data_mut().unwrap().0.is_empty()) };
+        assert_eq!(&op.data_mut().unwrap().0, &[0]);
     }
 
     #[test]
     fn complete_op_through_usize() {
-        let mut op = TypedHandle::new(TestOp::default());
+        let op = TypedHandle::new(TestOp::default());
         let handle = op.untyped();
 
         let handle_usize = handle.into_raw_usize();
-        let handle = unsafe { RawOpRef::from_raw_usize(handle_usize) };
-        handle.complete(CQEResult::new(Ok(0), 0));
+        // Safety: `handle_usize` retains the operation's kernel reference, and
+        // the test supplies its unreaped terminal completion.
+        unsafe {
+            RawOpRef::from_raw_usize(handle_usize).reap(CQEResult::new(Ok(0), 0));
+        }
 
         assert!(op.is_complete());
-        unsafe { assert!(op.data_mut().unwrap().0.is_empty()) };
+        assert_eq!(&op.data_mut().unwrap().0, &[0]);
     }
 
     #[test]
@@ -735,11 +735,15 @@ mod tests {
         }
 
         unsafe impl Operation for DropTracked {
+            type Completion = CQEResult;
+
             fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
                 unreachable!("the target lifetime test does not configure an SQE")
             }
 
-            fn cleanup(&mut self, _: CQEResult) {}
+            unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+                result
+            }
         }
 
         let dropped = Rc::new(Cell::new(false));
@@ -767,7 +771,11 @@ mod tests {
     struct TestMultishot;
 
     unsafe impl Operation for TestMultishot {
-        fn cleanup(&mut self, _: CQEResult) {}
+        type Completion = CQEResult;
+
+        unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+            result
+        }
 
         fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
             unimplemented!()
@@ -790,7 +798,11 @@ mod tests {
     struct TestSingleshot(Vec<u32>);
 
     unsafe impl Operation for TestSingleshot {
-        fn cleanup(&mut self, _: CQEResult) {}
+        type Completion = CQEResult;
+
+        unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+            result
+        }
 
         fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
             unimplemented!()
@@ -856,9 +868,12 @@ mod tests {
     fn multishot_completions_are_fifo() {
         let typed = TypedHandle::new(TestMultishot);
         let more = more_flag();
-        typed.untyped().complete(CQEResult::new(Ok(10), more));
-        typed.untyped().complete(CQEResult::new(Ok(20), more));
-        typed.untyped().complete(CQEResult::new(Ok(30), 0));
+        // Safety: the test supplies each modeled CQE once, in completion order.
+        unsafe {
+            typed.untyped().reap(CQEResult::new(Ok(10), more));
+            typed.untyped().reap(CQEResult::new(Ok(20), more));
+            typed.untyped().reap(CQEResult::new(Ok(30), 0));
+        }
 
         let mut submitted = SubmittedOp { inner: typed };
 
@@ -872,7 +887,8 @@ mod tests {
     #[test]
     fn singleshot_consumes_one_terminal_completion_directly() {
         let typed = TypedHandle::new(TestSingleshot::default());
-        typed.untyped().complete(CQEResult::new(Ok(30), 0));
+        // Safety: the test supplies `typed`'s unreaped terminal completion.
+        unsafe { typed.untyped().reap(CQEResult::new(Ok(30), 0)) };
         let mut submitted = SubmittedOp { inner: typed };
 
         assert_eq!(submitted.try_complete(), Some(vec![30]));
@@ -883,8 +899,11 @@ mod tests {
         let typed = TypedHandle::new(TestSingleshot::default());
         let kernel_ref = typed.untyped().into_raw_usize();
         for (value, flags) in [(10, more_flag()), (20, more_flag()), (30, 0)] {
-            let handle = unsafe { RawOpRef::from_raw_usize(kernel_ref) };
-            handle.complete(CQEResult::new(Ok(value), flags));
+            // Safety: `kernel_ref` retains this operation across MORE
+            // completions, and each modeled CQE is reaped once in order.
+            unsafe {
+                RawOpRef::from_raw_usize(kernel_ref).reap(CQEResult::new(Ok(value), flags));
+            }
         }
         let mut submitted = SubmittedOp { inner: typed };
 
@@ -898,7 +917,8 @@ mod tests {
         let submitted = SubmittedOp { inner: typed };
 
         assert!(submitted.needs_cancel());
-        completion.complete(CQEResult::new(Ok(0), 0));
+        // Safety: the test supplies `completion`'s unreaped terminal completion.
+        unsafe { completion.reap(CQEResult::new(Ok(0), 0)) };
         assert!(!submitted.needs_cancel());
     }
 
@@ -908,22 +928,47 @@ mod tests {
         let completion = typed.untyped();
         let submitted = SubmittedOp { inner: typed };
 
-        completion
-            .clone()
-            .complete(CQEResult::new(Ok(10), more_flag()));
+        // Safety: the test supplies this operation's MORE and terminal
+        // completions once, in completion order.
+        unsafe {
+            completion.clone().reap(CQEResult::new(Ok(10), more_flag()));
+        }
         assert!(submitted.needs_cancel());
-        completion.complete(CQEResult::new(Ok(20), 0));
+        unsafe { completion.reap(CQEResult::new(Ok(20), 0)) };
         assert!(!submitted.needs_cancel());
     }
 
     #[test]
-    fn dropped_multishot_cleans_pending_completions_once_in_fifo_order() {
-        #[derive(Debug)]
-        struct CleanupMultishot(Rc<RefCell<Vec<u32>>>);
+    fn dropped_multishot_drops_reaped_completions_once_in_fifo_order() {
+        const OPERATION_DROP: u32 = u32::MAX;
 
-        unsafe impl Operation for CleanupMultishot {
-            fn cleanup(&mut self, result: CQEResult) {
-                self.0.borrow_mut().push(result.into_result().unwrap());
+        struct DropTrackedCompletion {
+            value: u32,
+            dropped: Rc<RefCell<Vec<u32>>>,
+        }
+
+        impl Drop for DropTrackedCompletion {
+            fn drop(&mut self) {
+                self.dropped.borrow_mut().push(self.value);
+            }
+        }
+
+        struct ReapTrackedMultishot(Rc<RefCell<Vec<u32>>>);
+
+        impl Drop for ReapTrackedMultishot {
+            fn drop(&mut self) {
+                self.0.borrow_mut().push(OPERATION_DROP);
+            }
+        }
+
+        unsafe impl Operation for ReapTrackedMultishot {
+            type Completion = DropTrackedCompletion;
+
+            unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+                DropTrackedCompletion {
+                    value: result.into_result().unwrap(),
+                    dropped: Rc::clone(&self.0),
+                }
             }
 
             fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
@@ -932,15 +977,26 @@ mod tests {
         }
 
         let cleaned = Rc::new(RefCell::new(Vec::new()));
-        let typed = TypedHandle::new(CleanupMultishot(Rc::clone(&cleaned)));
+        let typed = TypedHandle::new(ReapTrackedMultishot(Rc::clone(&cleaned)));
         let kernel_ref = typed.untyped().into_raw_usize();
-        for (value, flags) in [(10, more_flag()), (20, more_flag()), (30, 0)] {
-            let handle = unsafe { RawOpRef::from_raw_usize(kernel_ref) };
-            handle.complete(CQEResult::new(Ok(value), flags));
+        for value in [10, 20] {
+            // Safety: `kernel_ref` retains this operation across MORE
+            // completions, and each modeled completion is reaped once.
+            unsafe {
+                RawOpRef::from_raw_usize(kernel_ref).reap(CQEResult::new(Ok(value), more_flag()));
+            }
         }
 
         drop(typed);
-        assert_eq!(&*cleaned.borrow(), &[10, 20, 30]);
+        assert!(cleaned.borrow().is_empty());
+
+        // Safety: the test supplies the unreaped terminal completion retained
+        // by `kernel_ref`.
+        unsafe {
+            RawOpRef::from_raw_usize(kernel_ref).reap(CQEResult::new(Ok(30), 0));
+        }
+
+        assert_eq!(&*cleaned.borrow(), &[10, 20, 30, OPERATION_DROP]);
     }
 
     #[test]
@@ -951,16 +1007,22 @@ mod tests {
         typed.register_waker(&waker);
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let kernel_ref = unsafe { RawOpRef::from_raw_usize(kernel_ref) };
-            kernel_ref.complete(CQEResult::new(Ok(10), more_flag()));
+            // Safety: the test supplies the unreaped MORE completion retained
+            // by `kernel_ref`.
+            unsafe {
+                RawOpRef::from_raw_usize(kernel_ref).reap(CQEResult::new(Ok(10), more_flag()));
+            }
         }));
         assert!(result.is_err());
         clear_wake_action();
 
         assert_eq!(typed.inner.header().refcount(), 2);
 
-        let terminal_ref = unsafe { RawOpRef::from_raw_usize(kernel_ref) };
-        terminal_ref.complete(CQEResult::new(Ok(20), 0));
+        // Safety: the test supplies the unreaped terminal completion retained
+        // by `kernel_ref`.
+        unsafe {
+            RawOpRef::from_raw_usize(kernel_ref).reap(CQEResult::new(Ok(20), 0));
+        }
         assert_eq!(typed.inner.header().refcount(), 1);
 
         let mut submitted = SubmittedOp { inner: typed };
@@ -982,18 +1044,115 @@ mod tests {
         });
         submitted.borrow().inner.register_waker(&waker);
 
-        let more_ref = unsafe { RawOpRef::from_raw_usize(kernel_ref) };
-        more_ref.complete(CQEResult::new(Ok(10), more_flag()));
+        // Safety: the test supplies the unreaped MORE completion retained by
+        // `kernel_ref`.
+        unsafe {
+            RawOpRef::from_raw_usize(kernel_ref).reap(CQEResult::new(Ok(10), more_flag()));
+        }
         clear_wake_action();
 
         assert_eq!(observed.get(), Some(10));
         assert_eq!(submitted.borrow().inner.inner.header().refcount(), 2);
 
-        let terminal_ref = unsafe { RawOpRef::from_raw_usize(kernel_ref) };
-        terminal_ref.complete(CQEResult::new(Ok(20), 0));
+        // Safety: the test supplies the unreaped terminal completion retained
+        // by `kernel_ref`.
+        unsafe {
+            RawOpRef::from_raw_usize(kernel_ref).reap(CQEResult::new(Ok(20), 0));
+        }
         assert_eq!(submitted.borrow_mut().try_next(), Some(20));
         assert_eq!(submitted.borrow_mut().try_next(), None);
         assert_eq!(submitted.borrow().inner.inner.header().refcount(), 1);
+    }
+
+    #[test]
+    fn terminal_waker_can_complete_and_drop_operation_synchronously() {
+        let typed = TypedHandle::new(TestSingleshot::default());
+        let terminal_ref = typed.untyped();
+        let submitted = Rc::new(RefCell::new(Some(SubmittedOp { inner: typed })));
+        let observed = Rc::new(RefCell::new(None));
+        let waker = test_waker({
+            let submitted = Rc::clone(&submitted);
+            let observed = Rc::clone(&observed);
+            move || {
+                let mut submitted = submitted
+                    .borrow_mut()
+                    .take()
+                    .expect("submitted operation missing during wake");
+                *observed.borrow_mut() = submitted.try_complete();
+                drop(submitted);
+            }
+        });
+        submitted
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .inner
+            .register_waker(&waker);
+
+        // Safety: the test supplies `terminal_ref`'s unreaped terminal completion.
+        unsafe { terminal_ref.reap(CQEResult::new(Ok(30), 0)) };
+        clear_wake_action();
+
+        assert!(submitted.borrow().is_none());
+        assert_eq!(observed.borrow().as_deref(), Some([30].as_slice()));
+    }
+
+    #[test]
+    fn terminal_completion_survives_panicking_waker() {
+        let typed = TypedHandle::new(TestSingleshot::default());
+        let terminal_ref = typed.untyped();
+        let waker = test_waker(|| panic!("wake panic"));
+        typed.register_waker(&waker);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // Safety: the test supplies `terminal_ref`'s unreaped terminal completion.
+            unsafe { terminal_ref.reap(CQEResult::new(Ok(30), 0)) };
+        }));
+        assert!(result.is_err());
+        clear_wake_action();
+
+        assert!(typed.is_complete());
+        assert_eq!(typed.inner.header().refcount(), 1);
+        let mut submitted = SubmittedOp { inner: typed };
+        assert_eq!(submitted.try_complete(), Some(vec![30]));
+    }
+
+    #[test]
+    fn panicking_reap_aborts_process() {
+        const CHILD_ENV: &str = "NORN_URING_PANICKING_REAP_CHILD";
+        const TEST_NAME: &str = "operation::tests::panicking_reap_aborts_process";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            struct PanickingReap;
+
+            unsafe impl Operation for PanickingReap {
+                type Completion = ();
+
+                fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+                    unreachable!("death test does not configure an SQE")
+                }
+
+                unsafe fn reap(&mut self, _result: CQEResult) -> Self::Completion {
+                    panic!("reap panic")
+                }
+            }
+
+            let typed = TypedHandle::new(PanickingReap);
+            // Safety: the test supplies `typed`'s unreaped terminal completion.
+            unsafe { typed.untyped().reap(CQEResult::new(Ok(0), 0)) };
+            unreachable!("panicking reap must abort")
+        }
+
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg(TEST_NAME)
+            .arg("--exact")
+            .arg("--test-threads=1")
+            .env(CHILD_ENV, "1")
+            .status()
+            .expect("failed to spawn reap death test");
+
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(libc::SIGABRT));
     }
 
     #[test]
@@ -1002,7 +1161,11 @@ mod tests {
         struct SubmitFailureOp;
 
         unsafe impl Operation for SubmitFailureOp {
-            fn cleanup(&mut self, _: CQEResult) {}
+            type Completion = CQEResult;
+
+            unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+                result
+            }
 
             fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
                 Ok(io_uring::opcode::Nop::new().build())
@@ -1043,11 +1206,15 @@ mod tests {
         struct ConfigurationFailureOp;
 
         unsafe impl Operation for ConfigurationFailureOp {
+            type Completion = CQEResult;
+
             fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
                 Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid op"))
             }
 
-            fn cleanup(&mut self, _: CQEResult) {}
+            unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+                result
+            }
         }
 
         impl Singleshot for ConfigurationFailureOp {
@@ -1078,7 +1245,11 @@ mod tests {
         struct NopOp;
 
         unsafe impl Operation for NopOp {
-            fn cleanup(&mut self, _: CQEResult) {}
+            type Completion = CQEResult;
+
+            unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+                result
+            }
 
             fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
                 Ok(io_uring::opcode::Nop::new().build())
@@ -1114,7 +1285,11 @@ mod tests {
         }
 
         unsafe impl Operation for TerminalMultishot {
-            fn cleanup(&mut self, _: CQEResult) {}
+            type Completion = CQEResult;
+
+            unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+                result
+            }
 
             fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
                 unimplemented!()
@@ -1142,10 +1317,14 @@ mod tests {
             updates: Rc::clone(&updates),
             complete: Rc::clone(&complete),
         });
-        typed.untyped().complete(CQEResult::new(
-            Err(io::Error::from_raw_os_error(libc::ECANCELED)),
-            0,
-        ));
+        // Safety: the test supplies `typed`'s unreaped terminal cancellation
+        // completion.
+        unsafe {
+            typed.untyped().reap(CQEResult::new(
+                Err(io::Error::from_raw_os_error(libc::ECANCELED)),
+                0,
+            ));
+        }
 
         let mut submitted = SubmittedOp { inner: typed };
         assert_eq!(submitted.try_next(), None);

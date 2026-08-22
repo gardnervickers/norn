@@ -705,18 +705,22 @@ mod tests {
     struct TaggedNop(u8);
 
     unsafe impl Operation for TaggedNop {
+        type Completion = CQEResult;
+
         fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
             Ok(io_uring::opcode::Nop::new().build())
         }
 
-        fn cleanup(&mut self, _: CQEResult) {}
+        unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+            result
+        }
     }
 
     impl Singleshot for TaggedNop {
         type Output = std::io::Result<u8>;
 
-        fn complete(self, result: CQEResult) -> Self::Output {
-            result.result.map(|_| self.0)
+        fn complete(self, completion: Self::Completion) -> Self::Output {
+            completion.result.map(|_| self.0)
         }
     }
 
@@ -724,18 +728,22 @@ mod tests {
     struct ConfigureFailed(&'static str);
 
     unsafe impl Operation for ConfigureFailed {
+        type Completion = CQEResult;
+
         fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
             Err(io::Error::new(io::ErrorKind::InvalidInput, self.0))
         }
 
-        fn cleanup(&mut self, _: CQEResult) {}
+        unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+            result
+        }
     }
 
     impl Singleshot for ConfigureFailed {
         type Output = std::io::Result<()>;
 
-        fn complete(self, result: CQEResult) -> Self::Output {
-            result.result.map(drop)
+        fn complete(self, completion: Self::Completion) -> Self::Output {
+            completion.result.map(drop)
         }
     }
 
@@ -840,41 +848,83 @@ mod tests {
     }
 
     #[test]
-    fn dropping_canceled_unsubmitted_request_runs_cleanup() {
+    fn canceled_unsubmitted_request_reaps_before_typed_completion_drop() {
         #[derive(Debug)]
-        struct CleanupTracked(Rc<Cell<Option<i32>>>);
+        struct TrackedCompletion {
+            result: Option<io::Result<u32>>,
+            dropped: Rc<Cell<Option<i32>>>,
+        }
 
-        unsafe impl Operation for CleanupTracked {
-            fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
-                Ok(io_uring::opcode::Nop::new().build())
+        impl TrackedCompletion {
+            fn into_result(mut self) -> io::Result<u32> {
+                self.result.take().expect("completion result missing")
             }
+        }
 
-            fn cleanup(&mut self, result: CQEResult) {
-                self.0.set(
+        impl Drop for TrackedCompletion {
+            fn drop(&mut self) {
+                let Some(result) = self.result.take() else {
+                    return;
+                };
+                self.dropped.set(
                     result
-                        .result
-                        .expect_err("cleanup should see cancellation")
+                        .expect_err("abandoned completion should contain cancellation")
                         .raw_os_error(),
                 );
             }
         }
 
-        impl Singleshot for CleanupTracked {
+        #[derive(Debug)]
+        struct ReapTracked {
+            reaped: Rc<Cell<Option<i32>>>,
+            dropped: Rc<Cell<Option<i32>>>,
+        }
+
+        unsafe impl Operation for ReapTracked {
+            type Completion = TrackedCompletion;
+
+            fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+                Ok(io_uring::opcode::Nop::new().build())
+            }
+
+            unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+                self.reaped.set(
+                    result
+                        .result
+                        .as_ref()
+                        .err()
+                        .and_then(io::Error::raw_os_error),
+                );
+                TrackedCompletion {
+                    result: Some(result.result),
+                    dropped: Rc::clone(&self.dropped),
+                }
+            }
+        }
+
+        impl Singleshot for ReapTracked {
             type Output = io::Result<()>;
 
-            fn complete(self, result: CQEResult) -> Self::Output {
-                result.result.map(drop)
+            fn complete(self, completion: Self::Completion) -> Self::Output {
+                completion.into_result().map(drop)
             }
         }
 
         let driver = crate::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
-        let cleaned = Rc::new(Cell::new(None));
-        let mut op = Box::pin(driver.handle().submit(CleanupTracked(Rc::clone(&cleaned))));
+        let reaped = Rc::new(Cell::new(None));
+        let dropped = Rc::new(Cell::new(None));
+        let mut op = Box::pin(driver.handle().submit(ReapTracked {
+            reaped: Rc::clone(&reaped),
+            dropped: Rc::clone(&dropped),
+        }));
 
         op.as_mut().cancel_unsubmitted();
+        assert_eq!(reaped.get(), Some(libc::ECANCELED));
+        assert_eq!(dropped.get(), None);
+
         drop(op);
 
-        assert_eq!(cleaned.get(), Some(libc::ECANCELED));
+        assert_eq!(dropped.get(), Some(libc::ECANCELED));
     }
 
     #[test]
