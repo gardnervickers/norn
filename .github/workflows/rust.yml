@@ -40,7 +40,6 @@ jobs:
         - norn-task
         - norn-executor
         - norn-timer
-        - norn-util
 
     steps:
     - uses: actions/checkout@v3
