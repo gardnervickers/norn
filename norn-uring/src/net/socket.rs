@@ -1808,8 +1808,10 @@ impl Event {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write as _;
     use std::panic::{self, AssertUnwindSafe};
     use std::pin::pin;
+    use std::time::{Duration, Instant};
 
     use futures_util::StreamExt;
     use norn_executor::LocalExecutor;
@@ -1846,6 +1848,68 @@ mod tests {
 
     fn connect_from_thread(addr: SocketAddr) -> std::thread::JoinHandle<io::Result<()>> {
         std::thread::spawn(move || std::net::TcpStream::connect(addr).map(drop))
+    }
+
+    async fn connected_socket_with_writer() -> io::Result<(Socket, std::net::TcpStream)> {
+        let listener =
+            Socket::bind("127.0.0.1:0".parse().unwrap(), Domain::IPV4, Type::STREAM).await?;
+        listener.listen(1).await?;
+        let addr = listener.local_addr()?;
+        let connector = std::thread::spawn(move || std::net::TcpStream::connect(addr));
+
+        let (socket, _) = listener.accept().await?;
+        let writer = connector.join().expect("connector thread panicked")?;
+        socket.set_nodelay(true).await?;
+        writer.set_nodelay(true)?;
+        listener.close().await?;
+        Ok((socket, writer))
+    }
+
+    fn socket_bytes_available(socket: &Socket) -> io::Result<i32> {
+        let mut available = 0;
+        let result =
+            unsafe { libc::ioctl(socket.fd.fd().0, libc::FIONREAD, &mut available as *mut i32) };
+        if result < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(available)
+        }
+    }
+
+    fn wait_for_socket_bytes(socket: &Socket, expected: i32) -> io::Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let available = socket_bytes_available(socket)?;
+            if available >= expected {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "socket did not reach {expected} readable bytes; last observed {available}"
+                    ),
+                ));
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    async fn wait_for_socket_consumption(socket: &Socket) -> io::Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            crate::noop().await;
+            let available = socket_bytes_available(socket)?;
+            if available == 0 {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("socket retained {available} readable bytes"),
+                ));
+            }
+        }
     }
 
     #[test]
@@ -1934,6 +1998,69 @@ mod tests {
         let err =
             validate_recv_multi_bundle_flags(libc::MSG_TRUNC | libc::MSG_WAITALL).unwrap_err();
         assert!(err.to_string().contains("MSG_TRUNC"));
+    }
+
+    #[test]
+    fn waitall_reorder_preserves_shared_bundle_and_scalar_ownership() -> io::Result<()> {
+        let feature_probe = io_uring::IoUring::new(2)?;
+        if !feature_probe.params().is_feature_recvsend_bundle() {
+            return Ok(());
+        }
+        drop(feature_probe);
+
+        const BUFFER_LEN: usize = 256;
+        let driver = crate::Driver::new(io_uring::IoUring::builder(), 16)?;
+        let mut executor = LocalExecutor::new(driver);
+
+        executor.block_on(async {
+            let ring = RecvBufRing::builder(31_804)
+                .ring_entries(4)
+                .buf_cnt(4)
+                .buf_len(BUFFER_LEN)
+                .build()?;
+            let (waitall_socket, mut waitall_writer) = connected_socket_with_writer().await?;
+            let (later_socket, mut later_writer) = connected_socket_with_writer().await?;
+            let (third_socket, mut third_writer) = connected_socket_with_writer().await?;
+
+            // Make the first receive consume the first published buffer without
+            // completing. Completed NOPs drive the ring while FIONREAD confirms
+            // consumption before the later receive starts.
+            waitall_writer.write_all(&[0xaa])?;
+            wait_for_socket_bytes(&waitall_socket, 1)?;
+            let mut waitall_receive =
+                pin!(waitall_socket.recv_ring_bundle_with_flags(&ring, libc::MSG_WAITALL));
+            assert!(futures_util::poll!(&mut waitall_receive).is_pending());
+            wait_for_socket_consumption(&waitall_socket).await?;
+            assert!(futures_util::poll!(&mut waitall_receive).is_pending());
+
+            // This later scalar receive consumes and completes the second
+            // publication before the earlier bundle produces its CQE.
+            later_writer.write_all(&vec![0xbb; BUFFER_LEN])?;
+            wait_for_socket_bytes(&later_socket, BUFFER_LEN as i32)?;
+            let (later, _) = later_socket.recv_from_ring(&ring).await?;
+            assert_eq!(later.len(), BUFFER_LEN);
+            assert!(later.iter().all(|byte| *byte == 0xbb));
+
+            waitall_writer.write_all(&vec![0xaa; BUFFER_LEN - 1])?;
+            waitall_writer.shutdown(std::net::Shutdown::Write)?;
+            let waitall = waitall_receive.await?;
+            assert_eq!(waitall.len(), BUFFER_LEN);
+            assert!(waitall.iter().flatten().all(|byte| *byte == 0xaa));
+
+            // Retain both earlier owners. A third bundle must skip both of
+            // their BIDs and claim the next live publication.
+            third_writer.write_all(b"third")?;
+            let third = third_socket.recv_ring_bundle(&ring).await?;
+            assert_eq!(
+                third.iter().flatten().copied().collect::<Vec<_>>(),
+                b"third"
+            );
+
+            drop((third, waitall, later));
+            waitall_socket.close().await?;
+            later_socket.close().await?;
+            third_socket.close().await
+        })
     }
 
     fn build_test_ring(driver: &crate::Driver, bgid: u16) -> io::Result<RecvBufRing> {
