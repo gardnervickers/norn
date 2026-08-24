@@ -223,6 +223,23 @@ fn recv_ring_buf_can_be_echoed_directly() -> Result<(), Box<dyn std::error::Erro
 }
 
 #[test]
+fn recv_ring_multi_ends_on_orderly_peer_close() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let (server, client) = connected_pair().await?;
+        let ring = RecvBufRing::builder(9).buf_cnt(1).buf_len(1024).build()?;
+        let mut incoming = Box::pin(server.recv_ring_multi(&ring));
+        let close = spawn(async move { client.close().await });
+
+        assert!(incoming.next().await.is_none());
+        close.await??;
+
+        drop(incoming);
+        server.close().await?;
+        Ok(())
+    })
+}
+
+#[test]
 fn recv_ring_buf_can_be_echoed_with_send_zc() -> Result<(), Box<dyn std::error::Error>> {
     util::with_test_env(|| async {
         let (server, client) = connected_pair().await?;

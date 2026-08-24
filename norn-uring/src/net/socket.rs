@@ -1000,7 +1000,7 @@ impl RecvRingMulti {
 // multishot terminal CQE. Each selected buffer is held by an owned completion
 // until it is yielded or dropped.
 unsafe impl Operation for RecvRingMulti {
-    type Completion = io::Result<BufRingBuf>;
+    type Completion = Option<io::Result<BufRingBuf>>;
 
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         self.ring.ensure_accepting_receives()?;
@@ -1012,7 +1012,15 @@ unsafe impl Operation for RecvRingMulti {
 
     unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
         let (result, flags) = result.into_parts();
-        result.and_then(|n| self.ring.get_buf(n, flags))
+        if result.as_ref().is_ok_and(|result| *result == 0)
+            && io_uring::cqueue::buffer_select(flags).is_none()
+        {
+            // An orderly stream shutdown completes the multishot receive
+            // without selecting a provided buffer. Preserve that terminal
+            // absence rather than attempting to claim a nonexistent buffer.
+            return None;
+        }
+        Some(result.and_then(|n| self.ring.get_buf(n, flags)))
     }
 }
 
@@ -1020,11 +1028,16 @@ impl Multishot for RecvRingMulti {
     type Item = io::Result<BufRingBuf>;
 
     fn update(&mut self, completion: Self::Completion) -> Self::Item {
-        completion
+        completion.unwrap_or_else(|| {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "non-terminal multishot receive completed without a buffer",
+            ))
+        })
     }
 
     fn complete(self, completion: Self::Completion) -> Option<Self::Item> {
-        Some(completion)
+        completion
     }
 }
 
