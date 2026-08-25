@@ -9,7 +9,7 @@ use futures_core::Stream;
 use futures_util::StreamExt;
 use norn_executor::spawn;
 use norn_uring::bufring::RecvBufRing;
-use norn_uring::net::{TcpListener, TcpSocket};
+use norn_uring::net::{TcpListener, TcpListenerOptions, TcpSocket};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 mod util;
@@ -50,6 +50,36 @@ fn single_accept_connection() -> Result<(), Box<dyn std::error::Error>> {
         socket.close().await?;
         client.close().await?;
 
+        Ok(())
+    })
+}
+
+#[test]
+fn listener_bind_does_not_reuse_port_by_default() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let first = TcpListener::bind("127.0.0.1:0".parse()?, 32).await?;
+        let addr = first.local_addr()?;
+
+        let error = TcpListener::bind(addr, 32).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+
+        first.close().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn listener_options_allow_reusing_bound_port() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let options = TcpListenerOptions::new().reuse_port(true);
+        let first = TcpListener::bind_with_options("127.0.0.1:0".parse()?, 32, options).await?;
+        let addr = first.local_addr()?;
+        let second = TcpListener::bind_with_options(addr, 32, options).await?;
+
+        assert_eq!(second.local_addr()?, addr);
+
+        second.close().await?;
+        first.close().await?;
         Ok(())
     })
 }
