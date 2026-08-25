@@ -933,8 +933,16 @@ async fn serve_sharded_connection(
             output.clear();
         }
         if (close_ready || peer_eof) && replies.is_empty() {
+            if peer_eof {
+                drop(incoming);
+                return socket.close().await;
+            }
+            // QUIT leaves the peer open and the multishot receive armed.
+            // Dropping both lets the receive's terminal cancellation retain
+            // the descriptor until its ordinary deferred close boundary.
             drop(incoming);
-            return socket.close().await;
+            drop(socket);
+            return Ok(());
         }
         if !need_more
             && !stop_dispatch
@@ -1988,7 +1996,9 @@ mod tests {
     use norn_executor::park::SpinPark;
 
     use super::*;
-    use crate::protocol::{OP_GET, OP_NOOP, OP_SETQ, OP_STAT, REQUEST_MAGIC, RESPONSE_MAGIC};
+    use crate::protocol::{
+        OP_GET, OP_NOOP, OP_QUIT, OP_SETQ, OP_STAT, REQUEST_MAGIC, RESPONSE_MAGIC,
+    };
 
     fn header(opcode: u8, key_len: usize, extras_len: usize, body_len: usize) -> RequestHeader {
         let mut bytes = [0_u8; HEADER_LEN];
@@ -2699,6 +2709,34 @@ mod tests {
                 assert_eq!(&response[HEADER_LEN..HEADER_LEN + 4], &0_u32.to_be_bytes());
                 assert!(response[HEADER_LEN + 4..].iter().all(|&byte| byte == 0x5a));
             }
+            Ok(())
+        })();
+
+        let shutdown = server.shutdown();
+        result?;
+        shutdown
+    }
+
+    #[test]
+    fn sharded_quit_closes_an_open_peer_without_an_explicit_close_race() -> io::Result<()> {
+        let server = ShardedServer::start(ShardedServerConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            ..ShardedServerConfig::default()
+        })?;
+        let address = server.local_addr();
+
+        let result = (|| -> io::Result<()> {
+            let mut stream = TcpStream::connect(address)?;
+            stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+            stream.set_write_timeout(Some(Duration::from_secs(3)))?;
+            stream.write_all(&binary_request(OP_QUIT, &[], &[], &[], 17))?;
+
+            let response = read_response(&mut stream)?;
+            assert_eq!(response[1], OP_QUIT);
+            assert_eq!(u32::from_be_bytes(response[12..16].try_into().unwrap()), 17);
+
+            let mut trailing = [0; 1];
+            assert_eq!(stream.read(&mut trailing)?, 0);
             Ok(())
         })();
 
