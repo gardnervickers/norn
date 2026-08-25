@@ -563,7 +563,7 @@ fn send_msg_zc_smoke() -> Result<(), Box<dyn std::error::Error>> {
         let expected_len = payload.len();
         let recv_task =
             spawn(async move { server.recv(BytesMut::with_capacity(expected_len)).await });
-        let (send_res, sent_buf) = client.send_msg_zc(payload, 0).await;
+        let (send_res, sent_buf) = client.send_msg_zc(payload).await;
         let sent = match send_res {
             Ok(sent) => sent,
             Err(err) => {

@@ -471,22 +471,6 @@ impl Socket {
         self.fd.submit(op).await
     }
 
-    pub(crate) async fn send_to_with_flags<B>(
-        &self,
-        buf: B,
-        addr: SocketAddr,
-        flags: i32,
-    ) -> (io::Result<usize>, B)
-    where
-        B: StableBuf + 'static,
-    {
-        if let Some(result) = self.try_send_to(&buf, Some(addr), flags) {
-            return (result, buf);
-        }
-        let op = SendTo::new(self.fd.lease(), buf, Some(addr), flags as u32);
-        self.fd.submit(op).await
-    }
-
     pub(crate) fn recv<B>(&self, buf: B) -> Op<Recv<B>>
     where
         B: StableBufMut + 'static,
@@ -511,14 +495,6 @@ impl Socket {
         self.fd.submit(op)
     }
 
-    pub(crate) fn send_with_flags<B>(&self, buf: B, flags: i32) -> Op<Send<B>>
-    where
-        B: StableBuf + 'static,
-    {
-        let op = Send::new(self.fd.lease(), buf, flags);
-        self.fd.submit(op)
-    }
-
     pub(crate) fn send_zc<B>(&self, buf: B) -> Op<SendZc<B>>
     where
         B: StableBuf + 'static,
@@ -527,19 +503,11 @@ impl Socket {
         self.fd.submit(op)
     }
 
-    pub(crate) fn send_zc_with_flags<B>(&self, buf: B, flags: i32) -> Op<SendZc<B>>
+    pub(crate) fn send_msg_zc<B>(&self, buf: B) -> Op<SendMsgZc<B>>
     where
         B: StableBuf + 'static,
     {
-        let op = SendZc::new(self.fd.lease(), buf, flags);
-        self.fd.submit(op)
-    }
-
-    pub(crate) fn send_msg_zc<B>(&self, buf: B, flags: i32) -> Op<SendMsgZc<B>>
-    where
-        B: StableBuf + 'static,
-    {
-        let op = SendMsgZc::new(self.fd.lease(), buf, flags);
+        let op = SendMsgZc::new(self.fd.lease(), buf, 0);
         self.fd.submit(op)
     }
 

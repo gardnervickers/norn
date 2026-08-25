@@ -162,6 +162,10 @@ The project is intentionally not general-purpose today; APIs are still in flux i
 ## Change Guidance for Agents
 
 - Keep edits localized and behavior-preserving unless explicitly requested otherwise.
+- Keep public APIs conservative. Do not forward raw kernel flags by default;
+  expose them only after establishing that every accepted value preserves runtime
+  ownership, lifecycle, and correctness semantics. Prefer dedicated, audited APIs
+  for supported behavior.
 - When changing semantics, add or update tests in the crate that owns the behavior.
 - For `norn-uring`, validate shutdown/cancel/drop implications explicitly; many paths are panic-sensitive.
 - Avoid introducing cross-thread assumptions; core runtime is single-thread/local by design.

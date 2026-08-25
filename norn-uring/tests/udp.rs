@@ -147,7 +147,7 @@ fn connected_send_recv_msg_zc() -> Result<(), Box<dyn std::error::Error>> {
         let recv_task =
             norn_executor::spawn(async move { s2.recv(BytesMut::with_capacity(64)).await });
         let payload = Bytes::from_static(b"udp-zc-msg");
-        let (res, sent) = s1.send_msg_zc(payload, 0).await;
+        let (res, sent) = s1.send_msg_zc(payload).await;
         let sent_n = match res {
             Ok(n) => n,
             Err(err) => {
@@ -170,13 +170,13 @@ fn connected_send_recv_msg_zc() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
-fn send_recv_msg() -> Result<(), Box<dyn std::error::Error>> {
+fn recv_msg() -> Result<(), Box<dyn std::error::Error>> {
     util::with_test_env(|| async {
         let s1 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
         let s2 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
 
         let (res, sent) = s1
-            .send_msg(Bytes::from_static(b"hello"), Some(s2.local_addr()?), 0)
+            .send_to(Bytes::from_static(b"hello"), s2.local_addr()?)
             .await;
         assert_eq!(res?, sent.len());
 
