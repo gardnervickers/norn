@@ -135,6 +135,27 @@ fn send_zc_rejects_buffers_larger_than_u32_max() -> Result<(), Box<dyn std::erro
 }
 
 #[test]
+fn tcp_socket_writer_sends_vectored_buffers_and_retains_close(
+) -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let (server, client) = connected_pair().await?;
+        let mut writer = Box::pin(server.writer());
+        let buffers = [io::IoSlice::new(b"vector-"), io::IoSlice::new(b"write")];
+
+        assert_eq!(writer.write_vectored(&buffers).await?, 12);
+        let mut client = Box::pin(client.into_stream());
+        let mut reply = [0; 12];
+        client.read_exact(&mut reply).await?;
+        assert_eq!(&reply, b"vector-write");
+
+        let error = server.close().await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        drop(writer);
+        Ok(())
+    })
+}
+
+#[test]
 fn close_rejects_unpolled_operation_without_invalidating_it(
 ) -> Result<(), Box<dyn std::error::Error>> {
     util::with_test_env(|| async {

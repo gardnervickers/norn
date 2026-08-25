@@ -36,6 +36,29 @@ The full baseline and profile are recorded in `norn-network-results.md`.
   connection send boundary. This changes response ownership and lifetime
   mechanics and needs a separately reviewable design.
 
+### Follow-up Result
+
+- Kept an adaptive connection output path for fixed responses. Wire responses
+  below 512 bytes retain the contiguous io_uring send path. Larger responses
+  retain their ordered owned buffers and use readiness-driven `writev` for
+  multi-buffer batches; one-buffer batches submit the existing buffer directly
+  through io_uring.
+  - Result: pipeline-32 throughput improved by 15.8% at a 512-byte payload and
+    33.3% at 1024 bytes. The 256-byte and pipeline-1 guardrails were flat.
+  - Current-master revalidation used five alternating 1,024-byte pairs: paired
+    median throughput improved 10.34% and p99 improved 29.94%. Five 256-byte
+    guard pairs were throughput-neutral; pipeline-1 did not regress. p99.9 was
+    too noisy for a retained tail claim.
+  - Full repeated measurements and raw-log locations are recorded in
+    `norn-network-results.md`.
+- Rejected deferring fixed-response encoding from hash owners to connection
+  workers. It improved 64-byte and 256-byte throughput but repeatedly regressed
+  1024-byte throughput by 11.1% because it removed useful work distribution.
+- Rejected deferring only owner-local responses. It regressed 64-byte and
+  256-byte throughput by 7.7% and 10.0%.
+- Rejected always-vectored output. Its fixed readiness/writev cost regressed
+  256-byte throughput by 10.0%.
+
 ## 2026-05-12: `uring_realworld` UDP Request/Response
 
 Target benchmark:

@@ -557,6 +557,16 @@ impl TcpSocket {
         TcpStream { reader, writer }
     }
 
+    /// Create a stateful writer which shares this socket.
+    ///
+    /// The writer uses readiness-driven socket writes and retains the
+    /// descriptor until it is dropped.
+    pub fn writer(&self) -> TcpStreamWriter {
+        TcpStreamWriter {
+            inner: ReadyStream::new(self.socket.clone()),
+        }
+    }
+
     /// Close the socket.
     ///
     /// Returns [`io::ErrorKind::WouldBlock`] if another owner or operation still
@@ -644,6 +654,21 @@ impl TcpStream {
     /// Split the stream into a reader and writer.
     pub fn owned_split(self) -> (TcpStreamReader, TcpStreamWriter) {
         (self.reader, self.writer)
+    }
+}
+
+impl TcpStreamWriter {
+    /// Poll a write from a set of non-contiguous buffers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if polling write readiness or the socket write fails.
+    pub fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        tokio::io::AsyncWrite::poll_write_vectored(self, context, bufs)
     }
 }
 

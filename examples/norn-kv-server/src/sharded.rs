@@ -9,7 +9,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
-use std::io;
+use std::io::{self, IoSlice};
 use std::net::SocketAddr;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::pin::Pin;
@@ -28,7 +28,7 @@ use norn_channel::DriverBuilder;
 use norn_executor::{spawn, LocalExecutor};
 use norn_uring::buf::{BufCursor, StableBuf};
 use norn_uring::bufring::{BufRingBuf, RecvBufRing};
-use norn_uring::net::{TcpListener, TcpListenerOptions, TcpSocket};
+use norn_uring::net::{TcpListener, TcpListenerOptions, TcpSocket, TcpStreamWriter};
 use smallvec::SmallVec;
 
 use crate::codec::{DecodeStatus, DecodedFrame, FrameDecoder, ResponseEncoder};
@@ -42,6 +42,7 @@ const PUMP_BATCH: usize = 64;
 const RECV_RING_BUFFERS: u16 = 8_192;
 const RECV_BUFFER_LEN: usize = 8 * 1024;
 const MAX_IN_FLIGHT_PER_CONNECTION: usize = 32;
+const VECTORED_RESPONSE_THRESHOLD: usize = 512;
 
 /// Configuration for a fixed group of sharded networking workers.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -693,7 +694,7 @@ async fn request_pump(
                     request.command.borrowed(),
                     &mut ResponseEncoder::new(&mut bytes),
                 )
-                .map(|action| CommandResponse { action, bytes })
+                .map(|action| CommandResponse::encoded(action, bytes))
                 .map_err(|error| RemoteError::Encoding(error.to_string()));
             // Every admitted request produces exactly one reverse envelope,
             // even when a quiet command deliberately encodes zero wire bytes.
@@ -858,11 +859,56 @@ async fn serve_sharded_connection(
     config: ServerConfig,
 ) -> io::Result<()> {
     socket.set_nodelay(true).await?;
+    if handler
+        .fixed_response_wire_len()
+        .is_some_and(|len| len >= VECTORED_RESPONSE_THRESHOLD)
+    {
+        let output = VectoredResponseOutput::new(socket.writer());
+        serve_sharded_connection_with_output(
+            socket,
+            worker,
+            worker_count,
+            connection,
+            handler,
+            router,
+            recv_ring,
+            config,
+            output,
+        )
+        .await
+    } else {
+        let output = ContiguousResponseOutput::new(config.max_body_len + HEADER_LEN);
+        serve_sharded_connection_with_output(
+            socket,
+            worker,
+            worker_count,
+            connection,
+            handler,
+            router,
+            recv_ring,
+            config,
+            output,
+        )
+        .await
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn serve_sharded_connection_with_output<O: ResponseOutput>(
+    socket: TcpSocket,
+    worker: usize,
+    worker_count: usize,
+    connection: u64,
+    handler: MemoryHandler,
+    router: Rc<RouterLocal>,
+    recv_ring: RecvBufRing,
+    config: ServerConfig,
+    mut output: O,
+) -> io::Result<()> {
     let replies = router.register_connection(connection)?;
     let mut incoming = Box::pin(socket.recv_ring_multi(&recv_ring));
     let decoder = FrameDecoder::new(config.max_body_len);
     let mut pending = Vec::with_capacity(RECV_BUFFER_LEN);
-    let mut output = Vec::with_capacity(config.max_body_len + HEADER_LEN);
     let mut stop_dispatch = false;
     let mut close_ready = false;
     let mut peer_eof = false;
@@ -906,7 +952,7 @@ async fn serve_sharded_connection(
         }
 
         let mut completed = 0;
-        while output.len() < config.max_batch_response_bytes
+        while output.bytes() < config.max_batch_response_bytes
             && completed < config.max_batch_commands
         {
             let Some(result) = replies.try_next() else {
@@ -914,23 +960,19 @@ async fn serve_sharded_connection(
             };
             let response = result?;
             close_ready |= response.action == ConnectionAction::Close;
-            output.extend_from_slice(&response.bytes);
+            output.push(response.into_bytes());
             completed += 1;
         }
 
         if !output.is_empty() {
-            output = send_all(&socket, output).await?;
-            output.clear();
+            output.send_all(&socket).await?;
         }
         if (close_ready || peer_eof) && replies.is_empty() {
-            if peer_eof {
-                drop(incoming);
-                return socket.close().await;
-            }
-            // QUIT leaves the peer open and the multishot receive armed.
-            // Dropping both lets the receive's terminal cancellation retain
-            // the descriptor until its ordinary deferred close boundary.
+            // The multishot receive and readiness writer can both retain the
+            // descriptor through terminal cancellation. Drop every connection
+            // owner and let the descriptor close at that reclamation boundary.
             drop(incoming);
+            output.close();
             drop(socket);
             return Ok(());
         }
@@ -978,7 +1020,7 @@ async fn serve_sharded_connection(
             Event::Response(response) => {
                 let response = response?;
                 close_ready |= response.action == ConnectionAction::Close;
-                output.extend_from_slice(&response.bytes);
+                output.push(response.into_bytes());
             }
         }
     }
@@ -997,7 +1039,7 @@ async fn dispatch_frame(
         let action = handler
             .handle(frame, &mut ResponseEncoder::new(&mut bytes))
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        replies.push_ready(CommandResponse { action, bytes })?;
+        replies.push_ready(CommandResponse::encoded(action, bytes))?;
         return Ok(false);
     };
 
@@ -1011,10 +1053,7 @@ async fn dispatch_frame(
         ResponseEncoder::new(&mut bytes)
             .append_empty(header, Status::UnknownCommand)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        replies.push_ready(CommandResponse {
-            action: ConnectionAction::Continue,
-            bytes,
-        })?;
+        replies.push_ready(CommandResponse::encoded(ConnectionAction::Continue, bytes))?;
         return Ok(false);
     }
 
@@ -1023,7 +1062,7 @@ async fn dispatch_frame(
         let action = handler
             .execute_command(header, command, &mut ResponseEncoder::new(&mut bytes))
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        replies.push_ready(CommandResponse { action, bytes })?;
+        replies.push_ready(CommandResponse::encoded(action, bytes))?;
         return Ok(closes);
     };
     let owner = key_owner(key, worker_count);
@@ -1032,7 +1071,7 @@ async fn dispatch_frame(
         let action = handler
             .execute_command(header, command, &mut ResponseEncoder::new(&mut bytes))
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        replies.push_ready(CommandResponse { action, bytes })?;
+        replies.push_ready(CommandResponse::encoded(action, bytes))?;
         return Ok(closes);
     }
 
@@ -1059,7 +1098,158 @@ fn command_key(command: Command<'_>) -> Option<&[u8]> {
     }
 }
 
-async fn send_all(socket: &TcpSocket, buffer: Vec<u8>) -> io::Result<Vec<u8>> {
+trait ResponseOutput {
+    fn bytes(&self) -> usize;
+    fn is_empty(&self) -> bool;
+    fn push(&mut self, buffer: Vec<u8>);
+    async fn send_all(&mut self, socket: &TcpSocket) -> io::Result<()>;
+    fn close(&mut self);
+}
+
+struct ContiguousResponseOutput {
+    buffer: Vec<u8>,
+}
+
+impl ContiguousResponseOutput {
+    fn new(capacity: usize) -> Self {
+        Self {
+            buffer: Vec::with_capacity(capacity),
+        }
+    }
+}
+
+impl ResponseOutput for ContiguousResponseOutput {
+    fn bytes(&self) -> usize {
+        self.buffer.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
+    }
+
+    fn push(&mut self, buffer: Vec<u8>) {
+        self.buffer.extend_from_slice(&buffer);
+    }
+
+    async fn send_all(&mut self, socket: &TcpSocket) -> io::Result<()> {
+        let buffer = std::mem::take(&mut self.buffer);
+        self.buffer = send_contiguous_all(socket, buffer).await?;
+        self.buffer.clear();
+        Ok(())
+    }
+
+    fn close(&mut self) {}
+}
+
+struct VectoredResponseOutput {
+    writer: Option<Pin<Box<TcpStreamWriter>>>,
+    buffers: VecDeque<Vec<u8>>,
+    front_offset: usize,
+    bytes: usize,
+}
+
+impl VectoredResponseOutput {
+    fn new(writer: TcpStreamWriter) -> Self {
+        Self {
+            writer: Some(Box::pin(writer)),
+            buffers: VecDeque::with_capacity(MAX_IN_FLIGHT_PER_CONNECTION),
+            front_offset: 0,
+            bytes: 0,
+        }
+    }
+
+    async fn send_vectored_all(&mut self, mut writer: Pin<&mut TcpStreamWriter>) -> io::Result<()> {
+        while self.bytes != 0 {
+            let sent = {
+                let mut slices = SmallVec::<[IoSlice<'_>; MAX_IN_FLIGHT_PER_CONNECTION]>::new();
+                for (index, buffer) in self.buffers.iter().enumerate() {
+                    let bytes = if index == 0 {
+                        &buffer[self.front_offset..]
+                    } else {
+                        buffer.as_slice()
+                    };
+                    if !bytes.is_empty() {
+                        slices.push(IoSlice::new(bytes));
+                    }
+                }
+                future::poll_fn(|context| {
+                    writer
+                        .as_mut()
+                        .poll_write_vectored(context, slices.as_slice())
+                })
+                .await?
+            };
+            if sent == 0 {
+                return Err(io::Error::from(io::ErrorKind::WriteZero));
+            }
+            self.consume(sent);
+        }
+        debug_assert!(self.buffers.is_empty());
+        debug_assert_eq!(self.front_offset, 0);
+        Ok(())
+    }
+
+    fn consume(&mut self, sent: usize) {
+        assert!(sent <= self.bytes, "socket sent beyond response batch");
+        self.bytes -= sent;
+        let mut remaining = sent;
+        while remaining != 0 {
+            let front = self
+                .buffers
+                .front()
+                .expect("response byte count exceeded owned buffers");
+            let available = front.len() - self.front_offset;
+            if remaining < available {
+                self.front_offset += remaining;
+                return;
+            }
+            remaining -= available;
+            self.buffers.pop_front();
+            self.front_offset = 0;
+        }
+    }
+}
+
+impl ResponseOutput for VectoredResponseOutput {
+    fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    fn is_empty(&self) -> bool {
+        self.bytes == 0
+    }
+
+    fn push(&mut self, buffer: Vec<u8>) {
+        if buffer.is_empty() {
+            return;
+        }
+        self.bytes = self
+            .bytes
+            .checked_add(buffer.len())
+            .expect("response batch byte count overflowed");
+        self.buffers.push_back(buffer);
+    }
+
+    async fn send_all(&mut self, socket: &TcpSocket) -> io::Result<()> {
+        if self.buffers.len() == 1 {
+            debug_assert_eq!(self.front_offset, 0);
+            let buffer = self.buffers.pop_front().unwrap();
+            self.bytes = 0;
+            let _ = send_contiguous_all(socket, buffer).await?;
+            return Ok(());
+        }
+        let mut writer = self.writer.take().expect("response writer was closed");
+        let result = self.send_vectored_all(writer.as_mut()).await;
+        self.writer = Some(writer);
+        result
+    }
+
+    fn close(&mut self) {
+        self.writer.take();
+    }
+}
+
+async fn send_contiguous_all(socket: &TcpSocket, buffer: Vec<u8>) -> io::Result<Vec<u8>> {
     let mut cursor = BufCursor::new(buffer);
     while cursor.bytes_init() != 0 {
         let (result, returned) = socket.send(cursor).await;
@@ -1135,6 +1325,21 @@ struct ShardRequest {
 struct CommandResponse {
     action: ConnectionAction,
     bytes: Vec<u8>,
+}
+
+impl CommandResponse {
+    fn encoded(action: ConnectionAction, bytes: Vec<u8>) -> Self {
+        Self { action, bytes }
+    }
+
+    fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
+    #[cfg(test)]
+    fn encoded_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
 }
 
 #[derive(Debug)]
@@ -2026,10 +2231,7 @@ mod tests {
                 connection,
                 sequence,
             },
-            result: Ok(CommandResponse {
-                action: ConnectionAction::Continue,
-                bytes,
-            }),
+            result: Ok(CommandResponse::encoded(ConnectionAction::Continue, bytes)),
         }
     }
 
@@ -2126,6 +2328,27 @@ mod tests {
             unreachable!();
         };
         assert!(!key.spilled());
+    }
+
+    #[test]
+    fn response_outputs_preserve_bytes_across_partial_writes() {
+        let mut contiguous = ContiguousResponseOutput::new(0);
+        contiguous.push(vec![0; 7]);
+        contiguous.push(vec![1; 5]);
+        assert_eq!(contiguous.bytes(), 12);
+
+        let mut vectored = VectoredResponseOutput {
+            writer: None,
+            buffers: VecDeque::new(),
+            front_offset: 0,
+            bytes: 0,
+        };
+        vectored.push(vec![0; VECTORED_RESPONSE_THRESHOLD]);
+        vectored.push(vec![1; 7]);
+        assert_eq!(vectored.bytes(), VECTORED_RESPONSE_THRESHOLD + 7);
+        vectored.consume(VECTORED_RESPONSE_THRESHOLD + 3);
+        assert_eq!(vectored.bytes(), 4);
+        assert_eq!(vectored.front_offset, 3);
     }
 
     #[test]
@@ -2285,8 +2508,8 @@ mod tests {
         assert!(replies.try_next().is_none());
         router.complete(response(0, 0, vec![0])).unwrap();
 
-        assert_eq!(replies.try_next().unwrap().unwrap().bytes, vec![0]);
-        assert_eq!(replies.try_next().unwrap().unwrap().bytes, vec![1]);
+        assert_eq!(replies.try_next().unwrap().unwrap().encoded_bytes(), [0]);
+        assert_eq!(replies.try_next().unwrap().unwrap().encoded_bytes(), [1]);
         assert!(replies.is_empty());
         assert_eq!(router.credits[0].borrow().available, 2);
     }
@@ -2297,16 +2520,16 @@ mod tests {
         let replies = router.register_connection(7).unwrap();
         submit_get(&router, &replies, acquire_now(&router), b"remote").unwrap();
         replies
-            .push_ready(CommandResponse {
-                action: ConnectionAction::Continue,
-                bytes: Vec::new(),
-            })
+            .push_ready(CommandResponse::encoded(
+                ConnectionAction::Continue,
+                Vec::new(),
+            ))
             .unwrap();
         replies
-            .push_ready(CommandResponse {
-                action: ConnectionAction::Close,
-                bytes: Vec::new(),
-            })
+            .push_ready(CommandResponse::encoded(
+                ConnectionAction::Close,
+                Vec::new(),
+            ))
             .unwrap();
 
         assert!(replies.try_next().is_none());
@@ -2314,11 +2537,11 @@ mod tests {
         let remote = replies.try_next().unwrap().unwrap();
         let quiet = replies.try_next().unwrap().unwrap();
         let quit = replies.try_next().unwrap().unwrap();
-        assert_eq!(remote.bytes, vec![9]);
+        assert_eq!(remote.encoded_bytes(), [9]);
         assert_eq!(quiet.action, ConnectionAction::Continue);
-        assert!(quiet.bytes.is_empty());
+        assert!(quiet.encoded_bytes().is_empty());
         assert_eq!(quit.action, ConnectionAction::Close);
-        assert!(quit.bytes.is_empty());
+        assert!(quit.encoded_bytes().is_empty());
     }
 
     #[test]
@@ -2328,44 +2551,53 @@ mod tests {
 
         for value in 0_u8..32 {
             replies
-                .push_ready(CommandResponse {
-                    action: ConnectionAction::Continue,
-                    bytes: vec![value],
-                })
+                .push_ready(CommandResponse::encoded(
+                    ConnectionAction::Continue,
+                    vec![value],
+                ))
                 .unwrap();
         }
         let error = replies
-            .push_ready(CommandResponse {
-                action: ConnectionAction::Continue,
-                bytes: vec![32],
-            })
+            .push_ready(CommandResponse::encoded(
+                ConnectionAction::Continue,
+                vec![32],
+            ))
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
 
         for expected in 0_u8..16 {
-            assert_eq!(replies.try_next().unwrap().unwrap().bytes, vec![expected]);
+            assert_eq!(
+                replies.try_next().unwrap().unwrap().encoded_bytes(),
+                [expected]
+            );
         }
         for value in 32_u8..48 {
             replies
-                .push_ready(CommandResponse {
-                    action: ConnectionAction::Continue,
-                    bytes: vec![value],
-                })
+                .push_ready(CommandResponse::encoded(
+                    ConnectionAction::Continue,
+                    vec![value],
+                ))
                 .unwrap();
         }
         for expected in 16_u8..48 {
-            assert_eq!(replies.try_next().unwrap().unwrap().bytes, vec![expected]);
+            assert_eq!(
+                replies.try_next().unwrap().unwrap().encoded_bytes(),
+                [expected]
+            );
         }
         for value in 48_u8..80 {
             replies
-                .push_ready(CommandResponse {
-                    action: ConnectionAction::Continue,
-                    bytes: vec![value],
-                })
+                .push_ready(CommandResponse::encoded(
+                    ConnectionAction::Continue,
+                    vec![value],
+                ))
                 .unwrap();
         }
         for expected in 48_u8..80 {
-            assert_eq!(replies.try_next().unwrap().unwrap().bytes, vec![expected]);
+            assert_eq!(
+                replies.try_next().unwrap().unwrap().encoded_bytes(),
+                [expected]
+            );
         }
         assert!(replies.is_empty());
     }
@@ -2375,10 +2607,10 @@ mod tests {
         let mut ready = ReplyWindow::new(7);
         ready.head_sequence = u64::MAX;
         assert!(ready
-            .push_ready(CommandResponse {
-                action: ConnectionAction::Continue,
-                bytes: Vec::new(),
-            })
+            .push_ready(CommandResponse::encoded(
+                ConnectionAction::Continue,
+                Vec::new(),
+            ))
             .is_err());
 
         let mut remote = ReplyWindow::new(7);
@@ -2395,14 +2627,14 @@ mod tests {
         submit_get(&router, &replies, acquire_now(&router), b"old").unwrap();
         assert_eq!(requests.try_recv().unwrap().id, id(0));
         router.complete(response(0, 0, vec![0])).unwrap();
-        assert_eq!(replies.try_next().unwrap().unwrap().bytes, vec![0]);
+        assert_eq!(replies.try_next().unwrap().unwrap().encoded_bytes(), [0]);
 
         for _ in 1..MAX_IN_FLIGHT_PER_CONNECTION {
             replies
-                .push_ready(CommandResponse {
-                    action: ConnectionAction::Continue,
-                    bytes: Vec::new(),
-                })
+                .push_ready(CommandResponse::encoded(
+                    ConnectionAction::Continue,
+                    Vec::new(),
+                ))
                 .unwrap();
             assert!(replies.try_next().unwrap().is_ok());
         }
@@ -2419,7 +2651,7 @@ mod tests {
             .complete(response(MAX_IN_FLIGHT_PER_CONNECTION as u64, 0, vec![8]))
             .unwrap();
         assert_eq!(router.credits[0].borrow().available, 1);
-        assert_eq!(replies.try_next().unwrap().unwrap().bytes, vec![8]);
+        assert_eq!(replies.try_next().unwrap().unwrap().encoded_bytes(), [8]);
     }
 
     #[test]

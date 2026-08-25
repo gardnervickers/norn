@@ -59,6 +59,15 @@ impl MemoryHandler {
         }
     }
 
+    pub(crate) fn fixed_response_wire_len(&self) -> Option<usize> {
+        match &self.backend {
+            Backend::Memory(_) => None,
+            Backend::FixedResponse(value) => {
+                Some(value.len().saturating_add(crate::protocol::HEADER_LEN + 4))
+            }
+        }
+    }
+
     pub(crate) fn handle(
         &self,
         frame: DecodedFrame<'_>,
@@ -331,6 +340,10 @@ mod tests {
     #[test]
     fn fixed_response_mode_has_no_key_value_state() {
         let handler = HandlerConfig::FixedResponse { value_len: 64 }.build();
+        assert_eq!(
+            handler.fixed_response_wire_len(),
+            Some(crate::protocol::HEADER_LEN + 4 + 64)
+        );
         let mut extras = Vec::new();
         extras.extend_from_slice(&9_u32.to_be_bytes());
         extras.extend_from_slice(&0_u32.to_be_bytes());
