@@ -9,17 +9,53 @@ use crate::protocol::{Command, EncodeError, Request, Status};
 
 const VERSION: &[u8] = b"norn-kv-server 0.1.0";
 
-/// In-memory command handler shared by local connection tasks.
+/// Backend selected for command execution.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HandlerConfig {
+    /// Execute commands against a worker-local in-memory key/value store.
+    #[default]
+    Memory,
+    /// Return a fixed value for every GET without owning a key/value store.
+    FixedResponse {
+        /// Number of value bytes appended after the four-byte GET flags field.
+        value_len: usize,
+    },
+}
+
+impl HandlerConfig {
+    /// Construct the configured command handler.
+    pub fn build(self) -> MemoryHandler {
+        match self {
+            Self::Memory => MemoryHandler::new(MemoryStore::new()),
+            Self::FixedResponse { value_len } => MemoryHandler::fixed_response(value_len),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum Backend {
+    Memory(Rc<RefCell<MemoryStore>>),
+    FixedResponse(Rc<[u8]>),
+}
+
+/// Command handler shared by local connection tasks.
 #[derive(Debug, Clone)]
 pub struct MemoryHandler {
-    store: Rc<RefCell<MemoryStore>>,
+    backend: Backend,
 }
 
 impl MemoryHandler {
     /// Construct a handler backed by `store`.
     pub fn new(store: MemoryStore) -> Self {
         Self {
-            store: Rc::new(RefCell::new(store)),
+            backend: Backend::Memory(Rc::new(RefCell::new(store))),
+        }
+    }
+
+    /// Construct a network-only handler which returns a fixed GET value.
+    pub fn fixed_response(value_len: usize) -> Self {
+        Self {
+            backend: Backend::FixedResponse(vec![0x5a; value_len].into()),
         }
     }
 
@@ -61,18 +97,25 @@ impl MemoryHandler {
     ) -> Result<ConnectionAction, EncodeError> {
         match command {
             Command::Get { key, quiet } => {
-                let store = self.store.borrow();
-                if let Some(entry) = store.get(key) {
-                    out.append(
-                        header,
-                        Status::Success,
-                        0,
-                        &entry.flags().to_be_bytes(),
-                        &[],
-                        entry.value(),
-                    )?;
-                } else if !quiet {
-                    out.append_empty(header, Status::KeyNotFound)?;
+                match &self.backend {
+                    Backend::Memory(store) => {
+                        let store = store.borrow();
+                        if let Some(entry) = store.get(key) {
+                            out.append(
+                                header,
+                                Status::Success,
+                                0,
+                                &entry.flags().to_be_bytes(),
+                                &[],
+                                entry.value(),
+                            )?;
+                        } else if !quiet {
+                            out.append_empty(header, Status::KeyNotFound)?;
+                        }
+                    }
+                    Backend::FixedResponse(value) => {
+                        out.append(header, Status::Success, 0, &0_u32.to_be_bytes(), &[], value)?;
+                    }
                 }
                 Ok(ConnectionAction::Continue)
             }
@@ -82,14 +125,19 @@ impl MemoryHandler {
                 value,
                 quiet,
             } => {
-                self.store.borrow_mut().set(key, flags, value);
+                if let Backend::Memory(store) = &self.backend {
+                    store.borrow_mut().set(key, flags, value);
+                }
                 if !quiet {
                     out.append_empty(header, Status::Success)?;
                 }
                 Ok(ConnectionAction::Continue)
             }
             Command::Delete { key, quiet } => {
-                let deleted = self.store.borrow_mut().delete(key);
+                let deleted = match &self.backend {
+                    Backend::Memory(store) => store.borrow_mut().delete(key),
+                    Backend::FixedResponse(_) => true,
+                };
                 if deleted {
                     if !quiet {
                         out.append_empty(header, Status::Success)?;
@@ -112,9 +160,13 @@ impl MemoryHandler {
                     out.append_empty(header, Status::InvalidArguments)?;
                     return Ok(ConnectionAction::Continue);
                 }
-                let stats = self.store.borrow().stats();
-                let items = stats.items.to_string();
-                let bytes = stats.value_bytes.to_string();
+                let (items, bytes) = match &self.backend {
+                    Backend::Memory(store) => {
+                        let stats = store.borrow().stats();
+                        (stats.items.to_string(), stats.value_bytes.to_string())
+                    }
+                    Backend::FixedResponse(value) => ("0".to_owned(), value.len().to_string()),
+                };
                 out.append(
                     header,
                     Status::Success,
@@ -274,5 +326,25 @@ mod tests {
         );
         assert_eq!(status(&invalid), Status::InvalidArguments as u16);
         assert!(!invalid[24..].is_empty());
+    }
+
+    #[test]
+    fn fixed_response_mode_has_no_key_value_state() {
+        let handler = HandlerConfig::FixedResponse { value_len: 64 }.build();
+        let mut extras = Vec::new();
+        extras.extend_from_slice(&9_u32.to_be_bytes());
+        extras.extend_from_slice(&0_u32.to_be_bytes());
+
+        let (_, set) = handle(&handler, &request(OP_SET, b"key", &extras, b"ignored", 1));
+        assert_eq!(status(&set), Status::Success as u16);
+
+        let (_, get) = handle(&handler, &request(OP_GET, b"another-key", &[], &[], 2));
+        assert_eq!(status(&get), Status::Success as u16);
+        assert_eq!(get.len(), crate::protocol::HEADER_LEN + 4 + 64);
+        assert_eq!(&get[24..28], &0_u32.to_be_bytes());
+        assert!(get[28..].iter().all(|&byte| byte == 0x5a));
+
+        let (_, delete) = handle(&handler, &request(OP_DELETE, b"missing", &[], &[], 3));
+        assert_eq!(status(&delete), Status::Success as u16);
     }
 }

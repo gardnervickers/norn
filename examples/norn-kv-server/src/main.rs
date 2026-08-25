@@ -4,8 +4,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use std::net::SocketAddr;
 
     use norn_executor::LocalExecutor;
-    use norn_kv_server::handler::MemoryHandler;
-    use norn_kv_server::memory::MemoryStore;
+    use norn_kv_server::handler::HandlerConfig;
     use norn_kv_server::server::{serve, RecvMode, ServerConfig};
     use norn_kv_server::sharded::{pin_current_thread, ShardedServer, ShardedServerConfig};
     use norn_uring::net::TcpListener;
@@ -18,6 +17,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         workers: usize,
         worker_cpus: Vec<usize>,
         pair_capacity: usize,
+        handler: HandlerConfig,
         server: ServerConfig,
     }
 
@@ -27,6 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "Usage: norn-kv-server [--listen ADDR] [--backlog N] [--ring-entries N] \
              [--workers N] [--worker-cpus LIST] \
              [--pair-capacity N] \
+             [--fixed-response-bytes N] \
              [--max-body N] [--max-connections N] [--recv-mode exact|multishot] \
              [--max-batch-commands N] [--max-batch-response-bytes N]\n\
              --pair-capacity defaults to {pair_capacity} credited in-flight exchanges per \
@@ -47,6 +48,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             workers: 1,
             worker_cpus: Vec::new(),
             pair_capacity: ShardedServerConfig::default().pair_capacity,
+            handler: HandlerConfig::Memory,
             server: ServerConfig::default(),
         };
 
@@ -68,6 +70,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ("--worker-cpus", raw.to_owned())
             } else if let Some(raw) = value(&arg, "--pair-capacity") {
                 ("--pair-capacity", raw.to_owned())
+            } else if let Some(raw) = value(&arg, "--fixed-response-bytes") {
+                ("--fixed-response-bytes", raw.to_owned())
             } else if let Some(raw) = value(&arg, "--max-body") {
                 ("--max-body", raw.to_owned())
             } else if let Some(raw) = value(&arg, "--max-connections") {
@@ -86,6 +90,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     | "--workers"
                     | "--worker-cpus"
                     | "--pair-capacity"
+                    | "--fixed-response-bytes"
                     | "--max-body"
                     | "--max-connections"
                     | "--recv-mode"
@@ -99,6 +104,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "--workers" => "--workers",
                     "--worker-cpus" => "--worker-cpus",
                     "--pair-capacity" => "--pair-capacity",
+                    "--fixed-response-bytes" => "--fixed-response-bytes",
                     "--max-body" => "--max-body",
                     "--max-connections" => "--max-connections",
                     "--recv-mode" => "--recv-mode",
@@ -134,6 +140,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "--workers" => config.workers = parse_number(name, &raw)?,
                 "--worker-cpus" => config.worker_cpus = parse_cpu_list(&raw)?,
                 "--pair-capacity" => config.pair_capacity = parse_number(name, &raw)?,
+                "--fixed-response-bytes" => {
+                    config.handler = HandlerConfig::FixedResponse {
+                        value_len: parse_number(name, &raw)?,
+                    }
+                }
                 "--max-body" => config.server.max_body_len = parse_number(name, &raw)?,
                 "--max-connections" => config.server.max_connections = parse_number(name, &raw)?,
                 "--max-batch-commands" => {
@@ -166,6 +177,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             || config.server.max_connections == 0
             || config.server.max_batch_commands == 0
             || config.server.max_batch_response_bytes == 0
+            || matches!(
+                config.handler,
+                HandlerConfig::FixedResponse { value_len: 0 }
+            )
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -215,6 +230,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             workers: config.workers,
             worker_cpus: config.worker_cpus,
             pair_capacity: config.pair_capacity,
+            handler: config.handler,
             server: config.server,
         })?;
         println!("listening on {}", server.local_addr());
@@ -241,7 +257,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             })?;
         let address = listener.local_addr()?;
         println!("listening on {address}");
-        let handler = MemoryHandler::new(MemoryStore::new());
+        let handler = config.handler.build();
         serve(listener, handler, config.server).await
     })?;
     Ok(())

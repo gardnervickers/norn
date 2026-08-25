@@ -32,9 +32,7 @@ use norn_uring::net::{TcpListener, TcpListenerOptions, TcpSocket};
 use smallvec::SmallVec;
 
 use crate::codec::{DecodeStatus, DecodedFrame, FrameDecoder, ResponseEncoder};
-use crate::handler::ConnectionAction;
-use crate::handler::MemoryHandler;
-use crate::memory::MemoryStore;
+use crate::handler::{ConnectionAction, HandlerConfig, MemoryHandler};
 use crate::protocol::{Command, RequestHeader, Status, HEADER_LEN};
 use crate::server::{RecvMode, ServerConfig};
 
@@ -58,6 +56,8 @@ pub struct ShardedServerConfig {
     pub workers: usize,
     /// Optional one-to-one worker CPU assignment.
     pub worker_cpus: Vec<usize>,
+    /// Command execution backend constructed independently on every worker.
+    pub handler: HandlerConfig,
     /// Limits inherited from the single-worker networking server.
     ///
     /// The receive mode must be [`RecvMode::Multishot`].
@@ -80,6 +80,7 @@ impl Default for ShardedServerConfig {
             ring_entries: 256,
             workers: 2,
             worker_cpus: Vec::new(),
+            handler: HandlerConfig::Memory,
             server: ServerConfig::default(),
             pair_capacity: DEFAULT_PAIR_CAPACITY,
         }
@@ -376,6 +377,7 @@ fn spawn_worker(
     let ring_entries = config.ring_entries;
     let worker_count = config.workers;
     let pair_capacity = config.pair_capacity;
+    let handler = config.handler;
     let server = config.server;
     let join = thread::Builder::new()
         .name(format!("norn-kv-{index}"))
@@ -392,6 +394,7 @@ fn spawn_worker(
                     ring_entries,
                     worker_count,
                     pair_capacity,
+                    handler,
                     server,
                     cpu,
                     channels,
@@ -427,6 +430,7 @@ fn run_worker(
     ring_entries: u32,
     worker_count: usize,
     pair_capacity: usize,
+    handler: HandlerConfig,
     server: ServerConfig,
     cpu: Option<usize>,
     channels: WorkerChannels,
@@ -473,6 +477,7 @@ fn run_worker(
         backlog,
         worker_count,
         pair_capacity,
+        handler,
         server,
         request_txs,
         request_rx,
@@ -495,6 +500,7 @@ async fn worker_main(
     backlog: u32,
     worker_count: usize,
     pair_capacity: usize,
+    handler: HandlerConfig,
     server: ServerConfig,
     request_txs: Vec<ShardedSender<ShardRequest>>,
     request_rx: norn_channel::mpsc::ShardedReceiver<ShardRequest>,
@@ -529,7 +535,7 @@ async fn worker_main(
         Some(Control::Stop) | None => return Ok(()),
     }
 
-    let handler = MemoryHandler::new(MemoryStore::new());
+    let handler = handler.build();
     let router = RouterLocal::new(
         request_txs,
         pair_capacity,
@@ -2653,6 +2659,46 @@ mod tests {
                 u32::from_be_bytes(final_noop[12..16].try_into().unwrap()),
                 7
             );
+            Ok(())
+        })();
+
+        let shutdown = server.shutdown();
+        result?;
+        shutdown
+    }
+
+    #[test]
+    fn two_worker_fixed_response_mode_uses_sharded_request_path() -> io::Result<()> {
+        let server = ShardedServer::start(ShardedServerConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            handler: HandlerConfig::FixedResponse { value_len: 64 },
+            ..ShardedServerConfig::default()
+        })?;
+        let address = server.local_addr();
+
+        let result = (|| -> io::Result<()> {
+            let mut stream = TcpStream::connect(address)?;
+            stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+            stream.set_write_timeout(Some(Duration::from_secs(3)))?;
+            let keys = [b"a".as_slice(), b"b".as_slice()];
+            assert_eq!(key_owner(keys[0], 2), 0);
+            assert_eq!(key_owner(keys[1], 2), 1);
+
+            let mut pipeline = Vec::new();
+            pipeline.extend(binary_request(OP_GET, keys[0], &[], &[], 1));
+            pipeline.extend(binary_request(OP_GET, keys[1], &[], &[], 2));
+            stream.write_all(&pipeline)?;
+
+            for opaque in [1_u32, 2] {
+                let response = read_response(&mut stream)?;
+                assert_eq!(
+                    u32::from_be_bytes(response[12..16].try_into().unwrap()),
+                    opaque
+                );
+                assert_eq!(response.len(), HEADER_LEN + 4 + 64);
+                assert_eq!(&response[HEADER_LEN..HEADER_LEN + 4], &0_u32.to_be_bytes());
+                assert!(response[HEADER_LEN + 4..].iter().all(|&byte| byte == 0x5a));
+            }
             Ok(())
         })();
 
