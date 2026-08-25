@@ -4,6 +4,38 @@ This file records benchmark-driven optimization attempts that were not kept, or
 that were kept only as part of a larger change. Check this before revisiting
 runtime benchmark work.
 
+## 2026-08-25: Storage-Neutral Norn KV Network Path
+
+Target benchmark:
+
+```text
+nix develop -c ./hack/bench-norn-network-only.sh
+```
+
+The full baseline and profile are recorded in `norn-network-results.md`.
+
+### Tried and Rejected
+
+- Execute fixed-response keyed requests on the accepting reuse-port worker
+  instead of routing them to the hash owner.
+  - Result: pipeline-32 throughput improved by 120% at 64 bytes and 54% at 256
+    bytes, but regressed by 40% at 1024 bytes. The 256-byte pipeline-1 guardrail
+    was flat.
+  - Reason rejected: payload-dependent regression; selecting the routing path
+    from response size would embed benchmark-specific policy in the server.
+
+- Reserve the exact fixed-response size before encoding each response.
+  - Result: no reliable 256-byte gain and an approximately 18% paired
+    regression at 1024 bytes against an unchanged-code refresh.
+  - Reason rejected: it did not produce a broad or repeatable improvement.
+
+### Follow-up Shape
+
+- Represent fixed responses without allocating and copying a complete owned
+  `Vec` per command, then batch or vector the immutable payload at the
+  connection send boundary. This changes response ownership and lifetime
+  mechanics and needs a separately reviewable design.
+
 ## 2026-05-12: `uring_realworld` UDP Request/Response
 
 Target benchmark:
