@@ -10,7 +10,7 @@ use futures_util::StreamExt;
 use norn_executor::spawn;
 use norn_uring::bufring::RecvBufRing;
 use norn_uring::net::{TcpListener, TcpListenerOptions, TcpSocket};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 mod util;
 
@@ -98,6 +98,75 @@ fn tcp_socket_round_trips_through_uring_fd() -> Result<(), Box<dyn std::error::E
 
         server.close().await?;
         client.close().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn tcp_stream_writer_suppresses_sigpipe_after_peer_close() -> Result<(), Box<dyn std::error::Error>>
+{
+    const CHILD_ENV: &str = "NORN_SIGPIPE_WRITER_CHILD";
+    if std::env::var_os(CHILD_ENV).is_none() {
+        let status = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "tcp_stream_writer_suppresses_sigpipe_after_peer_close",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .status()?;
+        assert!(status.success(), "SIGPIPE child exited with {status}");
+        return Ok(());
+    }
+
+    // Safety: SIGPIPE has the default disposition in the isolated child
+    // process so a signaling write terminates the process and fails the parent.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+    util::with_test_env(|| async {
+        let (server, client) = connected_pair().await?;
+        let close = spawn(async move { client.close().await });
+        let (reader, writer) = server.into_stream().owned_split();
+        let mut reader = Box::pin(reader);
+        let mut byte = [0; 1];
+        assert_eq!(reader.as_mut().read(&mut byte).await?, 0);
+        close.await??;
+
+        let mut writer = Box::pin(writer);
+        let payload = [0xaa; 1024];
+        let buffers = [
+            io::IoSlice::new(payload.as_slice()),
+            io::IoSlice::new(payload.as_slice()),
+        ];
+        let mut observed_disconnect = false;
+        for _ in 0..1024 {
+            match std::future::poll_fn(|context| {
+                writer.as_mut().poll_write_vectored(context, &buffers)
+            })
+            .await
+            {
+                Ok(written) => assert_ne!(written, 0),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+                    ) =>
+                {
+                    observed_disconnect = true;
+                    break;
+                }
+                Err(error) => return Err(error.into()),
+            }
+            norn_uring::noop().await;
+        }
+        assert!(
+            observed_disconnect,
+            "writer did not observe the closed peer"
+        );
+
+        drop(writer);
+        drop(reader);
         Ok(())
     })
 }

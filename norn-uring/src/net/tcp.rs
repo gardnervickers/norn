@@ -684,9 +684,11 @@ impl tokio::io::AsyncWrite for TcpStreamWriter {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.project();
-        let n = ready!(this
-            .inner
-            .poll_op(cx, |sock| sock.send(buf), socket::WRITE_FLAGS as u32))?;
+        let n = ready!(this.inner.poll_op(
+            cx,
+            |sock| sock.send_with_flags(buf, libc::MSG_NOSIGNAL),
+            socket::WRITE_FLAGS as u32
+        ))?;
         Poll::Ready(Ok(n))
     }
 
@@ -717,7 +719,7 @@ impl tokio::io::AsyncWrite for TcpStreamWriter {
         let this = self.project();
         let n = ready!(this.inner.poll_op(
             cx,
-            |sock| sock.send_vectored(bufs),
+            |sock| sock.send_vectored_with_flags(bufs, libc::MSG_NOSIGNAL),
             socket::WRITE_FLAGS as u32
         ))?;
         Poll::Ready(Ok(n))
