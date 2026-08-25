@@ -1,6 +1,8 @@
 //! UDP Protocol Socket
 use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
+use std::task::{ready, Context, Poll};
 
 use futures_core::Stream;
 use socket2::{Domain, Type};
@@ -9,6 +11,7 @@ use crate::buf::{StableBuf, StableBufMut};
 use crate::bufring::{BufRingBuf, BufRingBufBundle, RecvBufRing};
 use crate::fd::UringFd;
 use crate::net::socket::{self, Event, RecvMsgRingBuf};
+use crate::operation::Op;
 
 /// A UDP socket.
 ///
@@ -16,6 +19,124 @@ use crate::net::socket::{self, Event, RecvMsgRingBuf};
 /// [sent to] and [received from] any other socket address.
 pub struct UdpSocket {
     inner: socket::Socket,
+}
+
+pin_project_lite::pin_project! {
+    struct DatagramRecvRingMulti {
+        socket: socket::Socket,
+        ring: RecvBufRing,
+        #[pin]
+        current: Option<Op<socket::RecvRingMulti>>,
+        rearm: bool,
+    }
+}
+
+impl DatagramRecvRingMulti {
+    fn new(socket: &socket::Socket, ring: &RecvBufRing) -> Self {
+        let socket = socket.clone();
+        let ring = ring.clone();
+        let current = Some(socket.recv_ring_multi(&ring, socket::ZeroByteBehavior::Datagram));
+        Self {
+            socket,
+            ring,
+            current,
+            rearm: false,
+        }
+    }
+}
+
+impl Stream for DatagramRecvRingMulti {
+    type Item = io::Result<BufRingBuf>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        loop {
+            let mut this = self.as_mut().project();
+            let current = this
+                .current
+                .as_mut()
+                .as_pin_mut()
+                .expect("datagram receive operation missing");
+            match ready!(current.poll_next(cx)) {
+                Some(item) => {
+                    *this.rearm = item
+                        .as_ref()
+                        .is_ok_and(|buffer| buffer.is_empty() && buffer.capacity() == 0);
+                    return Poll::Ready(Some(item));
+                }
+                None if *this.rearm => {
+                    *this.rearm = false;
+                    this.current.set(Some(
+                        this.socket
+                            .recv_ring_multi(this.ring, socket::ZeroByteBehavior::Datagram),
+                    ));
+                }
+                None => return Poll::Ready(None),
+            }
+        }
+    }
+}
+
+pin_project_lite::pin_project! {
+    struct DatagramRecvBundleMulti {
+        socket: socket::Socket,
+        ring: RecvBufRing,
+        flags: i32,
+        #[pin]
+        current: Option<Op<socket::RecvRingBundleMulti>>,
+        rearm: bool,
+    }
+}
+
+impl DatagramRecvBundleMulti {
+    fn new(socket: &socket::Socket, ring: &RecvBufRing, flags: i32) -> Self {
+        let socket = socket.clone();
+        let ring = ring.clone();
+        let current = Some(socket.recv_ring_bundle_multi_with_flags(
+            &ring,
+            flags,
+            socket::ZeroByteBehavior::Datagram,
+        ));
+        Self {
+            socket,
+            ring,
+            flags,
+            current,
+            rearm: false,
+        }
+    }
+}
+
+impl Stream for DatagramRecvBundleMulti {
+    type Item = io::Result<BufRingBufBundle>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        loop {
+            let mut this = self.as_mut().project();
+            let current = this
+                .current
+                .as_mut()
+                .as_pin_mut()
+                .expect("datagram bundle receive operation missing");
+            match ready!(current.poll_next(cx)) {
+                Some(item) => {
+                    *this.rearm = item
+                        .as_ref()
+                        .is_ok_and(|bundle| bundle.is_empty() && bundle.buffer_count() == 0);
+                    return Poll::Ready(Some(item));
+                }
+                None if *this.rearm => {
+                    *this.rearm = false;
+                    this.current
+                        .set(Some(this.socket.recv_ring_bundle_multi_with_flags(
+                            this.ring,
+                            *this.flags,
+                            socket::ZeroByteBehavior::Datagram,
+                        )));
+                }
+                None => return Poll::Ready(None),
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for UdpSocket {
@@ -297,6 +418,10 @@ impl UdpSocket {
     /// Receives datagrams from a connected socket using a multishot recv operation backed by the
     /// provided buffer ring.
     ///
+    /// Empty datagrams are yielded as empty, zero-capacity buffers. Linux ends
+    /// the underlying multishot operation after such a completion, so this
+    /// stream transparently submits a replacement receive before continuing.
+    ///
     /// # Panics
     ///
     /// Panics when the buffer ring was registered with another driver.
@@ -304,7 +429,7 @@ impl UdpSocket {
         &self,
         ring: &RecvBufRing,
     ) -> impl Stream<Item = io::Result<BufRingBuf>> {
-        self.inner.recv_ring_multi(ring)
+        DatagramRecvRingMulti::new(&self.inner, ring)
     }
 
     /// Receives data from a connected socket using a single-shot recv bundle operation.
@@ -340,6 +465,9 @@ impl UdpSocket {
 
     /// Receives data from a connected socket using a multishot recv bundle operation.
     ///
+    /// Empty datagrams are yielded as empty bundles and the underlying
+    /// multishot operation is transparently rearmed.
+    ///
     /// # Panics
     ///
     /// Panics when the buffer ring was registered with another driver.
@@ -347,10 +475,13 @@ impl UdpSocket {
         &self,
         ring: &RecvBufRing,
     ) -> impl Stream<Item = io::Result<BufRingBufBundle>> {
-        self.inner.recv_ring_bundle_multi(ring)
+        DatagramRecvBundleMulti::new(&self.inner, ring, 0)
     }
 
     /// Receives data from a connected socket using a multishot recv bundle operation with flags.
+    ///
+    /// Empty datagrams are yielded as empty bundles and the underlying
+    /// multishot operation is transparently rearmed.
     ///
     /// # Panics
     ///
@@ -367,7 +498,7 @@ impl UdpSocket {
         ring: &RecvBufRing,
         flags: i32,
     ) -> impl Stream<Item = io::Result<BufRingBufBundle>> {
-        self.inner.recv_ring_bundle_multi_with_flags(ring, flags)
+        DatagramRecvBundleMulti::new(&self.inner, ring, flags)
     }
 
     /// Close the socket.

@@ -16,6 +16,12 @@ use crate::bufring::{BufRingBuf, BufRingBufBundle, RecvBufRing};
 use crate::fd::{NornFd, UringFd};
 use crate::operation::{CQEResult, Multishot, Op, Operation, Singleshot};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ZeroByteBehavior {
+    EndOfStream,
+    Datagram,
+}
+
 fn reap_owned_fd(result: CQEResult) -> io::Result<OwnedFd> {
     result.into_result().map(|fd| {
         // Safety: successful `Socket` and `Accept` CQEs return a newly owned
@@ -225,9 +231,13 @@ impl Socket {
         self.fd.submit(op)
     }
 
-    pub(crate) fn recv_ring_multi(&self, ring: &RecvBufRing) -> Op<RecvRingMulti> {
+    pub(crate) fn recv_ring_multi(
+        &self,
+        ring: &RecvBufRing,
+        zero_byte: ZeroByteBehavior,
+    ) -> Op<RecvRingMulti> {
         self.assert_bufring_driver(ring);
-        let op = RecvRingMulti::new(self.fd.lease(), ring.clone(), 0);
+        let op = RecvRingMulti::new(self.fd.lease(), ring.clone(), 0, zero_byte);
         self.fd.submit(op)
     }
 
@@ -247,9 +257,13 @@ impl Socket {
         self.fd.submit(op)
     }
 
-    pub(crate) fn recv_ring_bundle_multi(&self, ring: &RecvBufRing) -> Op<RecvRingBundleMulti> {
+    pub(crate) fn recv_ring_bundle_multi(
+        &self,
+        ring: &RecvBufRing,
+        zero_byte: ZeroByteBehavior,
+    ) -> Op<RecvRingBundleMulti> {
         self.assert_bufring_driver(ring);
-        let op = RecvRingBundleMulti::new(self.fd.lease(), ring.clone(), 0);
+        let op = RecvRingBundleMulti::new(self.fd.lease(), ring.clone(), 0, zero_byte);
         self.fd.submit(op)
     }
 
@@ -257,9 +271,10 @@ impl Socket {
         &self,
         ring: &RecvBufRing,
         flags: i32,
+        zero_byte: ZeroByteBehavior,
     ) -> Op<RecvRingBundleMulti> {
         self.assert_bufring_driver(ring);
-        let op = RecvRingBundleMulti::new(self.fd.lease(), ring.clone(), flags);
+        let op = RecvRingBundleMulti::new(self.fd.lease(), ring.clone(), flags, zero_byte);
         self.fd.submit(op)
     }
 
@@ -1006,11 +1021,22 @@ pub(crate) struct RecvRingMulti {
     fd: NornFd,
     ring: RecvBufRing,
     flags: i32,
+    zero_byte: ZeroByteBehavior,
 }
 
 impl RecvRingMulti {
-    pub(crate) fn new(fd: NornFd, ring: RecvBufRing, flags: i32) -> Self {
-        Self { fd, ring, flags }
+    pub(crate) fn new(
+        fd: NornFd,
+        ring: RecvBufRing,
+        flags: i32,
+        zero_byte: ZeroByteBehavior,
+    ) -> Self {
+        Self {
+            fd,
+            ring,
+            flags,
+            zero_byte,
+        }
     }
 }
 
@@ -1033,10 +1059,10 @@ unsafe impl Operation for RecvRingMulti {
         if result.as_ref().is_ok_and(|result| *result == 0)
             && io_uring::cqueue::buffer_select(flags).is_none()
         {
-            // An orderly stream shutdown completes the multishot receive
-            // without selecting a provided buffer. Preserve that terminal
-            // absence rather than attempting to claim a nonexistent buffer.
-            return None;
+            return match self.zero_byte {
+                ZeroByteBehavior::EndOfStream => None,
+                ZeroByteBehavior::Datagram => Some(Ok(BufRingBuf::empty(self.ring.clone()))),
+            };
         }
         Some(result.and_then(|n| self.ring.get_buf(n, flags)))
     }
@@ -1106,11 +1132,22 @@ pub(crate) struct RecvRingBundleMulti {
     fd: NornFd,
     ring: RecvBufRing,
     flags: i32,
+    zero_byte: ZeroByteBehavior,
 }
 
 impl RecvRingBundleMulti {
-    pub(crate) fn new(fd: NornFd, ring: RecvBufRing, flags: i32) -> Self {
-        Self { fd, ring, flags }
+    pub(crate) fn new(
+        fd: NornFd,
+        ring: RecvBufRing,
+        flags: i32,
+        zero_byte: ZeroByteBehavior,
+    ) -> Self {
+        Self {
+            fd,
+            ring,
+            flags,
+            zero_byte,
+        }
     }
 }
 
@@ -1118,7 +1155,7 @@ impl RecvRingBundleMulti {
 // terminal CQE. Each selected bundle is held by an owned completion until it is
 // yielded or dropped.
 unsafe impl Operation for RecvRingBundleMulti {
-    type Completion = io::Result<BufRingBufBundle>;
+    type Completion = Option<io::Result<BufRingBufBundle>>;
 
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         validate_recv_multi_bundle_flags(self.flags)?;
@@ -1131,7 +1168,13 @@ unsafe impl Operation for RecvRingBundleMulti {
 
     unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
         let (result, flags) = result.into_parts();
-        result.and_then(|n| self.ring.get_buf_bundle(n, flags))
+        if result.as_ref().is_ok_and(|result| *result == 0)
+            && io_uring::cqueue::buffer_select(flags).is_none()
+            && self.zero_byte == ZeroByteBehavior::EndOfStream
+        {
+            return None;
+        }
+        Some(result.and_then(|n| self.ring.get_buf_bundle(n, flags)))
     }
 }
 
@@ -1139,11 +1182,16 @@ impl Multishot for RecvRingBundleMulti {
     type Item = io::Result<BufRingBufBundle>;
 
     fn update(&mut self, completion: Self::Completion) -> Self::Item {
-        completion
+        completion.unwrap_or_else(|| {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "non-terminal multishot bundle receive completed without a buffer",
+            ))
+        })
     }
 
     fn complete(self, completion: Self::Completion) -> Option<Self::Item> {
-        Some(completion)
+        completion
     }
 }
 
@@ -2124,11 +2172,15 @@ mod tests {
     fn prepare_all_ring_receives(socket: &Socket, ring: &RecvBufRing) {
         drop(socket.recv_from_ring(ring));
         drop(socket.recv_from_ring_multi(ring));
-        drop(socket.recv_ring_multi(ring));
+        drop(socket.recv_ring_multi(ring, ZeroByteBehavior::EndOfStream));
         drop(socket.recv_ring_bundle(ring));
         drop(socket.recv_ring_bundle_with_flags(ring, libc::MSG_PEEK));
-        drop(socket.recv_ring_bundle_multi(ring));
-        drop(socket.recv_ring_bundle_multi_with_flags(ring, libc::MSG_PEEK));
+        drop(socket.recv_ring_bundle_multi(ring, ZeroByteBehavior::EndOfStream));
+        drop(socket.recv_ring_bundle_multi_with_flags(
+            ring,
+            libc::MSG_PEEK,
+            ZeroByteBehavior::EndOfStream,
+        ));
     }
 
     #[test]
@@ -2152,14 +2204,22 @@ mod tests {
         prepare_all_ring_receives(&socket, &second_ring);
         assert_driver_mismatch(|| drop(socket.recv_from_ring(&first_ring)));
         assert_driver_mismatch(|| drop(socket.recv_from_ring_multi(&first_ring)));
-        assert_driver_mismatch(|| drop(socket.recv_ring_multi(&first_ring)));
+        assert_driver_mismatch(|| {
+            drop(socket.recv_ring_multi(&first_ring, ZeroByteBehavior::EndOfStream));
+        });
         assert_driver_mismatch(|| drop(socket.recv_ring_bundle(&first_ring)));
         assert_driver_mismatch(|| {
             drop(socket.recv_ring_bundle_with_flags(&first_ring, libc::MSG_PEEK));
         });
-        assert_driver_mismatch(|| drop(socket.recv_ring_bundle_multi(&first_ring)));
         assert_driver_mismatch(|| {
-            drop(socket.recv_ring_bundle_multi_with_flags(&first_ring, libc::MSG_PEEK));
+            drop(socket.recv_ring_bundle_multi(&first_ring, ZeroByteBehavior::EndOfStream));
+        });
+        assert_driver_mismatch(|| {
+            drop(socket.recv_ring_bundle_multi_with_flags(
+                &first_ring,
+                libc::MSG_PEEK,
+                ZeroByteBehavior::EndOfStream,
+            ));
         });
         Ok(())
     }
