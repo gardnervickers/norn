@@ -61,14 +61,16 @@
         };
 
         devShells.default = pkgs.mkShell {
-          nativeBuildInputs = [
-            pkgs.cargo-udeps
-            pkgs.cargo-outdated
-            pkgs.jq
-            pkgs.memcached
-            pkgs.memtier-benchmark
-            rust-toolchain-nightly
-          ];
+          nativeBuildInputs =
+            [
+              pkgs.cargo-udeps
+              pkgs.cargo-outdated
+              pkgs.jq
+              pkgs.memcached
+              pkgs.memtier-benchmark
+              rust-toolchain-nightly
+            ]
+            ++ pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.util-linux ];
         };
       }
     );

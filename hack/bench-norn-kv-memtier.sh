@@ -7,6 +7,7 @@ server_cpu="${NORN_KV_SERVER_CPU:-0}"
 workers="${NORN_KV_WORKERS:-1}"
 worker_cpus="${NORN_KV_WORKER_CPUS:-$server_cpu}"
 pair_capacity="${NORN_KV_PAIR_CAPACITY:-1024}"
+fixed_response_bytes="${NORN_KV_FIXED_RESPONSE_BYTES:-}"
 client_cpus="${NORN_KV_CLIENT_CPUS:-8-15,24-31}"
 address="${NORN_KV_ADDRESS:-127.0.0.1:11211}"
 server_kind="${NORN_KV_SERVER_KIND:-norn}"
@@ -56,6 +57,14 @@ if ! [[ "$pair_capacity" =~ ^[1-9][0-9]*$ ]]; then
     echo "NORN_KV_PAIR_CAPACITY must be a positive integer" >&2
     exit 1
 fi
+if [[ -n "$fixed_response_bytes" ]] && ! [[ "$fixed_response_bytes" =~ ^[1-9][0-9]*$ ]]; then
+    echo "NORN_KV_FIXED_RESPONSE_BYTES must be a positive integer when set" >&2
+    exit 1
+fi
+if [[ -n "$fixed_response_bytes" && "$server_kind" != norn ]]; then
+    echo "NORN_KV_FIXED_RESPONSE_BYTES is only supported by the norn server" >&2
+    exit 1
+fi
 
 mkdir -p "$log_dir"
 server_log="$log_dir/server.log"
@@ -83,6 +92,9 @@ if [[ "$server_kind" == norn ]]; then
             --worker-cpus "$worker_cpus"
             --pair-capacity "$pair_capacity"
         )
+    fi
+    if [[ -n "$fixed_response_bytes" ]]; then
+        server_args+=(--fixed-response-bytes "$fixed_response_bytes")
     fi
     if [[ -n "$recv_mode" ]]; then
         server_args+=(--recv-mode "$recv_mode")
@@ -147,17 +159,19 @@ mixed=(
 # memtier treats --key-maximum as exclusive for --requests=allkeys but may
 # select it for random/Gaussian workloads. Prefill one extra key to cover the
 # measured workload's inclusive upper endpoint.
-prefill_maximum=$((key_maximum + 1))
-taskset -c "$client_cpus" memtier_benchmark \
-    "${common[@]}" \
-    --threads=1 \
-    --clients=1 \
-    --ratio=1:0 \
-    --pipeline=64 \
-    --requests=allkeys \
-    --key-maximum="$prefill_maximum" \
-    --key-pattern=S:S \
-    >"$log_dir/prefill.log" 2>&1
+if [[ -z "$fixed_response_bytes" ]]; then
+    prefill_maximum=$((key_maximum + 1))
+    taskset -c "$client_cpus" memtier_benchmark \
+        "${common[@]}" \
+        --threads=1 \
+        --clients=1 \
+        --ratio=1:0 \
+        --pipeline=64 \
+        --requests=allkeys \
+        --key-maximum="$prefill_maximum" \
+        --key-pattern=S:S \
+        >"$log_dir/prefill.log" 2>&1
+fi
 
 {
     if [[ "$server_kind" == norn ]]; then
@@ -178,6 +192,7 @@ taskset -c "$client_cpus" memtier_benchmark \
     echo "benchmark_timestamp=$timestamp"
     echo "server_kind=$server_kind server_cpu=$server_cpu client_cpus=$client_cpus address=$address recv_mode=$reported_recv_mode"
     echo "workers=$reported_workers worker_cpus=$reported_worker_cpus pair_capacity=$reported_pair_capacity"
+    echo "fixed_response_bytes=${fixed_response_bytes:-not-applicable}"
     echo "threads=$threads clients_per_thread=$clients_per_thread pipeline=$pipeline"
     echo "ratio=$ratio key_range=$key_minimum..=$key_maximum key_pattern=$key_pattern"
     echo "data_size_list=$data_size_list warmup_requests=$warmup_requests requests=$requests trials=$trials"
