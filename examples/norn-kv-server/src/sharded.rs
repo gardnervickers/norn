@@ -92,14 +92,8 @@ impl ShardedServerConfig {
         if self.workers < 2 {
             return Err(invalid_input("sharded mode requires at least two workers"));
         }
-        if self.backlog == 0
-            || self.ring_entries == 0
-            || self.pair_capacity == 0
-            || self.server.max_body_len == 0
-            || self.server.max_connections == 0
-            || self.server.max_batch_commands == 0
-            || self.server.max_batch_response_bytes == 0
-        {
+        self.server.validate()?;
+        if self.backlog == 0 || self.ring_entries == 0 || self.pair_capacity == 0 {
             return Err(invalid_input("numeric limits must be greater than zero"));
         }
         let receiver_capacity = self
@@ -110,10 +104,6 @@ impl ShardedServerConfig {
             .checked_mul(receiver_capacity)
             .and_then(|capacity| capacity.checked_mul(2))
             .ok_or_else(|| invalid_input("aggregate sharded channel capacity overflows usize"))?;
-        self.server
-            .max_body_len
-            .checked_add(HEADER_LEN)
-            .ok_or_else(|| invalid_input("maximum frame length overflows usize"))?;
         if self.server.recv_mode != RecvMode::Multishot {
             return Err(invalid_input(
                 "sharded mode currently requires --recv-mode multishot",

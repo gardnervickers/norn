@@ -59,16 +59,46 @@ impl Default for ServerConfig {
     }
 }
 
+impl ServerConfig {
+    /// Validate server limits before allocating connection resources.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] when a numeric limit is zero or
+    /// the maximum frame length cannot be represented by `usize`.
+    pub fn validate(&self) -> io::Result<()> {
+        if self.max_body_len == 0
+            || self.max_connections == 0
+            || self.max_batch_commands == 0
+            || self.max_batch_response_bytes == 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "server limits must be greater than zero",
+            ));
+        }
+        self.max_body_len.checked_add(HEADER_LEN).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "maximum frame length overflows usize",
+            )
+        })?;
+        Ok(())
+    }
+}
+
 /// Accept connections and serve requests until the listener fails or closes.
 ///
 /// # Errors
 ///
-/// Returns an error when the multishot accept stream fails.
+/// Returns an error when `config` is invalid or the multishot accept stream
+/// fails.
 pub async fn serve(
     listener: TcpListener,
     handler: MemoryHandler,
     config: ServerConfig,
 ) -> io::Result<()> {
+    config.validate()?;
     let active = Rc::new(Cell::new(0_usize));
     let recv_ring = match config.recv_mode {
         RecvMode::Exact => None,
@@ -432,6 +462,33 @@ mod tests {
     use crate::protocol::{
         Status, OP_GET, OP_NOOP, OP_QUIT, OP_SET, REQUEST_MAGIC, RESPONSE_MAGIC,
     };
+
+    #[test]
+    fn server_config_rejects_zero_limits() {
+        let mut configs = [ServerConfig::default(); 4];
+        configs[0].max_body_len = 0;
+        configs[1].max_connections = 0;
+        configs[2].max_batch_commands = 0;
+        configs[3].max_batch_response_bytes = 0;
+
+        for config in configs {
+            assert_eq!(
+                config.validate().unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+    }
+
+    #[test]
+    fn server_config_rejects_frame_length_overflow() {
+        let config = ServerConfig {
+            max_body_len: usize::MAX,
+            ..ServerConfig::default()
+        };
+        let error = config.validate().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(error.to_string(), "maximum frame length overflows usize");
+    }
 
     #[test]
     fn command_limit_leaves_complete_pipeline_for_next_batch() {
