@@ -8,11 +8,28 @@ use bytes::BytesMut;
 use futures_core::Stream;
 use futures_util::StreamExt;
 use norn_executor::spawn;
+use norn_uring::buf::StableBuf;
 use norn_uring::bufring::RecvBufRing;
 use norn_uring::net::{TcpListener, TcpListenerOptions, TcpSocket};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 mod util;
+
+#[cfg(target_pointer_width = "64")]
+struct OversizedBuf(usize);
+
+#[cfg(target_pointer_width = "64")]
+// Safety: tests only use this buffer to exercise configuration rejection
+// before the kernel can observe its nonzero logical length.
+unsafe impl StableBuf for OversizedBuf {
+    fn stable_ptr(&self) -> *const u8 {
+        std::ptr::NonNull::<u8>::dangling().as_ptr()
+    }
+
+    fn bytes_init(&self) -> usize {
+        self.0
+    }
+}
 
 #[test]
 fn incoming_connections() -> Result<(), Box<dyn std::error::Error>> {
@@ -95,6 +112,21 @@ fn tcp_socket_round_trips_through_uring_fd() -> Result<(), Box<dyn std::error::E
         let (result, buffer) = server.recv(BytesMut::with_capacity(16)).await;
         let length = result?;
         assert_eq!(&buffer[..length], b"round-trip");
+
+        server.close().await?;
+        client.close().await?;
+        Ok(())
+    })
+}
+
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn send_zc_rejects_buffers_larger_than_u32_max() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let (server, client) = connected_pair().await?;
+        let (result, buffer) = server.send_zc(OversizedBuf(u32::MAX as usize + 1)).await;
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(buffer.0, u32::MAX as usize + 1);
 
         server.close().await?;
         client.close().await?;
