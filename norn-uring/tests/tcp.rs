@@ -263,8 +263,30 @@ fn recv_ring_multi_ends_on_orderly_peer_close() -> Result<(), Box<dyn std::error
         assert!(incoming.next().await.is_none());
         close.await??;
 
-        drop(incoming);
         server.close().await?;
+        drop(incoming);
+        Ok(())
+    })
+}
+
+#[test]
+fn recv_bundle_multi_ends_on_orderly_peer_close() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let (server, client) = connected_pair().await?;
+        let ring = RecvBufRing::builder(13).buf_cnt(1).buf_len(1024).build()?;
+        let mut incoming = Box::pin(server.recv_bundle_multi(&ring));
+        let close = spawn(async move { client.close().await });
+
+        let terminal = incoming.next().await;
+        close.await??;
+        match terminal {
+            None => {}
+            Some(Err(err)) if util::recv_bundle_unsupported(&err) => {}
+            Some(result) => panic!("TCP EOF produced a bundle item: {result:?}"),
+        }
+
+        server.close().await?;
+        drop(incoming);
         Ok(())
     })
 }

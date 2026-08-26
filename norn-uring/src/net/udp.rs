@@ -1,6 +1,8 @@
 //! UDP Protocol Socket
 use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use futures_core::Stream;
 use socket2::{Domain, Type};
@@ -16,6 +18,58 @@ use crate::net::socket::{self, Event, RecvMsgRingBuf};
 /// [sent to] and [received from] any other socket address.
 pub struct UdpSocket {
     inner: socket::Socket,
+}
+
+pin_project_lite::pin_project! {
+    /// A stream of datagrams received into buffers from a registered ring.
+    ///
+    /// Empty datagrams are yielded as empty, zero-capacity buffers.
+    pub struct UdpRecvRingMulti {
+        #[pin]
+        inner: socket::RecvRingStream,
+    }
+}
+
+impl UdpRecvRingMulti {
+    fn new(socket: &socket::Socket, ring: &RecvBufRing) -> Self {
+        Self {
+            inner: socket.recv_ring_stream(ring),
+        }
+    }
+}
+
+impl Stream for UdpRecvRingMulti {
+    type Item = io::Result<BufRingBuf>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.project().inner.poll_next(cx)
+    }
+}
+
+pin_project_lite::pin_project! {
+    /// A stream of datagrams received into buffer bundles from a registered ring.
+    ///
+    /// Empty datagrams are yielded as empty, zero-buffer bundles.
+    pub struct UdpRecvBundleMulti {
+        #[pin]
+        inner: socket::RecvRingBundleStream,
+    }
+}
+
+impl UdpRecvBundleMulti {
+    fn new(socket: &socket::Socket, ring: &RecvBufRing, flags: i32) -> Self {
+        Self {
+            inner: socket.recv_ring_bundle_stream(ring, flags),
+        }
+    }
+}
+
+impl Stream for UdpRecvBundleMulti {
+    type Item = io::Result<BufRingBufBundle>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.project().inner.poll_next(cx)
+    }
 }
 
 impl std::fmt::Debug for UdpSocket {
@@ -297,14 +351,15 @@ impl UdpSocket {
     /// Receives datagrams from a connected socket using a multishot recv operation backed by the
     /// provided buffer ring.
     ///
+    /// Empty datagrams are yielded as empty, zero-capacity buffers. Linux ends
+    /// the underlying multishot operation after such a completion, so this
+    /// stream transparently submits a replacement receive before continuing.
+    ///
     /// # Panics
     ///
     /// Panics when the buffer ring was registered with another driver.
-    pub fn recv_ring_multi(
-        &self,
-        ring: &RecvBufRing,
-    ) -> impl Stream<Item = io::Result<BufRingBuf>> {
-        self.inner.recv_ring_multi(ring)
+    pub fn recv_ring_multi(&self, ring: &RecvBufRing) -> UdpRecvRingMulti {
+        UdpRecvRingMulti::new(&self.inner, ring)
     }
 
     /// Receives data from a connected socket using a single-shot recv bundle operation.
@@ -340,17 +395,20 @@ impl UdpSocket {
 
     /// Receives data from a connected socket using a multishot recv bundle operation.
     ///
+    /// Empty datagrams are yielded as empty bundles and the underlying
+    /// multishot operation is transparently rearmed.
+    ///
     /// # Panics
     ///
     /// Panics when the buffer ring was registered with another driver.
-    pub fn recv_bundle_multi(
-        &self,
-        ring: &RecvBufRing,
-    ) -> impl Stream<Item = io::Result<BufRingBufBundle>> {
-        self.inner.recv_ring_bundle_multi(ring)
+    pub fn recv_bundle_multi(&self, ring: &RecvBufRing) -> UdpRecvBundleMulti {
+        UdpRecvBundleMulti::new(&self.inner, ring, 0)
     }
 
     /// Receives data from a connected socket using a multishot recv bundle operation with flags.
+    ///
+    /// Empty datagrams are yielded as empty bundles and the underlying
+    /// multishot operation is transparently rearmed.
     ///
     /// # Panics
     ///
@@ -366,8 +424,8 @@ impl UdpSocket {
         &self,
         ring: &RecvBufRing,
         flags: i32,
-    ) -> impl Stream<Item = io::Result<BufRingBufBundle>> {
-        self.inner.recv_ring_bundle_multi_with_flags(ring, flags)
+    ) -> UdpRecvBundleMulti {
+        UdpRecvBundleMulti::new(&self.inner, ring, flags)
     }
 
     /// Close the socket.

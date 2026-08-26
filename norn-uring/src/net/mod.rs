@@ -8,6 +8,7 @@ mod udp;
 
 pub use socket::{Event, RecvMsgRingBuf};
 pub use tcp::{
-    TcpListener, TcpListenerOptions, TcpSocket, TcpStream, TcpStreamReader, TcpStreamWriter,
+    TcpListener, TcpListenerOptions, TcpRecvBundleMulti, TcpRecvRingMulti, TcpSocket, TcpStream,
+    TcpStreamReader, TcpStreamWriter,
 };
-pub use udp::UdpSocket;
+pub use udp::{UdpRecvBundleMulti, UdpRecvRingMulti, UdpSocket};

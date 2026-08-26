@@ -114,6 +114,10 @@ impl RecvBufRing {
 
 /// [`BufRingBuf`] is a reference to a buffer in a buffer ring.
 ///
+/// A zero-length datagram may complete without the kernel selecting a provided
+/// buffer. That result is represented by an empty value with zero capacity;
+/// it does not consume or return a ring buffer.
+///
 /// The value retains its ring and normally republishes its selected buffer when
 /// dropped. If ownership accounting has quarantined the ring, the buffer
 /// remains unavailable instead. Users should drop the buffer as soon as
@@ -130,6 +134,9 @@ pub struct BufRingBuf {
 
 /// [`BufRingBufBundle`] is a collection of one or more buffers selected from a buffer ring.
 ///
+/// A zero-length datagram may complete without the kernel selecting a provided
+/// buffer. That result is represented by an empty bundle with zero buffers.
+///
 /// This is primarily used by recv bundle operations that may consume multiple provided buffers
 /// for a single completion. Dropping the bundle normally republishes every
 /// selected buffer. If ownership accounting has quarantined the ring, those
@@ -141,7 +148,7 @@ pub struct BufRingBufBundle {
 }
 
 impl BufRingBufBundle {
-    fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         Self {
             bufgroup: None,
             claim: None,
@@ -258,14 +265,22 @@ impl fmt::Debug for BufRingBuf {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BufRingBuf")
             .field("bgid", &self.bufgroup.rc.bgid())
-            .field("bid", &self.token.bid())
+            .field("bid", &(!self.token.is_empty()).then(|| self.token.bid()))
             .field("len", &self.len)
-            .field("cap", &self.bufgroup.rc.buf_capacity())
+            .field("cap", &self.capacity())
             .finish()
     }
 }
 
 impl BufRingBuf {
+    pub(crate) fn empty(bufgroup: RecvBufRing) -> Self {
+        Self {
+            bufgroup,
+            len: 0,
+            token: BufferToken::empty(),
+        }
+    }
+
     fn new(bufgroup: RecvBufRing, token: BufferToken, len: usize) -> Self {
         assert!(len <= bufgroup.rc.buf_len);
 
@@ -289,12 +304,22 @@ impl BufRingBuf {
     }
 
     /// Return the total capacity of this buffer.
+    ///
+    /// Returns zero when a zero-length datagram completed without selecting a
+    /// provided buffer.
     pub fn capacity(&self) -> usize {
-        self.bufgroup.rc.buf_capacity()
+        if self.token.is_empty() {
+            0
+        } else {
+            self.bufgroup.rc.buf_capacity()
+        }
     }
 
     /// Return this buffer as a byte slice.
     pub fn as_slice(&self) -> &[u8] {
+        if self.token.is_empty() {
+            return &[];
+        }
         let p = self.bufgroup.rc.stable_ptr(self.token.bid());
         unsafe { std::slice::from_raw_parts(p, self.len) }
     }
@@ -307,7 +332,11 @@ impl BufRingBuf {
 // a send operation owns the buffer.
 unsafe impl StableBuf for BufRingBuf {
     fn stable_ptr(&self) -> *const u8 {
-        self.bufgroup.rc.stable_ptr(self.token.bid())
+        if self.token.is_empty() {
+            std::ptr::NonNull::<u8>::dangling().as_ptr()
+        } else {
+            self.bufgroup.rc.stable_ptr(self.token.bid())
+        }
     }
 
     fn bytes_init(&self) -> usize {
@@ -317,7 +346,9 @@ unsafe impl StableBuf for BufRingBuf {
 
 impl Drop for BufRingBuf {
     fn drop(&mut self) {
-        self.bufgroup.rc.return_buffer(self.token);
+        if !self.token.is_empty() {
+            self.bufgroup.rc.return_buffer(self.token);
+        }
     }
 }
 

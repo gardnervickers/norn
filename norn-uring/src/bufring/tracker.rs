@@ -33,7 +33,19 @@ pub(super) struct BufferToken {
 }
 
 impl BufferToken {
+    pub(super) fn empty() -> Self {
+        Self {
+            bid: NO_BID,
+            ticket: 0,
+        }
+    }
+
+    pub(super) fn is_empty(self) -> bool {
+        self.bid == NO_BID
+    }
+
     pub(super) fn bid(self) -> Bid {
+        assert!(!self.is_empty(), "empty buffer token has no BID");
         self.bid
     }
 

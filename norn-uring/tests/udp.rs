@@ -538,6 +538,28 @@ fn connected_send_recv_ring_multi() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn connected_recv_ring_multi_preserves_empty_datagrams() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let ring = RecvBufRing::builder(14).buf_cnt(4).buf_len(64).build()?;
+        let s1 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let s2 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        s1.connect(s2.local_addr()?).await?;
+        s2.connect(s1.local_addr()?).await?;
+
+        let mut recv = pin!(s2.recv_ring_multi(&ring));
+        assert_eq!(s1.send(Bytes::new()).await.0?, 0);
+        let empty = recv.next().await.expect("empty datagram ended stream")?;
+        assert!(empty.is_empty());
+        assert_eq!(empty.capacity(), 0);
+
+        s1.send(Bytes::from_static(b"after-empty")).await.0?;
+        let following = recv.next().await.expect("multishot stream ended")?;
+        assert_eq!(&following[..], b"after-empty");
+        Ok(())
+    })
+}
+
+#[test]
 fn connected_send_recv_from_ring_multi() -> Result<(), Box<dyn std::error::Error>> {
     util::with_test_env(|| async {
         let ring = RecvBufRing::builder(8).buf_cnt(32).buf_len(2048).build()?;
@@ -607,6 +629,33 @@ fn connected_send_recv_bundle_multi() -> Result<(), Box<dyn std::error::Error>> 
 }
 
 #[test]
+fn connected_recv_bundle_multi_preserves_empty_datagrams() -> Result<(), Box<dyn std::error::Error>>
+{
+    util::with_test_env(|| async {
+        let ring = RecvBufRing::builder(15).buf_cnt(4).buf_len(64).build()?;
+        let s1 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let s2 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        s1.connect(s2.local_addr()?).await?;
+        s2.connect(s1.local_addr()?).await?;
+
+        let mut recv = pin!(s2.recv_bundle_multi(&ring));
+        assert_eq!(s1.send(Bytes::new()).await.0?, 0);
+        let empty = match recv.next().await.expect("empty datagram ended stream") {
+            Ok(bundle) => bundle,
+            Err(err) if util::recv_bundle_unsupported(&err) => return Ok(()),
+            Err(err) => return Err(err.into()),
+        };
+        assert!(empty.is_empty());
+        assert_eq!(empty.buffer_count(), 0);
+
+        s1.send(Bytes::from_static(b"after-empty")).await.0?;
+        let following = recv.next().await.expect("multishot stream ended")?;
+        assert_eq!(flatten_bundle(&following), b"after-empty");
+        Ok(())
+    })
+}
+
+#[test]
 fn bundle_receive_rejects_invalid_flags_without_consuming_a_ring_buffer(
 ) -> Result<(), Box<dyn std::error::Error>> {
     util::with_test_env(|| async {
@@ -639,6 +688,27 @@ fn bundle_receive_rejects_invalid_flags_without_consuming_a_ring_buffer(
         assert_eq!(peer, s1.local_addr()?);
         assert_eq!(&buf[..], payload.as_ref());
 
+        Ok(())
+    })
+}
+
+#[test]
+fn terminal_bundle_configuration_error_releases_socket_ownership(
+) -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let ring = RecvBufRing::builder(16).buf_cnt(1).buf_len(128).build()?;
+        let socket = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let mut recv = Box::pin(socket.recv_bundle_multi_with_flags(&ring, libc::MSG_TRUNC));
+
+        let err = recv
+            .next()
+            .await
+            .expect("configuration failure must produce one stream item")
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+        socket.close().await?;
+        drop(recv);
         Ok(())
     })
 }
