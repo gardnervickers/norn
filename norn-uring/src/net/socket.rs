@@ -1795,8 +1795,8 @@ where
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
         let ptr = this.buf.stable_ptr();
-        let len = this.buf.bytes_init();
-        Ok(opcode::SendZc::new(this.fd.fd(), ptr, len as _)
+        let len = checked_scalar_len(this.buf.bytes_init(), "zerocopy send buffer length")?;
+        Ok(opcode::SendZc::new(this.fd.fd(), ptr, len)
             .flags(this.flags)
             .build())
     }
