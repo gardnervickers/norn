@@ -425,7 +425,7 @@ impl TcpSocket {
         ring: &RecvBufRing,
     ) -> impl Stream<Item = io::Result<BufRingBuf>> {
         self.socket
-            .recv_ring_multi(ring, socket::ZeroByteBehavior::EndOfStream)
+            .recv_ring_stream(ring, socket::EmptyRecv::EndOfStream)
     }
 
     /// Receive data using a single-shot recv bundle operation and a provided buffer ring.
@@ -469,7 +469,7 @@ impl TcpSocket {
         ring: &RecvBufRing,
     ) -> impl Stream<Item = io::Result<BufRingBufBundle>> {
         self.socket
-            .recv_ring_bundle_multi(ring, socket::ZeroByteBehavior::EndOfStream)
+            .recv_ring_bundle_stream(ring, 0, socket::EmptyRecv::EndOfStream)
     }
 
     /// Receive data using a multishot recv bundle operation and a provided buffer ring.
@@ -489,11 +489,8 @@ impl TcpSocket {
         ring: &RecvBufRing,
         flags: i32,
     ) -> impl Stream<Item = io::Result<BufRingBufBundle>> {
-        self.socket.recv_ring_bundle_multi_with_flags(
-            ring,
-            flags,
-            socket::ZeroByteBehavior::EndOfStream,
-        )
+        self.socket
+            .recv_ring_bundle_stream(ring, flags, socket::EmptyRecv::EndOfStream)
     }
 
     /// Convert this socket into a stream.

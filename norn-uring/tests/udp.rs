@@ -692,6 +692,27 @@ fn bundle_receive_rejects_invalid_flags_without_consuming_a_ring_buffer(
     })
 }
 
+#[test]
+fn terminal_bundle_configuration_error_releases_socket_ownership(
+) -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let ring = RecvBufRing::builder(16).buf_cnt(1).buf_len(128).build()?;
+        let socket = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let mut recv = Box::pin(socket.recv_bundle_multi_with_flags(&ring, libc::MSG_TRUNC));
+
+        let err = recv
+            .next()
+            .await
+            .expect("configuration failure must produce one stream item")
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+        socket.close().await?;
+        drop(recv);
+        Ok(())
+    })
+}
+
 struct UdpEchoServer {
     socket: UdpSocket,
 }

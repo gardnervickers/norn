@@ -145,7 +145,7 @@ pub struct BufRingBufBundle {
 }
 
 impl BufRingBufBundle {
-    fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         Self {
             bufgroup: None,
             claim: None,

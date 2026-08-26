@@ -263,8 +263,8 @@ fn recv_ring_multi_ends_on_orderly_peer_close() -> Result<(), Box<dyn std::error
         assert!(incoming.next().await.is_none());
         close.await??;
 
-        drop(incoming);
         server.close().await?;
+        drop(incoming);
         Ok(())
     })
 }
@@ -285,8 +285,8 @@ fn recv_bundle_multi_ends_on_orderly_peer_close() -> Result<(), Box<dyn std::err
             Some(result) => panic!("TCP EOF produced a bundle item: {result:?}"),
         }
 
-        drop(incoming);
         server.close().await?;
+        drop(incoming);
         Ok(())
     })
 }
