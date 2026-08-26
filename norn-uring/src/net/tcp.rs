@@ -435,15 +435,6 @@ impl TcpSocket {
         self.socket.send(buf)
     }
 
-    /// Send data from the given buffer with send flags.
-    pub fn send_with_flags<B: StableBuf>(
-        &self,
-        buf: B,
-        flags: i32,
-    ) -> impl crate::Request<Output = (io::Result<usize>, B)> {
-        self.socket.send_with_flags(buf, flags)
-    }
-
     /// Send data from the given buffer using `io_uring` zerocopy send.
     ///
     /// This method does not fall back to regular send if zerocopy is unsupported.
@@ -455,18 +446,6 @@ impl TcpSocket {
         self.socket.send_zc(buf)
     }
 
-    /// Send data from the given buffer using `io_uring` zerocopy send with send flags.
-    ///
-    /// This method does not fall back to regular send if zerocopy is unsupported.
-    /// Callers should enable `SO_ZEROCOPY` with [`TcpSocket::set_zerocopy`] first.
-    pub fn send_zc_with_flags<B: StableBuf>(
-        &self,
-        buf: B,
-        flags: i32,
-    ) -> impl crate::Request<Output = (io::Result<usize>, B)> {
-        self.socket.send_zc_with_flags(buf, flags)
-    }
-
     /// Send a message from the given buffer using `io_uring` zerocopy sendmsg.
     ///
     /// This method does not fall back to regular sendmsg if zerocopy is unsupported.
@@ -474,9 +453,8 @@ impl TcpSocket {
     pub fn send_msg_zc<B: StableBuf>(
         &self,
         buf: B,
-        flags: i32,
     ) -> impl crate::Request<Output = (io::Result<usize>, B)> {
-        self.socket.send_msg_zc(buf, flags)
+        self.socket.send_msg_zc(buf)
     }
 
     /// Recv data using the given buffer ring.

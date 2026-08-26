@@ -157,20 +157,6 @@ impl UdpSocket {
         self.inner.send_to(buf, addr).await
     }
 
-    /// Sends a single datagram message on the socket to the given address with the
-    /// provided send flags.
-    pub async fn send_to_with_flags<B>(
-        &self,
-        buf: B,
-        addr: SocketAddr,
-        flags: i32,
-    ) -> (io::Result<usize>, B)
-    where
-        B: StableBuf + 'static,
-    {
-        self.inner.send_to_with_flags(buf, addr, flags).await
-    }
-
     /// Sends a single datagram message on a connected socket.
     ///
     /// This takes ownership of the buffer provided and will return it back
@@ -182,15 +168,6 @@ impl UdpSocket {
         self.inner.send(buf).await
     }
 
-    /// Sends a single datagram message on a connected socket with the provided
-    /// send flags.
-    pub async fn send_with_flags<B>(&self, buf: B, flags: i32) -> (io::Result<usize>, B)
-    where
-        B: StableBuf + 'static,
-    {
-        self.inner.send_with_flags(buf, flags).await
-    }
-
     /// Sends a single datagram on a connected socket using `io_uring` zerocopy send.
     ///
     /// This method does not fall back to regular send if zerocopy is unsupported.
@@ -200,17 +177,6 @@ impl UdpSocket {
         B: StableBuf + 'static,
     {
         self.inner.send_zc(buf).await
-    }
-
-    /// Sends a single datagram on a connected socket using `io_uring` zerocopy send with flags.
-    ///
-    /// This method does not fall back to regular send if zerocopy is unsupported.
-    /// Callers should enable `SO_ZEROCOPY` with [`UdpSocket::set_zerocopy`] first.
-    pub async fn send_zc_with_flags<B>(&self, buf: B, flags: i32) -> (io::Result<usize>, B)
-    where
-        B: StableBuf + 'static,
-    {
-        self.inner.send_zc_with_flags(buf, flags).await
     }
 
     /// Receives a single datagram message on the socket. On success, returns the number
@@ -263,34 +229,15 @@ impl UdpSocket {
         self.inner.recv_with_flags(buf, flags).await
     }
 
-    /// Send a message on this socket using message-style flags.
-    ///
-    /// If `addr` is `Some`, the datagram is sent to that destination. If `None`, the socket
-    /// must already be connected.
-    pub async fn send_msg<B>(
-        &self,
-        buf: B,
-        addr: Option<SocketAddr>,
-        flags: i32,
-    ) -> (io::Result<usize>, B)
-    where
-        B: StableBuf + 'static,
-    {
-        match addr {
-            Some(addr) => self.send_to_with_flags(buf, addr, flags).await,
-            None => self.send_with_flags(buf, flags).await,
-        }
-    }
-
     /// Sends a message on a connected socket using `io_uring` zerocopy sendmsg.
     ///
     /// This method does not fall back to regular sendmsg if zerocopy is unsupported.
     /// Callers should enable `SO_ZEROCOPY` with [`UdpSocket::set_zerocopy`] first.
-    pub async fn send_msg_zc<B>(&self, buf: B, flags: i32) -> (io::Result<usize>, B)
+    pub async fn send_msg_zc<B>(&self, buf: B) -> (io::Result<usize>, B)
     where
         B: StableBuf + 'static,
     {
-        self.inner.send_msg_zc(buf, flags).await
+        self.inner.send_msg_zc(buf).await
     }
 
     /// Receive a message from this socket using message-style flags.
