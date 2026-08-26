@@ -18,30 +18,15 @@ use crate::bufring::{BufRingBuf, BufRingBufBundle, RecvBufRing};
 use crate::fd::{NornFd, UringFd};
 use crate::operation::{CQEResult, Multishot, Op, Operation, Singleshot};
 
-/// A successful raw receive completion before TCP or UDP semantics are applied.
-pub(crate) enum RingRecv<T> {
-    Buffer(T),
-    /// Zero bytes completed without the kernel selecting a provided buffer.
-    Empty,
-}
-
 pub(crate) struct RingRecvCompletion<T> {
-    result: io::Result<RingRecv<T>>,
+    result: io::Result<T>,
     terminal: bool,
-}
-
-/// Protocol-level interpretation of a raw empty receive completion.
-#[derive(Clone, Copy)]
-pub(crate) enum EmptyRecv {
-    EndOfStream,
-    Datagram,
 }
 
 pin_project_lite::pin_project! {
     pub(crate) struct RecvRingStream {
         socket: Option<Socket>,
         ring: Option<RecvBufRing>,
-        empty: EmptyRecv,
         #[pin]
         current: Option<Op<RecvRingMulti>>,
         rearm: bool,
@@ -50,14 +35,13 @@ pin_project_lite::pin_project! {
 }
 
 impl RecvRingStream {
-    fn new(socket: &Socket, ring: &RecvBufRing, empty: EmptyRecv) -> Self {
+    fn new(socket: &Socket, ring: &RecvBufRing) -> Self {
         let socket = socket.clone();
         let ring = ring.clone();
         let current = Some(socket.recv_ring_multi(&ring));
         Self {
             socket: Some(socket),
             ring: Some(ring),
-            empty,
             current,
             rearm: false,
             done: false,
@@ -90,28 +74,10 @@ impl futures_core::Stream for RecvRingStream {
                     this.current.set(None);
                 }
                 match completion.result {
-                    Ok(RingRecv::Buffer(buffer)) => {
+                    Ok(buffer) => {
                         *this.rearm = completion.terminal;
                         TaskPoll::Ready(Some(Ok(buffer)))
                     }
-                    Ok(RingRecv::Empty) => match this.empty {
-                        EmptyRecv::EndOfStream => {
-                            *this.done = true;
-                            this.current.set(None);
-                            this.socket.take();
-                            this.ring.take();
-                            TaskPoll::Ready(None)
-                        }
-                        EmptyRecv::Datagram => {
-                            *this.rearm = completion.terminal;
-                            let ring = this
-                                .ring
-                                .as_ref()
-                                .expect("receive buffer ring missing")
-                                .clone();
-                            TaskPoll::Ready(Some(Ok(BufRingBuf::empty(ring))))
-                        }
-                    },
                     Err(err) => {
                         if completion.terminal {
                             *this.done = true;
@@ -138,7 +104,6 @@ pin_project_lite::pin_project! {
         socket: Option<Socket>,
         ring: Option<RecvBufRing>,
         flags: i32,
-        empty: EmptyRecv,
         #[pin]
         current: Option<Op<RecvRingBundleMulti>>,
         rearm: bool,
@@ -147,7 +112,7 @@ pin_project_lite::pin_project! {
 }
 
 impl RecvRingBundleStream {
-    fn new(socket: &Socket, ring: &RecvBufRing, flags: i32, empty: EmptyRecv) -> Self {
+    fn new(socket: &Socket, ring: &RecvBufRing, flags: i32) -> Self {
         let socket = socket.clone();
         let ring = ring.clone();
         let current = Some(socket.recv_ring_bundle_multi_with_flags(&ring, flags));
@@ -155,7 +120,6 @@ impl RecvRingBundleStream {
             socket: Some(socket),
             ring: Some(ring),
             flags,
-            empty,
             current,
             rearm: false,
             done: false,
@@ -190,23 +154,10 @@ impl futures_core::Stream for RecvRingBundleStream {
                     this.current.set(None);
                 }
                 match completion.result {
-                    Ok(RingRecv::Buffer(bundle)) => {
+                    Ok(bundle) => {
                         *this.rearm = completion.terminal;
                         TaskPoll::Ready(Some(Ok(bundle)))
                     }
-                    Ok(RingRecv::Empty) => match this.empty {
-                        EmptyRecv::EndOfStream => {
-                            *this.done = true;
-                            this.current.set(None);
-                            this.socket.take();
-                            this.ring.take();
-                            TaskPoll::Ready(None)
-                        }
-                        EmptyRecv::Datagram => {
-                            *this.rearm = completion.terminal;
-                            TaskPoll::Ready(Some(Ok(BufRingBufBundle::empty())))
-                        }
-                    },
                     Err(err) => {
                         if completion.terminal {
                             *this.done = true;
@@ -437,17 +388,16 @@ impl Socket {
         self.fd.submit(op)
     }
 
-    pub(crate) fn recv_ring_stream(&self, ring: &RecvBufRing, empty: EmptyRecv) -> RecvRingStream {
-        RecvRingStream::new(self, ring, empty)
+    pub(crate) fn recv_ring_stream(&self, ring: &RecvBufRing) -> RecvRingStream {
+        RecvRingStream::new(self, ring)
     }
 
     pub(crate) fn recv_ring_bundle_stream(
         &self,
         ring: &RecvBufRing,
         flags: i32,
-        empty: EmptyRecv,
     ) -> RecvRingBundleStream {
-        RecvRingBundleStream::new(self, ring, flags, empty)
+        RecvRingBundleStream::new(self, ring, flags)
     }
 
     pub(crate) fn recv_ring_multi(&self, ring: &RecvBufRing) -> Op<RecvRingMulti> {
@@ -1251,9 +1201,9 @@ unsafe impl Operation for RecvRingMulti {
         let (result, flags) = result.into_parts();
         let result = result.and_then(|n| {
             if n == 0 && io_uring::cqueue::buffer_select(flags).is_none() {
-                Ok(RingRecv::Empty)
+                Ok(BufRingBuf::empty(self.ring.clone()))
             } else {
-                self.ring.get_buf(n, flags).map(RingRecv::Buffer)
+                self.ring.get_buf(n, flags)
             }
         });
         RingRecvCompletion {
@@ -1349,9 +1299,9 @@ unsafe impl Operation for RecvRingBundleMulti {
         let (result, flags) = result.into_parts();
         let result = result.and_then(|n| {
             if n == 0 && io_uring::cqueue::buffer_select(flags).is_none() {
-                Ok(RingRecv::Empty)
+                Ok(BufRingBufBundle::empty())
             } else {
-                self.ring.get_buf_bundle(n, flags).map(RingRecv::Buffer)
+                self.ring.get_buf_bundle(n, flags)
             }
         });
         RingRecvCompletion {

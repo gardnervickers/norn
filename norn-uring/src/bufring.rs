@@ -134,6 +134,9 @@ pub struct BufRingBuf {
 
 /// [`BufRingBufBundle`] is a collection of one or more buffers selected from a buffer ring.
 ///
+/// A zero-length datagram may complete without the kernel selecting a provided
+/// buffer. That result is represented by an empty bundle with zero buffers.
+///
 /// This is primarily used by recv bundle operations that may consume multiple provided buffers
 /// for a single completion. Dropping the bundle normally republishes every
 /// selected buffer. If ownership accounting has quarantined the ring, those

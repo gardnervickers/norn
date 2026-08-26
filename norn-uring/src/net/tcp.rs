@@ -46,6 +46,86 @@ pub struct TcpSocket {
 }
 
 pin_project_lite::pin_project! {
+    /// A stream of buffers received by a multishot TCP receive operation.
+    ///
+    /// The stream ends when the peer performs an orderly shutdown.
+    pub struct TcpRecvRingMulti {
+        #[pin]
+        inner: Option<socket::RecvRingStream>,
+    }
+}
+
+impl TcpRecvRingMulti {
+    fn new(socket: &socket::Socket, ring: &RecvBufRing) -> Self {
+        Self {
+            inner: Some(socket.recv_ring_stream(ring)),
+        }
+    }
+}
+
+impl Stream for TcpRecvRingMulti {
+    type Item = io::Result<BufRingBuf>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let mut this = self.project();
+        let Some(inner) = this.inner.as_mut().as_pin_mut() else {
+            return Poll::Ready(None);
+        };
+        match ready!(inner.poll_next(cx)) {
+            Some(Ok(buffer)) if buffer.capacity() == 0 => {
+                this.inner.set(None);
+                Poll::Ready(None)
+            }
+            item @ Some(_) => Poll::Ready(item),
+            None => {
+                this.inner.set(None);
+                Poll::Ready(None)
+            }
+        }
+    }
+}
+
+pin_project_lite::pin_project! {
+    /// A stream of buffer bundles received by a multishot TCP receive operation.
+    ///
+    /// The stream ends when the peer performs an orderly shutdown.
+    pub struct TcpRecvBundleMulti {
+        #[pin]
+        inner: Option<socket::RecvRingBundleStream>,
+    }
+}
+
+impl TcpRecvBundleMulti {
+    fn new(socket: &socket::Socket, ring: &RecvBufRing, flags: i32) -> Self {
+        Self {
+            inner: Some(socket.recv_ring_bundle_stream(ring, flags)),
+        }
+    }
+}
+
+impl Stream for TcpRecvBundleMulti {
+    type Item = io::Result<BufRingBufBundle>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let mut this = self.project();
+        let Some(inner) = this.inner.as_mut().as_pin_mut() else {
+            return Poll::Ready(None);
+        };
+        match ready!(inner.poll_next(cx)) {
+            Some(Ok(bundle)) if bundle.buffer_count() == 0 => {
+                this.inner.set(None);
+                Poll::Ready(None)
+            }
+            item @ Some(_) => Poll::Ready(item),
+            None => {
+                this.inner.set(None);
+                Poll::Ready(None)
+            }
+        }
+    }
+}
+
+pin_project_lite::pin_project! {
     /// [`TcpStream`] represents a connected TCP socket.
     ///
     /// Bytes can be read from and written to the socket using the
@@ -420,12 +500,8 @@ impl TcpSocket {
     /// # Panics
     ///
     /// Panics when the buffer ring was registered with another driver.
-    pub fn recv_ring_multi(
-        &self,
-        ring: &RecvBufRing,
-    ) -> impl Stream<Item = io::Result<BufRingBuf>> {
-        self.socket
-            .recv_ring_stream(ring, socket::EmptyRecv::EndOfStream)
+    pub fn recv_ring_multi(&self, ring: &RecvBufRing) -> TcpRecvRingMulti {
+        TcpRecvRingMulti::new(&self.socket, ring)
     }
 
     /// Receive data using a single-shot recv bundle operation and a provided buffer ring.
@@ -464,12 +540,8 @@ impl TcpSocket {
     /// # Panics
     ///
     /// Panics when the buffer ring was registered with another driver.
-    pub fn recv_bundle_multi(
-        &self,
-        ring: &RecvBufRing,
-    ) -> impl Stream<Item = io::Result<BufRingBufBundle>> {
-        self.socket
-            .recv_ring_bundle_stream(ring, 0, socket::EmptyRecv::EndOfStream)
+    pub fn recv_bundle_multi(&self, ring: &RecvBufRing) -> TcpRecvBundleMulti {
+        TcpRecvBundleMulti::new(&self.socket, ring, 0)
     }
 
     /// Receive data using a multishot recv bundle operation and a provided buffer ring.
@@ -488,9 +560,8 @@ impl TcpSocket {
         &self,
         ring: &RecvBufRing,
         flags: i32,
-    ) -> impl Stream<Item = io::Result<BufRingBufBundle>> {
-        self.socket
-            .recv_ring_bundle_stream(ring, flags, socket::EmptyRecv::EndOfStream)
+    ) -> TcpRecvBundleMulti {
+        TcpRecvBundleMulti::new(&self.socket, ring, flags)
     }
 
     /// Convert this socket into a stream.
