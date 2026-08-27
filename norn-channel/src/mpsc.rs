@@ -545,12 +545,19 @@ impl<T> ShardedLocal<T> {
 
     fn pop(&self) -> Option<T> {
         let queue_count = self.queues.len();
-        let start = self.next_queue.get();
-        for offset in 0..queue_count {
-            let index = (start + offset) % queue_count;
+        let mut index = self.next_queue.get();
+        for _ in 0..queue_count {
             if let Some(value) = Self::pop_lane(&self.queues[index]) {
-                self.next_queue.set((index + 1) % queue_count);
+                index += 1;
+                if index == queue_count {
+                    index = 0;
+                }
+                self.next_queue.set(index);
                 return Some(value);
+            }
+            index += 1;
+            if index == queue_count {
+                index = 0;
             }
         }
         None
@@ -1220,6 +1227,24 @@ mod tests {
         }
         assert_eq!(received, [4, 3, 3]);
         assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    #[test]
+    fn sharded_receiver_round_robins_ready_lanes() {
+        let (builder, endpoint) = endpoint();
+        let (senders, receiver) = bounded_sharded(&endpoint, 6, 3);
+        for (lane, sender) in senders.iter().enumerate() {
+            sender.try_send((lane, 0)).unwrap();
+            sender.try_send((lane, 1)).unwrap();
+        }
+
+        let driver = builder.build(SpinPark);
+        let mut receiver = receiver.attach(&driver.handle());
+        let received = (0..6)
+            .map(|_| receiver.try_recv().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(received, [(0, 0), (1, 0), (2, 0), (0, 1), (1, 1), (2, 1)]);
     }
 
     #[test]
