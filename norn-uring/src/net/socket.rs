@@ -1719,14 +1719,58 @@ fn update_send_zc_primary(
     *primary_result = Some(result.result.map(|v| v as usize));
 }
 
+const SEND_ZC_REPORT_USAGE: u16 = 1 << 3;
+const NOTIF_USAGE_ZC_COPIED: u32 = 1 << 31;
+
+/// How the kernel transferred a successful zero-copy send request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendZcUsage {
+    /// The kernel transferred the complete payload without copying it.
+    ZeroCopy,
+    /// The kernel copied at least part of the payload.
+    Copied,
+    /// The kernel completed the request without a usage notification.
+    Unknown,
+}
+
+/// The outcome of a successful zero-copy send request.
+#[must_use = "the send length and zero-copy usage must be handled"]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SendZcResult {
+    bytes_sent: usize,
+    usage: SendZcUsage,
+}
+
+impl SendZcResult {
+    /// Return the number of payload bytes accepted by the socket.
+    pub fn bytes_sent(self) -> usize {
+        self.bytes_sent
+    }
+
+    /// Return how the kernel transferred the payload.
+    pub fn usage(self) -> SendZcUsage {
+        self.usage
+    }
+}
+
 fn complete_send_zc_result(
     primary_result: Option<io::Result<usize>>,
     result: crate::operation::CQEResult,
-) -> io::Result<usize> {
+) -> io::Result<SendZcResult> {
     if result.notif() {
-        primary_result.unwrap_or_else(|| Err(invalid_zc_notification_error()))
+        let bytes_sent = primary_result.unwrap_or_else(|| Err(invalid_zc_notification_error()))?;
+        let usage_flags = result.result?;
+        let usage = if usage_flags & NOTIF_USAGE_ZC_COPIED == 0 {
+            SendZcUsage::ZeroCopy
+        } else {
+            SendZcUsage::Copied
+        };
+        Ok(SendZcResult { bytes_sent, usage })
     } else {
-        result.result.map(|v| v as usize)
+        result.result.map(|bytes_sent| SendZcResult {
+            bytes_sent: bytes_sent as usize,
+            usage: SendZcUsage::Unknown,
+        })
     }
 }
 
@@ -1766,6 +1810,7 @@ where
         let len = checked_scalar_len(this.buf.bytes_init(), "zerocopy send buffer length")?;
         Ok(opcode::SendZc::new(this.fd.fd(), ptr, len)
             .flags(this.flags)
+            .zc_flags(SEND_ZC_REPORT_USAGE)
             .build())
     }
 
@@ -1778,7 +1823,7 @@ impl<B> Singleshot for SendZc<B>
 where
     B: StableBuf,
 {
-    type Output = (io::Result<usize>, B);
+    type Output = (io::Result<SendZcResult>, B);
 
     fn update(&mut self, result: crate::operation::CQEResult) {
         update_send_zc_primary(&mut self.primary_result, result);
@@ -1853,6 +1898,7 @@ where
 
         let msghdr = this.msghdr.as_ptr();
         Ok(opcode::SendMsgZc::new(this.fd.fd(), msghdr)
+            .ioprio(SEND_ZC_REPORT_USAGE)
             .flags(this.flags as u32)
             .build())
     }
@@ -1866,7 +1912,7 @@ impl<B> Singleshot for SendMsgZc<B>
 where
     B: StableBuf,
 {
-    type Output = (io::Result<usize>, B);
+    type Output = (io::Result<SendZcResult>, B);
 
     fn update(&mut self, result: crate::operation::CQEResult) {
         update_send_zc_primary(&mut self.primary_result, result);
@@ -2326,11 +2372,12 @@ mod tests {
     fn zc_completion_single_cqe_uses_final_result() {
         let final_cqe = crate::operation::CQEResult::new(Ok(64), 0);
         let result = complete_send_zc_result(None, final_cqe).unwrap();
-        assert_eq!(result, 64);
+        assert_eq!(result.bytes_sent(), 64);
+        assert_eq!(result.usage(), SendZcUsage::Unknown);
     }
 
     #[test]
-    fn zc_completion_final_notification_uses_primary_result() {
+    fn zc_completion_final_notification_reports_zero_copy() {
         let mut primary = None;
         let update = crate::operation::CQEResult::new(Ok(32), more_flag());
         update_send_zc_primary(&mut primary, update);
@@ -2339,7 +2386,22 @@ mod tests {
             crate::operation::CQEResult::new(Ok(0), notif_flag()),
         )
         .unwrap();
-        assert_eq!(result, 32);
+        assert_eq!(result.bytes_sent(), 32);
+        assert_eq!(result.usage(), SendZcUsage::ZeroCopy);
+    }
+
+    #[test]
+    fn zc_completion_final_notification_reports_copy_fallback() {
+        let mut primary = None;
+        let update = crate::operation::CQEResult::new(Ok(32), more_flag());
+        update_send_zc_primary(&mut primary, update);
+        let result = complete_send_zc_result(
+            primary,
+            crate::operation::CQEResult::new(Ok(NOTIF_USAGE_ZC_COPIED), notif_flag()),
+        )
+        .unwrap();
+        assert_eq!(result.bytes_sent(), 32);
+        assert_eq!(result.usage(), SendZcUsage::Copied);
     }
 
     #[test]

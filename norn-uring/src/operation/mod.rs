@@ -595,16 +595,19 @@ where
 pub(crate) unsafe fn reap_operation(entry: &io_uring::cqueue::Entry) {
     assert!(entry.user_data() > 1024);
     let handle = RawOpRef::from_raw_usize(entry.user_data() as usize);
-    let result = entry.result();
-    let result = if result >= 0 {
-        Ok(result as u32)
-    } else {
-        Err(io::Error::from_raw_os_error(-result))
-    };
+    let result = decode_cqe_result(entry.result(), entry.flags());
     let result = CQEResult::new(result, entry.flags());
     // Safety: `handle` was reconstructed from this CQE's runtime-owned
     // `user_data`; draining the CQ invokes this path exactly once per entry.
     unsafe { handle.reap(result) };
+}
+
+fn decode_cqe_result(result: i32, flags: u32) -> io::Result<u32> {
+    if result >= 0 || io_uring::cqueue::notif(flags) {
+        Ok(result as u32)
+    } else {
+        Err(io::Error::from_raw_os_error(-result))
+    }
 }
 
 #[must_use = "futures do nothing unless you `.await` or poll them"]
@@ -669,6 +672,30 @@ mod tests {
     use std::task::{Poll, Wake, Waker};
 
     use super::*;
+
+    fn notif_flag() -> u32 {
+        (0..=u32::MAX)
+            .find(|flags| io_uring::cqueue::notif(*flags))
+            .expect("missing CQE notification flag")
+    }
+
+    #[test]
+    fn notification_result_preserves_usage_bits() {
+        assert_eq!(
+            decode_cqe_result(i32::MIN, notif_flag()).unwrap(),
+            i32::MIN as u32
+        );
+    }
+
+    #[test]
+    fn ordinary_negative_result_remains_an_error() {
+        assert_eq!(
+            decode_cqe_result(-libc::EINVAL, 0)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EINVAL)
+        );
+    }
 
     #[derive(Debug, Default)]
     struct TestOp(Vec<u32>);
