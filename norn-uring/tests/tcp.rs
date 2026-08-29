@@ -10,7 +10,7 @@ use futures_util::StreamExt;
 use norn_executor::spawn;
 use norn_uring::buf::StableBuf;
 use norn_uring::bufring::RecvBufRing;
-use norn_uring::net::{TcpListener, TcpListenerOptions, TcpSocket};
+use norn_uring::net::{SendZcUsage, TcpListener, TcpListenerOptions, TcpSocket};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 mod util;
@@ -355,7 +355,8 @@ fn recv_ring_buf_can_be_echoed_with_send_zc() -> Result<(), Box<dyn std::error::
                 return Err(err.into());
             }
         };
-        assert_eq!(sent, payload.len());
+        assert_eq!(sent.bytes_sent(), payload.len());
+        assert_ne!(sent.usage(), SendZcUsage::Unknown);
         drop(buf);
 
         let (recv_result, reply) = client.recv(BytesMut::with_capacity(payload.len())).await;
@@ -536,7 +537,8 @@ fn send_zc_smoke() -> Result<(), Box<dyn std::error::Error>> {
                 return Err(err.into());
             }
         };
-        assert_eq!(sent, sent_buf.len());
+        assert_eq!(sent.bytes_sent(), sent_buf.len());
+        assert_ne!(sent.usage(), SendZcUsage::Unknown);
 
         let (recv_res, recv_buf) = recv_task.await?;
         let recv_n = recv_res?;
@@ -574,7 +576,8 @@ fn send_msg_zc_smoke() -> Result<(), Box<dyn std::error::Error>> {
                 return Err(err.into());
             }
         };
-        assert_eq!(sent, sent_buf.len());
+        assert_eq!(sent.bytes_sent(), sent_buf.len());
+        assert_ne!(sent.usage(), SendZcUsage::Unknown);
 
         let (recv_res, recv_buf) = recv_task.await?;
         let recv_n = recv_res?;

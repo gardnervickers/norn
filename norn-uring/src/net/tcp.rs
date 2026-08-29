@@ -10,7 +10,7 @@ use socket2::{Domain, Type};
 use crate::buf::{StableBuf, StableBufMut};
 use crate::bufring::{BufRingBuf, BufRingBufBundle, RecvBufRing};
 use crate::fd::UringFd;
-use crate::net::socket::{self, Event};
+use crate::net::socket::{self, Event, SendZcResult};
 use crate::operation::Op;
 
 use super::socket::Accept;
@@ -437,23 +437,29 @@ impl TcpSocket {
 
     /// Send data from the given buffer using `io_uring` zerocopy send.
     ///
+    /// A successful result reports both the number of bytes sent and whether
+    /// the kernel copied any part of the payload.
+    ///
     /// This method does not fall back to regular send if zerocopy is unsupported.
     /// Callers should enable `SO_ZEROCOPY` with [`TcpSocket::set_zerocopy`] first.
     pub fn send_zc<B: StableBuf>(
         &self,
         buf: B,
-    ) -> impl crate::Request<Output = (io::Result<usize>, B)> {
+    ) -> impl crate::Request<Output = (io::Result<SendZcResult>, B)> {
         self.socket.send_zc(buf)
     }
 
     /// Send a message from the given buffer using `io_uring` zerocopy sendmsg.
+    ///
+    /// A successful result reports both the number of bytes sent and whether
+    /// the kernel copied any part of the payload.
     ///
     /// This method does not fall back to regular sendmsg if zerocopy is unsupported.
     /// Callers should enable `SO_ZEROCOPY` with [`TcpSocket::set_zerocopy`] first.
     pub fn send_msg_zc<B: StableBuf>(
         &self,
         buf: B,
-    ) -> impl crate::Request<Output = (io::Result<usize>, B)> {
+    ) -> impl crate::Request<Output = (io::Result<SendZcResult>, B)> {
         self.socket.send_msg_zc(buf)
     }
 

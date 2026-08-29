@@ -175,6 +175,9 @@ impl CQEResult {
 
     /// Consume the completion and return its result value.
     ///
+    /// Notification completions return their raw notification value, including
+    /// values whose high bit is set.
+    ///
     /// # Errors
     ///
     /// Returns the error reported by the kernel or generated while preparing, submitting, or
@@ -184,6 +187,7 @@ impl CQEResult {
     }
 
     /// Consume the completion and return its result value and CQE flags.
+    /// Notification completions preserve the raw notification value.
     pub fn into_parts(self) -> (io::Result<u32>, u32) {
         (self.result, self.flags)
     }

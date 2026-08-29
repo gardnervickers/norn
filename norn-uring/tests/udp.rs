@@ -11,7 +11,7 @@ use futures_util::future::poll_fn;
 use futures_util::task::AtomicWaker;
 use futures_util::StreamExt;
 use norn_uring::bufring::{BufRingBufBundle, RecvBufRing};
-use norn_uring::net::UdpSocket;
+use norn_uring::net::{SendZcUsage, UdpSocket};
 
 mod util;
 
@@ -115,7 +115,8 @@ fn connected_send_recv_zc() -> Result<(), Box<dyn std::error::Error>> {
                 return Err(err.into());
             }
         };
-        assert_eq!(sent_n, sent.len());
+        assert_eq!(sent_n.bytes_sent(), sent.len());
+        assert_ne!(sent_n.usage(), SendZcUsage::Unknown);
 
         let (res, buf) = recv_task.await?;
         let n = res?;
@@ -158,7 +159,8 @@ fn connected_send_recv_msg_zc() -> Result<(), Box<dyn std::error::Error>> {
                 return Err(err.into());
             }
         };
-        assert_eq!(sent_n, sent.len());
+        assert_eq!(sent_n.bytes_sent(), sent.len());
+        assert_ne!(sent_n.usage(), SendZcUsage::Unknown);
 
         let (res, buf) = recv_task.await?;
         let n = res?;

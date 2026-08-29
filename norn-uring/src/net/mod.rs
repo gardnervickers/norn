@@ -6,7 +6,7 @@ mod socket;
 mod tcp;
 mod udp;
 
-pub use socket::{Event, RecvMsgRingBuf};
+pub use socket::{Event, RecvMsgRingBuf, SendZcResult, SendZcUsage};
 pub use tcp::{
     TcpListener, TcpListenerOptions, TcpRecvBundleMulti, TcpRecvRingMulti, TcpSocket, TcpStream,
     TcpStreamReader, TcpStreamWriter,

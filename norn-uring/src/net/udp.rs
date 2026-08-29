@@ -10,7 +10,7 @@ use socket2::{Domain, Type};
 use crate::buf::{StableBuf, StableBufMut};
 use crate::bufring::{BufRingBuf, BufRingBufBundle, RecvBufRing};
 use crate::fd::UringFd;
-use crate::net::socket::{self, Event, RecvMsgRingBuf};
+use crate::net::socket::{self, Event, RecvMsgRingBuf, SendZcResult};
 
 /// A UDP socket.
 ///
@@ -170,9 +170,12 @@ impl UdpSocket {
 
     /// Sends a single datagram on a connected socket using `io_uring` zerocopy send.
     ///
+    /// A successful result reports both the number of bytes sent and whether
+    /// the kernel copied any part of the payload.
+    ///
     /// This method does not fall back to regular send if zerocopy is unsupported.
     /// Callers should enable `SO_ZEROCOPY` with [`UdpSocket::set_zerocopy`] first.
-    pub async fn send_zc<B>(&self, buf: B) -> (io::Result<usize>, B)
+    pub async fn send_zc<B>(&self, buf: B) -> (io::Result<SendZcResult>, B)
     where
         B: StableBuf + 'static,
     {
@@ -231,9 +234,12 @@ impl UdpSocket {
 
     /// Sends a message on a connected socket using `io_uring` zerocopy sendmsg.
     ///
+    /// A successful result reports both the number of bytes sent and whether
+    /// the kernel copied any part of the payload.
+    ///
     /// This method does not fall back to regular sendmsg if zerocopy is unsupported.
     /// Callers should enable `SO_ZEROCOPY` with [`UdpSocket::set_zerocopy`] first.
-    pub async fn send_msg_zc<B>(&self, buf: B) -> (io::Result<usize>, B)
+    pub async fn send_msg_zc<B>(&self, buf: B) -> (io::Result<SendZcResult>, B)
     where
         B: StableBuf + 'static,
     {
