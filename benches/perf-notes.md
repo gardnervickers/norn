@@ -2206,3 +2206,491 @@ alternating pairs. All pairs favored the candidate. The four-worker KV
 guardrail was neutral at the paired median but too variable for an application
 claim. Full measurements are recorded in `channel-results.md`; the example code
 and workload harness remained unchanged.
+
+## 2026-08-29: two-worker sharded network profile
+
+Goal: identify another Norn-owned optimization under the controlled sharded
+network workload before changing runtime code.
+
+The disposable DigitalOcean lab used two `c-4` nodes in `nyc1`. The server
+pinned its two Norn workers to CPUs 2 and 3 while private-NIC interrupt and RPS
+work stayed on CPU 0. The client issued exactly 12,000,000 memcache-binary
+requests with 2 threads, 16 clients per thread, pipeline 32, 256-byte fixed
+responses, and a 12,500 request/s per-connection limit. The optimized release
+binary at `a163fc32c21a918496c65a1994087661156949c8` included debuginfo and frame
+pointers.
+
+The baseline completed at 413,701 memtier ops/s with p50 1.087 ms and p99
+1.879 ms. `perf` captured 77,900 cycle samples across both workers with zero
+lost samples. The largest reusable Norn frame was the two sharded-channel
+receive drains at 3.65% combined. Instruction attribution showed that an
+inactive lane still entered `ArrayQueue::pop`, its sequentially consistent
+empty check, the lane-notification exchange, and a second queue check. The
+io_uring driver's named drain frame was 0.29%; its loop was not a plausible
+material target in this workload.
+
+### Skip definitely inactive sharded lanes
+
+The candidate consulted the existing lane publication bit and, to preserve the
+late-notification-arm race, fell back to `ArrayQueue::is_empty` before entering
+the full pop protocol. Message-level round-robin ordering and the existing
+lost-wakeup handshake were unchanged. All `norn-channel` unit and doc tests
+passed.
+
+Three exact-count pairs alternated order. Server CPU is the sum of worker
+`schedstat` runtime deltas; lower is better.
+
+| Pair | Baseline CPU | Candidate CPU | Paired delta |
+| --- | ---: | ---: | ---: |
+| 1 | 24.797 s | 21.948 s | -11.49% |
+| 2 | 21.827 s | 22.134 s | +1.41% |
+| 3 | 21.166 s | 21.863 s | +3.29% |
+| Median | 21.827 s | 21.948 s | +0.56% |
+
+Median external throughput was 399,453 ops/s for baseline and 399,399 ops/s
+for the candidate. Median p99 was 1.735 ms and 1.767 ms. The first baseline
+CPU result was a disturbance rather than a candidate effect: both subsequent
+pairs favored baseline, and the paired median was a 1.41% regression.
+
+A matching candidate trace then verified the mechanism before rejection. The
+request and response drain frames fell from 1.86% and 1.79% to 1.10% and 1.10%
+of samples. That is about 40% less time inside the targeted path but only 1.45
+percentage points of total sampled cycles before replacement overhead, below
+the whole-workload promotion threshold. Profiled CPU totals are excluded from
+the comparison because sampling overhead differed between the two captures.
+
+Decision: reject and restore the original receive path. Raw profile and pair
+artifacts are under `/tmp/norn-do-profile-next/results/`.
+
+### Remaining profile-backed candidates
+
+The remaining visible frames did not support another code screen:
+
+- The 3.21% task-cell frame was cumulative attribution for the request-pump
+  future. Its hottest annotated instructions were key hashing and handler
+  branches; the Norn task-state prologue was a small fraction of that frame.
+- `RouterLocal::submit_remote` was 2.54% and included the lane's `ArrayQueue`
+  publication. Replacing that safe cloneable lane with a specialized SPSC ring
+  had already regressed the dedicated channel workload by 93%, so this trace
+  supplied no reason to repeat it.
+- Allocator and raw-vector growth samples belonged to response encoding and
+  copied request ownership in the sample application, not operation allocation
+  in Norn.
+- The named io_uring completion drain was 0.29%; remote pending checks,
+  submission, and unpark frames were individually 0.18% or lower. Even removing
+  those frames entirely could not meet the 5% server-CPU threshold.
+- Bounded lane-bulk draining had already been screened on the dedicated channel
+  workload and rejected below 1%, while changing the round-robin contract would
+  spend correctness semantics for a sub-threshold ceiling.
+
+Decision: no candidate advances to five-pair promotion. The fresh profile
+places the current reusable Norn costs below the materiality gate for this
+two-worker network workload; the dominant remaining work is sample protocol,
+routing, response construction, and kernel TCP processing.
+
+## 2026-08-29: fixed-client multicore scaling on larger nodes
+
+Goal: test whether a larger host exposes a material Norn-owned scaling target
+after the two-worker profile placed individual runtime frames below the 5%
+promotion threshold.
+
+### Environment and network screen
+
+The disposable DigitalOcean lab used two `g5-8vcpu-16gb-30gb` nodes in `ric1`.
+The server and client had eight distinct virtual cores each. The optimized
+release binary at `a163fc32c21a918496c65a1994087661156949c8` included debuginfo
+and forced frame pointers. All retained measurements used a fixed 256-byte
+response, pipeline 32, exact request counts, zero connection errors, and the
+private VPC interface.
+
+Three bidirectional four-stream `iperf3` screens reproduced approximately
+16.1 Gbit/s in each direction. Retransmits were high but repeatable at roughly
+278,000 to 310,000 per direction, so the application workload retained small
+responses rather than treating the VPC as a clean large-payload bandwidth
+oracle.
+
+The host initially forced receive packet steering for every RX queue onto CPU
+0. Three position-balanced exact-count pairs compared that setting with RPS on
+all eight CPUs using the seven-worker, 224-connection workload:
+
+| RPS placement | median worker CPU (ns/request) | median wall throughput | median p50 |
+| --- | ---: | ---: | ---: |
+| CPU 0 | 2,886.290 | 1,195,585 ops/s | 5.919 ms |
+| CPUs 0-7 | 1,605.706 | 3,200,583 ops/s | 1.911 ms |
+
+Distributed RPS improved external throughput by 167.7% and reduced measured
+Norn worker CPU per request by 44.4%. All six runs completed exactly 42,000,000
+requests. This is a benchmark-host requirement rather than a source change;
+subsequent results use the distributed setting.
+
+### Corrected fixed-client scaling matrix
+
+The first scaling matrix varied client threads and connection count with the
+server worker count. It was useful as a saturation screen but could not isolate
+the cost of adding workers. A corrected position-balanced matrix held the
+client at seven threads, 32 clients per thread, 224 total connections, and
+42,000,000 requests for W1, W2, W4, and W7. Three rounds used orders
+`1/2/4/7`, `7/4/2/1`, and `2/7/1/4`.
+
+| workers | CPU ns/request, three runs | median wall ops/s | median p50 | median p99 |
+| ---: | --- | ---: | ---: | ---: |
+| 1 | 421.033; 426.872; 439.199 | 2,326,173 | 3.087 ms | 3.455 ms |
+| 2 | 1,225.720; 1,143.028; 1,179.360 | 1,609,804 | 4.191 ms | 6.271 ms |
+| 4 | 1,434.396; 1,415.311; 1,455.062 | 2,452,006 | 2.511 ms | 4.703 ms |
+| 7 | 1,528.790; 1,631.039; 1,617.032 | 3,199,455 | 1.887 ms | 2.975 ms |
+
+W2's throughput inversion repeated in all three matrix positions. Worker
+runtime was balanced at W2: the per-run minimum and maximum worker runtimes
+were 25.061-26.419, 23.770-24.237, and 24.238-25.295 seconds. This rules out a
+single-worker placement failure.
+
+With uniformly distributed keys, the remote fractions are 1/2, 3/4, and 6/7.
+Subtracting the W1 local-request median and dividing by those fractions gives
+an estimated incremental CPU cost per remote request of 1,505 ns at W2,
+1,343 ns at W4, and 1,389 ns at W7. The agreement across three topologies
+confirms that the dominant scaling cost is one cross-worker request/reply, not
+generic worker construction.
+
+### W1/W2 differential profile
+
+Matching W1 and W2 captures retained the same 224 clients and exact 42,000,000
+requests. The profiled worker totals were 436.090 and 1,251.417 ns/request;
+sampling slowed both workloads, so these captures are used only for
+attribution. `perf` recorded 18,257 and 157,697 cycle samples with zero lost
+samples.
+
+At W2, the request and response channel drains were 1.67% and 1.43% of cycles,
+and `RouterLocal::submit_remote` was 1.84%. Together they represent about
+62 ns/request when scaled by measured worker CPU. `AcquireCredit`, response
+completion, ready-window publication, and the named connection/task wake
+frames remain individually below 1%. The channel's dedicated benchmark already
+measures hundreds of millions of messages per second; replacing its queue
+cannot account for the roughly 752 ns/request W1-to-W2 increment.
+
+Kernel reschedule and call-function IPIs rose from 4.54% and 2.88% at W1 to
+10.79% and 4.24% at W2. Scaled by each run's worker CPU, their combined
+increment is approximately 156 ns/request. The remaining cost is distributed
+through the sample's cross-worker protocol: owned-command transfer, request
+and response pump scheduling, credit/reorder bookkeeping, response
+construction, and the second connection wake/poll path.
+
+Decision: retain no implementation. The larger-node experiment confirms a
+large architectural penalty for remote ownership, but does not support another
+`norn-channel` queue or notification micro-optimization. A material next step
+would need to change the request/reply architecture and prove a reusable Norn
+contract; direct reply slots would add a new cross-thread lifetime and
+reclamation protocol, while generic per-request oneshots would reintroduce the
+allocations and futures that the fixed reply window deliberately avoids. Treat
+that as a separate review-gated design rather than a speculative perf patch.
+
+Raw host configuration, exact-count logs, matrices, and profiles are under
+`/tmp/norn-do-scale-next/results/`. Lab provisioning remained outside the
+repository.
+
+### Blocking-park upper-bound screen
+
+The W2 workers were only partially busy in the corrected scaling matrix, so a
+follow-up tested whether io_uring sleep/wake latency capped throughput even
+though the named park frames were small in CPU profiles. A diagnostic build
+forced the channel driver's inner io_uring driver to receive `ParkMode::NoPark`
+on every executor turn. This intentionally busy-looping build is an upper-bound
+screen, not a production candidate. It changed no request, channel, or I/O
+semantics and passed all 20 `norn-channel` unit tests plus its doc test.
+
+Three order-balanced exact-count pairs used the same W2 workload and exact
+source revision as the scaling matrix. Server CPU is the sum of worker
+`schedstat` runtime deltas.
+
+| Build | CPU ns/request, three runs | median wall ops/s | median p50 | median p99 |
+| --- | --- | ---: | ---: | ---: |
+| Blocking baseline | 1,092.140; 1,084.657; 1,075.411 | 1,349,345 | 5.151 ms | 5.535 ms |
+| Forced nonblocking | 1,600.401; 1,545.646; 1,540.521 | 1,349,332 | 5.311 ms | 5.567 ms |
+
+Median throughput changed by less than 0.001%, while forced nonblocking raised
+median worker CPU per request by 42.5%. Every run completed exactly 42,000,000
+requests with zero connection errors. Across the same three runs, aggregate
+worker scheduling events fell from roughly 1.09-1.25 million to 5,117-5,633,
+confirming that the diagnostic removed the intended blocking behavior.
+
+A separate instrumented pair counted the mechanism. The baseline recorded
+11,321,556 `io_uring_enter` syscalls, 3,508,203 direct `write` syscalls
+consistent with eventfd unparks, and 2,734,095 context switches. Forced
+nonblocking recorded 10,055,259 `io_uring_enter` syscalls, zero direct writes,
+and 15,027 context switches. The forced build still enters io_uring to submit
+queued SQEs, but never asks it to wait for a completion.
+
+Decision: reject and restore normal parking. Sleep/wake activity is frequent,
+but removing it does not improve throughput or latency and materially worsens
+CPU efficiency. The fully nonblocking upper bound also gives no profile-backed
+reason to screen a bounded-spin policy for this workload.
+
+### Producer batching and response-envelope screen
+
+The next screen tested whether reverse-path publication overhead was hidden by
+the aggregate cross-worker profile. Two diagnostic candidates were compared:
+
+- a reusable `try_send_many` operation for ordinary and sharded Norn channels,
+  used to publish each naturally formed response-pump batch with one close
+  check and one notification decision;
+- an application-only ceiling that sent each per-origin group as one
+  `Vec<ShardResponse>` queue entry.
+
+Both candidates passed the 23-test `norn-channel` suite and the full 47-test
+Linux `norn-kv-server` suite, including io_uring loopback and repeated-shutdown
+coverage. The producer API preserved FIFO order and retained every unsent value
+across full and closed outcomes.
+
+A pinned dedicated channel benchmark ran seven independent samples per case.
+Each sample moved 262,144 `usize` messages and received in groups of 32.
+
+| Channel shape | scalar-send median | bulk-send median | delta |
+| --- | ---: | ---: | ---: |
+| one shared lane, 1P/1C | 26,040,193 ns | 2,439,117 ns | -90.63% |
+| four independent sharded lanes, 4P/1C | 1,606,416 ns | 1,685,520 ns | +4.92% |
+
+The split follows the notification protocol. The ordinary shared sender calls
+the remote notifier for every scalar message, so bulk submission removes most
+eventfd traffic. A sharded lane already coalesces notification until the
+consumer clears its ready flag; bulk submission retains every `ArrayQueue`
+push and adds `VecDeque` staging. The server uses the latter shape.
+
+Five position-balanced network runs per build then used the fixed W2 workload,
+42,000,000 requests per run, and zero errors. Server CPU is the sum of the two
+worker `schedstat` runtime deltas.
+
+| Build | CPU ns/request, five runs | median CPU | median wall ops/s | median p50 | median p99 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Baseline | 1090.927; 1114.246; 1127.306; 1080.787; 1080.984 | 1090.927 | 1,307,308 | 5.311 ms | 5.791 ms |
+| Norn bulk send | 1071.113; 1093.457; 1063.075; 1073.614; 1067.956 | 1071.113 (-1.82%) | 1,349,330 | 5.151 ms | 5.471 ms |
+| Response envelope | 1070.979; 1095.088; 1100.616; 1073.489; 1081.310 | 1081.310 (-0.88%) | 1,349,340 | 5.247 ms | 5.567 ms |
+
+The first three samples suggested a 3.87% bulk-send CPU reduction, so two
+reversed-order confirmations were added before deciding. The five-run median
+settled at 1.82%, below the 5% retention threshold. The 3.2% wall-throughput
+medians also remained below threshold and were sensitive to slower baseline
+host periods. The response-envelope ceiling was smaller than the Norn bulk
+candidate after its vector-envelope replacement overhead.
+
+Decision: reject both prototypes. The result is useful for the general channel:
+producer batching can be a large win for an ordinary shared sender, but this
+workload neither exercises that notification shape nor justifies adding public
+API. The response-side ceiling and profile attribution also give no support for
+the lifetime and reclamation complexity of direct cross-worker reply slots.
+
+### eBPF observability and receive-CPU steering screen
+
+A final network-placement screen tested two related questions: whether eBPF
+can provide trustworthy benchmark diagnostics, and whether pinned sharded
+workers benefit from setting `SO_INCOMING_CPU` on their reuseport listeners.
+The candidate exposed a typed `TcpListenerOptions::incoming_cpu(u32)` rather
+than an arbitrary socket-option or BPF file-descriptor API. The sharded sample
+used it only when each worker was explicitly pinned, assigning listener CPU 1
+or 2 for the W2 workload. The candidate passed all 22 Linux `norn-uring` TCP
+tests and all 47 `norn-kv-server` tests.
+
+The disposable eight-core server exposed kernel BTF plus the io_uring submit
+and complete tracepoints, scheduler wakeup and switch tracepoints, NET_RX
+softirq tracepoints, and a `reuseport_select_sock` fexit hook. Two benchmark-only
+bpftrace observers were kept outside the repository:
+
+- a low-frequency steering observer counted receive CPU and selected
+  listener `skc_incoming_cpu` for port 11211;
+- a hot-path diagnostic observer additionally counted io_uring submissions
+  and completions, worker wake-to-run latency, and NET_RX softirq duration.
+
+The completion tracepoint's `cflags` includes selected buffer IDs in its high
+bits. An initial raw-key prototype filled its BPF map and flooded warnings; that
+trial was invalid and excluded. Retained instrumentation masked `cflags` to its
+semantic low bits. Observer compilation and map printing were also moved
+outside the server CPU measurement snapshots before repeating every overhead
+comparison.
+
+Three corrected position-balanced pairs measured observer overhead on the
+same W2 fixed workload:
+
+| Observer | CPU ns/request, three runs | median CPU | median wall ops/s | median p50 | median p99 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Off | 1213.179; 1154.718; 1173.842 | 1173.842 | 1,671,415 | 4.191 ms | 6.207 ms |
+| Hot-path diagnostic | 1332.313; 1298.544; 1259.945 | 1298.544 (+10.62%) | 1,444,662 (-13.57%) | 4.511 ms | 7.487 ms |
+
+The hot-path observer is therefore unsuitable for headline benchmark numbers;
+it should run separately for attribution. A matching three-pair screen of the
+connection-only steering observer measured 1169.934 ns/request with the probe
+off and 1165.663 ns/request with it on (-0.36%). Its primary-metric effect is
+below run noise, so it is suitable for connection-placement validation.
+
+The steering probe then verified the candidate mechanism. With RPS distributed
+across CPUs 0-7, baseline listeners reported incoming CPU `-1`. Candidate
+listeners always reported CPU 1 or 2, and every connection processed on CPU 1
+or 2 selected the matching listener. Only 44 of 224 connections arrived on
+those two CPUs, leaving the other 180 to normal reuseport hash fallback. Three
+BPF-free position-balanced pairs under this all-core RPS setting produced:
+
+| Build | CPU ns/request, three runs | median CPU | median wall ops/s | median p50 | median p99 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Baseline | 1159.933; 1132.722; 1171.026 | 1159.933 | 1,610,636 | 4.063 ms | 6.175 ms |
+| `SO_INCOMING_CPU` | 1191.160; 1211.307; 1144.531 | 1191.160 (+2.69%) | 1,611,471 (+0.05%) | 4.223 ms | 6.271 ms |
+
+Restricting server RPS to worker CPUs 1 and 2 (`rps_cpus=06`) made placement
+exact: a short observed run selected CPU 1's listener for 118 connections and
+CPU 2's listener for 106, with zero fallbacks or mismatches. Three further
+BPF-free position-balanced pairs under this aligned setting produced:
+
+| Build | CPU ns/request, three runs | median CPU | median wall ops/s | median p50 | median p99 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Baseline | 1165.383; 1124.147; 1187.611 | 1165.383 | 1,548,888 | 3.999 ms | 6.527 ms |
+| `SO_INCOMING_CPU` | 1132.198; 1136.798; 1105.433 | 1132.198 (-2.85%) | 1,611,281 (+4.03%) | 3.919 ms | 6.463 ms |
+
+All retained full runs completed exactly 42,000,000 requests with zero
+connection errors. Alignment works as documented, but the candidate regressed
+CPU with the established all-core RPS configuration, and its aligned median
+gain remained below the 5% promotion threshold with one of three pairs
+regressing. Compared directly with the established all-core baseline, the
+aligned candidate improved median CPU by only 2.39%, left throughput unchanged,
+and raised median p99 by 4.66%.
+
+Decision: reject and restore the typed socket option plus sample integration.
+Retain the methodology result: low-frequency eBPF is a trustworthy way to
+validate connection placement; high-frequency io_uring, scheduler, and
+softirq tracing must remain a separate diagnostic workload. Raw exact-count
+logs and observer maps are under `/tmp/norn-do-scale-next/results/`; lab
+provisioning and BPF scripts remained outside the repository.
+
+## 2026-08-30: adaptive performance gate
+
+The prior fixed 5% retention threshold was useful for early high-signal work
+but conflated measurement confidence with engineering value. Subsequent work
+uses position-balanced paired deltas and a complexity-adjusted hurdle:
+
+- start with three pairs and expand effects between 1.5% and 5% to seven or
+  nine pairs;
+- consider roughly 1.5% for simple private mechanical changes, 2.5% for
+  localized internal changes, 5% for new public API or platform coupling, and
+  5-8% for added unsafe, lifecycle, or concurrency complexity;
+- require correctness and important secondary metrics to remain healthy;
+- allow a lower throughput gain when the change supplies a separate
+  deterministic benefit such as a material footprint reduction.
+
+The percentages are decision guidance rather than automatic acceptance. An
+effect hidden by benchmark variance requires a better setup or more pairs.
+
+### Reopened candidates
+
+Two prior results merit current-tree confirmation:
+
+- The private uninitialized runnable queue improved all seven exact-tree
+  focused pairs. Their paired deltas have a roughly 4.8% median, stronger than
+  the 3.8% independent-median comparison recorded originally. Its unsafe queue
+  management still requires current-tree guard matrices, dedicated growth and
+  drop tests, Miri, and expanded paired confirmation.
+- Channel producer batching improved worker CPU in all five W2 network pairs
+  with a 1.82% median and improved the ordinary shared-channel benchmark by
+  90.6%. The existing sharded implementation regressed its dedicated
+  throughput case by 4.92%, so it must first avoid that staging overhead and
+  then pass nine network pairs before any public API decision.
+
+The audit did not reopen `SO_INCOMING_CPU`, operation-header `UnsafeCell`
+access, inactive-lane skipping, or the application response envelope. Those
+results respectively regress the established configuration, add lifecycle
+unsafe code for mixed sub-threshold results, regress in repeated pairs, or do
+not improve reusable Norn code. The single-operation waiter footprint change
+was already retained for its deterministic size reduction.
+
+### Runnable queue current-tree confirmation
+
+The best masked `MaybeUninit<Runnable>` ring was reconstructed on the current
+stack at `a163fc32c21a918496c65a1994087661156949c8`. It retained the 1,024-slot
+initial allocation, power-of-two growth, FIFO order, and empty-queue head reset.
+New tests covered exact FIFO order across wrap, growth while wrapped, and
+exact-once destruction of 2,049 queued tasks. The focused `norn-task` suite
+passed.
+
+Nine process-isolated pairs ran on the Ryzen 9 5950X with the performance
+governor and both builds pinned to CPU 15. Pair order alternated. The command
+was `taskset -c 15 cargo bench -p benches --bench task_state --
+'bench_task_yield/tasks=128/yields=32'`.
+
+| Pair | Baseline | Candidate | Paired delta |
+| ---: | ---: | ---: | ---: |
+| 1 | 35,609 ns | 34,085 ns | -4.28% |
+| 2 | 35,265 ns | 34,848 ns | -1.18% |
+| 3 | 35,336 ns | 33,894 ns | -4.08% |
+| 4 | 35,293 ns | 33,724 ns | -4.45% |
+| 5 | 35,345 ns | 33,925 ns | -4.02% |
+| 6 | 35,679 ns | 33,831 ns | -5.18% |
+| 7 | 35,447 ns | 34,019 ns | -4.03% |
+| 8 | 35,977 ns | 34,509 ns | -4.08% |
+| 9 | 35,681 ns | 34,438 ns | -3.48% |
+
+All nine pairs favored the ring. The paired median was a 4.08% improvement;
+the independent medians were 35,447 ns and 34,019 ns, also 4.03% faster.
+
+Decision: reject again. The effect is real and unusually consistent, but the
+current-tree result remains below the 5-8% hurdle for replacing `VecDeque` with
+private unsafe initialization, growth, and destruction invariants. The
+expanded measurement resolves the old threshold ambiguity, so Miri and full
+guard matrices were not promoted.
+
+### Producer batching current-tree confirmation
+
+The batching API was reconstructed around a caller-owned iterator. Successful
+values consume a FIFO prefix; a full or closed result owns the first failed
+value and leaves the untouched suffix in the iterator. The final ordinary
+sender publishes after the first enqueue to preserve producer/consumer overlap
+and again when the batch ends to cover a receiver that drains the early prefix.
+An RAII guard performs the completion publication during iterator panic.
+
+Initial local screens exposed two benchmark and implementation errors before
+cloud promotion. Checking closure for every item retained scalar atomic cost
+and made batching slower. Sending all 262,144 messages as one batch serialized
+the producer and consumer. One close check per operation and natural 32-message
+batches produced a roughly 50% ordinary-channel improvement locally. The
+sharded local guard was within 1.2% of scalar.
+
+The disposable cloud lab used one `g5-8vcpu-16gb-30gb` server and client in
+`ric1`, Rust nightly 2026-08-28, dedicated virtual CPUs, and all-core RPS. The
+pinned channel matrix moved 262,144 `usize` messages per sample with a receive
+limit and send batch of 32. Seven process-isolated runs alternated scalar and
+batch order.
+
+The first cloud matrix removed iterator staging but deferred publication until
+batch completion. Ordinary shared-channel medians were 25,366,300 ns scalar
+and 2,740,698 ns batched, an 89.2% improvement. Sharded medians were 1,602,255
+ns and 1,679,712 ns, a 4.83% regression. This disproved the earlier staging
+attribution.
+
+A follow-up sharded implementation published after both the first enqueue and
+batch completion. A second seven-pair cloud matrix still regressed by 4.93% at
+the paired median and 5.04% by independent medians. Instrumented `perf stat`
+runs perturbed and reversed the small effect, while both uninstrumented
+matrices independently reproduced the regression. Decision: expose no batched
+API on `ShardedSender` and retain its existing per-lane coalescing protocol.
+
+The final exact source contains batching only on ordinary [`Sender`]. All KV
+example changes were removed. Seven final cloud pairs measured:
+
+| Pair | Scalar send | Batch send | Paired delta |
+| ---: | ---: | ---: | ---: |
+| 1 | 21,039,450 ns | 2,428,840 ns | -88.46% |
+| 2 | 19,684,625 ns | 2,590,600 ns | -86.84% |
+| 3 | 15,911,548 ns | 2,452,227 ns | -84.59% |
+| 4 | 29,006,036 ns | 2,511,228 ns | -91.34% |
+| 5 | 21,741,480 ns | 2,451,187 ns | -88.73% |
+| 6 | 26,132,531 ns | 2,483,978 ns | -90.49% |
+| 7 | 19,490,068 ns | 2,422,113 ns | -87.57% |
+
+All seven pairs favored batching. The paired median improved by 88.46%; the
+independent medians were 21,039,450 ns and 2,452,227 ns, an 88.34%
+improvement. The candidate passes all 24 `norn-channel` unit tests plus its doc
+test, all 47 Linux/io_uring KV server tests, strict targeted clippy, formatting,
+and diff checks. Coverage includes partial enqueue ownership, full and closed
+classification, iterator panic, and a deterministic early-drain/completion
+publication race.
+
+Decision: retain ordinary sender batching. It clears the public-API hurdle by
+a wide margin with no unsafe code or sharded-protocol change. The final sample
+server does not call the API, so the prior W2 network experiment no longer
+exercises this candidate and was not repeated. Exact benchmark logs remain
+under `/tmp/norn-do-scale-next/results/adaptive-channel-final/`. The lab stayed
+outside the repository and its two droplets, firewall, project attachment, and
+tag were destroyed and verified absent.
