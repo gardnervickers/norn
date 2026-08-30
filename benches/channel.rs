@@ -15,12 +15,14 @@ mod support;
 
 const MESSAGES_PER_ROUND: usize = 262_144;
 const QUEUE_CAPACITY: usize = MESSAGES_PER_ROUND;
+const SEND_BATCH: usize = 32;
 const STOP: usize = usize::MAX;
 
 struct ThroughputBench {
     producers: usize,
     receive_limit: usize,
     sharded: bool,
+    bulk_send: bool,
 }
 
 enum ThroughputSender {
@@ -69,9 +71,26 @@ macro_rules! spawn_throughput_producer {
     };
 }
 
+macro_rules! spawn_bulk_throughput_producer {
+    ($sender:ident, $cpu:ident, $start_rx:ident, $done_tx:ident, $messages:ident) => {
+        thread::spawn(move || {
+            pin_current_thread($cpu);
+            while $start_rx.recv().is_ok() {
+                send_many(&$sender, $messages);
+                $done_tx.send(()).unwrap();
+            }
+        })
+    };
+}
+
 impl bencher::TDynBenchFn for ThroughputBench {
     fn run(&self, b: &mut Bencher) {
-        let mut runtime = ThroughputRuntime::new(self.producers, self.receive_limit, self.sharded);
+        let mut runtime = ThroughputRuntime::new(
+            self.producers,
+            self.receive_limit,
+            self.sharded,
+            self.bulk_send,
+        );
         b.bytes = (MESSAGES_PER_ROUND * std::mem::size_of::<usize>()) as u64;
         b.iter(|| {
             runtime.run_round();
@@ -89,9 +108,10 @@ struct ThroughputRuntime {
 }
 
 impl ThroughputRuntime {
-    fn new(producers: usize, receive_limit: usize, sharded: bool) -> Self {
+    fn new(producers: usize, receive_limit: usize, sharded: bool, bulk_send: bool) -> Self {
         assert!(producers > 0);
         assert_eq!(MESSAGES_PER_ROUND % producers, 0);
+        assert!(!sharded || !bulk_send);
 
         let (consumer_done_tx, consumer_done) = std_mpsc::sync_channel(1);
         let (mut senders, consumer) = if sharded {
@@ -149,6 +169,13 @@ impl ThroughputRuntime {
             let (done_tx, done_rx) = std_mpsc::sync_channel(1);
             let cpu = producer_cpus.get(index).copied();
             let producer = match sender {
+                ThroughputSender::Shared(sender) if bulk_send => spawn_bulk_throughput_producer!(
+                    sender,
+                    cpu,
+                    start_rx,
+                    done_tx,
+                    messages_per_producer
+                ),
                 ThroughputSender::Shared(sender) => spawn_throughput_producer!(
                     sender,
                     cpu,
@@ -344,6 +371,14 @@ fn send_sharded_retry(sender: &norn_channel::mpsc::ShardedSender<usize>, mut val
     }
 }
 
+fn send_many(sender: &Sender<usize>, messages: usize) {
+    for start in (0..messages).step_by(SEND_BATCH) {
+        let end = (start + SEND_BATCH).min(messages);
+        let mut values = start..end;
+        assert_eq!(sender.try_send_many(&mut values), Ok(end - start));
+    }
+}
+
 fn benches() -> Vec<TestDescAndFn> {
     let mut benches = vec![
         dynamic_bench(
@@ -352,6 +387,7 @@ fn benches() -> Vec<TestDescAndFn> {
                 producers: 1,
                 receive_limit: 1,
                 sharded: false,
+                bulk_send: false,
             },
         ),
         dynamic_bench(
@@ -360,6 +396,7 @@ fn benches() -> Vec<TestDescAndFn> {
                 producers: 1,
                 receive_limit: 16,
                 sharded: false,
+                bulk_send: false,
             },
         ),
         dynamic_bench(
@@ -368,6 +405,16 @@ fn benches() -> Vec<TestDescAndFn> {
                 producers: 1,
                 receive_limit: 32,
                 sharded: false,
+                bulk_send: false,
+            },
+        ),
+        dynamic_bench(
+            "throughput/1p1c/send_batch=32/recv_limit=32/messages=262144",
+            ThroughputBench {
+                producers: 1,
+                receive_limit: 32,
+                sharded: false,
+                bulk_send: true,
             },
         ),
         dynamic_bench(
@@ -376,6 +423,7 @@ fn benches() -> Vec<TestDescAndFn> {
                 producers: 4,
                 receive_limit: 32,
                 sharded: false,
+                bulk_send: false,
             },
         ),
         dynamic_bench(
@@ -384,6 +432,7 @@ fn benches() -> Vec<TestDescAndFn> {
                 producers: 4,
                 receive_limit: 32,
                 sharded: true,
+                bulk_send: false,
             },
         ),
         dynamic_bench("latency/1p1c/round_trip", RoundTripBench),

@@ -1,8 +1,8 @@
 //! Bounded multi-producer, single-consumer channels.
 //!
-//! Receive-side batching is bounded explicitly by the caller. Bulk submission
-//! is intentionally deferred until its partial-enqueue and ownership-return
-//! semantics can be designed against measured workloads.
+//! Receive-side batching is bounded explicitly by the caller. [`Sender`] may
+//! also consume a caller-owned iterator as one notification batch while
+//! returning ownership of the first value that cannot be enqueued.
 
 use std::cell::{Cell, RefCell};
 use std::error::Error;
@@ -119,6 +119,25 @@ struct Shared<T> {
     receiver_closed: AtomicBool,
     senders: AtomicUsize,
     remote: Arc<Remote>,
+}
+
+struct NotifyOnDrop<'a> {
+    remote: &'a Remote,
+    sent: bool,
+}
+
+impl NotifyOnDrop<'_> {
+    fn notify(&self) {
+        self.remote.notify();
+    }
+}
+
+impl Drop for NotifyOnDrop<'_> {
+    fn drop(&mut self) {
+        if self.sent {
+            self.notify();
+        }
+    }
 }
 
 impl<T> Shared<T> {
@@ -300,8 +319,6 @@ impl<T> Sender<T> {
     /// Returns [`TrySendError::Full`] when the bounded queue has no remaining
     /// capacity, or [`TrySendError::Closed`] after the receiver closes.
     pub fn try_send(&self, value: T) -> Result<(), TrySendError<T>> {
-        // TODO: Add bounded bulk submit after defining partial-enqueue return
-        // semantics and measuring whether producers naturally form batches.
         if self.is_closed() {
             return Err(TrySendError::Closed(value));
         }
@@ -313,6 +330,66 @@ impl<T> Sender<T> {
             }
             Err(value) if self.is_closed() => Err(TrySendError::Closed(value)),
             Err(value) => Err(TrySendError::Full(value)),
+        }
+    }
+
+    /// Attempt to enqueue messages from `values` as one notification batch.
+    ///
+    /// Successfully enqueued messages are consumed as a FIFO prefix of the
+    /// iterator. If the channel becomes full or closes, the returned error owns
+    /// the first value that could not be sent and `values` retains every later
+    /// value. The receiver is notified after the first enqueue and again when a
+    /// non-empty batch ends, covering a receiver that drains the early prefix
+    /// while the producer is still iterating. Completion notification also runs
+    /// when iteration panics.
+    ///
+    /// This operation is not atomic: the receiver may consume messages while
+    /// the batch is being enqueued. Receiver closure is checked before the
+    /// first enqueue and again after a failed enqueue; closure racing with an
+    /// in-progress batch may therefore leave the whole prefix accepted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrySendManyError`] when a value cannot be enqueued. The error
+    /// reports how many earlier values were sent and whether the queue was full
+    /// or the receiver was closed.
+    pub fn try_send_many<I>(&self, values: &mut I) -> Result<usize, TrySendManyError<T>>
+    where
+        I: Iterator<Item = T>,
+    {
+        let mut sent = 0;
+        let mut notify = NotifyOnDrop {
+            remote: &self.shared.remote,
+            sent: false,
+        };
+
+        let Some(mut value) = values.next() else {
+            return Ok(0);
+        };
+        if self.is_closed() {
+            return Err(TrySendManyError::new(0, TrySendError::Closed(value)));
+        }
+
+        loop {
+            match self.shared.queue.push(value) {
+                Ok(()) => {
+                    if sent == 0 {
+                        notify.notify();
+                    }
+                    sent += 1;
+                    notify.sent = true;
+                    let Some(next) = values.next() else {
+                        return Ok(sent);
+                    };
+                    value = next;
+                }
+                Err(value) if self.is_closed() => {
+                    return Err(TrySendManyError::new(sent, TrySendError::Closed(value)));
+                }
+                Err(value) => {
+                    return Err(TrySendManyError::new(sent, TrySendError::Full(value)));
+                }
+            }
         }
     }
 
@@ -769,8 +846,6 @@ impl<T> ShardedSender<T> {
     /// Returns [`TrySendError::Full`] when this lane has no remaining capacity,
     /// or [`TrySendError::Closed`] after the receiver closes.
     pub fn try_send(&self, value: T) -> Result<(), TrySendError<T>> {
-        // TODO: Add bounded bulk submit after defining partial-enqueue return
-        // semantics and measuring whether producers naturally form batches.
         if self.is_closed() {
             return Err(TrySendError::Closed(value));
         }
@@ -1004,6 +1079,42 @@ impl<T> fmt::Display for TrySendError<T> {
 
 impl<T> Error for TrySendError<T> where T: fmt::Debug {}
 
+/// An error returned by a batched non-blocking send operation.
+#[derive(Debug, PartialEq, Eq)]
+pub struct TrySendManyError<T> {
+    sent: usize,
+    error: TrySendError<T>,
+}
+
+impl<T> TrySendManyError<T> {
+    fn new(sent: usize, error: TrySendError<T>) -> Self {
+        Self { sent, error }
+    }
+
+    /// Return the number of values enqueued before the failure.
+    pub fn sent(&self) -> usize {
+        self.sent
+    }
+
+    /// Return the failed send operation by reference.
+    pub fn error(&self) -> &TrySendError<T> {
+        &self.error
+    }
+
+    /// Consume this error and return the failed send operation.
+    pub fn into_error(self) -> TrySendError<T> {
+        self.error
+    }
+}
+
+impl<T> fmt::Display for TrySendManyError<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} after sending {} messages", self.error, self.sent)
+    }
+}
+
+impl<T> Error for TrySendManyError<T> where T: fmt::Debug {}
+
 /// An error returned by non-blocking receive operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TryRecvError {
@@ -1026,6 +1137,7 @@ impl Error for TryRecvError {}
 
 #[cfg(test)]
 mod tests {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
     use std::sync::atomic::AtomicUsize;
     use std::sync::{mpsc as std_mpsc, Arc};
     use std::task::Wake;
@@ -1041,6 +1153,19 @@ mod tests {
         let builder = DriverBuilder::new();
         let endpoint = builder.endpoint().clone();
         (builder, endpoint)
+    }
+
+    #[derive(Default)]
+    struct WakeCount(AtomicUsize);
+
+    impl Wake for WakeCount {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     #[test]
@@ -1171,6 +1296,101 @@ mod tests {
         assert_eq!(receiver.try_recv(), Ok(1));
         assert_eq!(receiver.try_recv(), Ok(2));
         assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    #[test]
+    fn bounded_bulk_send_preserves_failed_value_and_iterator_suffix() {
+        let driver = Driver::new(SpinPark);
+        let (sender, receiver) = bounded(&driver.endpoint(), 2);
+        let mut receiver = receiver.attach(&driver.handle());
+        let mut values = 0..4;
+
+        let error = sender.try_send_many(&mut values).unwrap_err();
+        assert_eq!(error.sent(), 2);
+        assert_eq!(error.into_error(), TrySendError::Full(2));
+        assert_eq!(values.next(), Some(3));
+        assert_eq!(receiver.try_recv(), Ok(0));
+        assert_eq!(receiver.try_recv(), Ok(1));
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    #[test]
+    fn bulk_send_returns_closed_value_without_consuming_suffix() {
+        let driver = Driver::new(SpinPark);
+        let (sender, receiver) = bounded(&driver.endpoint(), 2);
+        drop(receiver);
+        let mut values = 7..10;
+
+        let error = sender.try_send_many(&mut values).unwrap_err();
+        assert_eq!(error.sent(), 0);
+        assert_eq!(error.into_error(), TrySendError::Closed(7));
+        assert_eq!(values.collect::<Vec<_>>(), [8, 9]);
+    }
+
+    #[test]
+    fn bulk_send_notifies_after_iterator_panic() {
+        let (builder, endpoint) = endpoint();
+        let (sender, receiver) = bounded(&endpoint, 2);
+        let mut driver = builder.build(SpinPark);
+        let mut receiver = receiver.attach(&driver.handle());
+        let wake_count = Arc::new(WakeCount::default());
+        let waker = Waker::from(Arc::clone(&wake_count));
+        let mut context = Context::from_waker(&waker);
+        assert_eq!(receiver.poll_recv(&mut context), Poll::Pending);
+
+        let mut calls = 0;
+        let mut values = std::iter::from_fn(|| {
+            calls += 1;
+            if calls == 1 {
+                Some(42)
+            } else {
+                panic!("iterator failed")
+            }
+        });
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            let _ = sender.try_send_many(&mut values);
+        }));
+        assert!(panic.is_err());
+
+        driver.park(ParkMode::NoPark).unwrap();
+        assert_eq!(wake_count.0.load(Ordering::Relaxed), 1);
+        assert_eq!(receiver.poll_recv(&mut context), Poll::Ready(Some(42)));
+    }
+
+    #[test]
+    fn bulk_send_completion_notifies_after_early_prefix_drains() {
+        let (builder, endpoint) = endpoint();
+        let (sender, receiver) = bounded(&endpoint, 2);
+        let mut driver = builder.build(SpinPark);
+        let mut receiver = receiver.attach(&driver.handle());
+        let wake_count = Arc::new(WakeCount::default());
+        let waker = Waker::from(Arc::clone(&wake_count));
+        let mut context = Context::from_waker(&waker);
+        assert_eq!(receiver.poll_recv(&mut context), Poll::Pending);
+
+        let mut calls = 0;
+        {
+            let mut values = std::iter::from_fn(|| {
+                calls += 1;
+                match calls {
+                    1 => Some(1),
+                    2 => {
+                        driver.park(ParkMode::NoPark).unwrap();
+                        assert_eq!(wake_count.0.load(Ordering::Relaxed), 1);
+                        assert_eq!(receiver.try_recv(), Ok(1));
+                        assert_eq!(receiver.poll_recv(&mut context), Poll::Pending);
+                        Some(2)
+                    }
+                    3 => None,
+                    _ => unreachable!(),
+                }
+            });
+            assert_eq!(sender.try_send_many(&mut values), Ok(2));
+        }
+
+        driver.park(ParkMode::NoPark).unwrap();
+        assert_eq!(wake_count.0.load(Ordering::Relaxed), 2);
+        assert_eq!(receiver.poll_recv(&mut context), Poll::Ready(Some(2)));
     }
 
     #[test]
