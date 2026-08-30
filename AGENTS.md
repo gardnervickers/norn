@@ -116,7 +116,19 @@ The project is intentionally not general-purpose today; APIs are still in flux i
 
 - Always benchmark before and after with the same command/filter.
 - Use the `bencher` harness filters for focused cases (for example `bench_spawn/num_tasks=1024`).
-- Collect a baseline full matrix first, then repeat key hot cases at least 3 times and compare medians.
+- Collect a baseline full matrix first, then start key hot comparisons with at
+  least 3 position-balanced pairs. Analyze paired deltas; do not rely only on
+  independent baseline and candidate medians.
+- Treat 5% as the default materiality hurdle, not a universal cutoff. When an
+  initial paired effect is 1.5-5%, expand to 7 or 9 pairs before deciding.
+- Separate measurement confidence from engineering value. A simple private
+  mechanical change may justify retention around 1.5%; a localized internal
+  implementation around 2.5%; public API or platform coupling normally still
+  needs about 5%; and new unsafe, lifecycle, or concurrency complexity normally
+  needs 5-8% unless it supplies a separate deterministic benefit.
+- Require important secondary metrics to remain healthy. If benchmark noise is
+  comparable to the estimated effect, improve the setup or collect more pairs
+  instead of deciding from the nominal percentage.
 - Keep runtime checks consistent for perf branches:
   - `cargo fmt --all`
   - `cargo test` (or targeted crate tests during iteration, full/expanded before commit)
@@ -128,7 +140,9 @@ The project is intentionally not general-purpose today; APIs are still in flux i
   - Linux (when available): use `perf record`/`perf report` for equivalent sampling.
 - Check `benches/perf-notes.md` before revisiting benchmark-driven optimizations;
   it records attempts that were noisy, regressed, or need a different benchmark shape.
-- Only checkpoint a perf commit when the gain is material and repeatable; include exact before/after numbers and commands in the commit body.
+- Only checkpoint a perf commit when its paired gain is repeatable and justifies
+  its complexity under the adaptive hurdle; include exact before/after numbers
+  and commands in the commit body.
 
 ## Test Coverage Map
 
