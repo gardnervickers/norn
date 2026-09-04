@@ -71,14 +71,25 @@ impl Level {
     }
 
     pub(crate) fn next_expiration(&mut self, now: u64) -> Option<Expiration> {
-        let slot = self.next_occupied_slot(now)?;
-        let slot_bit = occupied_bit(slot);
-        if self.dirty_slots & slot_bit != 0 {
-            self.slot_deadlines[slot] = self.slots[slot].iter().map(Entry::expiration).min();
-            self.dirty_slots &= !slot_bit;
-        }
-        let deadline =
-            self.slot_deadlines[slot].expect("occupied slot must have a tracked minimum deadline");
+        let slot = if self.level == crate::NUM_LEVELS - 1 {
+            // The top level also holds deadlines beyond one full wheel turn.
+            // Their slot order can wrap ahead of an earlier deadline, so compare
+            // the occupied slots' actual minima instead of their positions.
+            let mut occupied = self.bitfield;
+            let mut earliest: Option<(usize, u64)> = None;
+            while occupied != 0 {
+                let slot = occupied.trailing_zeros() as usize;
+                occupied &= occupied - 1;
+                let deadline = self.slot_deadline(slot);
+                if earliest.is_none_or(|(_, current)| deadline < current) {
+                    earliest = Some((slot, deadline));
+                }
+            }
+            earliest?.0
+        } else {
+            self.next_occupied_slot(now)?
+        };
+        let deadline = self.slot_deadline(slot);
         let expiration = Expiration::new(self.level, slot, deadline);
         debug_assert!(
             expiration.deadline() >= now,
@@ -93,6 +104,15 @@ impl Level {
         );
 
         Some(expiration)
+    }
+
+    fn slot_deadline(&mut self, slot: usize) -> u64 {
+        let slot_bit = occupied_bit(slot);
+        if self.dirty_slots & slot_bit != 0 {
+            self.slot_deadlines[slot] = self.slots[slot].iter().map(Entry::expiration).min();
+            self.dirty_slots &= !slot_bit;
+        }
+        self.slot_deadlines[slot].expect("occupied slot must have a tracked minimum deadline")
     }
 
     fn next_occupied_slot(&self, now: u64) -> Option<usize> {

@@ -94,19 +94,29 @@ impl std::fmt::Debug for Handle {
 impl Handle {
     /// Create a new timer with the specified duration.
     ///
-    /// Once the duration has elapsed, the timer will fire.
+    /// The duration starts at construction. Once it has elapsed, the timer
+    /// will fire. Nonzero durations round up to the timer wheel's millisecond
+    /// tick. Deadlines beyond `u64::MAX` milliseconds since the clock origin
+    /// saturate at that final tick. See [`Handle::sleep_until`] for an absolute
+    /// deadline.
     pub fn sleep(&self, duration: Duration) -> Sleep {
-        Sleep::new(self.wheels.clone(), duration)
+        Sleep::new(self.wheels.clone(), self.clock.clone(), duration)
     }
 
     /// Create a new timer that completes at an absolute deadline.
     ///
-    /// If the deadline has already elapsed, the sleep completes on its next
-    /// poll. The deadline uses the same clock as this handle, so simulated
-    /// clocks can be advanced after constructing the sleep without changing
-    /// its target time.
+    /// If the deadline has already elapsed at construction, the sleep completes
+    /// on its next poll. The deadline uses the same clock as this handle, so
+    /// simulated clocks can be advanced after constructing the sleep without
+    /// changing its target time. Future absolute deadlines round up to the
+    /// timer wheel's millisecond tick and saturate at `u64::MAX` milliseconds
+    /// since the clock origin.
     pub fn sleep_until(&self, deadline: Instant) -> Sleep {
-        Sleep::new_at(self.wheels.clone(), self.clock.instant_to_tick(deadline))
+        Sleep::new_at(
+            self.wheels.clone(),
+            self.clock.clone(),
+            self.clock.instant_to_tick(deadline),
+        )
     }
 
     /// Get the clock used by the timer.
@@ -170,10 +180,14 @@ where
         if let Some(expiration) = next_expiration {
             let delta = expiration.deadline().saturating_sub(ticks);
             let duration = self.clock.tick_to_duration(delta);
-            if let ParkMode::Timeout(timeout) = mode {
-                mode = ParkMode::Timeout(timeout.min(duration));
-            } else {
-                mode = ParkMode::Timeout(duration)
+            match mode {
+                ParkMode::NoPark => {}
+                ParkMode::Timeout(timeout) => {
+                    mode = ParkMode::Timeout(timeout.min(duration));
+                }
+                ParkMode::NextCompletion => {
+                    mode = ParkMode::Timeout(duration);
+                }
             }
         }
         self.inner.park(mode)
