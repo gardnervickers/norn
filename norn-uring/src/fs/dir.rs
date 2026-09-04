@@ -1,5 +1,6 @@
 use io_uring::{opcode, types};
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 use crate::operation::{Operation, Singleshot};
@@ -203,10 +204,7 @@ impl UnlinkAt {
     }
 
     fn new(path: &Path, flags: i32) -> io::Result<Self> {
-        let path = path
-            .to_str()
-            .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
-        let path = std::ffi::CString::new(path)?;
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
         Ok(Self { path, flags })
     }
 }
@@ -243,10 +241,7 @@ struct MkDirAt {
 
 impl MkDirAt {
     fn new(path: &Path, mode: u32) -> io::Result<Self> {
-        let path = path
-            .to_str()
-            .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
-        let path = std::ffi::CString::new(path)?;
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
         Ok(Self { path, mode })
     }
 }
@@ -597,10 +592,7 @@ where
 }
 
 fn path_to_cstring(path: &Path) -> io::Result<std::ffi::CString> {
-    let path = path
-        .to_str()
-        .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
-    Ok(std::ffi::CString::new(path)?)
+    Ok(std::ffi::CString::new(path.as_os_str().as_bytes())?)
 }
 
 fn bytes_to_cstring(bytes: &[u8], what: &'static str) -> io::Result<std::ffi::CString> {

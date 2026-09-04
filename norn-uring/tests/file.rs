@@ -5,6 +5,8 @@ use futures_core::Future;
 use futures_util::future::poll_fn;
 use norn_uring::fixedbuf::{AcquireError, FixedBuffer, RegisterErrorKind, UnregisterErrorKind};
 use norn_uring::fs;
+use std::ffi::OsString;
+use std::os::unix::ffi::OsStringExt;
 use std::task::Poll;
 
 mod util;
@@ -19,6 +21,55 @@ fn open_close() -> Result<(), Box<dyn std::error::Error>> {
 
         let file = opts.open(path).await?;
         file.close().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn filesystem_paths_preserve_non_utf8_bytes() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let dir = util::ThreadNameTestDir::new();
+        let file_path = dir.join(OsString::from_vec(b"file-\xff".to_vec()));
+        let renamed_path = dir.join(OsString::from_vec(b"renamed-\xfe".to_vec()));
+        let directory_path = dir.join(OsString::from_vec(b"directory-\xfd".to_vec()));
+
+        let mut opts = fs::OpenOptions::new();
+        opts.create(true).write(true).read(true);
+        let file = opts.open(&file_path).await?;
+        file.close().await?;
+
+        fs::rename(&file_path, &renamed_path).await?;
+        assert!(fs::metadata(&renamed_path).await.is_ok());
+        fs::remove_file(&renamed_path).await?;
+
+        fs::create_dir(&directory_path).await?;
+        assert!(fs::statx(
+            &directory_path,
+            libc::AT_STATX_SYNC_AS_STAT,
+            libc::STATX_BASIC_STATS,
+        )
+        .await
+        .is_ok());
+        fs::remove_dir(&directory_path).await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn filesystem_paths_reject_embedded_nul() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let dir = util::ThreadNameTestDir::new();
+        let path = dir.join(OsString::from_vec(b"embedded\0nul".to_vec()));
+
+        let mut opts = fs::OpenOptions::new();
+        opts.create(true).write(true);
+        let error = opts.open(&path).await.expect_err("embedded NUL must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+
+        let error = fs::create_dir(&path)
+            .await
+            .expect_err("embedded NUL must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         Ok(())
     })
 }
