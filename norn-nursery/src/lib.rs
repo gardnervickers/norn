@@ -30,6 +30,8 @@ use pin_project_lite::pin_project;
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 
+const TASK_POLL_BUDGET: usize = 32;
+
 /// Creates an async scope within which child jobs can be spawned.
 ///
 /// Child jobs may borrow from stack values that outlive the scope and they are
@@ -200,17 +202,19 @@ where
         pending()
     }
 
-    fn poll_tasks(&self) {
-        loop {
+    fn poll_tasks(&self) -> bool {
+        for _ in 0..TASK_POLL_BUDGET {
             let runnable = self.shared.runqueue.borrow_mut().pop_front();
             let Some(runnable) = runnable else {
-                break;
+                return false;
             };
             runnable.run();
             if self.terminated.borrow().is_some() {
-                break;
+                return false;
             }
         }
+
+        !self.shared.runqueue.borrow().is_empty()
     }
 
     fn is_idle(&self) -> bool {
@@ -255,7 +259,8 @@ struct Shared {
 
 impl Shared {
     fn wake_scope(&self) {
-        if let Some(waker) = self.waker.borrow_mut().take() {
+        let waker = self.waker.borrow_mut().take();
+        if let Some(waker) = waker {
             waker.wake();
         }
     }
@@ -297,6 +302,10 @@ impl<R> Drop for ScopeClearGuard<'_, '_, R> {
 
 pin_project! {
     /// The future returned by [`scope_fn`] and [`scope!`].
+    ///
+    /// Each poll drives a bounded number of ready child tasks before yielding
+    /// and re-waking its caller when child work remains. A child future's own
+    /// poll remains cooperative and cannot be preempted.
     #[must_use = "futures do nothing unless polled or awaited"]
     pub struct ScopeBody<'env, R: 'env, F>
     where
@@ -358,7 +367,7 @@ where
             }
         }
 
-        this.scope.poll_tasks();
+        let has_remaining_tasks = this.scope.poll_tasks();
 
         if let Some(terminated) = this.scope.take_terminated() {
             this.scope.clear();
@@ -374,6 +383,9 @@ where
         }
 
         this.scope.set_waker(cx.waker());
+        if has_remaining_tasks {
+            this.scope.shared.wake_scope();
+        }
         Poll::Pending
     }
 }
@@ -401,10 +413,13 @@ mod tests {
     use std::cell::Cell;
     use std::future::{pending, Future};
     use std::pin::Pin;
+    use std::rc::Rc;
     use std::task::{Context, Poll, Waker};
 
     use norn_executor::park::SpinPark;
     use norn_executor::LocalExecutor;
+
+    use super::TASK_POLL_BUDGET;
 
     fn poll_once<F>(fut: Pin<&mut F>) -> Poll<F::Output>
     where
@@ -571,6 +586,76 @@ mod tests {
         });
 
         assert_eq!(out, Err("boom"));
+    }
+
+    #[test]
+    fn termination_cancels_children_left_in_the_runqueue() {
+        struct DropFlag<'a>(&'a Cell<bool>);
+
+        impl Drop for DropFlag<'_> {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+
+        let mut ex = LocalExecutor::new(SpinPark);
+        let dropped = Cell::new(false);
+        let dropped_ref = &dropped;
+        let out = ex.block_on(async {
+            crate::scope!(|scope| -> Result<(), &'static str> {
+                std::mem::drop(scope.spawn(async move |scope| {
+                    let _: () = scope.terminate(Err("stop")).await;
+                }));
+                let flag = DropFlag(dropped_ref);
+                std::mem::drop(scope.spawn(async move |_| {
+                    let _flag = flag;
+                    pending::<()>().await;
+                }));
+                Ok(())
+            })
+            .await
+        });
+
+        assert_eq!(out, Err("stop"));
+        assert!(dropped.get());
+    }
+
+    #[test]
+    fn self_waking_child_makes_progress_across_bounded_polls() {
+        struct SelfWaker {
+            polls: Rc<Cell<usize>>,
+        }
+
+        impl Future for SelfWaker {
+            type Output = ();
+
+            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                let polls = self.polls.get() + 1;
+                self.polls.set(polls);
+                if polls == TASK_POLL_BUDGET + 1 {
+                    Poll::Ready(())
+                } else {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            }
+        }
+
+        let polls = Rc::new(Cell::new(0));
+        let polls_by_child = Rc::clone(&polls);
+        let mut scope = Box::pin(crate::scope!(|scope| {
+            std::mem::drop(scope.spawn(async move |_| {
+                SelfWaker {
+                    polls: polls_by_child,
+                }
+                .await
+            }));
+        }));
+
+        assert!(matches!(poll_once(scope.as_mut()), Poll::Pending));
+        assert_eq!(polls.get(), TASK_POLL_BUDGET);
+        assert!(matches!(poll_once(scope.as_mut()), Poll::Ready(())));
+        assert_eq!(polls.get(), TASK_POLL_BUDGET + 1);
     }
 
     #[test]
