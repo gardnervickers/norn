@@ -195,14 +195,17 @@ impl Entry {
     }
 
     pub(crate) fn fire(&self, completion: Result<(), error::Error>) {
-        self.state.set(State::Fired);
-        self.complete.set(completion);
-        // Take the waker before invoking it so no mutable entry access spans
-        // the callback.
-        let waker = unsafe { (*self.waker.get()).take() };
-        if let Some(waker) = waker {
+        if let Some(waker) = self.complete(completion) {
             waker.wake();
         }
+    }
+
+    /// Commit completion without invoking callbacks while a wheel slot is detached.
+    pub(crate) fn complete(&self, completion: Result<(), error::Error>) -> Option<Waker> {
+        self.state.set(State::Fired);
+        self.complete.set(completion);
+        // Safety: entries are local-only, and this access performs no callbacks.
+        unsafe { (*self.waker.get()).take() }
     }
 }
 
