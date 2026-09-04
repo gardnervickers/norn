@@ -1,7 +1,6 @@
 use std::cell::{Cell, UnsafeCell};
 use std::pin::Pin;
 use std::ptr;
-use std::time::Duration;
 
 use cordyceps::List;
 
@@ -16,13 +15,12 @@ pub(crate) struct Wheels {
 }
 
 impl Wheels {
-    pub(crate) fn add(&self, entry: Pin<&mut entry::Entry>, duration: Duration) {
-        let expiration = self.elapsed().saturating_add(duration.as_millis() as u64);
-        self.add_at(entry, expiration);
-    }
-
-    pub(crate) fn add_at(&self, entry: Pin<&mut entry::Entry>, expiration: u64) {
-        if expiration <= self.elapsed() {
+    pub(crate) fn add_at(&self, entry: Pin<&mut entry::Entry>, expiration: u64, now: u64) {
+        if self.shutdown.get() {
+            entry.as_ref().fire(Err(error::Error::Shutdown));
+            return;
+        }
+        if expiration <= self.elapsed().max(now) {
             entry.as_ref().fire(Ok(()));
             return;
         }
@@ -245,7 +243,7 @@ mod tests {
     #[test]
     fn timer_fires_immediately() {
         let mut cx = futures_test::task::noop_context();
-        let timer = Driver::new((), Clock::system());
+        let timer = Driver::new((), Clock::simulated());
         let handle = timer.handle();
         let sleep = pin!(handle.sleep(Duration::from_millis(0)));
         assert!(sleep.poll(&mut cx).is_ready());
@@ -254,7 +252,7 @@ mod tests {
     #[test]
     fn future_timer_does_not_fire() {
         let mut cx = futures_test::task::noop_context();
-        let timer = Driver::new((), Clock::system());
+        let timer = Driver::new((), Clock::simulated());
         let handle = timer.handle();
         let mut sleep = pin!(handle.sleep(Duration::from_millis(1)));
         assert!(sleep.as_mut().poll(&mut cx).is_pending());
@@ -270,7 +268,7 @@ mod tests {
     #[test]
     fn timer_drop() {
         let mut cx = futures_test::task::noop_context();
-        let timer = Driver::new((), Clock::system());
+        let timer = Driver::new((), Clock::simulated());
         let handle = timer.handle();
         {
             let mut sleep = pin!(handle.sleep(Duration::from_millis(1)));
@@ -282,7 +280,7 @@ mod tests {
     #[test]
     fn timer_fire() {
         let mut cx = futures_test::task::noop_context();
-        let timer = Driver::new((), Clock::system());
+        let timer = Driver::new((), Clock::simulated());
         let handle = timer.handle();
         let mut sleep = pin!(handle.sleep(Duration::from_millis(20)));
         assert!(sleep.as_mut().poll(&mut cx).is_pending());
@@ -299,7 +297,7 @@ mod tests {
     #[test]
     fn higher_level_timer_reports_exact_deadline() {
         let mut cx = futures_test::task::noop_context();
-        let timer = Driver::new((), Clock::system());
+        let timer = Driver::new((), Clock::simulated());
         let handle = timer.handle();
         let mut sleep = pin!(handle.sleep(Duration::from_millis(1000)));
         assert!(sleep.as_mut().poll(&mut cx).is_pending());
@@ -321,7 +319,7 @@ mod tests {
     #[test]
     fn removing_earliest_timer_updates_slot_deadline() {
         let mut cx = futures_test::task::noop_context();
-        let timer = Driver::new((), Clock::system());
+        let timer = Driver::new((), Clock::simulated());
         let handle = timer.handle();
         let mut second = pin!(handle.sleep(Duration::from_millis(1020)));
 
@@ -352,7 +350,7 @@ mod tests {
     #[test]
     fn removing_multiple_earliest_timers_preserves_exact_deadline() {
         let mut cx = futures_test::task::noop_context();
-        let timer = Driver::new((), Clock::system());
+        let timer = Driver::new((), Clock::simulated());
         let handle = timer.handle();
         let mut first = Box::pin(handle.sleep(Duration::from_millis(4096)));
         let mut second = Box::pin(handle.sleep(Duration::from_millis(4097)));
