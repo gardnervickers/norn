@@ -1,5 +1,6 @@
 use std::any::Any;
 use std::cell::{Cell, RefCell, UnsafeCell};
+use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
@@ -91,6 +92,46 @@ pub struct Driver {
     /// [`Driver::drop`] releases the buffer only after the drain sentinel proves
     /// every earlier request, including the eventfd read, is terminal.
     unparker_buf: mem::ManuallyDrop<UnparkerBuffer>,
+    /// CQEs copied out of the kernel ring but not dispatched because a wake
+    /// callback unwound. This is empty on the normal path.
+    deferred_cqes: RefCell<VecDeque<cqueue::Entry>>,
+}
+
+/// Tracks one batch copied from the kernel CQ.
+///
+/// Advancing the cursor before dispatch gives an unwinding destructor an exact
+/// tail to preserve. The current entry has either reached its operation or is
+/// a special token whose state transition was committed before any callback.
+struct CqeBatch<'a> {
+    entries: &'a [cqueue::Entry],
+    next: usize,
+    deferred: &'a RefCell<VecDeque<cqueue::Entry>>,
+}
+
+impl<'a> CqeBatch<'a> {
+    fn new(entries: &'a [cqueue::Entry], deferred: &'a RefCell<VecDeque<cqueue::Entry>>) -> Self {
+        Self {
+            entries,
+            next: 0,
+            deferred,
+        }
+    }
+
+    fn next(&mut self) -> Option<&'a cqueue::Entry> {
+        let entry = self.entries.get(self.next)?;
+        self.next += 1;
+        Some(entry)
+    }
+}
+
+impl Drop for CqeBatch<'_> {
+    fn drop(&mut self) {
+        if self.next < self.entries.len() {
+            self.deferred
+                .borrow_mut()
+                .extend(self.entries[self.next..].iter().cloned());
+        }
+    }
 }
 
 struct UnparkerBuffer {
@@ -595,6 +636,7 @@ impl Driver {
             }),
             unparker: Arc::new(unpark::Unparker::new()?),
             unparker_buf: mem::ManuallyDrop::new(UnparkerBuffer::new()),
+            deferred_cqes: RefCell::new(VecDeque::new()),
         })
     }
 
@@ -677,67 +719,25 @@ impl Driver {
             unsafe { mem::MaybeUninit::uninit().assume_init() };
         let mut total_drained = 0;
         loop {
+            while total_drained < max {
+                let entry = self.deferred_cqes.borrow_mut().pop_front();
+                let Some(entry) = entry else {
+                    break;
+                };
+                self.dispatch_cqe(&entry);
+                total_drained += 1;
+            }
+            if total_drained >= max {
+                break;
+            }
+
             let remaining = max - total_drained;
             let batch_len = remaining.min(N);
             let (entries, has_more) = self.shared.drain_fill(&mut entries[..batch_len]);
             let nr_drained = entries.len();
-            for cqe in entries {
-                let user_data = cqe.user_data() as usize;
-                if user_data == Self::OPERATIONS_DRAIN_TOKEN {
-                    debug_assert_eq!(self.shared.status(), Status::DrainingOperations);
-                    if cqe.result() < 0 {
-                        let err = io::Error::from_raw_os_error(-cqe.result());
-                        warn!(target: LOG, "drain.operations.failed {err:?}");
-                        self.shared.set_status(Status::Closing);
-                    } else {
-                        trace!(target: LOG, "drain.operations.token");
-                        self.shared.set_status(Status::ClosingResources);
-                    }
-                    continue;
-                }
-                if user_data == Self::RESOURCES_DRAIN_TOKEN {
-                    debug_assert_eq!(self.shared.status(), Status::DrainingResources);
-                    if cqe.result() < 0 {
-                        let err = io::Error::from_raw_os_error(-cqe.result());
-                        warn!(target: LOG, "drain.resources.failed {err:?}");
-                        self.shared.set_status(Status::ClosingResources);
-                    } else {
-                        trace!(target: LOG, "drain.resources.token");
-                        self.shared.finish_shutdown(ShutdownOutcome::CleanDrained);
-                    }
-                    continue;
-                }
-                if user_data == Self::UNPARKER_WAKE_TOKEN {
-                    trace!(target: LOG, "drain.token");
-                    self.unparker.reset();
-                    continue;
-                }
-
-                if user_data == Self::CANCELLATION_TOKEN {
-                    trace!(target: LOG, "cancellation.token");
-                    continue;
-                }
-
-                if user_data == Self::CLOSE_FD_TOKEN {
-                    trace!(target: LOG, "close_fd.token");
-                    continue;
-                }
-
-                if user_data <= 1024 {
-                    let result = cqe.result();
-                    let result = if result >= 0 {
-                        Ok(result as u32)
-                    } else {
-                        Err(io::Error::from_raw_os_error(-result))
-                    };
-                    warn!(target: LOG, "drain.invalid_user_data {result:?}");
-                    // Surely nothing in our heap is going to be allocated at < 1024!
-                    // We are keeping this space reserved for additional operations.
-                    continue;
-                }
-                // Safety: This is being called on a completion queue entry which has been generated
-                // by a prior submission.
-                unsafe { reap_operation(cqe) }
+            let mut batch = CqeBatch::new(entries, &self.deferred_cqes);
+            while let Some(cqe) = batch.next() {
+                self.dispatch_cqe(cqe);
             }
             total_drained += nr_drained;
             if !has_more || total_drained >= max {
@@ -745,6 +745,65 @@ impl Driver {
             }
         }
         total_drained
+    }
+
+    fn dispatch_cqe(&self, cqe: &cqueue::Entry) {
+        let user_data = cqe.user_data() as usize;
+        if user_data == Self::OPERATIONS_DRAIN_TOKEN {
+            debug_assert_eq!(self.shared.status(), Status::DrainingOperations);
+            if cqe.result() < 0 {
+                let err = io::Error::from_raw_os_error(-cqe.result());
+                warn!(target: LOG, "drain.operations.failed {err:?}");
+                self.shared.set_status(Status::Closing);
+            } else {
+                trace!(target: LOG, "drain.operations.token");
+                self.shared.set_status(Status::ClosingResources);
+            }
+            return;
+        }
+        if user_data == Self::RESOURCES_DRAIN_TOKEN {
+            debug_assert_eq!(self.shared.status(), Status::DrainingResources);
+            if cqe.result() < 0 {
+                let err = io::Error::from_raw_os_error(-cqe.result());
+                warn!(target: LOG, "drain.resources.failed {err:?}");
+                self.shared.set_status(Status::ClosingResources);
+            } else {
+                trace!(target: LOG, "drain.resources.token");
+                self.shared.finish_shutdown(ShutdownOutcome::CleanDrained);
+            }
+            return;
+        }
+        if user_data == Self::UNPARKER_WAKE_TOKEN {
+            trace!(target: LOG, "drain.token");
+            self.unparker.reset();
+            return;
+        }
+
+        if user_data == Self::CANCELLATION_TOKEN {
+            trace!(target: LOG, "cancellation.token");
+            return;
+        }
+
+        if user_data == Self::CLOSE_FD_TOKEN {
+            trace!(target: LOG, "close_fd.token");
+            return;
+        }
+
+        if user_data <= 1024 {
+            let result = cqe.result();
+            let result = if result >= 0 {
+                Ok(result as u32)
+            } else {
+                Err(io::Error::from_raw_os_error(-result))
+            };
+            warn!(target: LOG, "drain.invalid_user_data {result:?}");
+            // Surely nothing in our heap is going to be allocated at < 1024!
+            // We are keeping this space reserved for additional operations.
+            return;
+        }
+        // Safety: This is being called on a completion queue entry which has been generated
+        // by a prior submission.
+        unsafe { reap_operation(cqe) }
     }
 
     fn retry_shutdown(&self, stage: &'static str, err: &io::Error) {
@@ -1007,11 +1066,13 @@ impl Shared {
     /// All waiters will be notified of the status change.
     fn set_status(&self, status: Status) {
         debug!(target: LOG, "status.change {:?} => {:?}", self.status.get(), status);
-        if status != self.status.get() {
-            // On status change, notify all waiters.
+        let previous = self.status.replace(status);
+        if status != previous {
+            // Commit the state before callbacks. A waker may panic, but the
+            // CQE that caused this transition has already been consumed and
+            // subsequent driver work must observe its new stage.
             self.backpressure.notify(usize::MAX);
         }
-        self.status.set(status);
     }
 
     /// Attempt to push a single entry into the submission queue.
@@ -1407,10 +1468,12 @@ mod tests {
     use std::net::TcpListener;
     use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
     use std::os::unix::net::UnixStream;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::pin::pin;
     use std::rc::Rc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc};
-    use std::task::Poll;
+    use std::task::{Context, Poll, Wake, Waker};
     use std::time::Duration;
 
     use smallvec::SmallVec;
@@ -1733,6 +1796,132 @@ mod tests {
         preload_nop_completions(&unbounded, 3);
         unbounded.park(ParkMode::NoPark).unwrap();
         assert_eq!(unbounded.shared.ring.borrow_mut().completion().len(), 0);
+    }
+
+    struct PanicOnce(AtomicBool);
+
+    impl Wake for PanicOnce {
+        fn wake(self: Arc<Self>) {
+            assert!(self.0.swap(true, Ordering::SeqCst), "completion wake panic");
+        }
+    }
+
+    struct TrackedCompletion(Arc<AtomicUsize>);
+
+    impl Drop for TrackedCompletion {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct TrackedNop {
+        reaped: Arc<AtomicUsize>,
+        completions_dropped: Arc<AtomicUsize>,
+        operations_dropped: Arc<AtomicUsize>,
+    }
+
+    impl Drop for TrackedNop {
+        fn drop(&mut self) {
+            self.operations_dropped.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    // Safety: the NOP has no external resources and its completion owns only
+    // the test accounting handle.
+    unsafe impl Operation for TrackedNop {
+        type Completion = TrackedCompletion;
+
+        fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+            Ok(opcode::Nop::new().build())
+        }
+
+        unsafe fn reap(&mut self, _result: CQEResult) -> Self::Completion {
+            self.reaped.fetch_add(1, Ordering::SeqCst);
+            TrackedCompletion(Arc::clone(&self.completions_dropped))
+        }
+    }
+
+    impl Singleshot for TrackedNop {
+        type Output = ();
+
+        fn complete(self, completion: Self::Completion) -> Self::Output {
+            drop(completion);
+        }
+    }
+
+    #[test]
+    fn panicking_completion_waker_preserves_cqe_tail_and_resources() {
+        let mut driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let reaped = Arc::new(AtomicUsize::new(0));
+        let completions_dropped = Arc::new(AtomicUsize::new(0));
+        let operations_dropped = Arc::new(AtomicUsize::new(0));
+        let new_op = || TrackedNop {
+            reaped: Arc::clone(&reaped),
+            completions_dropped: Arc::clone(&completions_dropped),
+            operations_dropped: Arc::clone(&operations_dropped),
+        };
+
+        let mut first = Box::pin(driver.handle().submit(new_op()));
+        let mut second = Box::pin(driver.handle().submit(new_op()));
+        let panic_waker = Waker::from(Arc::new(PanicOnce(AtomicBool::new(false))));
+        assert!(first
+            .as_mut()
+            .poll(&mut Context::from_waker(&panic_waker))
+            .is_pending());
+        assert!(second
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+
+        driver.park(ParkMode::NoPark).unwrap();
+        let panic = catch_unwind(AssertUnwindSafe(|| driver.park(ParkMode::NoPark)));
+        assert!(panic.is_err(), "the waker panic must propagate");
+
+        // The first completion was reaped before the wake. Dropping its future
+        // must release its completion and operation even though draining unwound.
+        drop(first);
+        driver.park(ParkMode::NoPark).unwrap();
+        assert!(driver.deferred_cqes.borrow().is_empty());
+        assert!(second
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_ready());
+        drop(second);
+
+        assert_eq!(reaped.load(Ordering::SeqCst), 2);
+        assert_eq!(completions_dropped.load(Ordering::SeqCst), 2);
+        assert_eq!(operations_dropped.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn status_transition_commits_before_panicking_waiter() {
+        let driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let mut panicking_waiter = pin!(driver.shared.backpressure.wait());
+        let panic_waker = Waker::from(Arc::new(PanicOnce(AtomicBool::new(false))));
+        assert!(Future::poll(
+            panicking_waiter.as_mut(),
+            &mut Context::from_waker(&panic_waker)
+        )
+        .is_pending());
+
+        let (waker, wake_count) = futures_test::task::new_count_waker();
+        let mut following_waiter = pin!(driver.shared.backpressure.wait());
+        assert!(
+            Future::poll(following_waiter.as_mut(), &mut Context::from_waker(&waker)).is_pending()
+        );
+
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            driver.shared.set_status(Status::Closing);
+        }));
+        assert!(panic.is_err(), "the waiter panic must propagate");
+        assert_eq!(driver.shared.status(), Status::Closing);
+
+        driver.shared.set_status(Status::DrainingOperations);
+        assert_eq!(wake_count.get(), 1);
+
+        // This unit test transitions the status directly, without submitting
+        // the drain sentinel that would normally establish this state.
+        driver.shared.finish_shutdown(ShutdownOutcome::CleanDrained);
     }
 
     #[test]
