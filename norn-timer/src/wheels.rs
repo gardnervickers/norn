@@ -1,6 +1,8 @@
-use std::cell::{Cell, UnsafeCell};
+use std::cell::{Cell, RefCell, UnsafeCell};
+use std::collections::VecDeque;
 use std::pin::Pin;
 use std::ptr;
+use std::task::Waker;
 use std::time::Duration;
 
 use cordyceps::List;
@@ -13,6 +15,25 @@ pub(crate) struct Wheels {
     levels: UnsafeCell<[level::Level; NUM_LEVELS]>,
     next_expiration_hint: Cell<Option<level::Expiration>>,
     next_expiration_dirty: Cell<bool>,
+    // Reuse wake storage without retaining a borrow across user callbacks.
+    wake_storage: RefCell<VecDeque<Waker>>,
+}
+
+struct WakeBatch(VecDeque<Waker>);
+
+impl WakeBatch {
+    fn wake_all(&mut self) {
+        while let Some(waker) = self.0.pop_front() {
+            waker.wake();
+        }
+    }
+}
+
+impl Drop for WakeBatch {
+    fn drop(&mut self) {
+        // If one callback unwinds, still notify the remaining completed timers.
+        self.wake_all();
+    }
 }
 
 impl Wheels {
@@ -38,6 +59,7 @@ impl Wheels {
             levels: UnsafeCell::new(std::array::from_fn(level::Level::new)),
             next_expiration_hint: Cell::new(None),
             next_expiration_dirty: Cell::new(false),
+            wake_storage: RefCell::new(VecDeque::new()),
         }
     }
 
@@ -57,6 +79,7 @@ impl Wheels {
     pub(crate) fn advance(&self, now: u64) -> (usize, Option<level::Expiration>) {
         let mut pending = List::<entry::Entry>::new();
         let mut fired = 0;
+        let mut wakers = self.wake_storage.take();
 
         let mut next_expiration = self.next_expiration();
         while let Some(expiration) = next_expiration {
@@ -71,21 +94,22 @@ impl Wheels {
                     pending.push_front(entry);
                 } else {
                     fired += 1;
-                    unsafe { entry.as_ref().fire(Ok(())) };
+                    if let Some(waker) = unsafe { entry.as_ref().complete(Ok(())) } {
+                        wakers.push_back(waker);
+                    }
                 }
             }
             self.set_elapsed(expiration.deadline());
             next_expiration = self.next_expiration();
         }
         self.set_elapsed(now);
-        let needs_reschedule = !pending.is_empty();
         for entry in pending.into_iter() {
             self.insert(entry);
         }
-        if needs_reschedule {
-            next_expiration = self.next_expiration();
-        }
-        (fired, next_expiration)
+        // Every entry now belongs to its wheel or has completed. Callbacks may
+        // drop or register timers, so inspect the next deadline after waking.
+        self.wake_all(wakers);
+        (fired, self.next_expiration())
     }
 
     pub(crate) fn elapsed(&self) -> u64 {
@@ -190,12 +214,25 @@ impl Wheels {
 
     pub(crate) fn shutdown(&self) {
         self.shutdown.set(true);
+        let mut wakers = self.wake_storage.take();
         while let Some(exp) = self.next_expiration() {
             let entries = self.take_entries(&exp);
             for entry in entries {
-                unsafe { entry.as_ref().fire(Err(error::Error::Shutdown)) };
+                if let Some(waker) = unsafe { entry.as_ref().complete(Err(error::Error::Shutdown)) }
+                {
+                    wakers.push_back(waker);
+                }
             }
         }
+        self.wake_all(wakers);
+    }
+
+    fn wake_all(&self, wakers: VecDeque<Waker>) {
+        let mut batch = WakeBatch(wakers);
+        batch.wake_all();
+        // Reentrant advancement may have populated its own empty storage. No
+        // wakers are dropped while this cache is borrowed.
+        self.wake_storage.replace(std::mem::take(&mut batch.0));
     }
 }
 
