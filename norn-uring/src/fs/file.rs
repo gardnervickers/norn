@@ -2,6 +2,7 @@ use io_uring::types::FsyncFlags;
 use io_uring::{opcode, types};
 use std::io;
 use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 use crate::buf::{set_init_checked, StableBuf, StableBufMut};
@@ -537,10 +538,7 @@ struct Open {
 
 impl Open {
     fn new(path: &Path, access_mode: i32, creation_mode: i32, mode: u32) -> io::Result<Self> {
-        let path = path
-            .to_str()
-            .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
-        let path = std::ffi::CString::new(path)?;
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
         let flags = access_mode | creation_mode | libc::O_CLOEXEC;
         let mut how = types::OpenHow::new().flags(flags as u64);
         if creation_mode & libc::O_CREAT != 0 {
