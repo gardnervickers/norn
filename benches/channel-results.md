@@ -500,3 +500,45 @@ without a bootstrap transport.
   lost-wakeup handshake.
 - Deliberately deferred: bounded bulk submit still needs partial-enqueue and
   ownership-return semantics; it is not part of this PR.
+
+## 2026-08-27: remove dynamic remainder from sharded receive
+
+The four-worker network profile identified
+`ShardedReceiver::drain_into` as the largest named Norn channel cost. Each
+message selected its next ready lane with two remainder operations whose
+divisor was the runtime lane count. The candidate preserves the same
+message-level round-robin order and replaces those remainders with conditional
+index wraparound.
+
+Seven process-isolated baseline/candidate pairs alternated order on the
+existing pinned four-producer, four-lane benchmark:
+
+```console
+taskset -c 2,4,6,8,10 \
+  NORN_CHANNEL_CONSUMER_CPU=2 \
+  NORN_CHANNEL_PRODUCER_CPUS=4,6,8,10 \
+  <channel-benchmark> \
+  throughput/4p1c/sharded/recv_limit=32/messages=262144
+```
+
+| Metric | Baseline | Candidate | Delta |
+| --- | ---: | ---: | ---: |
+| Median round time | 1,135,061 ns | 1,033,046 ns | -8.99% |
+| Aggregate throughput | 230.951 Mmsg/s | 253.758 Mmsg/s | +9.88% |
+
+Every paired round-time delta favored the candidate, ranging from -8.26% to
+-9.63%; the paired median was -8.92%. Raw results and the frozen executable
+hashes are under `/tmp/norn-channel-modulo-pairs/`.
+
+The unchanged 256-byte, pipeline-32, four-worker KV sample was also run in five
+alternating pairs. Its reuse-port connection placement remained too variable
+for a fine application-level claim: external-throughput deltas ranged from
+-28.54% to +19.97%, with a paired median of +0.0015%. Every run completed all
+32,000,000 requests with zero misses and connection errors. Treat this as a
+neutral correctness/regression guardrail, not evidence of an end-to-end KV
+gain. Raw results are under `/tmp/norn-channel-wrap-kv-pairs/`.
+
+Decision: retain. This is a Norn channel implementation improvement; the KV
+example and benchmark harness are unchanged. Channel tests cover exact
+round-robin ordering, bounded capacity, per-producer FIFO, closure, and forced
+empty-transition wakeup races.
