@@ -10,6 +10,10 @@ norn-channel = { path = "../../norn-channel" }
 norn-executor = { path = "../../norn-executor" }
 smallvec = "1.11.1"
 thiserror.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hdrhistogram = { version = "7", default-features = false }
+tokio = { version = "1", features = ["rt", "net", "io-util", "time", "sync"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"
@@ -23,3 +27,7 @@ path = "src/main.rs"
 [[bin]]
 name = "norn-kv-loadgen"
 path = "src/bin/network-loadgen.rs"
+
+[[bin]]
+name = "norn-mixed-loadgen"
+path = "src/bin/mixed-loadgen.rs"
