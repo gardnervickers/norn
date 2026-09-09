@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "seed": 1,
+  "threads": 2,
+  "connections": 8,
+  "pipeline": 32,
+  "max_in_flight_bytes_per_connection": 1048576,
+  "small_keys": 32,
+  "medium_keys": 16,
+  "large_keys": 8,
+  "overwrite_slots": 2,
+  "server_workers": 1,
+  "hot_shard": 0,
+  "warmup_ms": 100,
+  "steady_ms": 500,
+  "overload_ms": 300,
+  "recovery_ms": 500,
+  "drain_ms": 5000,
+  "rate": 1000,
+  "overload_rate": 2000,
+  "max_schedule_lag_us": 20000,
+  "deadlines_us": [
+    2000,
+    5000,
+    20000,
+    5000
+  ],
+  "histogram_max_us": 60000000,
+  "profile": "overload"
+}

@@ -16,6 +16,7 @@
 pub mod codec;
 pub mod handler;
 pub mod memory;
+pub mod mixed_workload;
 pub mod protocol;
 
 #[cfg(target_os = "linux")]
