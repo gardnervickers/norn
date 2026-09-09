@@ -52,6 +52,12 @@ still be built on macOS.
 
 ## Examples
 
+The [mixed network workload](examples/norn-kv-server/MIXED_WORKLOAD.md) is the
+primary end-to-end performance harness. It reuses the optimized in-memory
+server with scheduled mixed-size GET/SET traffic, per-class latency reporting,
+and overload/recovery profiles. The older memtier scripts remain diagnostic
+references.
+
 - [`examples/norn-kv`](examples/norn-kv/) is a small block-oriented key/value
   store. It uses `norn-uring` on Linux and a blocking backend elsewhere.
 - [`examples/ping-pong-grpc`](examples/ping-pong-grpc/) runs a tonic gRPC
