@@ -131,6 +131,14 @@ than an exact measurement-window CPU-per-operation result. Server termination
 is runner cleanup; the result makes no graceful-shutdown guarantee.
 
 The runner supports explicit `--client` and `--server` paths for comparisons.
+The `mixed-v1-balanced-four-workers.json` manifest provides a 20,000 requests/s
+screen with four server workers and one client thread. On the local workstation,
+use `--workers 4 --server-cpus 0,1,2,3 --client-cpus 8 --require-performance`.
+It exercises cross-worker dispatch; the single-worker default bypasses that
+path. See [the initial paired screen](../../benches/mixed-perf-screen-2026-09-13.md)
+for qualification, exact binaries, and limitations. Requalify on another host
+or at another rate.
+
 Build each server separately, pass the same frozen client path to both, and
 alternate process-isolated baseline/candidate runs. Record each immediate-parent
 comparison separately from a full-stack comparison. Keep existing component
