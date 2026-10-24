@@ -1072,22 +1072,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "norn-kv-bench"
+version = "0.1.0"
+dependencies = [
+ "hdrhistogram",
+ "libc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "norn-kv-server"
 version = "0.1.0"
 dependencies = [
  "foldhash",
  "futures-util",
- "hdrhistogram",
  "io-uring",
  "libc",
  "norn-channel",
  "norn-executor",
  "norn-uring",
- "serde",
- "serde_json",
  "smallvec",
  "thiserror",
- "tokio",
 ]
 
 [[package]]

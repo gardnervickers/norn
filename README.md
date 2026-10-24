@@ -52,12 +52,6 @@ still be built on macOS.
 
 ## Examples
 
-The [mixed network workload](examples/norn-kv-server/MIXED_WORKLOAD.md) is the
-primary end-to-end performance harness. It reuses the optimized in-memory
-server with scheduled mixed-size GET/SET traffic, per-class latency reporting,
-and overload/recovery profiles. The older memtier scripts remain diagnostic
-references.
-
 - [`examples/norn-kv`](examples/norn-kv/) is a small block-oriented key/value
   store. It uses `norn-uring` on Linux and a blocking backend elsewhere.
 - [`examples/ping-pong-grpc`](examples/ping-pong-grpc/) runs a tonic gRPC
@@ -68,9 +62,16 @@ references.
 - [`norn-nursery` crate documentation](norn-nursery/src/lib.rs) demonstrates
   scoped borrowing, nested child tasks, and early termination.
 
+[`examples/norn-kv-bench`](examples/norn-kv-bench/) is the end-to-end
+benchmark for runtime optimization. It drives `norn-kv-server` with a mixed
+memcached-binary workload and reports validated, low-noise server cost per
+request (instructions, CPU time, context switches) at saturation and at fixed
+offered rates, per-class latency, and paired baseline/candidate comparisons.
+
 The [`benches`](benches/) package contains focused task, executor, timer,
-channel, HTTP, buffer, and `io_uring` benchmarks. Results and methodology are
-recorded alongside the benchmarks.
+channel, HTTP, buffer, and `io_uring` benchmarks that diagnose why an
+end-to-end number moved. Results and methodology are recorded alongside the
+benchmarks.
 
 ## Building and checking documentation
 

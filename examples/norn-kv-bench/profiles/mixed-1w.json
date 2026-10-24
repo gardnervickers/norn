@@ -1,0 +1,111 @@
+{
+  "version": 2,
+  "name": "mixed-1w",
+  "seed": 1,
+  "server_workers": 1,
+  "client": {
+    "threads": 4,
+    "connections": 128,
+    "closed_loop_depth": 8,
+    "max_outstanding_per_connection": 512
+  },
+  "keyspaces": [
+    {
+      "name": "small",
+      "keys": 100000,
+      "value_min": 64,
+      "value_max": 512,
+      "zipf": 0.99
+    },
+    {
+      "name": "medium",
+      "keys": 10000,
+      "value_min": 2048,
+      "value_max": 8192,
+      "zipf": 0.99
+    },
+    {
+      "name": "large",
+      "keys": 512,
+      "value_min": 32768,
+      "value_max": 49152,
+      "zipf": 0.0
+    }
+  ],
+  "writable": {
+    "slots_per_connection": 16,
+    "value_min": 64,
+    "value_max": 4096
+  },
+  "mix": [
+    {
+      "class": "get_small",
+      "op": "get",
+      "keyspace": "small",
+      "weight": 60
+    },
+    {
+      "class": "get_medium",
+      "op": "get",
+      "keyspace": "medium",
+      "weight": 14
+    },
+    {
+      "class": "get_large",
+      "op": "get",
+      "keyspace": "large",
+      "weight": 2
+    },
+    {
+      "class": "get_miss",
+      "op": "get_miss",
+      "weight": 6
+    },
+    {
+      "class": "set",
+      "op": "set",
+      "weight": 12
+    },
+    {
+      "class": "get_own",
+      "op": "get_own",
+      "weight": 6
+    }
+  ],
+  "bursts": [
+    {
+      "size": 1,
+      "weight": 80
+    },
+    {
+      "size": 8,
+      "weight": 15
+    },
+    {
+      "size": 32,
+      "weight": 5
+    }
+  ],
+  "churn": {
+    "connections_per_sec": 500,
+    "requests_per_connection": 4,
+    "keyspace": "small"
+  },
+  "phases": {
+    "warmup_ms": 2000,
+    "capacity_ms": 6000,
+    "settle_ms": 1000,
+    "segment_ms": 5000,
+    "drain_timeout_ms": 10000
+  },
+  "rates": [
+    20000,
+    100000,
+    250000
+  ],
+  "qualification": {
+    "max_lag_p99_us": 50.0,
+    "min_capacity_utilization": 0.9,
+    "max_preemptions_per_s": 20.0
+  }
+}
