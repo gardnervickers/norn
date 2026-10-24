@@ -53,6 +53,36 @@ fn incoming_connections() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn incoming_rearms_multishot_accept_terminated_by_full_completion_queue(
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Two SQ entries give a four-entry completion queue. The kernel ends a
+    // multishot accept, without an error, when it cannot post another
+    // completion; the stream must re-arm rather than report end of stream.
+    let driver = norn_uring::Driver::new(io_uring::IoUring::builder(), 2)?;
+    let mut executor = norn_executor::LocalExecutor::new(driver);
+    executor.block_on(async {
+        let listener = TcpListener::bind("127.0.0.1:0".parse()?, 128).await?;
+        let addr = listener.local_addr()?;
+        let mut incoming = pin!(listener.incoming());
+
+        let mut clients = vec![std::net::TcpStream::connect(addr)?];
+        let mut accepted = vec![incoming.next().await.unwrap()?];
+        // Completions for these are posted while the stream is not polled,
+        // overflowing the completion queue.
+        for _ in 0..32 {
+            clients.push(std::net::TcpStream::connect(addr)?);
+        }
+        while accepted.len() < clients.len() {
+            match incoming.next().await {
+                Some(socket) => accepted.push(socket?),
+                None => panic!("accept stream ended after {} connections", accepted.len()),
+            }
+        }
+        Ok(())
+    })
+}
+
+#[test]
 fn single_accept_connection() -> Result<(), Box<dyn std::error::Error>> {
     util::with_test_env(|| async {
         let listener = TcpListener::bind("127.0.0.1:0".parse()?, 32).await?;
