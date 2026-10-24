@@ -98,7 +98,7 @@ impl Park for FastPark {
             ParkMode::NoPark => Ok(()),
             ParkMode::NextCompletion => unimplemented!(),
             ParkMode::Timeout(duration) => {
-                self.0.advance(duration);
+                self.0.advance(duration / 2);
                 Ok(())
             }
         }

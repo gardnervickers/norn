@@ -172,12 +172,22 @@ impl Wheels {
         let now = self.elapsed.get();
         // Safety: Scanning is local-only and does not call user code.
         let levels = unsafe { &mut *self.levels.get() };
-        for level in levels.iter_mut() {
-            if let Some(expiration) = level.next_expiration(now) {
-                return Some(expiration);
+        let (lowest, mut next) = levels
+            .iter_mut()
+            .enumerate()
+            .find_map(|(index, level)| Some((index, level.next_expiration(now)?)))?;
+        // Slots are taken at their earliest deadline rather than when elapsed
+        // time enters them. A higher level's current slot can therefore still
+        // hold a deadline before every lower-level timer; its later slots
+        // cannot.
+        for level in &mut levels[lowest + 1..] {
+            if let Some(current) = level.current_expiration(now) {
+                if current.deadline() < next.deadline() {
+                    next = current;
+                }
             }
         }
-        None
+        Some(next)
     }
 
     /// Set the amount of ticks which have elapsed since the creation of this Wheel, if `when`

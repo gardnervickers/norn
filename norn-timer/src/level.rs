@@ -106,6 +106,15 @@ impl Level {
         Some(expiration)
     }
 
+    /// Return the earliest deadline in the slot containing `now`.
+    pub(crate) fn current_expiration(&mut self, now: u64) -> Option<Expiration> {
+        let slot = slot_for(now, self.level);
+        if self.bitfield & occupied_bit(slot) == 0 {
+            return None;
+        }
+        Some(Expiration::new(self.level, slot, self.slot_deadline(slot)))
+    }
+
     fn slot_deadline(&mut self, slot: usize) -> u64 {
         let slot_bit = occupied_bit(slot);
         if self.dirty_slots & slot_bit != 0 {

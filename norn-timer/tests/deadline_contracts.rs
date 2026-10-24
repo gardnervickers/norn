@@ -319,3 +319,44 @@ fn saturated_deadline_does_not_block_an_earlier_top_level_timer() {
     );
     poll_pending(saturated.as_mut());
 }
+
+#[test]
+fn lower_level_timer_does_not_hide_an_earlier_higher_level_deadline() {
+    let clock = Clock::simulated();
+    let modes = Rc::new(RefCell::new(Vec::new()));
+    let mut driver = Driver::new(RecordPark(Rc::clone(&modes)), clock.clone());
+    let handle = driver.handle();
+
+    let mut earlier = Box::pin(handle.sleep(Duration::from_millis(5000)));
+    poll_pending(earlier.as_mut());
+    clock.advance(Duration::from_millis(4100));
+    driver.park(ParkMode::NoPark).unwrap();
+
+    let mut later = Box::pin(handle.sleep(Duration::from_millis(4000)));
+    poll_pending(later.as_mut());
+    let mut unrelated = Box::pin(handle.sleep(Duration::from_millis(100)));
+    poll_pending(unrelated.as_mut());
+    clock.advance(Duration::from_millis(100));
+    driver.park(ParkMode::NoPark).unwrap();
+    assert_eq!(
+        unrelated
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop())),
+        Poll::Ready(Ok(()))
+    );
+
+    driver.park(ParkMode::NextCompletion).unwrap();
+    assert_eq!(
+        modes.borrow().last(),
+        Some(&ParkMode::Timeout(Duration::from_millis(800)))
+    );
+    clock.advance(Duration::from_millis(800));
+    driver.park(ParkMode::NoPark).unwrap();
+    assert_eq!(
+        earlier
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop())),
+        Poll::Ready(Ok(()))
+    );
+    poll_pending(later.as_mut());
+}
