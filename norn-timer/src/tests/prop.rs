@@ -8,12 +8,8 @@ use crate::clock::Clock;
 use crate::entry;
 use crate::wheels::Wheels;
 
-fn new_sleep(wheels: &Rc<Wheels>, clock: &Clock, deadline: u64) -> Pin<Box<entry::Sleep>> {
-    Box::pin(entry::Sleep::new_at(
-        wheels.clone(),
-        clock.clone(),
-        deadline,
-    ))
+fn new_sleep(wheels: &Rc<Wheels>, deadline: u64) -> Pin<Box<entry::Sleep>> {
+    Box::pin(entry::Sleep::new_at(wheels.clone(), deadline))
 }
 
 proptest! {
@@ -23,12 +19,11 @@ proptest! {
         cases in prop::collection::vec((prop_oneof![1..64 * 128_u64, 1..=u64::MAX], any::<bool>()), 1..128)
     ) {
         let mut cx = futures_test::task::noop_context();
-        let wheels = Rc::new(Wheels::new());
-        let clock = Clock::simulated();
+        let wheels = Rc::new(Wheels::new(Clock::simulated()));
         let mut timers = Vec::with_capacity(cases.len());
 
         for &(timestamp, cancel) in &cases {
-            let mut timer = new_sleep(&wheels, &clock, timestamp);
+            let mut timer = new_sleep(&wheels, timestamp);
             assert!(timer.as_mut().poll(&mut cx).is_pending());
             timers.push((timestamp, cancel, Some(timer)));
         }
@@ -72,13 +67,12 @@ proptest! {
         // 4. For each poll time, advance the wheel and check if it should return
         //    a timer.
         let mut cx = futures_test::task::noop_context();
-        let wheels = Rc::new(Wheels::new());
-        let clock = Clock::simulated();
+        let wheels = Rc::new(Wheels::new(Clock::simulated()));
 
 
         let mut timers = vec![];
         for &timestamp in timestamps.iter() {
-            let mut timer = new_sleep(&wheels, &clock, timestamp);
+            let mut timer = new_sleep(&wheels, timestamp);
             // poll the timer to register it
             assert!(timer.as_mut().poll(&mut cx).is_pending());
             timers.push(timer);
@@ -115,12 +109,11 @@ proptest! {
         // 3. Advance the wheel until it returns None.
         // 4. All of the timers should have fired.
         let mut cx = futures_test::task::noop_context();
-        let wheels = Rc::new(Wheels::new());
-        let clock = Clock::simulated();
+        let wheels = Rc::new(Wheels::new(Clock::simulated()));
 
         let mut timers = vec![];
         for &timestamp in timestamps.iter() {
-            let mut timer = new_sleep(&wheels, &clock, timestamp);
+            let mut timer = new_sleep(&wheels, timestamp);
             // poll the timer to register it
             assert!(timer.as_mut().poll(&mut cx).is_pending());
             timers.push(timer);

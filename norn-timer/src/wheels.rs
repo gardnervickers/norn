@@ -6,9 +6,10 @@ use std::task::Waker;
 
 use cordyceps::List;
 
-use crate::{entry, error, level, MAX_DURATION, NUM_LEVELS};
+use crate::{entry, error, level, Clock, MAX_DURATION, NUM_LEVELS};
 
 pub(crate) struct Wheels {
+    clock: Clock,
     elapsed: Cell<u64>,
     shutdown: Cell<bool>,
     levels: UnsafeCell<[level::Level; NUM_LEVELS]>,
@@ -36,12 +37,14 @@ impl Drop for WakeBatch {
 }
 
 impl Wheels {
-    pub(crate) fn add_at(&self, entry: Pin<&mut entry::Entry>, expiration: u64, now: u64) {
+    pub(crate) fn add_at(&self, entry: Pin<&mut entry::Entry>, expiration: u64) {
         if self.shutdown.get() {
             entry.as_ref().fire(Err(error::Error::Shutdown));
             return;
         }
-        if expiration <= self.elapsed().max(now) {
+        // Consult the clock so a sleep that became due before the wheel last
+        // advanced completes without waiting for the driver to park.
+        if expiration <= self.elapsed() || expiration <= self.clock.tick() {
             entry.as_ref().fire(Ok(()));
             return;
         }
@@ -50,8 +53,9 @@ impl Wheels {
         Wheels::insert(self, entry);
     }
 
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(clock: Clock) -> Self {
         Self {
+            clock,
             elapsed: Cell::new(0),
             shutdown: Cell::new(false),
             levels: UnsafeCell::new(std::array::from_fn(level::Level::new)),
@@ -59,6 +63,10 @@ impl Wheels {
             next_expiration_dirty: Cell::new(false),
             wake_storage: RefCell::new(VecDeque::new()),
         }
+    }
+
+    pub(crate) fn clock(&self) -> &Clock {
+        &self.clock
     }
 
     /// Expensive operation to count the number of registered timers.

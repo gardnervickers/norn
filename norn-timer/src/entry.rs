@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use cordyceps::{list, Linked};
 
-use crate::{error, wheels::Wheels, Clock};
+use crate::{error, wheels::Wheels};
 
 pin_project_lite::pin_project! {
     /// Future returned by [`crate::Handle::sleep`] and
@@ -22,7 +22,6 @@ pin_project_lite::pin_project! {
         wheels: Rc<Wheels>,
         #[pin]
         entry: Entry,
-        clock: Clock,
         deadline: u64,
         relative: Option<Duration>,
     }
@@ -60,8 +59,7 @@ impl Future for Sleep {
                 State::Unregistered => {
                     debug_assert!(!me.entry.is_registered());
 
-                    me.wheels
-                        .add_at(me.entry.as_mut(), *me.deadline, me.clock.tick());
+                    me.wheels.add_at(me.entry.as_mut(), *me.deadline);
                     continue;
                 }
                 State::Registered => {
@@ -88,21 +86,19 @@ impl Future for Sleep {
 }
 
 impl Sleep {
-    pub(crate) fn new(wheels: Rc<Wheels>, clock: Clock, duration: Duration) -> Self {
+    pub(crate) fn new(wheels: Rc<Wheels>, duration: Duration) -> Self {
         Self {
+            deadline: wheels.clock().deadline_after(duration),
             wheels,
             entry: Entry::new(),
-            deadline: clock.deadline_after(duration),
-            clock,
             relative: Some(duration),
         }
     }
 
-    pub(crate) fn new_at(wheels: Rc<Wheels>, clock: Clock, deadline: u64) -> Self {
+    pub(crate) fn new_at(wheels: Rc<Wheels>, deadline: u64) -> Self {
         Self {
             wheels,
             entry: Entry::new(),
-            clock,
             deadline,
             relative: None,
         }
@@ -116,7 +112,7 @@ impl Sleep {
     pub fn reset(self: Pin<&mut Self>) {
         let mut me = self.project();
         if let Some(duration) = me.relative {
-            *me.deadline = me.clock.deadline_after(*duration);
+            *me.deadline = me.wheels.clock().deadline_after(*duration);
         }
         if me.entry.is_registered() {
             // Safety: We are not moving the entry, so it is safe to construct
