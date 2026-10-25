@@ -1584,7 +1584,7 @@ struct RouterLocal {
     fatal: Sender<String>,
     stopping: Arc<AtomicBool>,
     credits: Vec<RefCell<PeerCredits>>,
-    connections: RefCell<HashMap<u64, Rc<RefCell<ReplyWindow>>>>,
+    connections: RefCell<HashMap<u64, Rc<RefCell<ReplyWindow>>, foldhash::fast::RandomState>>,
     closed: Cell<bool>,
 }
 
@@ -1608,7 +1608,7 @@ impl RouterLocal {
             fatal,
             stopping,
             credits,
-            connections: RefCell::new(HashMap::new()),
+            connections: RefCell::new(HashMap::default()),
             closed: Cell::new(false),
         })
     }

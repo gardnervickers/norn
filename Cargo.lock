@@ -1065,6 +1065,7 @@ dependencies = [
 name = "norn-kv-server"
 version = "0.1.0"
 dependencies = [
+ "foldhash",
  "futures-util",
  "io-uring",
  "libc",
