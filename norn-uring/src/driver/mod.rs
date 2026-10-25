@@ -19,7 +19,7 @@ use crate::bufring::{
     ReserveError as ReserveBufRingError,
 };
 use crate::error::SubmitError;
-use crate::operation::{reap_operation, ConfiguredEntry, Op, Operation};
+use crate::operation::{reap_operation, AsyncCancel, ConfiguredEntry, Op, OpTarget, Operation};
 use crate::registered_buffers::Registry as RegisteredBuffers;
 pub(crate) use crate::registered_buffers::{
     Generation as FixedBufGeneration, Release as FixedBufRelease,
@@ -161,6 +161,11 @@ struct Shared {
     ring: RefCell<IoUring>,
     backpressure: Notify,
     status: Cell<Status>,
+    /// Cancellations of dropped operations that did not fit in the SQ.
+    ///
+    /// Each target retains its operation's identity until the cancellation is
+    /// queued. Parks retry these after draining completions.
+    deferred_cancels: RefCell<VecDeque<OpTarget>>,
     submit_error: RefCell<Option<(io::ErrorKind, String)>>,
     shutdown_outcome: Cell<Option<ShutdownOutcome>>,
     #[cfg(test)]
@@ -449,14 +454,13 @@ impl Handle {
         Op::new(op, self.clone())
     }
 
-    /// Issue a cancellation request.
+    /// Request asynchronous cancellation of a submitted operation.
     ///
-    /// Setting `sync` to true will cause the cancellation to
-    /// be performed synchronously. If `sync` is false, async
-    /// cancellation will be attempted first followed by sync
-    /// cancellation if the async cancellation fails.
-    pub(crate) fn cancel(&self, criteria: CancelBuilder, sync: bool) -> io::Result<()> {
-        self.shared.cancel(criteria, sync)
+    /// This never enters the kernel. The cancellation is queued in the SQ, or
+    /// deferred in driver-owned state when the SQ is full, and is submitted
+    /// by a later park.
+    pub(crate) fn cancel_op(&self, target: OpTarget) {
+        self.shared.cancel_op(target)
     }
 
     /// Attempt to push a new entry into the submission queue.
@@ -627,6 +631,7 @@ impl Driver {
                 ring: RefCell::new(ring),
                 backpressure: Notify::default(),
                 status: Cell::new(Status::Running),
+                deferred_cancels: RefCell::new(VecDeque::new()),
                 submit_error: RefCell::new(None),
                 shutdown_outcome: Cell::new(None),
                 #[cfg(test)]
@@ -690,6 +695,14 @@ impl Driver {
     ///
     /// Returns the number of entries which were submitted.
     fn submit(&self, mut mode: ParkMode) -> io::Result<usize> {
+        if matches!(mode, ParkMode::Timeout(_) | ParkMode::NextCompletion)
+            && self.shared.has_sq_demand()
+        {
+            // Work waiting for SQ space needs capacity, not a completion. Blocking
+            // for a CQE could strand it behind long-lived operations, so submit
+            // without waiting and let the next park queue it.
+            return self.shared.submit(ParkMode::NoPark);
+        }
         // If we're going to park, then prepare the unparker.
         if matches!(mode, ParkMode::Timeout(_) | ParkMode::NextCompletion) && !self.prepare_park() {
             // Preparing the unparker failed, don't park!
@@ -853,6 +866,7 @@ impl Driver {
             trace!(target: LOG, "park.drained {}", drained);
             mode = ParkMode::NoPark;
         }
+        self.shared.flush_deferred_cancels();
 
         loop {
             match self.submit(mode) {
@@ -929,8 +943,14 @@ impl Driver {
                 Status::Running => self.shared.set_status(Status::Closing),
                 Status::Closing => {
                     self.unparker.wake();
+                    // Queue deferred cancellations before the synchronous cancel so
+                    // they still apply on kernels without synchronous cancellation.
+                    self.shared.flush_deferred_cancels();
                     if let Err(err) = self.shared.submit_all_pending() {
                         self.retry_shutdown("submit", &err);
+                        continue;
+                    }
+                    if self.shared.has_deferred_cancels() {
                         continue;
                     }
 
@@ -965,6 +985,11 @@ impl Driver {
                     }
                 }
                 Status::ClosingResources => {
+                    // Every admitted operation is terminal, so any remaining deferred
+                    // cancellation is moot. Release its target identity here, inside
+                    // the driver context, so that destroying the target can queue its
+                    // resource-release work ahead of the final barrier.
+                    drop(self.shared.take_deferred_cancels());
                     // Reaping the first barrier can destroy RawOps. Their destructors may
                     // enqueue close SQEs or other resource-release work after that barrier,
                     // so flush the complete userspace SQ before ordering a final drain behind it.
@@ -1276,28 +1301,69 @@ impl Shared {
         sq.len()
     }
 
-    /// Cancel a specific request synchronously.
-    ///
-    /// Returns an error if the request could not be cancelled.
-    fn cancel(&self, criteria: CancelBuilder, sync: bool) -> io::Result<()> {
-        // Submit all unsubmitted entries to the ring so that we can cancel them.
-        self.submit(ParkMode::NoPark)?;
+    /// Returns true when queued work is waiting for SQ space.
+    fn has_sq_demand(&self) -> bool {
+        self.backpressure.waiters() > 0 || self.has_deferred_cancels()
+    }
 
-        // First try to submit an async cancel request, this avoids a syscall.
-        let mut ring = self.ring.borrow_mut();
-        if !sync {
-            let mut sq = ring.submission();
-            if !sq.is_full() {
-                let cancel = opcode::AsyncCancel2::new(criteria)
-                    .build()
-                    .user_data(Driver::CANCELLATION_TOKEN as u64);
-                unsafe { sq.push(&cancel) }.unwrap();
-                return Ok(());
+    fn has_deferred_cancels(&self) -> bool {
+        !self.deferred_cancels.borrow().is_empty()
+    }
+
+    fn take_deferred_cancels(&self) -> VecDeque<OpTarget> {
+        mem::take(&mut *self.deferred_cancels.borrow_mut())
+    }
+
+    /// Request asynchronous cancellation of `target` without entering the kernel.
+    ///
+    /// The cancellation SQE follows the target's SQE in the queue, so it cannot
+    /// reach the kernel first. If the SQ is full, the target is retained in
+    /// driver-owned state and retried by later parks.
+    fn cancel_op(&self, target: OpTarget) {
+        if target.is_complete() {
+            return;
+        }
+        if self.has_deferred_cancels() {
+            self.deferred_cancels.borrow_mut().push_back(target);
+            return;
+        }
+        if let Err(target) = self.try_push_cancel(target) {
+            trace!(target: LOG, "cancel.deferred");
+            self.deferred_cancels.borrow_mut().push_back(target);
+        }
+    }
+
+    fn try_push_cancel(&self, target: OpTarget) -> Result<(), OpTarget> {
+        if self.ring.borrow_mut().submission().is_full() {
+            return Err(target);
+        }
+        let entry = AsyncCancel::entry(target.clone());
+        match self.try_push(entry) {
+            Ok(()) => Ok(()),
+            Err(entry) => {
+                drop(entry);
+                Err(target)
             }
         }
-        let submitter = ring.submitter();
-        submitter.register_sync_cancel(None, criteria)?;
-        Ok(())
+    }
+
+    /// Queue as many deferred cancellations as the SQ can hold.
+    fn flush_deferred_cancels(&self) {
+        loop {
+            let Some(target) = self.deferred_cancels.borrow_mut().pop_front() else {
+                return;
+            };
+            if target.is_complete() {
+                // Dropping a completed target may destroy its operation, so do it
+                // without holding the deferred queue.
+                drop(target);
+                continue;
+            }
+            if let Err(target) = self.try_push_cancel(target) {
+                self.deferred_cancels.borrow_mut().push_front(target);
+                return;
+            }
+        }
     }
 
     fn close_fd(&self, fd: types::Fd) -> Result<(), CloseFdError> {
@@ -1410,11 +1476,11 @@ impl Shared {
     }
 
     fn needs_park(&self) -> bool {
-        // A registered waiter proves that an operation observed a full SQ and
-        // needs the driver to submit queued work. The executor task quantum
+        // A registered waiter or deferred cancellation proves that work observed
+        // a full SQ and needs the driver to submit queued work. The executor task quantum
         // bounds all other driver work without inspecting the shared SQ/CQ
         // indices after every task poll.
-        self.backpressure.waiters() > 0
+        self.has_sq_demand()
     }
 
     /// Drain the completion queue into the provided buffer.
@@ -2573,5 +2639,238 @@ mod tests {
             driver.shared.registered_buffers.test_state(),
             FixedBufState::Empty
         );
+    }
+
+    fn long_lived_read(handle: &Handle, dropped: &Arc<AtomicBool>) -> Op<LongLivedOp> {
+        let (reader, writer) = UnixStream::pair().unwrap();
+        handle.submit(LongLivedOp {
+            io: LongLivedIo::Read {
+                reader,
+                _writer: writer,
+                buf: Box::new([0; 8]),
+            },
+            _driver: handle.clone(),
+            dropped: Arc::clone(dropped),
+        })
+    }
+
+    /// Fill the userspace SQ with NOPs whose completions the driver ignores.
+    fn fill_sq(driver: &Driver) {
+        let nop = opcode::Nop::new()
+            .build()
+            .user_data(Driver::CANCELLATION_TOKEN as u64);
+        while unsafe { driver.shared.try_push_raw(&nop) }.is_ok() {}
+    }
+
+    fn park_until(driver: &mut Driver, max_parks: usize, done: impl Fn() -> bool) -> bool {
+        for _ in 0..max_parks {
+            if done() {
+                return true;
+            }
+            driver.park(ParkMode::NoPark).unwrap();
+        }
+        done()
+    }
+
+    struct MultishotPoll {
+        reader: UnixStream,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Drop for MultishotPoll {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::Release);
+        }
+    }
+
+    // Safety: multishot poll references only the descriptor, which this
+    // operation owns until it is destroyed after the terminal CQE.
+    unsafe impl Operation for MultishotPoll {
+        type Completion = CQEResult;
+
+        fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+            Ok(
+                opcode::PollAdd::new(types::Fd(self.reader.as_raw_fd()), libc::POLLIN as _)
+                    .multi(true)
+                    .build(),
+            )
+        }
+
+        unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+            result
+        }
+    }
+
+    impl crate::operation::Multishot for MultishotPoll {
+        type Item = CQEResult;
+
+        fn update(&mut self, completion: Self::Completion) -> Self::Item {
+            completion
+        }
+    }
+
+    #[test]
+    fn drop_cancel_survives_transient_ebusy() {
+        let mut driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let handle = driver.handle();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut op = Box::pin(long_lived_read(&handle, &dropped));
+        let waker = futures_test::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(op.as_mut().poll(&mut cx).is_pending());
+        driver.park(ParkMode::NoPark).unwrap();
+
+        // Exhaust the submit EBUSY retries. Dropping must not depend on entering
+        // the kernel, and later healthy parks must deliver the cancellation.
+        for _ in 0..9 {
+            driver.shared.fail_next_submit(libc::EBUSY);
+        }
+        drop(op);
+        assert!(
+            park_until(&mut driver, 5, || dropped.load(Ordering::Acquire)),
+            "a cancel queued by Drop must survive transient EBUSY"
+        );
+        assert!(handle.health_error().is_none());
+        drop(handle);
+        assert_eq!(
+            driver.shutdown_with_outcome(),
+            ShutdownOutcome::CleanDrained
+        );
+    }
+
+    #[test]
+    fn drop_cancel_is_deferred_when_sq_is_full() {
+        let mut driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let handle = driver.handle();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut op = Box::pin(long_lived_read(&handle, &dropped));
+        let waker = futures_test::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(op.as_mut().poll(&mut cx).is_pending());
+        driver.park(ParkMode::NoPark).unwrap();
+
+        fill_sq(&driver);
+        drop(op);
+        assert!(driver.shared.has_deferred_cancels());
+        assert!(
+            driver.needs_park(),
+            "a deferred cancellation must request a park"
+        );
+        assert!(
+            park_until(&mut driver, 5, || dropped.load(Ordering::Acquire)),
+            "a deferred cancellation must be retried once the SQ drains"
+        );
+        assert!(!driver.shared.has_deferred_cancels());
+        drop(handle);
+        assert_eq!(
+            driver.shutdown_with_outcome(),
+            ShutdownOutcome::CleanDrained
+        );
+        assert_eq!(Rc::strong_count(&driver.shared), 1);
+    }
+
+    #[test]
+    fn deferred_cancel_does_not_block_a_waiting_park() {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+            let handle = driver.handle();
+            let dropped = Arc::new(AtomicBool::new(false));
+            let mut op = Box::pin(long_lived_read(&handle, &dropped));
+            let waker = futures_test::task::noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            assert!(op.as_mut().poll(&mut cx).is_pending());
+            driver.park(ParkMode::NoPark).unwrap();
+
+            fill_sq(&driver);
+            drop(op);
+            // Nothing else will complete. A park that waits for a CQE without
+            // first delivering the cancellation would block forever.
+            for _ in 0..5 {
+                if dropped.load(Ordering::Acquire) {
+                    break;
+                }
+                driver.park(ParkMode::NextCompletion).unwrap();
+            }
+            tx.send(dropped.load(Ordering::Acquire)).unwrap();
+            drop(handle);
+        });
+        assert!(rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a waiting park stranded the deferred cancellation"));
+    }
+
+    #[test]
+    fn dropped_multishot_is_cancelled_after_deferral() {
+        let mut driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let handle = driver.handle();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        let mut op = Box::pin(handle.submit(MultishotPoll {
+            reader,
+            dropped: Arc::clone(&dropped),
+        }));
+        let waker = futures_test::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(futures_core::Stream::poll_next(op.as_mut(), &mut cx).is_pending());
+        driver.park(ParkMode::NoPark).unwrap();
+
+        use std::io::Write;
+        writer.write_all(b"x").unwrap();
+        let mut item = None;
+        for _ in 0..5 {
+            driver.park(ParkMode::NoPark).unwrap();
+            if let Poll::Ready(next) = futures_core::Stream::poll_next(op.as_mut(), &mut cx) {
+                item = next;
+                break;
+            }
+        }
+        let item = item.expect("multishot poll must yield while armed");
+        assert!(item.more(), "the multishot poll must remain armed");
+
+        fill_sq(&driver);
+        drop(op);
+        assert!(driver.shared.has_deferred_cancels());
+        // The abandoned poll keeps producing completions until it is cancelled.
+        writer.write_all(b"y").unwrap();
+        assert!(
+            park_until(&mut driver, 6, || dropped.load(Ordering::Acquire)),
+            "a deferred cancellation must terminate an abandoned multishot operation"
+        );
+        drop(handle);
+        assert_eq!(
+            driver.shutdown_with_outcome(),
+            ShutdownOutcome::CleanDrained
+        );
+    }
+
+    #[test]
+    fn shutdown_flushes_pending_deferred_cancels() {
+        let mut driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let handle = driver.handle();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut ops: Vec<_> = (0..3)
+            .map(|_| Box::pin(long_lived_read(&handle, &dropped)))
+            .collect();
+        let waker = futures_test::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        for op in &mut ops {
+            assert!(op.as_mut().poll(&mut cx).is_pending());
+        }
+        driver.park(ParkMode::NoPark).unwrap();
+
+        fill_sq(&driver);
+        drop(ops);
+        assert_eq!(driver.shared.deferred_cancels.borrow().len(), 3);
+        drop(handle);
+        // Exercise the path that cannot rely on synchronous cancellation.
+        driver.shared.fail_next_cancel_all(libc::EINVAL);
+        assert_eq!(
+            driver.shutdown_with_outcome(),
+            ShutdownOutcome::CleanDrained
+        );
+        assert!(!driver.shared.has_deferred_cancels());
+        assert!(dropped.load(Ordering::Acquire));
+        assert_eq!(Rc::strong_count(&driver.shared), 1);
     }
 }
