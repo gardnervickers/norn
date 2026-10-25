@@ -109,6 +109,15 @@ impl Remote {
         }
     }
 
+    pub(crate) fn synchronize_with_publishers(&self) {
+        // Every mutation of pending after initialization is an AcqRel RMW.
+        // This serializes receiver destruction with notify() after a queue
+        // publication, even across intervening notifications or driver polls.
+        // Do not replace these RMWs with loads/stores: channel reclamation
+        // relies on their acquire/release chain.
+        self.pending.fetch_or(false, Ordering::AcqRel);
+    }
+
     fn take_pending(&self) -> bool {
         self.pending.swap(false, Ordering::AcqRel)
     }
