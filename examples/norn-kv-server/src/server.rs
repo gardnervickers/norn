@@ -245,12 +245,9 @@ fn process_pending(
         pending.copy_within(outcome.consumed.., 0);
         pending.truncate(remaining);
     }
-    if pending.len() > config.max_body_len + HEADER_LEN {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "request frame exceeds configured maximum",
-        ));
-    }
+    // FrameDecoder enforces the leading frame's declared body limit. A batch
+    // budget can leave many complete frames here; their aggregate length is
+    // not a frame size.
     Ok(outcome.close)
 }
 
@@ -464,6 +461,69 @@ mod tests {
     };
 
     #[test]
+    fn small_frame_limit_allows_budgeted_pipeline_and_incomplete_tail() {
+        for response_limit in [false, true] {
+            let handler = MemoryHandler::new(MemoryStore::new());
+            let config = ServerConfig {
+                max_body_len: 64,
+                max_batch_commands: if response_limit { 256 } else { 1 },
+                max_batch_response_bytes: if response_limit { 1 } else { 4096 },
+                ..ServerConfig::default()
+            };
+            let mut pending = Vec::new();
+            for opaque in 0..10_u32 {
+                pending.extend_from_slice(&encode_request(OP_NOOP, &[], &[], &[], opaque));
+            }
+            let set = encode_request(
+                OP_SET,
+                b"key",
+                &3_u32.to_be_bytes(),
+                b"fragmented value",
+                10,
+            );
+            pending.extend_from_slice(&set[..HEADER_LEN + 1]);
+            let mut response = Vec::new();
+            for opaque in 0..10_u32 {
+                let mut commands = 0;
+                response.clear();
+                assert!(!process_pending(
+                    &handler,
+                    config,
+                    &mut pending,
+                    &mut response,
+                    &mut commands
+                )
+                .unwrap());
+                assert_eq!(commands, 1);
+                assert_eq!(&response[12..16], &opaque.to_be_bytes());
+            }
+            assert_eq!(pending, set[..HEADER_LEN + 1]);
+            response.clear();
+            let mut commands = 0;
+            assert!(
+                !process_pending(&handler, config, &mut pending, &mut response, &mut commands)
+                    .unwrap()
+            );
+            assert_eq!(commands, 0);
+            pending.extend_from_slice(&set[HEADER_LEN + 1..]);
+            assert!(
+                !process_pending(&handler, config, &mut pending, &mut response, &mut commands)
+                    .unwrap()
+            );
+            assert_eq!(commands, 1);
+            assert_eq!(&response[12..16], &10_u32.to_be_bytes());
+            assert!(pending.is_empty());
+
+            // A declared oversized leading frame must still fail immediately.
+            let mut oversized = encode_request(OP_SET, b"key", &[], &[0; 65], 11);
+            oversized.truncate(HEADER_LEN);
+            let error = process_pending(&handler, config, &mut oversized, &mut Vec::new(), &mut 0)
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        }
+    }
+
+    #[test]
     fn server_config_rejects_zero_limits() {
         let mut configs = [ServerConfig::default(); 4];
         configs[0].max_body_len = 0;
@@ -570,11 +630,36 @@ mod tests {
     #[test]
     fn loopback_handles_fragmented_and_pipelined_requests() {
         for mode in [RecvMode::Exact, RecvMode::Multishot] {
-            loopback_handles_fragmented_and_pipelined_requests_with(mode);
+            loopback_handles_fragmented_and_pipelined_requests_with(
+                mode,
+                ServerConfig::default(),
+                64,
+            );
         }
     }
 
-    fn loopback_handles_fragmented_and_pipelined_requests_with(mode: RecvMode) {
+    #[test]
+    fn loopback_small_limits_preserve_coalesced_pipeline() {
+        for response_limit in [false, true] {
+            let config = ServerConfig {
+                max_body_len: 64,
+                max_batch_commands: if response_limit { 256 } else { 1 },
+                max_batch_response_bytes: if response_limit { 1 } else { 4096 },
+                ..ServerConfig::default()
+            };
+            loopback_handles_fragmented_and_pipelined_requests_with(
+                RecvMode::Multishot,
+                config,
+                1024,
+            );
+        }
+    }
+
+    fn loopback_handles_fragmented_and_pipelined_requests_with(
+        mode: RecvMode,
+        config: ServerConfig,
+        buf_len: usize,
+    ) {
         use std::io::Write;
         use std::net::{SocketAddr, TcpStream};
         use std::sync::mpsc;
@@ -593,13 +678,13 @@ mod tests {
                 let (socket, _) = listener.accept().await?;
                 let handler = MemoryHandler::new(MemoryStore::new());
                 match mode {
-                    RecvMode::Exact => {
-                        serve_connection(socket, handler, ServerConfig::default()).await
-                    }
+                    RecvMode::Exact => serve_connection(socket, handler, config).await,
                     RecvMode::Multishot => {
-                        let ring = RecvBufRing::builder(7).buf_cnt(64).buf_len(64).build()?;
-                        serve_connection_multishot(socket, handler, ServerConfig::default(), ring)
-                            .await
+                        let ring = RecvBufRing::builder(7)
+                            .buf_cnt(64)
+                            .buf_len(buf_len)
+                            .build()?;
+                        serve_connection_multishot(socket, handler, config, ring).await
                     }
                 }
             })
@@ -607,6 +692,24 @@ mod tests {
 
         let mut client = TcpStream::connect(address_rx.recv().unwrap()).unwrap();
         client.set_nodelay(true).unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        client
+            .set_write_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+
+        let mut noops = Vec::new();
+        for opaque in 100..110 {
+            noops.extend_from_slice(&encode_request(OP_NOOP, &[], &[], &[], opaque));
+        }
+        // More than one frame cap, followed by a fragmented valid SET.
+        client.write_all(&noops).unwrap();
+        for opaque in 100..110_u32 {
+            let (header, body) = read_response(&mut client);
+            assert_eq!(&header[12..16], &opaque.to_be_bytes());
+            assert!(body.is_empty());
+        }
 
         let set = encode_request(OP_SET, b"key", &3_u32.to_be_bytes(), b"value", 1);
         for byte in set {
@@ -680,5 +783,109 @@ mod tests {
         let mut body = vec![0_u8; body_len];
         stream.read_exact(&mut body).unwrap();
         (header, body)
+    }
+
+    #[test]
+    fn small_ring_completes_all_requests() {
+        small_ring_connections(1);
+    }
+
+    #[test]
+    fn shared_small_ring_preserves_two_connections() {
+        small_ring_connections(2);
+    }
+
+    fn small_ring_connections(connections: u32) {
+        use norn_executor::LocalExecutor;
+        use std::io::Write;
+        use std::net::TcpStream;
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        let (address_tx, address_rx) = mpsc::sync_channel(1);
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let server = thread::spawn(move || -> io::Result<()> {
+            let driver = norn_uring::Driver::new(io_uring::IoUring::builder(), 64)?;
+            let mut executor = LocalExecutor::new(driver);
+            executor.block_on(async move {
+                let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap(), 8).await?;
+                address_tx.send(listener.local_addr()?).unwrap();
+                // Queue all 256 requests before arming either receive, as in
+                // the review repro. Both tasks share this one-buffer ring.
+                ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                let ring = RecvBufRing::builder(7)
+                    .ring_entries(1)
+                    .buf_cnt(1)
+                    .buf_len(64)
+                    .build()?;
+                let mut tasks = Vec::new();
+                for _connection in 0..connections {
+                    let (socket, _) = listener.accept().await?;
+                    tasks.push(norn_executor::spawn(serve_connection_multishot(
+                        socket,
+                        MemoryHandler::fixed_response(4096),
+                        ServerConfig::default(),
+                        ring.clone(),
+                    )));
+                }
+                for task in tasks {
+                    task.await.unwrap()?;
+                }
+                Ok(())
+            })
+        });
+        let address = address_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let mut clients = Vec::new();
+        for connection in 0..connections {
+            let mut client = TcpStream::connect(address).unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            client
+                .set_write_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut pipeline = Vec::new();
+            for sequence in 0..256 {
+                pipeline.extend_from_slice(&encode_request(
+                    OP_GET,
+                    b"key",
+                    &[],
+                    &[],
+                    connection * 1000 + sequence,
+                ));
+            }
+            client.write_all(&pipeline).unwrap();
+            clients.push(client);
+        }
+        ready_tx.send(()).unwrap();
+        // Leave the second client's responses unread while draining the first.
+        for (connection, client) in clients.iter_mut().enumerate() {
+            for sequence in 0..256 {
+                let (header, body) = read_response(client);
+                assert_eq!(header[0], RESPONSE_MAGIC);
+                assert_eq!(header[1], OP_GET);
+                assert_eq!(&header[6..8], &(Status::Success as u16).to_be_bytes());
+                assert_eq!(
+                    &header[12..16],
+                    &(connection as u32 * 1000 + sequence).to_be_bytes()
+                );
+                assert_eq!(&body[4..], vec![0x5a; 4096]);
+            }
+            // New traffic after recovering proves the connection is still usable.
+            client
+                .write_all(&encode_request(OP_NOOP, &[], &[], &[], 9000))
+                .unwrap();
+            let (header, body) = read_response(client);
+            assert_eq!(header[1], OP_NOOP);
+            assert_eq!(&header[12..16], &9000_u32.to_be_bytes());
+            assert!(body.is_empty());
+            client
+                .write_all(&encode_request(OP_QUIT, &[], &[], &[], 9001))
+                .unwrap();
+            assert_eq!(read_response(client).0[1], OP_QUIT);
+        }
+        drop(clients);
+        server.join().unwrap().unwrap();
     }
 }

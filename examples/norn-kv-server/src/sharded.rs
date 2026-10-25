@@ -2759,4 +2759,115 @@ mod tests {
         }
         Ok(())
     }
+
+    #[test]
+    fn small_ring_sharded_completes_all_requests() {
+        small_ring_sharded_connections(1);
+    }
+
+    #[test]
+    fn shared_small_ring_preserves_two_sharded_connections() {
+        small_ring_sharded_connections(2);
+    }
+
+    fn small_ring_sharded_connections(connections: u32) {
+        use norn_executor::LocalExecutor;
+        use std::io::Write;
+        use std::net::TcpStream;
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        let (address_tx, address_rx) = mpsc::sync_channel(1);
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let server = thread::spawn(move || -> io::Result<()> {
+            let driver = norn_uring::Driver::new(io_uring::IoUring::builder(), 64)?;
+            let mut executor = LocalExecutor::new(driver);
+            executor.block_on(async move {
+                let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap(), 8).await?;
+                address_tx.send(listener.local_addr()?).unwrap();
+                // Queue all 256 requests before arming either receive, as in
+                // the review repro. Both tasks share this one-buffer ring.
+                ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                let ring = RecvBufRing::builder(7)
+                    .ring_entries(1)
+                    .buf_cnt(1)
+                    .buf_len(64)
+                    .build()?;
+                let (router, _requests, _fatal, _driver) = router_fixture(1);
+                let mut tasks = Vec::new();
+                for connection in 0..connections {
+                    let (socket, _) = listener.accept().await?;
+                    tasks.push(norn_executor::spawn(serve_sharded_connection(
+                        socket,
+                        0,
+                        2,
+                        u64::from(connection) + 7,
+                        MemoryHandler::fixed_response(4096),
+                        router.clone(),
+                        ring.clone(),
+                        ServerConfig::default(),
+                    )));
+                }
+                for task in tasks {
+                    task.await.unwrap()?;
+                }
+                Ok(())
+            })
+        });
+        let address = address_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let mut clients = Vec::new();
+        for connection in 0..connections {
+            let mut client = TcpStream::connect(address).unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            client
+                .set_write_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut pipeline = Vec::new();
+            for sequence in 0..256 {
+                pipeline.extend_from_slice(&binary_request(
+                    OP_NOOP,
+                    &[],
+                    &[],
+                    &[],
+                    connection * 1000 + sequence,
+                ));
+            }
+            client.write_all(&pipeline).unwrap();
+            clients.push(client);
+        }
+        ready_tx.send(()).unwrap();
+        // Leave the second client's responses unread while draining the first.
+        for (connection, client) in clients.iter_mut().enumerate() {
+            for sequence in 0..256 {
+                let response = read_response(client).unwrap();
+                let (header, body) = response.split_at(HEADER_LEN);
+                assert_eq!(header[0], RESPONSE_MAGIC);
+                assert_eq!(header[1], OP_NOOP);
+                assert_eq!(&header[6..8], &0_u16.to_be_bytes());
+                assert_eq!(
+                    &header[12..16],
+                    &(connection as u32 * 1000 + sequence).to_be_bytes()
+                );
+                assert!(body.is_empty());
+            }
+            // New traffic after recovering proves the connection is still usable.
+            client
+                .write_all(&binary_request(OP_NOOP, &[], &[], &[], 9000))
+                .unwrap();
+            let response = read_response(client).unwrap();
+            let (header, body) = response.split_at(HEADER_LEN);
+            assert_eq!(header[1], OP_NOOP);
+            assert_eq!(&header[12..16], &9000_u32.to_be_bytes());
+            assert!(body.is_empty());
+            client
+                .write_all(&binary_request(OP_QUIT, &[], &[], &[], 9001))
+                .unwrap();
+            assert_eq!(read_response(client).unwrap()[1], OP_QUIT);
+        }
+        drop(clients);
+        server.join().unwrap().unwrap();
+    }
 }
