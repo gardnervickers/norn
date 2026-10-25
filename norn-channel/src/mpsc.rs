@@ -38,6 +38,7 @@ where
 
     let shared = Arc::new(Shared {
         queue: ArrayQueue::new(capacity),
+        receiver_dropped: AtomicBool::new(false),
         receiver_closed: AtomicBool::new(false),
         senders: AtomicUsize::new(1),
         remote: endpoint.remote(),
@@ -94,6 +95,7 @@ where
             Arc::new(ShardedLane {
                 queue: ArrayQueue::new(lane_capacity + usize::from(index < larger_lanes)),
                 notified: AtomicBool::new(false),
+                receiver_dropped: AtomicBool::new(false),
             })
         })
         .collect();
@@ -116,12 +118,32 @@ where
 
 struct Shared<T> {
     queue: ArrayQueue<T>,
+    receiver_dropped: AtomicBool,
     receiver_closed: AtomicBool,
     senders: AtomicUsize,
     remote: Arc<Remote>,
 }
 
 impl<T> Shared<T> {
+    fn destroy_receiver(&self) {
+        self.receiver_closed.store(true, Ordering::Release);
+        self.receiver_dropped.store(true, Ordering::Release);
+        // Serialize with successful sends' notification RMWs. Publications
+        // ordered before this barrier are visible to our drain; later ones
+        // acquire receiver_dropped and drain themselves.
+        self.remote.synchronize_with_publishers();
+        discard(&self.queue);
+    }
+
+    fn finish_send(&self) {
+        // Called after remote.notify(), whose acquire RMW pairs with
+        // destroy_receiver's barrier. A load without that handshake could
+        // miss destruction after the receiver's last empty pop.
+        if self.receiver_dropped.load(Ordering::Acquire) {
+            discard(&self.queue);
+        }
+    }
+
     fn is_disconnected(&self) -> bool {
         self.receiver_closed.load(Ordering::Acquire) || self.senders.load(Ordering::Acquire) == 0
     }
@@ -182,7 +204,8 @@ impl<T> Drop for WaitGuard<T> {
 ///
 /// This value may be moved between threads while the application assembles
 /// its runtime topology. Call [`DetachedReceiver::attach`] on the destination
-/// thread before receiving messages. Dropping this value closes the channel.
+/// thread before receiving messages. Dropping this value closes the channel
+/// and discards buffered messages, including concurrent publications.
 pub struct DetachedReceiver<T> {
     shared: Option<Arc<Shared<T>>>,
 }
@@ -217,12 +240,13 @@ where
     pub fn attach(mut self, handle: &Handle) -> Receiver<T> {
         let shared = self
             .shared
-            .take()
+            .as_ref()
             .expect("detached receiver attached more than once");
         assert!(
             handle.belongs_to(&shared.remote),
             "detached receiver attached to a different driver endpoint"
         );
+        let shared = self.shared.take().expect("receiver validated above");
         let local = Rc::new(Local {
             shared: Arc::clone(&shared),
             waker: RefCell::new(None),
@@ -254,7 +278,7 @@ where
 impl<T> Drop for DetachedReceiver<T> {
     fn drop(&mut self) {
         if let Some(shared) = &self.shared {
-            shared.receiver_closed.store(true, Ordering::Release);
+            shared.destroy_receiver();
         }
     }
 }
@@ -306,9 +330,12 @@ impl<T> Sender<T> {
             return Err(TrySendError::Closed(value));
         }
 
+        #[cfg(test)]
+        before_publish();
         match self.shared.queue.push(value) {
             Ok(()) => {
                 self.shared.remote.notify();
+                self.shared.finish_send();
                 Ok(())
             }
             Err(value) if self.is_closed() => Err(TrySendError::Closed(value)),
@@ -331,6 +358,8 @@ impl<T> Sender<T> {
 ///
 /// A receiver is neither cloneable nor [`Send`]. It stores ordinary Norn task
 /// wakers, which the channel driver invokes only on the destination thread.
+/// Dropping it closes the channel and discards buffered messages. A send
+/// already in progress may succeed, but its message will also be discarded.
 pub struct Receiver<T> {
     local: Rc<Local<T>>,
     handle: Handle,
@@ -354,14 +383,7 @@ impl<T> Receiver<T> {
     /// Returns [`TryRecvError::Empty`] while the open channel has no buffered
     /// message, or [`TryRecvError::Closed`] once it is closed and drained.
     pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
-        if let Some(value) = self.local.shared.queue.pop() {
-            return Ok(value);
-        }
-        if self.local.shared.is_disconnected() {
-            Err(TryRecvError::Closed)
-        } else {
-            Err(TryRecvError::Empty)
-        }
+        self.receive()
     }
 
     /// Receive one message, waiting until a message arrives or the channel closes.
@@ -391,13 +413,12 @@ impl<T> Receiver<T> {
         limit: usize,
     ) -> Result<usize, TryRecvError> {
         assert!(limit > 0, "receive limit must be non-zero");
-        let received = self.drain_into(output, limit);
-        if received > 0 {
-            Ok(received)
-        } else if self.local.shared.is_disconnected() {
-            Err(TryRecvError::Closed)
-        } else {
-            Err(TryRecvError::Empty)
+        match self.receive() {
+            Ok(value) => {
+                output.push(value);
+                Ok(1 + self.drain_into(output, limit - 1))
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -422,6 +443,8 @@ impl<T> Receiver<T> {
     ///
     /// Subsequent sends fail immediately. Receive operations may continue to
     /// drain messages that were already buffered and then report closure.
+    /// A send already in progress may still succeed; this method does not
+    /// wait for such sends to finish.
     pub fn close(&mut self) {
         self.local
             .shared
@@ -434,26 +457,46 @@ impl<T> Receiver<T> {
         self.local.shared.queue.capacity()
     }
 
-    fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<T>> {
+    // Only an empty queue pays for the terminal-state check and retry.
+    fn receive(&self) -> Result<T, TryRecvError> {
         if let Some(value) = self.local.shared.queue.pop() {
-            self.local.clear_waker();
-            return Poll::Ready(Some(value));
+            return Ok(value);
         }
+        #[cfg(test)]
+        after_empty();
         if self.local.shared.is_disconnected() {
-            self.local.clear_waker();
-            return Poll::Ready(None);
+            // In particular, acquire senders == 0 BEFORE the final pop.
+            // Its release sequence includes every sender's last publication.
+            self.local.shared.queue.pop().ok_or(TryRecvError::Closed)
+        } else {
+            Err(TryRecvError::Empty)
+        }
+    }
+
+    fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<T>> {
+        match self.receive() {
+            Ok(value) => {
+                self.local.clear_waker();
+                return Poll::Ready(Some(value));
+            }
+            Err(TryRecvError::Closed) => {
+                self.local.clear_waker();
+                return Poll::Ready(None);
+            }
+            Err(TryRecvError::Empty) => {}
         }
 
         self.local.register_waker(cx.waker());
-
-        if let Some(value) = self.local.shared.queue.pop() {
-            self.local.clear_waker();
-            Poll::Ready(Some(value))
-        } else if self.local.shared.is_disconnected() {
-            self.local.clear_waker();
-            Poll::Ready(None)
-        } else {
-            Poll::Pending
+        match self.receive() {
+            Ok(value) => {
+                self.local.clear_waker();
+                Poll::Ready(Some(value))
+            }
+            Err(TryRecvError::Closed) => {
+                self.local.clear_waker();
+                Poll::Ready(None)
+            }
+            Err(TryRecvError::Empty) => Poll::Pending,
         }
     }
 
@@ -463,27 +506,13 @@ impl<T> Receiver<T> {
         output: &mut Vec<T>,
         limit: usize,
     ) -> Poll<usize> {
-        let received = self.drain_into(output, limit);
-        if received > 0 {
-            self.local.clear_waker();
-            return Poll::Ready(received);
-        }
-        if self.local.shared.is_disconnected() {
-            self.local.clear_waker();
-            return Poll::Ready(0);
-        }
-
-        self.local.register_waker(cx.waker());
-
-        let received = self.drain_into(output, limit);
-        if received > 0 {
-            self.local.clear_waker();
-            Poll::Ready(received)
-        } else if self.local.shared.is_disconnected() {
-            self.local.clear_waker();
-            Poll::Ready(0)
-        } else {
-            Poll::Pending
+        match self.poll_recv(cx) {
+            Poll::Ready(Some(value)) => {
+                output.push(value);
+                Poll::Ready(1 + self.drain_into(output, limit - 1))
+            }
+            Poll::Ready(None) => Poll::Ready(0),
+            Poll::Pending => Poll::Pending,
         }
     }
 
@@ -501,7 +530,7 @@ impl<T> Receiver<T> {
 
 impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
-        self.close();
+        self.local.shared.destroy_receiver();
         self.local.clear_waker();
         if let Some(id) = self.registration.take() {
             self.handle.unregister(id);
@@ -623,7 +652,8 @@ impl<T> Drop for ShardedWaitGuard<T> {
 ///
 /// This value may be moved to the destination runtime thread independently of
 /// its producer lanes. Call [`DetachedShardedReceiver::attach`] there before
-/// receiving messages. Dropping this value closes every producer lane.
+/// receiving messages. Dropping this value closes every producer lane and
+/// discards buffered messages, including concurrent publications.
 pub struct DetachedShardedReceiver<T> {
     shared: Option<Arc<ShardedShared>>,
     queues: Vec<Arc<ShardedLane<T>>>,
@@ -660,12 +690,13 @@ where
     pub fn attach(mut self, handle: &Handle) -> ShardedReceiver<T> {
         let shared = self
             .shared
-            .take()
+            .as_ref()
             .expect("detached sharded receiver attached more than once");
         assert!(
             handle.belongs_to(&shared.remote),
             "detached sharded receiver attached to a different driver endpoint"
         );
+        let shared = self.shared.take().expect("receiver validated above");
         let queues = std::mem::take(&mut self.queues);
         let local = Rc::new(ShardedLocal {
             shared: Arc::clone(&shared),
@@ -705,6 +736,9 @@ impl<T> Drop for DetachedShardedReceiver<T> {
     fn drop(&mut self) {
         if let Some(shared) = &self.shared {
             shared.receiver_closed.store(true, Ordering::Release);
+            for lane in &self.queues {
+                lane.destroy_receiver();
+            }
         }
     }
 }
@@ -722,6 +756,33 @@ pub struct ShardedSender<T> {
 struct ShardedLane<T> {
     queue: ArrayQueue<T>,
     notified: AtomicBool,
+    receiver_dropped: AtomicBool,
+}
+
+fn discard<T>(queue: &ArrayQueue<T>) {
+    while let Some(value) = queue.pop() {
+        drop(value);
+    }
+}
+
+impl<T> ShardedLane<T> {
+    fn destroy_receiver(&self) {
+        self.receiver_dropped.store(true, Ordering::Release);
+        // Pair with the existing notification RMW after each publication.
+        // Earlier publishers are visible to this drain; later publishers
+        // acquire receiver_dropped and drain themselves. All intervening
+        // lane notification mutations are also AcqRel RMWs.
+        self.notified.fetch_or(false, Ordering::AcqRel);
+        discard(&self.queue);
+    }
+
+    fn finish_send(&self) -> bool {
+        let notify = !self.notified.swap(true, Ordering::AcqRel);
+        if self.receiver_dropped.load(Ordering::Acquire) {
+            discard(&self.queue);
+        }
+        notify
+    }
 }
 
 impl<T> fmt::Debug for ShardedSender<T> {
@@ -768,9 +829,11 @@ impl<T> ShardedSender<T> {
             return Err(TrySendError::Closed(value));
         }
 
+        #[cfg(test)]
+        before_publish();
         match self.lane.queue.push(value) {
             Ok(()) => {
-                if !self.lane.notified.swap(true, Ordering::AcqRel) {
+                if self.lane.finish_send() {
                     self.shared.remote.notify();
                 }
                 Ok(())
@@ -795,7 +858,9 @@ impl<T> ShardedSender<T> {
 ///
 /// This receiver is neither cloneable nor [`Send`]. It drains its producer
 /// lanes round-robin and invokes stored task wakers only on the destination
-/// executor thread.
+/// executor thread. Dropping it closes every lane and discards buffered
+/// messages. A send already in progress may succeed, but its message will
+/// also be discarded.
 pub struct ShardedReceiver<T> {
     local: Rc<ShardedLocal<T>>,
     handle: Handle,
@@ -820,14 +885,7 @@ impl<T> ShardedReceiver<T> {
     /// Returns [`TryRecvError::Empty`] while the open channel has no buffered
     /// message, or [`TryRecvError::Closed`] once it is closed and drained.
     pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
-        if let Some(value) = self.local.pop() {
-            return Ok(value);
-        }
-        if self.local.shared.is_disconnected() {
-            Err(TryRecvError::Closed)
-        } else {
-            Err(TryRecvError::Empty)
-        }
+        self.receive()
     }
 
     /// Receive one message, waiting until a message arrives or the channel closes.
@@ -857,13 +915,12 @@ impl<T> ShardedReceiver<T> {
         limit: usize,
     ) -> Result<usize, TryRecvError> {
         assert!(limit > 0, "receive limit must be non-zero");
-        let received = self.drain_into(output, limit);
-        if received > 0 {
-            Ok(received)
-        } else if self.local.shared.is_disconnected() {
-            Err(TryRecvError::Closed)
-        } else {
-            Err(TryRecvError::Empty)
+        match self.receive() {
+            Ok(value) => {
+                output.push(value);
+                Ok(1 + self.drain_into(output, limit - 1))
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -885,6 +942,9 @@ impl<T> ShardedReceiver<T> {
     }
 
     /// Close the receiver while retaining access to buffered messages.
+    ///
+    /// A send already in progress may still succeed; this method does not
+    /// wait for such sends to finish.
     pub fn close(&mut self) {
         self.local
             .shared
@@ -902,26 +962,46 @@ impl<T> ShardedReceiver<T> {
         self.local.queues.len()
     }
 
-    fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<T>> {
+    // Only an empty queue pays for the terminal-state check and retry.
+    fn receive(&self) -> Result<T, TryRecvError> {
         if let Some(value) = self.local.pop() {
-            self.local.clear_waker();
-            return Poll::Ready(Some(value));
+            return Ok(value);
         }
+        #[cfg(test)]
+        after_empty();
         if self.local.shared.is_disconnected() {
-            self.local.clear_waker();
-            return Poll::Ready(None);
+            // In particular, acquire senders == 0 BEFORE the final pop.
+            // Its release sequence includes every sender's last publication.
+            self.local.pop().ok_or(TryRecvError::Closed)
+        } else {
+            Err(TryRecvError::Empty)
+        }
+    }
+
+    fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<T>> {
+        match self.receive() {
+            Ok(value) => {
+                self.local.clear_waker();
+                return Poll::Ready(Some(value));
+            }
+            Err(TryRecvError::Closed) => {
+                self.local.clear_waker();
+                return Poll::Ready(None);
+            }
+            Err(TryRecvError::Empty) => {}
         }
 
         self.local.register_waker(cx.waker());
-
-        if let Some(value) = self.local.pop() {
-            self.local.clear_waker();
-            Poll::Ready(Some(value))
-        } else if self.local.shared.is_disconnected() {
-            self.local.clear_waker();
-            Poll::Ready(None)
-        } else {
-            Poll::Pending
+        match self.receive() {
+            Ok(value) => {
+                self.local.clear_waker();
+                Poll::Ready(Some(value))
+            }
+            Err(TryRecvError::Closed) => {
+                self.local.clear_waker();
+                Poll::Ready(None)
+            }
+            Err(TryRecvError::Empty) => Poll::Pending,
         }
     }
 
@@ -931,27 +1011,13 @@ impl<T> ShardedReceiver<T> {
         output: &mut Vec<T>,
         limit: usize,
     ) -> Poll<usize> {
-        let received = self.drain_into(output, limit);
-        if received > 0 {
-            self.local.clear_waker();
-            return Poll::Ready(received);
-        }
-        if self.local.shared.is_disconnected() {
-            self.local.clear_waker();
-            return Poll::Ready(0);
-        }
-
-        self.local.register_waker(cx.waker());
-
-        let received = self.drain_into(output, limit);
-        if received > 0 {
-            self.local.clear_waker();
-            Poll::Ready(received)
-        } else if self.local.shared.is_disconnected() {
-            self.local.clear_waker();
-            Poll::Ready(0)
-        } else {
-            Poll::Pending
+        match self.poll_recv(cx) {
+            Poll::Ready(Some(value)) => {
+                output.push(value);
+                Poll::Ready(1 + self.drain_into(output, limit - 1))
+            }
+            Poll::Ready(None) => Poll::Ready(0),
+            Poll::Pending => Poll::Pending,
         }
     }
 
@@ -970,6 +1036,9 @@ impl<T> ShardedReceiver<T> {
 impl<T> Drop for ShardedReceiver<T> {
     fn drop(&mut self) {
         self.close();
+        for lane in &self.local.queues {
+            lane.destroy_receiver();
+        }
         self.local.clear_waker();
         if let Some(id) = self.registration.take() {
             self.handle.unregister(id);
@@ -1018,6 +1087,28 @@ impl fmt::Display for TryRecvError {
 impl Error for TryRecvError {}
 
 #[cfg(test)]
+thread_local! {
+    static AFTER_EMPTY: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static BEFORE_PUBLISH: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+#[cfg(test)]
+fn after_empty() {
+    let hook = AFTER_EMPTY.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(test)]
+fn before_publish() {
+    let hook = BEFORE_PUBLISH.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::sync::{mpsc as std_mpsc, Arc};
@@ -1034,6 +1125,186 @@ mod tests {
         let builder = DriverBuilder::new();
         let endpoint = builder.endpoint().clone();
         (builder, endpoint)
+    }
+
+    fn on_empty(hook: Box<dyn FnOnce()>, second_pass: bool) {
+        AFTER_EMPTY.with(|slot| {
+            *slot.borrow_mut() = Some(if second_pass {
+                Box::new(move || {
+                    AFTER_EMPTY.with(|slot| *slot.borrow_mut() = Some(hook));
+                })
+            } else {
+                hook
+            });
+        });
+    }
+
+    // Exercise every entry point and both sides of async waker registration.
+    // Publication and final sender drop happen strictly after the empty pop.
+    #[test]
+    fn final_publication_between_empty_pop_and_disconnect_check() {
+        macro_rules! check {
+            ($sender:expr, $receiver:expr, $path:expr, $second:expr) => {{
+                let sender = $sender;
+                let mut receiver = $receiver;
+                let path = $path;
+                on_empty(
+                    Box::new(move || {
+                        thread::spawn(move || {
+                            sender.try_send(42).unwrap();
+                            if path % 2 == 1 {
+                                sender.try_send(43).unwrap();
+                            }
+                            drop(sender);
+                        })
+                        .join()
+                        .unwrap();
+                    }),
+                    $second,
+                );
+                let mut output = Vec::new();
+                let mut cx = Context::from_waker(Waker::noop());
+                match path {
+                    0 => assert_eq!(receiver.try_recv(), Ok(42)),
+                    1 => {
+                        assert_eq!(receiver.try_recv_many(&mut output, 2), Ok(2));
+                        assert_eq!(output, [42, 43]);
+                    }
+                    2 => assert_eq!(receiver.poll_recv(&mut cx), Poll::Ready(Some(42))),
+                    3 => {
+                        assert_eq!(
+                            receiver.poll_recv_many(&mut cx, &mut output, 2),
+                            Poll::Ready(2)
+                        );
+                        assert_eq!(output, [42, 43]);
+                    }
+                    _ => unreachable!(),
+                }
+                assert_eq!(receiver.try_recv(), Err(TryRecvError::Closed));
+            }};
+        }
+
+        for path in 0..4 {
+            for second_pass in [false, true] {
+                if second_pass && path < 2 {
+                    continue;
+                }
+                let driver = Driver::new(SpinPark);
+                let (sender, receiver) = bounded(&driver.endpoint(), 2);
+                check!(sender, receiver.attach(&driver.handle()), path, second_pass);
+
+                let (mut senders, receiver) = bounded_sharded(&driver.endpoint(), 4, 2);
+                // Leave the active lane last in the scan; drop the other lane.
+                let sender = senders.pop().unwrap();
+                drop(senders);
+                check!(sender, receiver.attach(&driver.handle()), path, second_pass);
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct DropCount(Arc<AtomicUsize>);
+
+    impl Drop for DropCount {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    // Freeze an accepted send just before queue publication, destroy its
+    // receiver, then let publication finish. Keep the sender alive while
+    // checking destruction so Shared/Lane destruction cannot mask retention.
+    #[test]
+    fn late_publication_after_receiver_destruction_is_discarded() {
+        macro_rules! check {
+            ($sender:expr, $receiver:expr) => {{
+                let sender = $sender;
+                let receiver = $receiver;
+                let dropped = Arc::new(AtomicUsize::new(0));
+                let value = DropCount(dropped.clone());
+                let (entered_tx, entered_rx) = std_mpsc::channel();
+                let (resume_tx, resume_rx) = std_mpsc::channel();
+                let producer = thread::spawn(move || {
+                    BEFORE_PUBLISH.with(|slot| {
+                        *slot.borrow_mut() = Some(Box::new(move || {
+                            entered_tx.send(()).unwrap();
+                            resume_rx.recv().unwrap();
+                        }));
+                    });
+                    sender.try_send(value).unwrap();
+                    sender
+                });
+                entered_rx.recv().unwrap();
+                drop(receiver);
+                resume_tx.send(()).unwrap();
+                let sender = producer.join().unwrap();
+                assert!(sender.is_closed());
+                assert_eq!(dropped.load(Ordering::Relaxed), 1);
+                drop(sender);
+                assert_eq!(dropped.load(Ordering::Relaxed), 1);
+            }};
+        }
+
+        for attached in [false, true] {
+            let driver = Driver::new(SpinPark);
+            let (sender, receiver) = bounded(&driver.endpoint(), 1);
+            if attached {
+                check!(sender, receiver.attach(&driver.handle()));
+            } else {
+                check!(sender, receiver);
+            }
+
+            let (senders, receiver) = bounded_sharded(&driver.endpoint(), 2, 2);
+            // Clones on one lane must share the destruction state too.
+            let sender = senders[1].clone();
+            if attached {
+                check!(sender, receiver.attach(&driver.handle()));
+            } else {
+                check!(sender, receiver);
+            }
+            assert!(senders.iter().all(ShardedSender::is_closed));
+        }
+    }
+
+    #[test]
+    fn graceful_close_keeps_buffered_and_in_flight_messages() {
+        macro_rules! check {
+            ($sender:expr, $receiver:expr, $push:expr, $finish:expr) => {{
+                let sender = $sender;
+                let mut receiver = $receiver;
+                sender.try_send(1).unwrap();
+                // Simulate a send that already passed its open check.
+                receiver.close();
+                $push;
+                $finish;
+                assert_eq!(sender.try_send(3), Err(TrySendError::Closed(3)));
+                let mut output = Vec::new();
+                assert_eq!(receiver.try_recv_many(&mut output, 2), Ok(2));
+                assert_eq!(output, [1, 2]);
+                assert_eq!(receiver.try_recv(), Err(TryRecvError::Closed));
+            }};
+        }
+        let driver = Driver::new(SpinPark);
+        let (sender, receiver) = bounded(&driver.endpoint(), 2);
+        let shared = sender.shared.clone();
+        check!(
+            sender,
+            receiver.attach(&driver.handle()),
+            shared.queue.push(2).unwrap(),
+            {
+                shared.remote.notify();
+                shared.finish_send();
+            }
+        );
+        let (mut senders, receiver) = bounded_sharded(&driver.endpoint(), 2, 1);
+        let sender = senders.pop().unwrap();
+        let lane = sender.lane.clone();
+        check!(
+            sender,
+            receiver.attach(&driver.handle()),
+            lane.queue.push(2).unwrap(),
+            lane.finish_send()
+        );
     }
 
     #[test]
@@ -1418,7 +1689,7 @@ mod tests {
         senders[0].lane.queue.push(1).unwrap();
         assert_eq!(receiver.try_recv(), Ok(1));
         assert_eq!(receiver.poll_recv(&mut context), Poll::Pending);
-        assert!(!senders[0].lane.notified.swap(true, Ordering::AcqRel));
+        assert!(senders[0].lane.finish_send());
         senders[0].shared.remote.notify();
 
         // The late notification finds an empty queue. It must still clear the
@@ -1437,7 +1708,7 @@ mod tests {
         senders[1].lane.queue.push(3).unwrap();
         assert_eq!(receiver.try_recv(), Ok(3));
         assert_eq!(receiver.poll_recv(&mut context), Poll::Pending);
-        assert!(!senders[1].lane.notified.swap(true, Ordering::AcqRel));
+        assert!(senders[1].lane.finish_send());
         senders[1].shared.remote.notify();
         senders[0].try_send(4).unwrap();
 
