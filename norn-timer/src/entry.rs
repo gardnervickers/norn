@@ -64,14 +64,27 @@ impl Future for Sleep {
                 }
                 State::Registered => {
                     debug_assert!(me.entry.is_registered());
-                    // Safety: Timer entries are local-only. This mutable access
-                    // is short-lived and performs no callbacks.
-                    let w = unsafe { &mut *me.entry.waker.get() };
-                    if !w
-                        .as_ref()
-                        .is_some_and(|existing| existing.will_wake(cx.waker()))
-                    {
-                        *w = Some(cx.waker().clone());
+                    // Safety: Entries are local-only. Inspect the slot without
+                    // retaining a borrow across clone or drop callbacks.
+                    let same_waker = unsafe {
+                        (*me.entry.waker.get())
+                            .as_ref()
+                            .is_some_and(|existing| existing.will_wake(cx.waker()))
+                    };
+                    if !same_waker {
+                        let new_waker = cx.waker().clone();
+                        // Cloning can re-enter and complete this timer.
+                        if !me.entry.is_registered() {
+                            drop(new_waker);
+                            continue;
+                        }
+                        // Safety: Replacement itself performs no callbacks.
+                        let old_waker = unsafe { (*me.entry.waker.get()).replace(new_waker) };
+                        drop(old_waker);
+                        // Dropping the old waker can also complete the timer.
+                        if !me.entry.is_registered() {
+                            continue;
+                        }
                     }
                     return Poll::Pending;
                 }

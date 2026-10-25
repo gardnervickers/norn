@@ -1240,6 +1240,14 @@ impl Shared {
                     }
                     return Ok(submitted);
                 }
+                Err(err)
+                    if matches!(mode, ParkMode::Timeout(_))
+                        && err.raw_os_error() == Some(libc::ETIME) =>
+                {
+                    // A timed CQ wait expired normally. ETIME in other submit
+                    // modes remains an unexpected driver failure.
+                    return Ok(0);
+                }
                 Err(err) if err.raw_os_error() == Some(libc::EINTR) => {
                     trace!(target: LOG, "submit.eintr");
                     continue;
@@ -2526,6 +2534,28 @@ mod tests {
                 assert_eq!(right.kind(), io::ErrorKind::InvalidInput);
             }
             other => panic!("expected immediate invalid-input errors, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn etime_is_expected_only_for_timed_submissions() {
+        for mode in [
+            ParkMode::Timeout(Duration::from_millis(1)),
+            ParkMode::NoPark,
+            ParkMode::NextCompletion,
+        ] {
+            let driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+            driver.shared.fail_next_submit(libc::ETIME);
+            let result = driver.shared.submit(mode);
+            if matches!(mode, ParkMode::Timeout(_)) {
+                assert_eq!(result.unwrap(), 0);
+                assert!(driver.handle().health_error().is_none());
+                assert_eq!(driver.shared.status.get(), Status::Running);
+            } else {
+                assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ETIME));
+                assert!(driver.handle().health_error().is_some());
+                assert_eq!(driver.shared.status.get(), Status::Closing);
+            }
         }
     }
 
