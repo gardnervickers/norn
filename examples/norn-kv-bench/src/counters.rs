@@ -17,17 +17,30 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use serde::Serialize;
 
+/// One raw `perf_event` read: the count and the times the counter was
+/// enabled and actually running. Scaling for multiplexing must use interval
+/// differences of all three, not cumulative scaled values.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct PerfReading {
+    pub value: u64,
+    pub enabled: u64,
+    pub running: u64,
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 pub struct ThreadSample {
+    /// `false` once the thread has exited; its scheduler statistics are then
+    /// unavailable, but its perf counters can still be read.
+    pub alive: bool,
     pub cpu_ns: u64,
     pub run_delay_ns: u64,
     pub utime_ticks: u64,
     pub stime_ticks: u64,
     pub voluntary_switches: u64,
     pub involuntary_switches: u64,
-    pub instructions: Option<u64>,
-    pub instructions_user: Option<u64>,
-    pub cycles: Option<u64>,
+    pub instructions: Option<PerfReading>,
+    pub instructions_user: Option<PerfReading>,
+    pub cycles: Option<PerfReading>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -54,6 +67,13 @@ pub struct Delta {
     pub involuntary_by_thread: BTreeMap<String, u64>,
     /// Run-queue wait nanoseconds per thread name.
     pub run_delay_by_thread: BTreeMap<String, u64>,
+    /// Threads that started or exited within the interval. Their counts are
+    /// incomplete: an exited thread's last scheduler statistics are lost,
+    /// and a new thread's perf counters open only when it is discovered.
+    pub thread_changes: u32,
+    /// Smallest fraction of enabled time a perf counter was actually
+    /// counting (1.0 without multiplexing).
+    pub perf_coverage: Option<f64>,
 }
 
 struct PerfCounter {
@@ -116,7 +136,7 @@ impl PerfCounter {
         })
     }
 
-    fn read(&self) -> Option<u64> {
+    fn read(&self) -> Option<PerfReading> {
         let mut buf = [0_u64; 3];
         // SAFETY: reading into a properly sized local buffer.
         let n = unsafe { libc::read(self.fd.as_raw_fd(), buf.as_mut_ptr().cast(), 24) };
@@ -124,15 +144,53 @@ impl PerfCounter {
             return None;
         }
         let [value, enabled, running] = buf;
-        if running == 0 {
-            return Some(0);
-        }
-        // Scale if the kernel multiplexed the counter.
-        Some(if running < enabled {
-            (u128::from(value) * u128::from(enabled) / u128::from(running)) as u64
-        } else {
-            value
+        Some(PerfReading {
+            value,
+            enabled,
+            running,
         })
+    }
+}
+
+/// Sum of interval counts across threads, scaled per thread and interval.
+#[derive(Default)]
+struct PerfSum {
+    count: u64,
+    enabled: u64,
+    running: u64,
+    /// A thread ran with this counter unavailable or never scheduled on the PMU.
+    missing: bool,
+}
+
+impl PerfSum {
+    fn add(&mut self, start: Option<PerfReading>, end: Option<PerfReading>) {
+        let Some(end) = end else {
+            self.missing = true;
+            return;
+        };
+        // A thread first seen at the end snapshot counts from zero.
+        let start = start.unwrap_or_default();
+        let value = end.value.saturating_sub(start.value);
+        let enabled = end.enabled.saturating_sub(start.enabled);
+        let running = end.running.saturating_sub(start.running);
+        self.enabled += enabled;
+        self.running += running;
+        if enabled == 0 {
+            return; // not scheduled in the interval
+        }
+        if running == 0 {
+            self.missing = true;
+            return;
+        }
+        self.count += (u128::from(value) * u128::from(enabled) / u128::from(running)) as u64;
+    }
+
+    fn total(&self) -> Option<u64> {
+        (!self.missing).then_some(self.count)
+    }
+
+    fn coverage(&self) -> Option<f64> {
+        (self.enabled > 0).then(|| self.running as f64 / self.enabled as f64)
     }
 }
 
@@ -218,8 +276,20 @@ impl ProcessCounters {
         let mut snapshot = Snapshot::default();
         for (&tid, counters) in &self.threads {
             let base = format!("/proc/{}/task/{tid}", self.pid);
+            let perf = |c: &Option<PerfCounter>| c.as_ref().and_then(PerfCounter::read);
             let Some(sched) = read_u64s(&format!("{base}/schedstat")) else {
-                continue; // thread exited
+                // Exited: scheduler statistics are gone, perf counts remain.
+                snapshot.threads.insert(
+                    tid,
+                    ThreadSample {
+                        alive: false,
+                        instructions: perf(&counters.instructions),
+                        instructions_user: perf(&counters.instructions_user),
+                        cycles: perf(&counters.cycles),
+                        ..Default::default()
+                    },
+                );
+                continue;
             };
             let (utime, stime) = fs::read_to_string(format!("{base}/stat"))
                 .ok()
@@ -243,18 +313,16 @@ impl ProcessCounters {
             snapshot.threads.insert(
                 tid,
                 ThreadSample {
+                    alive: true,
                     cpu_ns: sched.first().copied().unwrap_or(0),
                     run_delay_ns: sched.get(1).copied().unwrap_or(0),
                     utime_ticks: utime,
                     stime_ticks: stime,
                     voluntary_switches: voluntary,
                     involuntary_switches: involuntary,
-                    instructions: counters.instructions.as_ref().and_then(PerfCounter::read),
-                    instructions_user: counters
-                        .instructions_user
-                        .as_ref()
-                        .and_then(PerfCounter::read),
-                    cycles: counters.cycles.as_ref().and_then(PerfCounter::read),
+                    instructions: perf(&counters.instructions),
+                    instructions_user: perf(&counters.instructions_user),
+                    cycles: perf(&counters.cycles),
                 },
             );
         }
@@ -264,38 +332,38 @@ impl ProcessCounters {
     pub fn delta(&self, start: &Snapshot, end: &Snapshot) -> Delta {
         let tick_ns = 1_000_000_000 / self.clock_ticks;
         let mut delta = Delta::default();
-        let mut instructions = Some(0_u64);
-        let mut instructions_user = Some(0_u64);
-        let mut cycles = Some(0_u64);
+        let mut instructions = PerfSum::default();
+        let mut instructions_user = PerfSum::default();
+        let mut cycles = PerfSum::default();
         for (tid, e) in &end.threads {
-            // A thread created during the interval started from zero.
-            let s = start.threads.get(tid).copied().unwrap_or_default();
-            let cpu = e.cpu_ns.saturating_sub(s.cpu_ns);
-            delta.cpu_ns += cpu;
-            let run_delay = e.run_delay_ns.saturating_sub(s.run_delay_ns);
-            delta.run_delay_ns += run_delay;
-            delta.user_ns += e.utime_ticks.saturating_sub(s.utime_ticks) * tick_ns;
-            delta.system_ns += e.stime_ticks.saturating_sub(s.stime_ticks) * tick_ns;
-            delta.voluntary_switches += e.voluntary_switches.saturating_sub(s.voluntary_switches);
-            delta.involuntary_switches += e
-                .involuntary_switches
-                .saturating_sub(s.involuntary_switches);
-            let add = |acc: &mut Option<u64>, end: Option<u64>, start: Option<u64>| {
-                *acc = match (*acc, end) {
-                    (Some(a), Some(e)) => Some(a + e.saturating_sub(start.unwrap_or(0))),
-                    _ => None,
-                };
+            let started = start.threads.get(tid);
+            let s = started.copied().unwrap_or_default();
+            if started.is_some_and(|s| s.alive) != e.alive {
+                delta.thread_changes += 1;
+            }
+            // An exited thread reports no scheduler statistics at the end.
+            let sched = |end: u64, start: u64| {
+                if e.alive {
+                    end.saturating_sub(start)
+                } else {
+                    0
+                }
             };
+            let cpu = sched(e.cpu_ns, s.cpu_ns);
+            delta.cpu_ns += cpu;
+            let run_delay = sched(e.run_delay_ns, s.run_delay_ns);
+            delta.run_delay_ns += run_delay;
+            delta.user_ns += sched(e.utime_ticks, s.utime_ticks) * tick_ns;
+            delta.system_ns += sched(e.stime_ticks, s.stime_ticks) * tick_ns;
+            delta.voluntary_switches += sched(e.voluntary_switches, s.voluntary_switches);
+            let involuntary = sched(e.involuntary_switches, s.involuntary_switches);
+            delta.involuntary_switches += involuntary;
             // Threads with negligible CPU but no counter (e.g. exited before
             // discovery) should not void the aggregate.
             if e.instructions_user.is_some() || cpu > 1_000_000 {
-                add(&mut instructions, e.instructions, s.instructions);
-                add(
-                    &mut instructions_user,
-                    e.instructions_user,
-                    s.instructions_user,
-                );
-                add(&mut cycles, e.cycles, s.cycles);
+                instructions.add(s.instructions, e.instructions);
+                instructions_user.add(s.instructions_user, e.instructions_user);
+                cycles.add(s.cycles, e.cycles);
             }
             let name = self
                 .threads
@@ -308,15 +376,26 @@ impl ProcessCounters {
                     }
                 })
                 .unwrap_or_default();
-            *delta.involuntary_by_thread.entry(name.clone()).or_default() += e
-                .involuntary_switches
-                .saturating_sub(s.involuntary_switches);
+            *delta.involuntary_by_thread.entry(name.clone()).or_default() += involuntary;
             *delta.run_delay_by_thread.entry(name.clone()).or_default() += run_delay;
             *delta.cpu_ns_by_thread.entry(name).or_default() += cpu;
         }
-        delta.instructions = instructions.filter(|_| self.perf_available);
-        delta.instructions_user = instructions_user.filter(|_| self.perf_available);
-        delta.cycles = cycles.filter(|_| self.perf_available);
+        // A thread seen at the start but missing at the end vanished
+        // between snapshots without being recorded as exited.
+        delta.thread_changes += start
+            .threads
+            .iter()
+            .filter(|(tid, s)| s.alive && !end.threads.contains_key(tid))
+            .count() as u32;
+        if self.perf_available {
+            delta.instructions = instructions.total();
+            delta.instructions_user = instructions_user.total();
+            delta.cycles = cycles.total();
+            delta.perf_coverage = [&instructions, &instructions_user, &cycles]
+                .iter()
+                .filter_map(|c| c.coverage())
+                .reduce(f64::min);
+        }
         delta
     }
 }
@@ -377,4 +456,64 @@ pub fn fractions(
             (total > 0).then(|| field(e).saturating_sub(field(s)) as f64 / total as f64)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reading(value: u64, enabled: u64, running: u64) -> Option<PerfReading> {
+        Some(PerfReading {
+            value,
+            enabled,
+            running,
+        })
+    }
+
+    #[test]
+    fn perf_counts_are_scaled_per_interval() {
+        // Multiplexed 50% before the interval and 100% within it: the
+        // interval count is exactly 100, not a difference of scaled totals.
+        let mut sum = PerfSum::default();
+        sum.add(reading(100, 100, 50), reading(200, 200, 150));
+        assert_eq!(sum.total(), Some(100));
+        assert_eq!(sum.coverage(), Some(1.0));
+
+        let mut sum = PerfSum::default();
+        sum.add(reading(0, 0, 0), reading(50, 100, 50));
+        assert_eq!(sum.total(), Some(100));
+        assert_eq!(sum.coverage(), Some(0.5));
+
+        // Enabled but never counting: unavailable, not zero.
+        let mut sum = PerfSum::default();
+        sum.add(reading(10, 10, 10), reading(10, 20, 10));
+        assert_eq!(sum.total(), None);
+
+        // Not scheduled at all in the interval: contributes nothing.
+        let mut sum = PerfSum::default();
+        sum.add(reading(10, 10, 10), reading(10, 10, 10));
+        assert_eq!(sum.total(), Some(0));
+    }
+
+    #[test]
+    fn thread_starts_and_exits_are_reported() {
+        let counters = ProcessCounters::new(std::process::id() as i32, false);
+        let alive = |cpu_ns| ThreadSample {
+            alive: true,
+            cpu_ns,
+            ..Default::default()
+        };
+        let mut start = Snapshot::default();
+        start.threads.insert(1, alive(10));
+        start.threads.insert(2, alive(10));
+        let mut end = Snapshot::default();
+        end.threads.insert(1, alive(30));
+        end.threads.insert(2, ThreadSample::default()); // exited
+        end.threads.insert(3, alive(5)); // started
+        let delta = counters.delta(&start, &end);
+        assert_eq!(delta.thread_changes, 2);
+        assert_eq!(delta.cpu_ns, 20 + 5);
+
+        assert_eq!(counters.delta(&end, &end).thread_changes, 0);
+    }
 }

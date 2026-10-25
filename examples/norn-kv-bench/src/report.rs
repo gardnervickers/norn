@@ -6,7 +6,7 @@ use std::fmt::Write as _;
 use hdrhistogram::Histogram;
 use serde::{Deserialize, Serialize};
 
-use crate::client::{Mode, SegStats, Segment};
+use crate::client::{Mode, SegStats, Segment, COMPLETION_TICK_NS};
 use crate::counters::Delta;
 use crate::profile::Profile;
 
@@ -69,6 +69,13 @@ pub struct ServerSegment {
     #[serde(default)]
     pub run_delay_fraction: f64,
     pub cpu_ns_by_thread: BTreeMap<String, u64>,
+    /// Server threads started or exited within the window; their counts
+    /// are incomplete.
+    #[serde(default)]
+    pub thread_changes: u32,
+    /// Smallest fraction of enabled time a perf counter was counting.
+    #[serde(default)]
+    pub perf_coverage: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,7 +94,17 @@ pub struct SegmentResult {
     pub window_s: f64,
     pub planned: u64,
     pub dropped: u64,
+    /// Responses whose completion time fell in the nominal window.
     pub completed: u64,
+    /// Responses completed within the coordinator's actual sampling
+    /// interval; the denominator of every per-request server metric.
+    #[serde(default)]
+    pub sampled_completed: Option<u64>,
+    /// Largest distance between a sampling instant and its nominal boundary.
+    #[serde(default)]
+    pub sample_skew_us: Option<f64>,
+    /// Completions per second over the sampling interval (nominal window
+    /// without server sampling).
     pub throughput: f64,
     pub churn_sessions: u64,
     pub rx_bytes: u64,
@@ -170,6 +187,9 @@ pub struct RunResult {
 
 /// Coordinator measurements of one segment window.
 pub struct Sample {
+    /// Actual sampling instants relative to the shared start. Cost per
+    /// request divides counters over this interval by completions in it.
+    pub window_ns: (u64, u64),
     /// Server counter delta and the actual sampled wall interval.
     pub server: Option<(Delta, u64)>,
     pub client_preemptions: u64,
@@ -188,6 +208,7 @@ pub fn build_segments(
     segments: &[Segment],
     stats: &[SegStats],
     samples: &[Option<Sample>],
+    completions: &[u32],
 ) -> Vec<SegmentResult> {
     let names = profile.class_names();
     let churn = names.len() - 1;
@@ -217,7 +238,19 @@ pub fn build_segments(
                     latency: Quantiles::of(&st.latency[i]),
                 })
                 .collect();
-            let ops = st.completed.max(1) as f64;
+            // Completions over the coordinator's actual sampling interval,
+            // which can differ from the nominal window by its wakeup delay.
+            let sampled = sample.as_ref().map(|v| {
+                let (t0, t1) = v.window_ns;
+                let ticks = |t: u64| ((t / COMPLETION_TICK_NS) as usize).min(completions.len());
+                let count: u64 = completions[ticks(t0)..ticks(t1)]
+                    .iter()
+                    .map(|&c| u64::from(c))
+                    .sum();
+                let skew = t0.abs_diff(s.measure_start_ns).max(t1.abs_diff(s.end_ns));
+                (count, t1 - t0, skew)
+            });
+            let ops = sampled.map_or(st.completed, |(count, _, _)| count).max(1) as f64;
             let server = srv.map(|(d, wall_ns)| {
                 let per = |v: Option<u64>| v.map(|v| v as f64 / ops);
                 ServerSegment {
@@ -246,6 +279,8 @@ pub fn build_segments(
                         as f64
                         / *wall_ns as f64,
                     cpu_ns_by_thread: d.cpu_ns_by_thread.clone(),
+                    thread_changes: d.thread_changes,
+                    perf_coverage: d.perf_coverage,
                 }
             });
             let (mode, offered_rate, closed_loop_depth) = match s.mode {
@@ -261,7 +296,11 @@ pub fn build_segments(
                 planned: st.planned,
                 dropped: st.dropped,
                 completed: st.completed,
-                throughput: st.completed as f64 / window_s,
+                sampled_completed: sampled.map(|(count, _, _)| count),
+                sample_skew_us: sampled.map(|(_, _, skew)| skew as f64 / 1e3),
+                throughput: sampled.map_or(st.completed as f64 / window_s, |(count, wall, _)| {
+                    count as f64 / (wall as f64 / 1e9)
+                }),
                 churn_sessions: st.churn_sessions,
                 rx_bytes: st.rx_bytes,
                 tx_bytes: st.tx_bytes,
@@ -303,6 +342,14 @@ pub fn qualify(
     all
 }
 
+/// Largest sampling-boundary skew, as a fraction of the window. Completions
+/// are counted over the actual interval, but a late boundary shifts the
+/// window into the neighbouring segment's load.
+const MAX_SAMPLE_SKEW: f64 = 0.005;
+/// Smallest acceptable perf counter coverage before scaling estimates
+/// dominate the counts.
+const MIN_PERF_COVERAGE: f64 = 0.99;
+
 /// Collects `(reason code, message)` pairs.
 struct Warnings(Vec<(&'static str, String)>);
 
@@ -323,6 +370,39 @@ fn segment_warnings(profile: &Profile, s: &SegmentResult) -> Vec<(&'static str, 
                     format!(
                         "{}: server threads preempted {:.0}/s; host is not quiet",
                         s.name, server.preemptions_per_s
+                    ),
+                ));
+            }
+        }
+        if let Some(skew) = s
+            .sample_skew_us
+            .filter(|skew| skew * 1e3 > MAX_SAMPLE_SKEW * s.window_s * 1e9)
+        {
+            warnings.push((
+                "sample-skew",
+                format!(
+                    "{}: the coordinator sampled {skew:.0}us away from a window boundary",
+                    s.name
+                ),
+            ));
+        }
+        if let Some(server) = &s.server {
+            if server.thread_changes > 0 {
+                warnings.push((
+                    "thread-churn",
+                    format!(
+                        "{}: {} server threads started or exited; their counts are incomplete",
+                        s.name, server.thread_changes
+                    ),
+                ));
+            }
+            if let Some(coverage) = server.perf_coverage.filter(|c| *c < MIN_PERF_COVERAGE) {
+                warnings.push((
+                    "perf-multiplexed",
+                    format!(
+                        "{}: perf counters ran {:.1}% of the time; another perf user is multiplexing them",
+                        s.name,
+                        coverage * 100.0
                     ),
                 ));
             }
@@ -624,6 +704,9 @@ pub struct MetricComparison {
     pub delta_max: f64,
     /// Larger of the two builds' (max - min) / median across runs.
     pub spread: f64,
+    /// Pairs in which both runs reported the metric (with a nonzero
+    /// baseline); every statistic above uses only these.
+    pub pairs_used: usize,
     pub verdict: String,
 }
 
@@ -638,12 +721,13 @@ pub fn compare(pairs: &[(RunResult, RunResult)]) -> Vec<MetricComparison> {
         let mut cand = Vec::new();
         let mut deltas = Vec::new();
         for (b, c) in pairs {
-            if let (Some(b), Some(c)) = ((metric.extract)(b), (metric.extract)(c)) {
-                base.push(b);
-                cand.push(c);
-                if b != 0.0 {
+            match ((metric.extract)(b), (metric.extract)(c)) {
+                (Some(b), Some(c)) if b != 0.0 => {
+                    base.push(b);
+                    cand.push(c);
                     deltas.push(c / b - 1.0);
                 }
+                _ => {}
             }
         }
         if deltas.is_empty() {
@@ -679,7 +763,7 @@ pub fn compare(pairs: &[(RunResult, RunResult)]) -> Vec<MetricComparison> {
         };
         // An unqualified verdict still shows what the data indicated, as a
         // hint for whether a qualified rerun is worthwhile.
-        let verdict = if pairs.len() < 3 {
+        let verdict = if deltas.len() < 3 {
             "too few pairs".to_owned()
         } else if !qualified {
             format!("unqualified/{indicated}")
@@ -694,6 +778,7 @@ pub fn compare(pairs: &[(RunResult, RunResult)]) -> Vec<MetricComparison> {
             delta_min: lo,
             delta_max: hi,
             spread: within,
+            pairs_used: deltas.len(),
             verdict,
         });
     }
@@ -705,17 +790,17 @@ pub fn comparison_table(rows: &[MetricComparison], pairs: usize) -> String {
     let _ = writeln!(
         out,
         "{pairs} interleaved pairs; delta = median of per-pair candidate/baseline - 1; \
-         `unqualified/X` = some run failed qualification for this segment; X is only a hint"
+         `unqualified/X` = some run failed qualification for this segment; X is only a hint; n = pairs with the metric"
     );
     let _ = writeln!(
         out,
-        "{:<34} {:>11} {:>11} {:>8} {:>18} {:>7}  verdict",
-        "metric", "baseline", "candidate", "delta", "pair range", "spread"
+        "{:<34} {:>11} {:>11} {:>8} {:>18} {:>7} {:>2}  verdict",
+        "metric", "baseline", "candidate", "delta", "pair range", "spread", "n"
     );
     for r in rows {
         let _ = writeln!(
             out,
-            "{:<34} {:>11} {:>11} {:>+7.2}% {:>+8.2}%..{:>+6.2}% {:>6.2}%  {}",
+            "{:<34} {:>11} {:>11} {:>+7.2}% {:>+8.2}%..{:>+6.2}% {:>6.2}% {:>2}  {}",
             r.metric,
             si(r.baseline_median),
             si(r.candidate_median),
@@ -723,8 +808,128 @@ pub fn comparison_table(rows: &[MetricComparison], pairs: usize) -> String {
             r.delta_min * 100.0,
             r.delta_max * 100.0,
             r.spread * 100.0,
+            r.pairs_used,
             r.verdict
         );
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn profile() -> Profile {
+        Profile::load(concat!(env!("CARGO_MANIFEST_DIR"), "/profiles/smoke.json")).unwrap()
+    }
+
+    /// A run whose every segment sampled `window` (relative to the shared
+    /// start, per segment) and saw `instructions` user instructions, with
+    /// one completion per tick over the whole timeline.
+    fn run(
+        instructions: Option<u64>,
+        window: impl Fn(&Segment) -> (u64, u64),
+    ) -> (RunResult, Vec<SegmentResult>) {
+        let profile = profile();
+        let timeline = crate::client::timeline(&profile);
+        let mut stats: Vec<_> = timeline
+            .iter()
+            .map(|_| SegStats::empty(profile.class_names().len()))
+            .collect();
+        for (st, s) in stats.iter_mut().zip(&timeline) {
+            st.completed = (s.end_ns - s.measure_start_ns) / COMPLETION_TICK_NS;
+            st.planned = st.completed;
+        }
+        let end = timeline.last().unwrap().end_ns;
+        let completions = vec![1_u32; (2 * end / COMPLETION_TICK_NS) as usize];
+        let samples: Vec<_> = timeline
+            .iter()
+            .map(|s| {
+                let (t0, t1) = window(s);
+                Some(Sample {
+                    window_ns: (t0, t1),
+                    server: Some((
+                        Delta {
+                            instructions_user: instructions,
+                            cpu_ns: t1 - t0,
+                            ..Default::default()
+                        },
+                        t1 - t0,
+                    )),
+                    client_preemptions: 0,
+                    client_max_run_delay_ns: 0,
+                    server_sibling_busy: Some(0.0),
+                    server_cpu_busy: Some(1.0),
+                    server_cpu_irq: Some(0.0),
+                })
+            })
+            .collect();
+        let mut segments = build_segments(&profile, &timeline, &stats, &samples, &completions);
+        qualify(&profile, &mut segments, &[]);
+        let result = RunResult {
+            result_version: RESULT_VERSION,
+            label: "test".into(),
+            profile,
+            provenance: Provenance::default(),
+            valid: true,
+            error: None,
+            qualified: true,
+            warnings: vec![],
+            populate_s: 0.0,
+            drain_s: 0.0,
+            verified_slots: 1,
+            segments: segments.clone(),
+        };
+        (result, segments)
+    }
+
+    fn nominal(s: &Segment) -> (u64, u64) {
+        (s.measure_start_ns, s.end_ns)
+    }
+
+    #[test]
+    fn per_request_metrics_use_completions_in_the_sampled_interval() {
+        // The coordinator woke late and sampled twice the nominal window.
+        let (_, segments) = run(Some(1_000_000), |s| {
+            (s.measure_start_ns, 2 * s.end_ns - s.measure_start_ns)
+        });
+        let s = &segments[0];
+        let ticks = 2 * (s.window_s * 1e9) as u64 / COMPLETION_TICK_NS;
+        assert_eq!(s.sampled_completed, Some(ticks));
+        let per_op = s.server.as_ref().unwrap().instructions_user_per_op.unwrap();
+        assert!((per_op - 1e6 / ticks as f64).abs() < 1e-9, "{per_op}");
+        assert!(
+            s.reasons.iter().any(|r| r == "sample-skew"),
+            "{:?}",
+            s.reasons
+        );
+
+        let (_, segments) = run(Some(1_000_000), nominal);
+        assert!(segments[0].qualified, "{:?}", segments[0].warnings);
+    }
+
+    #[test]
+    fn verdict_requires_three_pairs_with_the_metric() {
+        let pairs = vec![
+            (run(Some(100_000), nominal).0, run(Some(90_000), nominal).0),
+            (run(None, nominal).0, run(None, nominal).0),
+            (run(None, nominal).0, run(None, nominal).0),
+        ];
+        let rows = compare(&pairs);
+        let row = rows
+            .iter()
+            .find(|r| r.metric == "capacity user_instructions/op")
+            .unwrap();
+        assert_eq!((row.pairs_used, row.verdict.as_str()), (1, "too few pairs"));
+
+        let pairs: Vec<_> = (0..3)
+            .map(|_| (run(Some(100_000), nominal).0, run(Some(90_000), nominal).0))
+            .collect();
+        let rows = compare(&pairs);
+        let row = rows
+            .iter()
+            .find(|r| r.metric == "capacity user_instructions/op")
+            .unwrap();
+        assert_eq!((row.pairs_used, row.verdict.as_str()), (3, "better"));
+    }
 }

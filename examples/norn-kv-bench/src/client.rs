@@ -28,6 +28,11 @@ const READ_BUFFER: usize = 256 * 1024;
 const MAX_READS_PER_EVENT: usize = 4;
 /// Busy-poll when the next deadline is closer than this.
 const SPIN_NS: u64 = 1_500_000;
+/// Resolution of the completion-time histogram that lets the coordinator
+/// count completions over its actual sampling interval.
+pub const COMPLETION_TICK_NS: u64 = 100_000;
+/// Completion ticks kept beyond the timeline end, for late final samples.
+const COMPLETION_SLACK_NS: u64 = 2_000_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Mode {
@@ -162,6 +167,8 @@ impl SegStats {
 
 pub struct ThreadReport {
     pub segments: Vec<SegStats>,
+    /// Recorded completions per [`COMPLETION_TICK_NS`] since the start.
+    pub completions: Vec<u32>,
     pub populate_ns: u64,
     pub drain_ns: u64,
     pub verified: u64,
@@ -177,6 +184,10 @@ pub struct Shared {
     /// Shared start offset from `epoch`, published between the barriers.
     pub start_ns: Mutex<u64>,
     pub barrier: Barrier,
+    /// Set by the coordinator once its last counter snapshot is taken.
+    /// Client threads keep running, and do not start verification traffic,
+    /// until then, so the final window counts them and only them.
+    pub sampled: AtomicBool,
     pub failed: AtomicBool,
     pub error: Mutex<Option<String>>,
 }
@@ -340,6 +351,7 @@ struct Worker<'a> {
     key: [u8; KEY_LEN],
     outstanding: usize,
     churn_opened: u64,
+    completions: Vec<u32>,
 }
 
 fn err(context: &str, error: impl std::fmt::Display) -> String {
@@ -394,6 +406,7 @@ impl<'a> Worker<'a> {
             key: [0; KEY_LEN],
             outstanding: 0,
             churn_opened: thread as u64 * 97,
+            completions: completion_ticks(shared.segments.last().map_or(0, |s| s.end_ns)),
         })
     }
 
@@ -623,6 +636,7 @@ impl<'a> Worker<'a> {
         let w = self.w;
         let rel_now = self.rel(now);
         let done_seg = self.measured_segment(rel_now);
+        let done_tick = (rel_now / COMPLETION_TICK_NS) as usize;
         let mut completed = false;
         loop {
             let conn = self.conns[index].as_mut().unwrap();
@@ -704,6 +718,9 @@ impl<'a> Worker<'a> {
             let churn_done = !persistent && conn.churn_remaining == 0;
             let churn_intended = conn.churn_intended_ns;
             if pending.class != UNRECORDED {
+                if let Some(tick) = self.completions.get_mut(done_tick) {
+                    *tick += 1;
+                }
                 if let Some(seg) = done_seg {
                     self.stats[seg].completed += 1;
                     self.stats[seg].completed_by_class[pending.class as usize] += 1;
@@ -892,6 +909,37 @@ impl<'a> Worker<'a> {
         Ok(counts.iter().sum())
     }
 
+    /// Issue every open-loop arrival of segment `index` due before
+    /// `min(now, segment end)`, advancing `next_arrival`. Arrivals are issued
+    /// late rather than skipped, so a stalled client shows up as arrival lag.
+    fn issue_arrivals(&mut self, index: usize, now: u64, next_arrival: &mut f64, mean: f64) {
+        let s = &self.shared.segments[index];
+        let end = s.end_ns as f64;
+        let max_outstanding = self.shared.profile.client.max_outstanding_per_connection;
+        while *next_arrival <= now as f64 && *next_arrival < end {
+            let intended = *next_arrival as u64;
+            let burst = self.w.pick_burst(&mut self.rng);
+            let conn = self.rng.below(self.persistent as u64) as usize;
+            let seg = self.measured_segment(intended);
+            let lag = self.rel(self.shared.now_ns()).saturating_sub(intended);
+            for _ in 0..burst {
+                let class = self.w.pick_class(&mut self.rng);
+                if let Some(seg) = seg {
+                    self.stats[seg].planned += 1;
+                    self.stats[seg].lag.saturating_record(lag);
+                }
+                if self.conns[conn].as_ref().unwrap().pending.len() >= max_outstanding {
+                    if let Some(seg) = seg {
+                        self.stats[seg].dropped += 1;
+                    }
+                    continue;
+                }
+                self.issue(conn, class, intended + self.start_ns);
+            }
+            *next_arrival += self.rng.exp(mean);
+        }
+    }
+
     fn run(&mut self) -> Result<ThreadReport, String> {
         let shared = self.shared;
         let profile = &shared.profile;
@@ -918,7 +966,6 @@ impl<'a> Worker<'a> {
         } else {
             f64::INFINITY
         };
-        let max_outstanding = profile.client.max_outstanding_per_connection;
         let mut segment = usize::MAX;
         let mut next_arrival = f64::INFINITY;
         let mut arrival_mean = f64::INFINITY;
@@ -927,11 +974,23 @@ impl<'a> Worker<'a> {
         loop {
             self.check_failed()?;
             let now = self.rel(shared.now_ns());
-            if now >= end_ns {
-                break;
-            }
-            let current = segments.iter().position(|s| now < s.end_ns).unwrap();
-            if current != segment {
+            let current = segments.iter().position(|s| now < s.end_ns);
+            if current != Some(segment) {
+                // Arrivals of the segment just left that fell due before its
+                // end are still issued, then counted against it.
+                if let Some(s) = segments.get(segment) {
+                    if matches!(s.mode, Mode::Open { .. }) {
+                        self.issue_arrivals(segment, now, &mut next_arrival, arrival_mean);
+                    }
+                }
+                while next_churn < now.min(end_ns) as f64 {
+                    self.open_churn(next_churn as u64 + self.start_ns)?;
+                    next_churn += self.rng.exp(churn_mean_ns);
+                }
+                let Some(current) = current else {
+                    self.flush()?;
+                    break;
+                };
                 segment = current;
                 let s = &segments[segment];
                 match s.mode {
@@ -950,28 +1009,7 @@ impl<'a> Worker<'a> {
 
             match s.mode {
                 Mode::Open { .. } => {
-                    while next_arrival <= now as f64 && next_arrival < s.end_ns as f64 {
-                        let intended = next_arrival as u64;
-                        let burst = self.w.pick_burst(&mut self.rng);
-                        let index = self.rng.below(self.persistent as u64) as usize;
-                        let seg = self.measured_segment(intended);
-                        for _ in 0..burst {
-                            let class = self.w.pick_class(&mut self.rng);
-                            if let Some(seg) = seg {
-                                self.stats[seg].planned += 1;
-                                self.stats[seg].lag.saturating_record(now - intended);
-                            }
-                            if self.conns[index].as_ref().unwrap().pending.len() >= max_outstanding
-                            {
-                                if let Some(seg) = seg {
-                                    self.stats[seg].dropped += 1;
-                                }
-                                continue;
-                            }
-                            self.issue(index, class, intended + self.start_ns);
-                        }
-                        next_arrival += self.rng.exp(arrival_mean);
-                    }
+                    self.issue_arrivals(segment, now, &mut next_arrival, arrival_mean);
                     self.refill.clear();
                 }
                 Mode::Closed { depth } => {
@@ -1020,14 +1058,31 @@ impl<'a> Worker<'a> {
             }
         }
         let drain_ns = shared.now_ns() - drain_start;
+        while !shared.sampled.load(Ordering::Acquire) {
+            self.check_failed()?;
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         let verified = self.verify()?;
         Ok(ThreadReport {
             segments: std::mem::take(&mut self.stats),
+            completions: std::mem::take(&mut self.completions),
             populate_ns,
             drain_ns,
             verified,
         })
     }
+}
+
+/// A zeroed completion histogram covering `end_ns` plus slack, with every
+/// page touched so recording does not fault during measurement.
+fn completion_ticks(end_ns: u64) -> Vec<u32> {
+    let len = ((end_ns + COMPLETION_SLACK_NS) / COMPLETION_TICK_NS) as usize;
+    let mut ticks = vec![0_u32; len];
+    for i in (0..len).step_by(1024) {
+        // SAFETY: `i < len`; a volatile write keeps the touch from being elided.
+        unsafe { std::ptr::write_volatile(ticks.as_mut_ptr().add(i), 0) };
+    }
+    ticks
 }
 
 /// Start a non-blocking connect. Requests may be queued immediately: writes

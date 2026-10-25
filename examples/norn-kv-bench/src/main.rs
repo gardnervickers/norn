@@ -400,6 +400,7 @@ work cannot run there. Generic servers substitute {port} and
             epoch: Instant::now(),
             start_ns: Mutex::new(0),
             barrier: Barrier::new(threads + 1),
+            sampled: AtomicBool::new(false),
             failed: AtomicBool::new(false),
             error: Mutex::new(None),
         });
@@ -472,6 +473,7 @@ work cannot run there. Generic servers substitute {port} and
                 .zip(a.zip(b))
                 .map(|(c, (a, b))| (c.delta(&a, &b), t1 - t0));
             samples.push(Some(report::Sample {
+                window_ns: (t0 - start, t1 - start),
                 server,
                 client_preemptions,
                 client_max_run_delay_ns,
@@ -498,6 +500,7 @@ work cannot run there. Generic servers substitute {port} and
                 })),
             }));
         }
+        shared.sampled.store(true, Ordering::Release);
         if let Some(c) = &counters {
             provenance.perf_counters = c.perf_available;
             provenance.server_threads = c.thread_names();
@@ -516,6 +519,7 @@ work cannot run there. Generic servers substitute {port} and
 
         let classes = profile.class_names().len();
         let mut merged: Vec<SegStats> = Vec::new();
+        let mut completions: Vec<u32> = Vec::new();
         let (mut populate_ns, mut drain_ns, mut verified) = (0, 0, 0);
         for report in reports.iter().flatten() {
             populate_ns = populate_ns.max(report.populate_ns);
@@ -531,12 +535,16 @@ work cannot run there. Generic servers substitute {port} and
             for (m, s) in merged.iter_mut().zip(&report.segments) {
                 m.merge(s);
             }
+            completions.resize(completions.len().max(report.completions.len()), 0);
+            for (m, c) in completions.iter_mut().zip(&report.completions) {
+                *m += c;
+            }
         }
         let valid = error.is_none() && reports.iter().all(Option::is_some);
         let mut segment_results = if merged.is_empty() {
             Vec::new()
         } else {
-            report::build_segments(profile, &segments, &merged, &samples)
+            report::build_segments(profile, &segments, &merged, &samples, &completions)
         };
         let mut run_warnings = plan.placement_warnings.to_vec();
         if counters.is_some() && !provenance.perf_counters {

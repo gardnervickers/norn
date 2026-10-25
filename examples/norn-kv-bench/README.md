@@ -90,8 +90,14 @@ boundaries. It records:
 - per-thread `perf_event_open` counters for instructions, user-space
   instructions, and cycles.
 
-Threads created mid-run, such as io-wq workers, are discovered at every
-snapshot. The coordinator also reads `/proc/stat` for the server CPUs and
+Perf counts are scaled for multiplexing per interval, from raw count,
+enabled, and running times. Threads are rediscovered at every snapshot, but a
+thread that starts or exits within a window has incomplete counts, so the
+window is disqualified (`thread-churn`). Per-request metrics divide by the
+completions within the coordinator's actual sampling interval, taken from a
+100 us completion-time histogram, and a boundary sampled more than 0.5% of
+the window late is disqualified (`sample-skew`). Client threads wait for the
+final snapshot before their readback traffic. The coordinator also reads `/proc/stat` for the server CPUs and
 their SMT siblings.
 
 The summary's `util` column is server thread CPU time per worker. `core` is
@@ -177,6 +183,9 @@ distort the result:
   `max_sibling_busy_fraction` (default 5%) busy. On the development
   workstation, server IPC was about 0.3 with a busy sibling and about 0.5
   with a mostly idle one;
+- no server thread started or exited in the window, perf counters ran at
+  least 99% of their enabled time (no multiplexing by another perf user), and
+  the coordinator sampled within 0.5% of the window of each boundary;
 - client and server were pinned, with no shared physical cores.
 
 On an unqualified run, capacity instruction counts are still a useful hint.
@@ -196,7 +205,8 @@ The verdict is `better` or `worse` only when every pair agrees in sign and
 the median delta exceeds half the within-build spread, and `noise` in all
 other cases. If any run failed qualification for that segment, the verdict
 is prefixed: `unqualified/worse` is a hint for whether a qualified rerun is
-worthwhile, not a result. Fewer than three pairs reports `too few pairs`.
+worthwhile, not a result. Fewer than three pairs in which both runs report
+the metric (column `n`) reports `too few pairs`.
 
 Recommended practice:
 
