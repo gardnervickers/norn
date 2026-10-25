@@ -49,6 +49,12 @@ pin_project_lite::pin_project! {
     /// A stream of buffers received by a multishot TCP receive operation.
     ///
     /// The stream ends when the peer performs an orderly shutdown.
+    ///
+    /// Buffer exhaustion is absorbed as backpressure: receiving waits for a
+    /// buffer return and re-arms without yielding ENOBUFS or discarding queued data.
+    /// Drop held buffers to allow progress. Ring quarantine yields a terminal
+    /// error; driver shutdown ends a stream waiting for buffers. Other socket
+    /// errors remain terminal.
     pub struct TcpRecvRingMulti {
         #[pin]
         inner: Option<socket::RecvRingStream>,
@@ -89,6 +95,12 @@ pin_project_lite::pin_project! {
     /// A stream of buffer bundles received by a multishot TCP receive operation.
     ///
     /// The stream ends when the peer performs an orderly shutdown.
+    ///
+    /// Buffer exhaustion is absorbed as backpressure: receiving waits for a
+    /// buffer return and re-arms without yielding ENOBUFS or discarding queued data.
+    /// Drop held buffers to allow progress. Ring quarantine yields a terminal
+    /// error; driver shutdown ends a stream waiting for buffers. Other socket
+    /// errors remain terminal.
     pub struct TcpRecvBundleMulti {
         #[pin]
         inner: Option<socket::RecvRingBundleStream>,

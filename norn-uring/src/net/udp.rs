@@ -24,6 +24,12 @@ pin_project_lite::pin_project! {
     /// A stream of datagrams received into buffers from a registered ring.
     ///
     /// Empty datagrams are yielded as empty, zero-capacity buffers.
+    ///
+    /// Buffer exhaustion is absorbed as backpressure: receiving waits for a
+    /// buffer return and re-arms without yielding ENOBUFS or discarding queued data.
+    /// Drop held buffers to allow progress. Ring quarantine yields a terminal
+    /// error; driver shutdown ends a stream waiting for buffers. Other socket
+    /// errors remain terminal.
     pub struct UdpRecvRingMulti {
         #[pin]
         inner: socket::RecvRingStream,
@@ -50,6 +56,12 @@ pin_project_lite::pin_project! {
     /// A stream of datagrams received into buffer bundles from a registered ring.
     ///
     /// Empty datagrams are yielded as empty, zero-buffer bundles.
+    ///
+    /// Buffer exhaustion is absorbed as backpressure: receiving waits for a
+    /// buffer return and re-arms without yielding ENOBUFS or discarding queued data.
+    /// Drop held buffers to allow progress. Ring quarantine yields a terminal
+    /// error; driver shutdown ends a stream waiting for buffers. Other socket
+    /// errors remain terminal.
     pub struct UdpRecvBundleMulti {
         #[pin]
         inner: socket::RecvRingBundleStream,
@@ -66,6 +78,29 @@ impl UdpRecvBundleMulti {
 
 impl Stream for UdpRecvBundleMulti {
     type Item = io::Result<BufRingBufBundle>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.project().inner.poll_next(cx)
+    }
+}
+
+pin_project_lite::pin_project! {
+    /// A persistent stream of datagrams and sender addresses from a buffer ring.
+    ///
+    /// Successful terminal kernel completions transparently re-arm receiving.
+    /// Buffer exhaustion is absorbed as backpressure: the stream waits for a
+    /// buffer return, then re-arms without yielding ENOBUFS or discarding queued data.
+    /// Drop held buffers to allow progress. Ring quarantine yields a terminal
+    /// error; driver shutdown ends a stream waiting for buffers. Other socket
+    /// errors remain terminal.
+    pub struct UdpRecvFromRingMulti {
+        #[pin]
+        inner: socket::RecvFromRingStream,
+    }
+}
+
+impl Stream for UdpRecvFromRingMulti {
+    type Item = io::Result<(RecvMsgRingBuf, SocketAddr)>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.project().inner.poll_next(cx)
@@ -284,15 +319,15 @@ impl UdpSocket {
     /// provided buffer ring.
     ///
     /// Each yielded item includes payload bytes and the sender address.
+    /// See [`UdpRecvFromRingMulti`] for recovery and backpressure behavior.
     ///
     /// # Panics
     ///
     /// Panics when the buffer ring was registered with another driver.
-    pub fn recv_from_ring_multi(
-        &self,
-        ring: &RecvBufRing,
-    ) -> impl Stream<Item = io::Result<(RecvMsgRingBuf, SocketAddr)>> {
-        self.inner.recv_from_ring_multi(ring)
+    pub fn recv_from_ring_multi(&self, ring: &RecvBufRing) -> UdpRecvFromRingMulti {
+        UdpRecvFromRingMulti {
+            inner: self.inner.recv_from_ring_stream(ring),
+        }
     }
 
     /// Receives datagrams from a connected socket using a multishot recv operation backed by the

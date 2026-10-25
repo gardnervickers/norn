@@ -10,6 +10,7 @@ use std::{fmt, io, ops, ptr};
 
 use crate::buf::StableBuf;
 use crate::driver::BufRingRegistration;
+use crate::util::notify::Notify;
 use crate::Handle;
 use io_uring::types::{self, BufRingEntry};
 use io_uring::{IoUring, Submitter};
@@ -85,6 +86,50 @@ impl RecvBufRing {
     /// Returns the number of buffers in the buffer ring.
     pub fn buf_count(&self) -> u16 {
         self.rc.buf_cnt
+    }
+
+    pub(crate) fn return_epoch(&self) -> u64 {
+        self.rc.return_epoch.get()
+    }
+
+    pub(crate) fn driver_running(&self) -> bool {
+        self.rc.registration.is_running()
+    }
+
+    /// Wait for publication after the failed receive was configured. The epoch
+    /// also catches returns before the terminal ENOBUFS is consumed. A retry
+    /// may lose a shared buffer to another receive, but cannot retry again
+    /// without another publication: an empty pool never causes a busy loop.
+    pub(crate) async fn wait_for_return(self, epoch: u64) -> io::Result<bool> {
+        use std::future::{poll_fn, Future};
+        use std::pin::pin;
+        use std::task::Poll;
+        let mut returned = pin!(self.rc.returned.wait());
+        let mut shutdown = pin!(self.rc.registration.wait_for_shutdown());
+        poll_fn(|cx| loop {
+            let notified = returned.as_mut().poll(cx).is_ready();
+            if shutdown.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(Ok(false));
+            }
+            // Buffer returns and waiter registration are local to this thread.
+            // Register first, then recheck; no callback runs with a tracker
+            // borrow held. Thus a return on either side is observed.
+            if let Err(error) = self.ensure_accepting_receives() {
+                return Poll::Ready(Err(error));
+            }
+            if self.return_epoch() != epoch {
+                return Poll::Ready(Ok(true));
+            }
+            if notified {
+                // Cancelling a fired Notified transfers its wake to another
+                // waiter. Such a wake need not represent a newer publication;
+                // refresh the notification and keep waiting on the condition.
+                returned.set(self.rc.returned.wait());
+                continue;
+            }
+            return Poll::Pending;
+        })
+        .await
     }
 
     pub(crate) fn get_buf(&self, res: u32, flags: u32) -> io::Result<BufRingBuf> {
@@ -797,6 +842,8 @@ pub(crate) struct BufRingStorage {
     // different order from buffer selection, so a raw BID is not itself proof
     // of ownership.
     tracker: RefCell<PublicationTracker>,
+    return_epoch: Cell<u64>,
+    returned: Notify,
 }
 
 impl BufRingStorage {
@@ -836,6 +883,8 @@ impl BufRingStorage {
             buf_list,
             local_tail: Cell::new(0),
             tracker: RefCell::new(PublicationTracker::new(buf_cnt)),
+            return_epoch: Cell::new(0),
+            returned: Notify::default(),
         };
 
         Ok(buf_ring)
@@ -920,6 +969,7 @@ impl BufRingStorage {
 
     fn poison(&self, message: impl Into<String>) -> io::Error {
         self.tracker.borrow_mut().poison();
+        self.returned.notify(self.returned.waiters());
         io::Error::new(io::ErrorKind::InvalidData, message.into())
     }
 
@@ -932,11 +982,13 @@ impl BufRingStorage {
                 self.bgid,
                 error
             );
+            self.returned.notify(self.returned.waiters());
             return;
         }
 
         self.buf_ring_push(token.bid());
         self.buf_ring_sync();
+        self.notify_return();
     }
 
     fn return_bundle(&self, claim: &BundleClaim) {
@@ -948,6 +1000,7 @@ impl BufRingStorage {
                 self.bgid,
                 error
             );
+            self.returned.notify(self.returned.waiters());
             return;
         }
 
@@ -955,6 +1008,19 @@ impl BufRingStorage {
             self.buf_ring_push(token.bid());
         }
         self.buf_ring_sync();
+        self.notify_return();
+    }
+
+    fn notify_return(&self) {
+        // Publish to the kernel before notifying receive streams.
+        self.return_epoch
+            .set(self.return_epoch.get().wrapping_add(1));
+        self.returned.notify(self.returned.waiters());
+    }
+
+    fn claim_error(&self, error: TrackerError) -> io::Error {
+        self.returned.notify(self.returned.waiters());
+        Self::tracker_error(error)
     }
 
     // Returns the buffer the uring interface picked from the buf_ring for the completion result
@@ -978,11 +1044,8 @@ impl BufRingStorage {
             )));
         }
 
-        let token = self
-            .tracker
-            .borrow_mut()
-            .claim_one(bid)
-            .map_err(Self::tracker_error)?;
+        let result = self.tracker.borrow_mut().claim_one(bid);
+        let token = result.map_err(|error| self.claim_error(error))?;
         Ok(BufRingBuf::new(buf_ring, token, len))
     }
 
@@ -1007,11 +1070,8 @@ impl BufRingStorage {
         } else {
             total_len.div_ceil(self.buf_len)
         };
-        let claim = self
-            .tracker
-            .borrow_mut()
-            .claim_bundle(first_bid, needed)
-            .map_err(Self::tracker_error)?;
+        let result = self.tracker.borrow_mut().claim_bundle(first_bid, needed);
+        let claim = result.map_err(|error| self.claim_error(error))?;
         Ok(BufRingBufBundle::new(buf_ring, claim, total_len))
     }
 
@@ -1164,6 +1224,94 @@ mod tests {
     use norn_executor::park::{Park, ParkMode};
 
     use crate::Driver;
+
+    #[test]
+    fn buffer_return_wait_registers_without_losing_notifications() -> io::Result<()> {
+        use std::future::Future;
+        use std::task::Context;
+        let driver = Driver::new(io_uring::IoUring::builder(), 8)?;
+        let _guard = driver.enter();
+        let ring = RecvBufRing::builder(1).buf_cnt(1).buf_len(8).build()?;
+        let (waker, count) = futures_test::task::new_count_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        // Return between the receive's epoch snapshot and waiter registration.
+        let epoch = ring.return_epoch();
+        ring.rc.notify_return();
+        let mut before = Box::pin(ring.clone().wait_for_return(epoch));
+        assert!(matches!(
+            before.as_mut().poll(&mut cx),
+            std::task::Poll::Ready(Ok(true))
+        ));
+        drop(before);
+        assert_eq!(ring.rc.returned.waiters(), 0);
+
+        // Both streams must observe one publication; availability is shared,
+        // rather than a permit a dropped waiter can consume permanently.
+        let epoch = ring.return_epoch();
+        let mut first = Box::pin(ring.clone().wait_for_return(epoch));
+        let mut second = Box::pin(ring.clone().wait_for_return(epoch));
+        assert!(first.as_mut().poll(&mut cx).is_pending());
+        assert!(second.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(ring.rc.returned.waiters(), 2);
+        ring.rc.notify_return();
+        assert_eq!(count.get(), 2);
+        drop(first);
+        assert!(matches!(
+            second.as_mut().poll(&mut cx),
+            std::task::Poll::Ready(Ok(true))
+        ));
+        drop(second);
+        assert_eq!(ring.rc.returned.waiters(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn transferred_notification_does_not_retry_without_a_buffer_return() -> io::Result<()> {
+        use std::future::Future;
+        use std::task::Context;
+        let driver = Driver::new(io_uring::IoUring::builder(), 8)?;
+        let _guard = driver.enter();
+        let ring = RecvBufRing::builder(1).buf_cnt(1).buf_len(8).build()?;
+        let (waker, _) = futures_test::task::new_count_waker();
+        let mut cx = Context::from_waker(&waker);
+        let epoch = ring.return_epoch();
+        let mut first = Box::pin(ring.clone().wait_for_return(epoch));
+        assert!(first.as_mut().poll(&mut cx).is_pending());
+        ring.rc.notify_return();
+        let mut second = Box::pin(ring.clone().wait_for_return(ring.return_epoch()));
+        assert!(second.as_mut().poll(&mut cx).is_pending());
+        drop(first); // Transfer an old publication's notification to second.
+        assert!(second.as_mut().poll(&mut cx).is_pending());
+        assert!(second.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(ring.rc.returned.waiters(), 1);
+        ring.rc.notify_return();
+        assert!(matches!(
+            second.as_mut().poll(&mut cx),
+            std::task::Poll::Ready(Ok(true))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn quarantined_ring_wakes_buffer_return_waiters() -> io::Result<()> {
+        use std::future::Future;
+        use std::task::Context;
+        let driver = Driver::new(io_uring::IoUring::builder(), 8)?;
+        let _guard = driver.enter();
+        let ring = RecvBufRing::builder(1).buf_cnt(1).buf_len(8).build()?;
+        let (waker, count) = futures_test::task::new_count_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut wait = Box::pin(ring.clone().wait_for_return(ring.return_epoch()));
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        let _ = ring.rc.poison("test quarantine");
+        assert_eq!(count.get(), 1);
+        let std::task::Poll::Ready(Err(error)) = wait.as_mut().poll(&mut cx) else {
+            panic!("quarantined ring stranded a receive waiter");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        Ok(())
+    }
 
     #[test]
     fn selected_bid_requires_buffer_select_flag() {

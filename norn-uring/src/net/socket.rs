@@ -23,159 +23,154 @@ pub(crate) struct RingRecvCompletion<T> {
     terminal: bool,
 }
 
-pin_project_lite::pin_project! {
-    pub(crate) struct RecvRingStream {
-        socket: Option<Socket>,
-        ring: Option<RecvBufRing>,
-        #[pin]
-        current: Option<Op<RecvRingMulti>>,
-        rearm: bool,
-        done: bool,
-    }
+pub(crate) trait RingReceive:
+    'static + Multishot<Item = RingRecvCompletion<Self::Buffer>>
+{
+    type Buffer;
+    fn receive(socket: &Socket, ring: &RecvBufRing, flags: i32) -> Op<Self>
+    where
+        Self: Sized;
 }
 
-impl RecvRingStream {
-    fn new(socket: &Socket, ring: &RecvBufRing) -> Self {
-        let socket = socket.clone();
-        let ring = ring.clone();
-        let current = Some(socket.recv_ring_multi(&ring));
-        Self {
-            socket: Some(socket),
-            ring: Some(ring),
-            current,
-            rearm: false,
-            done: false,
-        }
-    }
-}
-
-impl futures_core::Stream for RecvRingStream {
-    type Item = io::Result<BufRingBuf>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> TaskPoll<Option<Self::Item>> {
-        let mut this = self.as_mut().project();
-        if *this.done {
-            return TaskPoll::Ready(None);
-        }
-        if this.current.is_none() && *this.rearm {
-            *this.rearm = false;
-            let socket = this.socket.as_ref().expect("receive socket missing");
-            let ring = this.ring.as_ref().expect("receive buffer ring missing");
-            this.current.set(Some(socket.recv_ring_multi(ring)));
-        }
-        let current = this
-            .current
-            .as_mut()
-            .as_pin_mut()
-            .expect("receive operation missing");
-        match ready!(current.poll_next(cx)) {
-            Some(completion) => {
-                if completion.terminal {
-                    this.current.set(None);
-                }
-                match completion.result {
-                    Ok(buffer) => {
-                        *this.rearm = completion.terminal;
-                        TaskPoll::Ready(Some(Ok(buffer)))
-                    }
-                    Err(err) => {
-                        if completion.terminal {
-                            *this.done = true;
-                            this.socket.take();
-                            this.ring.take();
-                        }
-                        TaskPoll::Ready(Some(Err(err)))
-                    }
-                }
-            }
-            None => {
-                *this.done = true;
-                this.current.set(None);
-                this.socket.take();
-                this.ring.take();
-                TaskPoll::Ready(None)
-            }
-        }
-    }
-}
+type BufferReturnWait = Pin<Box<dyn std::future::Future<Output = io::Result<bool>>>>;
 
 pin_project_lite::pin_project! {
-    pub(crate) struct RecvRingBundleStream {
+    pub(crate) struct RingRecvStream<T: RingReceive> {
         socket: Option<Socket>,
         ring: Option<RecvBufRing>,
         flags: i32,
+        // Snapshot immediately before configuring each receive. Keeping this
+        // on the stream avoids enlarging every queued receive completion.
+        return_epoch: u64,
         #[pin]
-        current: Option<Op<RecvRingBundleMulti>>,
-        rearm: bool,
+        current: Option<Op<T>>,
+        waiting: Option<BufferReturnWait>,
         done: bool,
     }
 }
 
-impl RecvRingBundleStream {
+pub(crate) type RecvRingStream = RingRecvStream<RecvRingMulti>;
+pub(crate) type RecvRingBundleStream = RingRecvStream<RecvRingBundleMulti>;
+pub(crate) type RecvFromRingStream = RingRecvStream<RecvFromRingMulti>;
+
+impl<T: RingReceive> RingRecvStream<T> {
     fn new(socket: &Socket, ring: &RecvBufRing, flags: i32) -> Self {
-        let socket = socket.clone();
-        let ring = ring.clone();
-        let current = Some(socket.recv_ring_bundle_multi_with_flags(&ring, flags));
+        let return_epoch = ring.return_epoch();
+        let current = Some(T::receive(socket, ring, flags));
         Self {
-            socket: Some(socket),
-            ring: Some(ring),
+            socket: Some(socket.clone()),
+            ring: Some(ring.clone()),
             flags,
+            return_epoch,
             current,
-            rearm: false,
+            waiting: None,
             done: false,
         }
     }
 }
 
-impl futures_core::Stream for RecvRingBundleStream {
-    type Item = io::Result<BufRingBufBundle>;
+impl<T: RingReceive> futures_core::Stream for RingRecvStream<T> {
+    type Item = io::Result<T::Buffer>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> TaskPoll<Option<Self::Item>> {
         let mut this = self.as_mut().project();
         if *this.done {
             return TaskPoll::Ready(None);
         }
-        if this.current.is_none() && *this.rearm {
-            *this.rearm = false;
-            let socket = this.socket.as_ref().expect("receive socket missing");
-            let ring = this.ring.as_ref().expect("receive buffer ring missing");
-            this.current.set(Some(
-                socket.recv_ring_bundle_multi_with_flags(ring, *this.flags),
-            ));
-        }
-        let current = this
-            .current
-            .as_mut()
-            .as_pin_mut()
-            .expect("bundle receive operation missing");
-        match ready!(current.poll_next(cx)) {
-            Some(completion) => {
-                if completion.terminal {
-                    this.current.set(None);
-                }
-                match completion.result {
-                    Ok(bundle) => {
-                        *this.rearm = completion.terminal;
-                        TaskPoll::Ready(Some(Ok(bundle)))
+        loop {
+            if let Some(waiting) = this.waiting.as_mut() {
+                let result = ready!(waiting.as_mut().poll(cx));
+                this.waiting.take();
+                match result {
+                    Ok(true) => {}
+                    result => {
+                        *this.done = true;
+                        this.socket.take();
+                        this.ring.take();
+                        return TaskPoll::Ready(result.err().map(Err));
                     }
-                    Err(err) => {
-                        if completion.terminal {
-                            *this.done = true;
-                            this.socket.take();
-                            this.ring.take();
+                }
+            }
+            if this.current.is_none() {
+                let ring = this.ring.as_ref().expect("receive buffer ring missing");
+                if !ring.driver_running() {
+                    *this.done = true;
+                    this.socket.take();
+                    this.ring.take();
+                    return TaskPoll::Ready(None);
+                }
+                let socket = this.socket.as_ref().expect("receive socket missing");
+                *this.return_epoch = ring.return_epoch();
+                this.current
+                    .set(Some(T::receive(socket, ring, *this.flags)));
+            }
+            let current = this
+                .current
+                .as_mut()
+                .as_pin_mut()
+                .expect("receive operation missing");
+            match ready!(current.poll_next(cx)) {
+                Some(completion) => {
+                    if completion.terminal {
+                        // The Op has delivered all preceding owned completions
+                        // and consumed its terminal CQE. Only now may it be
+                        // replaced; cancellation alone would not suffice.
+                        this.current.set(None);
+                    }
+                    match completion.result {
+                        Ok(buffer) => return TaskPoll::Ready(Some(Ok(buffer))),
+                        Err(error)
+                            if completion.terminal
+                                && error.raw_os_error() == Some(libc::ENOBUFS) =>
+                        {
+                            let ring = this
+                                .ring
+                                .as_ref()
+                                .expect("receive buffer ring missing")
+                                .clone();
+                            *this.waiting =
+                                Some(Box::pin(ring.wait_for_return(*this.return_epoch)));
                         }
-                        TaskPoll::Ready(Some(Err(err)))
+                        Err(error) => {
+                            if completion.terminal {
+                                *this.done = true;
+                                this.socket.take();
+                                this.ring.take();
+                            }
+                            return TaskPoll::Ready(Some(Err(error)));
+                        }
                     }
                 }
-            }
-            None => {
-                *this.done = true;
-                this.current.set(None);
-                this.socket.take();
-                this.ring.take();
-                TaskPoll::Ready(None)
+                None => {
+                    *this.done = true;
+                    this.current.set(None);
+                    this.socket.take();
+                    this.ring.take();
+                    return TaskPoll::Ready(None);
+                }
             }
         }
+    }
+}
+
+impl RingReceive for RecvRingMulti {
+    type Buffer = BufRingBuf;
+    fn receive(socket: &Socket, ring: &RecvBufRing, _flags: i32) -> Op<Self> {
+        socket.recv_ring_multi(ring)
+    }
+}
+
+impl RingReceive for RecvRingBundleMulti {
+    type Buffer = BufRingBufBundle;
+    fn receive(socket: &Socket, ring: &RecvBufRing, flags: i32) -> Op<Self> {
+        socket.recv_ring_bundle_multi_with_flags(ring, flags)
+    }
+}
+
+impl RingReceive for RecvFromRingMulti {
+    type Buffer = (RecvMsgRingBuf, SocketAddr);
+    fn receive(socket: &Socket, ring: &RecvBufRing, _flags: i32) -> Op<Self> {
+        socket.recv_from_ring_multi(ring)
     }
 }
 
@@ -388,8 +383,12 @@ impl Socket {
         self.fd.submit(op)
     }
 
+    pub(crate) fn recv_from_ring_stream(&self, ring: &RecvBufRing) -> RecvFromRingStream {
+        RecvFromRingStream::new(self, ring, 0)
+    }
+
     pub(crate) fn recv_ring_stream(&self, ring: &RecvBufRing) -> RecvRingStream {
-        RecvRingStream::new(self, ring)
+        RecvRingStream::new(self, ring, 0)
     }
 
     pub(crate) fn recv_ring_bundle_stream(
@@ -1102,7 +1101,7 @@ impl RecvFromRingMulti {
 // multishot terminal CQE. Each selected buffer is held by an owned completion
 // until it is yielded or dropped.
 unsafe impl Operation for RecvFromRingMulti {
-    type Completion = io::Result<BufRingBuf>;
+    type Completion = RingRecvCompletion<BufRingBuf>;
 
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         self.ring.ensure_accepting_receives()?;
@@ -1122,19 +1121,25 @@ unsafe impl Operation for RecvFromRingMulti {
 
     unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
         let (result, flags) = result.into_parts();
-        result.and_then(|n| self.ring.get_buf(n, flags))
+        RingRecvCompletion {
+            result: result.and_then(|n| self.ring.get_buf(n, flags)),
+            terminal: !io_uring::cqueue::more(flags),
+        }
     }
 }
 
 impl Multishot for RecvFromRingMulti {
-    type Item = io::Result<(RecvMsgRingBuf, SocketAddr)>;
+    type Item = RingRecvCompletion<(RecvMsgRingBuf, SocketAddr)>;
 
     fn update(&mut self, completion: Self::Completion) -> Self::Item {
-        self.recv_item(completion)
+        RingRecvCompletion {
+            result: self.recv_item(completion.result),
+            terminal: completion.terminal,
+        }
     }
 
     fn complete(mut self, completion: Self::Completion) -> Option<Self::Item> {
-        Some(self.recv_item(completion))
+        Some(self.update(completion))
     }
 }
 
@@ -1988,10 +1993,100 @@ mod tests {
     use std::pin::pin;
     use std::time::{Duration, Instant};
 
+    use futures_core::Stream;
     use futures_util::StreamExt;
     use norn_executor::LocalExecutor;
 
     use super::*;
+
+    fn drive_receive<T: RingReceive>(
+        driver: &mut crate::Driver,
+        stream: &mut Pin<Box<RingRecvStream<T>>>,
+        cx: &mut Context<'_>,
+    ) -> io::Result<T::Buffer> {
+        use norn_executor::park::{Park, ParkMode};
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let TaskPoll::Ready(item) = stream.as_mut().poll_next(cx) {
+                return item.expect("receive stream ended");
+            }
+            assert!(Instant::now() < deadline, "receive did not complete");
+            driver.park(ParkMode::NoPark).unwrap();
+        }
+    }
+
+    fn receive_waiter_lifecycle<T: RingReceive>(shutdown: bool) {
+        use norn_executor::park::{Park, ParkMode};
+        let mut driver = crate::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let _guard = driver.enter();
+        let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        let address = receiver.local_addr().unwrap();
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let socket =
+            Socket::from_uring_fd(UringFd::from_fd_on(receiver.into_raw_fd(), driver.handle()));
+        let ring = RecvBufRing::builder(1)
+            .buf_cnt(1)
+            .buf_len(1024)
+            .build()
+            .unwrap();
+        let mut stream = Box::pin(RingRecvStream::<T>::new(&socket, &ring, 0));
+        let (waker, count) = futures_test::task::new_count_waker();
+        let mut cx = Context::from_waker(&waker);
+        sender.send_to(b"first", address).unwrap();
+        let held = drive_receive(&mut driver, &mut stream, &mut cx).unwrap();
+        sender.send_to(b"second", address).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while stream.as_ref().get_ref().waiting.is_none() {
+            assert!(stream.as_mut().poll_next(&mut cx).is_pending());
+            driver.park(ParkMode::NoPark).unwrap();
+            assert!(
+                Instant::now() < deadline,
+                "ENOBUFS did not reach buffer wait"
+            );
+        }
+        assert!(stream.as_ref().get_ref().current.is_none());
+        let wakes = count.get();
+        for _ in 0..64 {
+            assert!(stream.as_mut().poll_next(&mut cx).is_pending());
+            driver.park(ParkMode::NoPark).unwrap();
+        }
+        assert_eq!(count.get(), wakes, "empty ring must not schedule retries");
+        if shutdown {
+            driver.shutdown();
+            assert!(count.get() > wakes, "shutdown must wake the buffer waiter");
+            assert!(matches!(
+                stream.as_mut().poll_next(&mut cx),
+                TaskPoll::Ready(None)
+            ));
+            assert!(matches!(
+                stream.as_mut().poll_next(&mut cx),
+                TaskPoll::Ready(None)
+            ));
+            drop(held);
+        } else {
+            // Dropping a stream parked on buffer availability unlinks both
+            // notifications. A fresh receive must work after the buffer returns.
+            drop(stream);
+            drop(held);
+            let mut replacement = Box::pin(RingRecvStream::<T>::new(&socket, &ring, 0));
+            drop(drive_receive(&mut driver, &mut replacement, &mut cx).unwrap());
+        }
+    }
+
+    #[test]
+    fn drop_receive_stream_while_waiting_for_buffers() {
+        receive_waiter_lifecycle::<RecvRingMulti>(false);
+        receive_waiter_lifecycle::<RecvRingBundleMulti>(false);
+        receive_waiter_lifecycle::<RecvFromRingMulti>(false);
+    }
+
+    #[test]
+    fn shutdown_receive_stream_while_waiting_for_buffers() {
+        receive_waiter_lifecycle::<RecvRingMulti>(true);
+        receive_waiter_lifecycle::<RecvRingBundleMulti>(true);
+        receive_waiter_lifecycle::<RecvFromRingMulti>(true);
+    }
 
     #[test]
     fn unconsumed_reaped_descriptor_closes_directly() {
