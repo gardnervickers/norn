@@ -695,9 +695,8 @@ impl Driver {
     ///
     /// Returns the number of entries which were submitted.
     fn submit(&self, mut mode: ParkMode) -> io::Result<usize> {
-        if matches!(mode, ParkMode::Timeout(_) | ParkMode::NextCompletion)
-            && self.shared.has_sq_demand()
-        {
+        let waiting = matches!(mode, ParkMode::Timeout(_) | ParkMode::NextCompletion);
+        if waiting && self.shared.has_sq_demand() {
             // Work waiting for SQ space needs capacity, not a completion. Blocking
             // for a CQE could strand it behind long-lived operations, so submit,
             // wait only for SQ capacity, and hand that capacity to the waiters.
@@ -706,13 +705,22 @@ impl Driver {
             self.shared.notify_sq_capacity();
             return Ok(submitted);
         }
+        let mut submitted = 0;
+        if waiting && self.shared.sqpoll_sq_full() {
+            // The SQPOLL kernel thread has not yet consumed queued entries, so
+            // there is no room to arm the unparker and the park would return
+            // at once, turning the caller's wait into a spin. Wake the thread
+            // and wait for a free slot first.
+            submitted += self.shared.submit(ParkMode::NoPark)?;
+            self.shared.wait_for_sq_capacity()?;
+        }
         // If we're going to park, then prepare the unparker.
-        if matches!(mode, ParkMode::Timeout(_) | ParkMode::NextCompletion) && !self.prepare_park() {
+        if waiting && !self.prepare_park() {
             // Preparing the unparker failed, don't park!
             mode = ParkMode::NoPark;
         }
         trace!(target: LOG, "submit.mode {:?}", mode);
-        let submitted = self.shared.submit(mode)?;
+        submitted += self.shared.submit(mode)?;
         log::trace!(target: LOG, "submit.submitted {}", submitted);
         Ok(submitted)
     }
@@ -1328,15 +1336,22 @@ impl Shared {
     /// thread. Without SQPOLL a submit consumes the SQ synchronously, so this
     /// returns immediately.
     fn wait_for_sq_capacity(&self) -> io::Result<()> {
-        let mut ring = self.ring.borrow_mut();
-        if !ring.params().is_setup_sqpoll() || !ring.submission().is_full() {
+        if !self.sqpoll_sq_full() {
             return Ok(());
         }
+        let ring = self.ring.borrow_mut();
         match ring.submitter().squeue_wait() {
             Ok(_) => Ok(()),
             Err(err) if err.raw_os_error() == Some(libc::EINTR) => Ok(()),
             Err(err) => Err(err),
         }
+    }
+
+    /// Returns true when an SQPOLL ring's SQ has no free slot, because the
+    /// kernel thread has not yet consumed the queued entries.
+    fn sqpoll_sq_full(&self) -> bool {
+        let mut ring = self.ring.borrow_mut();
+        ring.params().is_setup_sqpoll() && ring.submission().is_full()
     }
 
     /// Returns true when queued work is waiting for SQ space.
