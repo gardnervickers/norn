@@ -22,3 +22,6 @@ pub mod protocol;
 pub mod server;
 #[cfg(target_os = "linux")]
 pub mod sharded;
+
+#[cfg(test)]
+mod alloc_count;

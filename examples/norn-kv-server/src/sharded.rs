@@ -33,7 +33,7 @@ use smallvec::SmallVec;
 
 use crate::codec::{DecodeStatus, DecodedFrame, FrameDecoder, ResponseEncoder};
 use crate::handler::{ConnectionAction, HandlerConfig, MemoryHandler};
-use crate::protocol::{Command, RequestHeader, Status, HEADER_LEN};
+use crate::protocol::{Command, EncodeError, RequestHeader, Status, HEADER_LEN};
 use crate::server::{RecvMode, ServerConfig};
 
 const INLINE_KEY_LEN: usize = 32;
@@ -42,6 +42,11 @@ const PUMP_BATCH: usize = 64;
 const RECV_RING_BUFFERS: u16 = 8_192;
 const RECV_BUFFER_LEN: usize = 8 * 1024;
 const MAX_IN_FLIGHT_PER_CONNECTION: usize = 32;
+// Reply buffers are recycled per worker. Larger buffers (rare large GETs) are
+// freed rather than retained so pooled memory stays proportional to the
+// common response size.
+const MAX_POOLED_REPLY_BUFFERS: usize = 1_024;
+const MAX_POOLED_REPLY_CAPACITY: usize = 16 * 1024;
 
 /// Configuration for a fixed group of sharded networking workers.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -686,23 +691,9 @@ async fn request_pump(
                 ));
             }
 
-            let mut bytes = Vec::new();
-            let result = handler
-                .execute_command(
-                    request.header,
-                    request.command.borrowed(),
-                    &mut ResponseEncoder::new(&mut bytes),
-                )
-                .map(|action| CommandResponse { action, bytes })
-                .map_err(|error| RemoteError::Encoding(error.to_string()));
-            // Every admitted request produces exactly one reverse envelope,
-            // even when a quiet command deliberately encodes zero wire bytes.
-            let response = ShardResponse {
-                owner: worker,
-                id: request.id,
-                result,
-            };
-            match responses[request.origin].try_send(response) {
+            let origin = request.origin;
+            let response = execute_remote(worker, &handler, request);
+            match responses[origin].try_send(response) {
                 Ok(()) => {}
                 Err(TrySendError::Full(_)) => {
                     return Err(io::Error::other(
@@ -718,6 +709,27 @@ async fn request_pump(
             }
         }
         yield_once().await;
+    }
+}
+
+fn execute_remote(worker: usize, handler: &MemoryHandler, request: ShardRequest) -> ShardResponse {
+    // The origin lends a pooled buffer with each request, so encoding here
+    // allocates only when that buffer must grow.
+    let mut bytes = request.reply_buffer;
+    let result = handler
+        .execute_command(
+            request.header,
+            request.command.borrowed(),
+            &mut ResponseEncoder::new(&mut bytes),
+        )
+        .map(|action| CommandResponse { action, bytes })
+        .map_err(|error| RemoteError::Encoding(error.to_string()));
+    // Every admitted request produces exactly one reverse envelope, even when
+    // a quiet command deliberately encodes zero wire bytes.
+    ShardResponse {
+        owner: worker,
+        id: request.id,
+        result,
     }
 }
 
@@ -874,6 +886,7 @@ async fn serve_sharded_connection(
         while !stop_dispatch
             && replies.len() < MAX_IN_FLIGHT_PER_CONNECTION
             && dispatched < config.max_batch_commands
+            && output.len() < config.max_batch_response_bytes
         {
             let DecodeStatus::Frame {
                 frame,
@@ -886,8 +899,17 @@ async fn serve_sharded_connection(
                 break;
             };
 
-            let closes =
-                dispatch_frame(frame, worker, worker_count, &handler, &router, &replies).await?;
+            let closes = dispatch_frame(
+                frame,
+                worker,
+                worker_count,
+                &handler,
+                &router,
+                &replies,
+                &mut output,
+                &mut close_ready,
+            )
+            .await?;
             consumed += frame_len;
             dispatched += 1;
             stop_dispatch |= closes;
@@ -915,6 +937,7 @@ async fn serve_sharded_connection(
             let response = result?;
             close_ready |= response.action == ConnectionAction::Close;
             output.extend_from_slice(&response.bytes);
+            replies.recycle(response.bytes);
             completed += 1;
         }
 
@@ -979,11 +1002,13 @@ async fn serve_sharded_connection(
                 let response = response?;
                 close_ready |= response.action == ConnectionAction::Close;
                 output.extend_from_slice(&response.bytes);
+                replies.recycle(response.bytes);
             }
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_frame(
     frame: DecodedFrame<'_>,
     worker: usize,
@@ -991,13 +1016,13 @@ async fn dispatch_frame(
     handler: &MemoryHandler,
     router: &Rc<RouterLocal>,
     replies: &ConnectionReplies,
+    output: &mut Vec<u8>,
+    close_ready: &mut bool,
 ) -> io::Result<bool> {
     let DecodedFrame::Request(request) = frame else {
-        let mut bytes = Vec::new();
-        let action = handler
-            .handle(frame, &mut ResponseEncoder::new(&mut bytes))
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        replies.push_ready(CommandResponse { action, bytes })?;
+        reply_local(replies, output, close_ready, |out| {
+            handler.handle(frame, out)
+        })?;
         return Ok(false);
     };
 
@@ -1007,32 +1032,24 @@ async fn dispatch_frame(
     if matches!(command, Command::Stat { .. }) {
         // Local shard statistics would be observably incomplete. Until an
         // explicit aggregation protocol exists, sharded STAT is unsupported.
-        let mut bytes = Vec::new();
-        ResponseEncoder::new(&mut bytes)
-            .append_empty(header, Status::UnknownCommand)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        replies.push_ready(CommandResponse {
-            action: ConnectionAction::Continue,
-            bytes,
+        reply_local(replies, output, close_ready, |out| {
+            out.append_empty(header, Status::UnknownCommand)?;
+            Ok(ConnectionAction::Continue)
         })?;
         return Ok(false);
     }
 
     let Some(key) = command_key(command) else {
-        let mut bytes = Vec::new();
-        let action = handler
-            .execute_command(header, command, &mut ResponseEncoder::new(&mut bytes))
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        replies.push_ready(CommandResponse { action, bytes })?;
+        reply_local(replies, output, close_ready, |out| {
+            handler.execute_command(header, command, out)
+        })?;
         return Ok(closes);
     };
     let owner = key_owner(key, worker_count);
     if owner == worker {
-        let mut bytes = Vec::new();
-        let action = handler
-            .execute_command(header, command, &mut ResponseEncoder::new(&mut bytes))
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        replies.push_ready(CommandResponse { action, bytes })?;
+        reply_local(replies, output, close_ready, |out| {
+            handler.execute_command(header, command, out)
+        })?;
         return Ok(closes);
     }
 
@@ -1044,6 +1061,30 @@ async fn dispatch_frame(
     let command = OwnedCommand::copy_from(command).expect("keyed command must be ownable");
     router.submit_remote(replies, permit, worker, owner, header, command)?;
     Ok(closes)
+}
+
+/// Encode a reply for a command executed on this worker.
+///
+/// With no earlier reply outstanding, the reply is at the ordered head and is
+/// encoded straight into the connection batch. Otherwise it waits in the reply
+/// window in a pooled buffer, preserving the result observed at execution
+/// time.
+fn reply_local(
+    replies: &ConnectionReplies,
+    output: &mut Vec<u8>,
+    close_ready: &mut bool,
+    encode: impl FnOnce(&mut ResponseEncoder<'_>) -> Result<ConnectionAction, EncodeError>,
+) -> io::Result<()> {
+    if replies.at_head()? {
+        let action = encode(&mut ResponseEncoder::new(output))
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        *close_ready |= action == ConnectionAction::Close;
+        return Ok(());
+    }
+    let mut bytes = replies.take_buffer();
+    let action = encode(&mut ResponseEncoder::new(&mut bytes))
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    replies.push_ready(CommandResponse { action, bytes })
 }
 
 fn command_key(command: Command<'_>) -> Option<&[u8]> {
@@ -1129,6 +1170,8 @@ struct ShardRequest {
     id: RequestId,
     header: RequestHeader,
     command: OwnedCommand,
+    /// Empty pooled buffer from the origin for the owner to encode into.
+    reply_buffer: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -1535,8 +1578,24 @@ impl ConnectionReplies {
         self.window.borrow().is_empty()
     }
 
+    /// Return whether a reply admitted now would be the ordered head, after
+    /// checking that the window still admits replies.
+    fn at_head(&self) -> io::Result<bool> {
+        let window = self.window.borrow();
+        window.ensure_admission()?;
+        Ok(window.is_empty())
+    }
+
     fn push_ready(&self, response: CommandResponse) -> io::Result<()> {
         self.window.borrow_mut().push_ready(response)
+    }
+
+    fn take_buffer(&self) -> Vec<u8> {
+        self.router.take_buffer()
+    }
+
+    fn recycle(&self, bytes: Vec<u8>) {
+        self.router.recycle(bytes);
     }
 
     fn reserve_remote(&self, owner: usize) -> io::Result<RequestId> {
@@ -1585,6 +1644,7 @@ struct RouterLocal {
     stopping: Arc<AtomicBool>,
     credits: Vec<RefCell<PeerCredits>>,
     connections: RefCell<HashMap<u64, Rc<RefCell<ReplyWindow>>, foldhash::fast::RandomState>>,
+    reply_buffers: RefCell<Vec<Vec<u8>>>,
     closed: Cell<bool>,
 }
 
@@ -1609,8 +1669,24 @@ impl RouterLocal {
             stopping,
             credits,
             connections: RefCell::new(HashMap::default()),
+            reply_buffers: RefCell::new(Vec::with_capacity(MAX_POOLED_REPLY_BUFFERS)),
             closed: Cell::new(false),
         })
+    }
+
+    fn take_buffer(&self) -> Vec<u8> {
+        self.reply_buffers.borrow_mut().pop().unwrap_or_default()
+    }
+
+    fn recycle(&self, mut bytes: Vec<u8>) {
+        if bytes.capacity() == 0 || bytes.capacity() > MAX_POOLED_REPLY_CAPACITY {
+            return;
+        }
+        let mut buffers = self.reply_buffers.borrow_mut();
+        if buffers.len() < MAX_POOLED_REPLY_BUFFERS {
+            bytes.clear();
+            buffers.push(bytes);
+        }
     }
 
     fn register_connection(self: &Rc<Self>, connection: u64) -> io::Result<ConnectionReplies> {
@@ -1668,6 +1744,7 @@ impl RouterLocal {
             id,
             header,
             command,
+            reply_buffer: self.take_buffer(),
         };
 
         match self.request_txs[peer].try_send(request) {
@@ -2016,6 +2093,7 @@ mod tests {
                 key: SmallVec::from_slice(key),
                 quiet: false,
             },
+            reply_buffer: Vec::new(),
         }
     }
 
@@ -2869,5 +2947,185 @@ mod tests {
         }
         drop(clients);
         server.join().unwrap().unwrap();
+    }
+
+    fn decode_one(bytes: &[u8]) -> DecodedFrame<'_> {
+        let DecodeStatus::Frame { frame, .. } = FrameDecoder::new(64 * 1024).decode(bytes).unwrap()
+        else {
+            panic!("complete request remained incomplete");
+        };
+        frame
+    }
+
+    /// Iterate response opaques without allocating.
+    fn response_opaques(mut bytes: &[u8]) -> impl Iterator<Item = u32> + '_ {
+        std::iter::from_fn(move || {
+            if bytes.is_empty() {
+                return None;
+            }
+            assert_eq!(bytes[0], RESPONSE_MAGIC);
+            let body_len = u32::from_be_bytes(bytes[8..12].try_into().unwrap()) as usize;
+            let opaque = u32::from_be_bytes(bytes[12..16].try_into().unwrap());
+            bytes = &bytes[HEADER_LEN + body_len..];
+            Some(opaque)
+        })
+    }
+
+    #[test]
+    fn local_head_get_encodes_into_output_without_allocating() {
+        const GETS: usize = 256;
+        let response_len = HEADER_LEN + 4 + 4096;
+        let mut store = crate::memory::MemoryStore::new();
+        store.set(b"a", 0, &[42; 4096]);
+        let handler = MemoryHandler::new(store);
+        let (router, _requests, _fatal, _driver) = router_fixture(1);
+        let replies = router.register_connection(7).unwrap();
+        let worker = key_owner(b"a", 2);
+        let bytes = binary_request(OP_GET, b"a", &[], &[], 1);
+        let frame = decode_one(&bytes);
+        let mut output = Vec::with_capacity(GETS * response_len);
+        let mut close_ready = false;
+
+        let allocations = crate::alloc_count::count(|| {
+            for _ in 0..GETS {
+                let closes = dispatch_frame(
+                    frame.clone(),
+                    worker,
+                    2,
+                    &handler,
+                    &router,
+                    &replies,
+                    &mut output,
+                    &mut close_ready,
+                )
+                .now_or_never()
+                .unwrap()
+                .unwrap();
+                assert!(!closes);
+            }
+        });
+
+        assert_eq!(allocations, (0, 0));
+        assert!(replies.is_empty());
+        assert!(!close_ready);
+        assert_eq!(output.len(), GETS * response_len);
+        assert!(response_opaques(&output).eq(std::iter::repeat_n(1, GETS)));
+    }
+
+    #[test]
+    fn replies_behind_remote_head_reuse_pooled_buffers_in_order() {
+        const ROUNDS: usize = 256;
+        let mut store = crate::memory::MemoryStore::new();
+        store.set(b"local", 0, &[42; 4096]);
+        let handler = MemoryHandler::new(store);
+        let (router, requests, _fatal, driver) = router_fixture(1);
+        let driver = driver.build(SpinPark);
+        let mut requests = requests.attach(&driver.handle());
+        let replies = router.register_connection(7).unwrap();
+        let local = binary_request(OP_GET, b"local", &[], &[], 2);
+        let local = decode_one(&local);
+        let mut output = Vec::with_capacity(64 * 1024);
+        let mut close_ready = false;
+
+        let remote_header =
+            RequestHeader::decode(&binary_request(OP_GET, b"remote", &[], &[], 1)[..HEADER_LEN])
+                .unwrap();
+        let mut round = || {
+            // Remote head: the single-peer fixture routes it to "owner" 0.
+            let permit = router.acquire(0).now_or_never().unwrap().unwrap();
+            router
+                .submit_remote(
+                    &replies,
+                    permit,
+                    1,
+                    0,
+                    remote_header,
+                    OwnedCommand::copy_from(Command::Get {
+                        key: b"remote",
+                        quiet: false,
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+            // A local GET behind the remote head waits in a pooled buffer.
+            dispatch_frame(
+                local.clone(),
+                0,
+                1,
+                &handler,
+                &router,
+                &replies,
+                &mut output,
+                &mut close_ready,
+            )
+            .now_or_never()
+            .unwrap()
+            .unwrap();
+            assert!(output.is_empty());
+            assert!(replies.try_next().is_none());
+
+            let response = execute_remote(0, &handler, requests.try_recv().unwrap());
+            router.complete(response).unwrap();
+            while let Some(response) = replies.try_next() {
+                let response = response.unwrap();
+                output.extend_from_slice(&response.bytes);
+                replies.recycle(response.bytes);
+            }
+            assert!(replies.is_empty());
+            assert!(response_opaques(&output).eq([1, 2]));
+            output.clear();
+        };
+
+        // The pool is LIFO, so the first rounds may swap buffers between the
+        // short remote reply and the 4 KiB local reply and grow one once.
+        round();
+        round();
+        let allocations = crate::alloc_count::count(|| {
+            for _ in 0..ROUNDS {
+                round();
+            }
+        });
+        assert_eq!(allocations, (0, 0));
+        assert!(!close_ready);
+        assert_eq!(router.credits[0].borrow().available, 1);
+    }
+
+    #[test]
+    fn quit_at_head_marks_connection_ready_to_close() {
+        let handler = MemoryHandler::new(crate::memory::MemoryStore::new());
+        let (router, _requests, _fatal, _driver) = router_fixture(1);
+        let replies = router.register_connection(7).unwrap();
+        let quit = binary_request(OP_QUIT, &[], &[], &[], 9);
+        let mut output = Vec::new();
+        let mut close_ready = false;
+        let closes = dispatch_frame(
+            decode_one(&quit),
+            0,
+            2,
+            &handler,
+            &router,
+            &replies,
+            &mut output,
+            &mut close_ready,
+        )
+        .now_or_never()
+        .unwrap()
+        .unwrap();
+        assert!(closes);
+        assert!(close_ready);
+        assert!(replies.is_empty());
+        assert!(response_opaques(&output).eq([9]));
+    }
+
+    #[test]
+    fn pool_discards_oversized_buffers() {
+        let (router, _requests, _fatal, _driver) = router_fixture(1);
+        router.recycle(Vec::with_capacity(MAX_POOLED_REPLY_CAPACITY + 1));
+        router.recycle(Vec::new());
+        assert!(router.reply_buffers.borrow().is_empty());
+        router.recycle(vec![1, 2, 3]);
+        let buffer = router.take_buffer();
+        assert!(buffer.is_empty());
+        assert!(buffer.capacity() >= 3);
     }
 }
