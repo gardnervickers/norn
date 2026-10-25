@@ -272,6 +272,7 @@ impl TcpListener {
         Incoming {
             listener: &self.socket,
             current: None,
+            accepted: false,
         }
     }
 
@@ -303,6 +304,8 @@ pin_project_lite::pin_project! {
         listener: &'a socket::Socket,
         #[pin]
         current: Option<Op<Accept<true>>>,
+        // Whether the current operation produced a connection.
+        accepted: bool,
     }
 }
 
@@ -320,12 +323,20 @@ impl Stream for Incoming<'_> {
                     }
 
                     Some(Ok(socket)) => {
+                        *this.accepted = true;
                         let socket = socket::Socket::from_fd(socket);
                         return Poll::Ready(Some(Ok(TcpSocket { socket })));
                     }
                     None => {
                         this.current.set(None);
-                        return Poll::Ready(None);
+                        // The kernel also ends a multishot accept without an
+                        // error, for example when it cannot post a completion
+                        // to a full completion queue. Re-arm after an
+                        // operation that accepted connections; one that ended
+                        // without producing anything ends the stream.
+                        if !std::mem::take(this.accepted) {
+                            return Poll::Ready(None);
+                        }
                     }
                 }
             }
