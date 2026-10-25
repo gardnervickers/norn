@@ -2171,3 +2171,38 @@ Decision: reject. The completion representation was restored. The benchmark
 correction is retained; no runtime implementation from this TCP pass is kept.
 Profiles and saved comparison binaries are under
 `/tmp/norn-tcp-normal-profile-2026-08-18/`.
+
+## 2026-08-27: Norn-only network performance audit
+
+The optimization boundary was clarified after an application response-batching
+experiment: the KV server is a workload and correctness oracle, while retained
+performance changes must improve Norn itself. The response-batching PR was
+closed without merge.
+
+On exact `origin/master` `c4b46dd1b706f7c78771388da42fae75b18d0136`,
+the unchanged 256-byte, pipeline-32, one-worker fixed-response workload produced
+four external-wall runs within 0.005% around 1.997M ops/s and one known
+one-second termination-bucket outlier. A fresh symbolized profile attributed
+most user cycles to the sample application: frame decode 21.91%, frame
+processing 17.84%, request decode 15.72%, response append 8.49%, and handler
+execution 8.60% across its two named frames. The largest isolated Norn frames
+were multishot receive polling at 2.83%, the TCP EOF wrapper at 0.94%, and
+provided-buffer publication tracking at 0.86%.
+
+Two Norn runtime candidates were rejected in five alternating pairs:
+
+- Specializing scalar publication claims instead of using the general bundle
+  routine made all five memtier active-rate comparisons slower by 0.38% to
+  1.65%, and four runs crossed the next external-wall second bucket.
+- Inlining the two multishot stream layers produced a +0.27% paired median
+  active-rate change, effectively unchanged external throughput, and no
+  consistent latency improvement.
+
+The sharded workload profile then identified dynamic lane remainders in
+`norn-channel` as a concrete library target. Replacing them with conditional
+wraparound reduced the dedicated four-producer/four-lane median from 1,135,061
+to 1,033,046 ns per 262,144 messages (-8.99%, +9.88% throughput) across seven
+alternating pairs. All pairs favored the candidate. The four-worker KV
+guardrail was neutral at the paired median but too variable for an application
+claim. Full measurements are recorded in `channel-results.md`; the example code
+and workload harness remained unchanged.
