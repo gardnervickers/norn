@@ -102,7 +102,7 @@
   "qualification": {
     "max_lag_p99_us": 50.0,
     "min_capacity_utilization": 0.9,
-    "max_preemptions_per_s": 20.0,
+    "max_preemptions_per_s": 100.0,
     "max_run_delay_fraction": 0.01,
     "max_sibling_busy_fraction": 0.05
   }

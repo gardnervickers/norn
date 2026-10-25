@@ -168,7 +168,7 @@ never compared.
 distort the result:
 
 - server threads were preempted at most `max_preemptions_per_s` (default
-  20/s) in every window, and no server or client thread waited for a CPU for
+  100/s) in every window, and no server or client thread waited for a CPU for
   more than `max_run_delay_fraction` (default 1%) of a window. Both detect a
   busy host; the wait check also catches rare preemptions that each cost tens
   of milliseconds. Client preemptions are recorded but not gated: brief
@@ -236,7 +236,11 @@ Recommended practice:
 - Hardware counters need `kernel.perf_event_paranoid` ≤ 1 for kernel-inclusive
   instructions. At 2 only `uinst/op` is available.
 - Run on a quiet host. The preemption and run-queue wait counters show
-  whether it was.
+  whether it was. Even when idle, kernel housekeeping threads (`rcu_preempt`,
+  per-CPU kworkers, `ksoftirqd`) preempt a saturated server 50-80 times/s at
+  a cost of about 0.1% of the window. Removing that needs `isolcpus` /
+  `nohz_full` boot options. The coordinator keeps itself off the server,
+  sibling, client, and held CPUs.
 - If other work shares the host, run the benchmark in its own top-level
   cgroup so the scheduler shares CPU between cgroups rather than between
   threads, for example

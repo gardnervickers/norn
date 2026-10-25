@@ -299,6 +299,40 @@ work cannot run there. Generic servers substitute {port} and
         (!v.is_empty()).then(|| v.iter().sum::<f64>() / v.len() as f64)
     }
 
+    /// Keep the coordinator (and anything it spawns before pinning) off the
+    /// server CPUs, their SMT siblings, and the client and held CPUs. Its
+    /// boundary wakeups and snapshot reads would otherwise preempt the server
+    /// or contend for its core. Client, holder, and server processes set their
+    /// own affinity explicitly.
+    fn reserve_measured_cpus(server_cpus: &[usize], client_cpus: &[usize], hold_cpus: &[usize]) {
+        let reserved: Vec<usize> = server_cpus
+            .iter()
+            .flat_map(|&cpu| siblings(cpu))
+            .chain(client_cpus.iter().copied())
+            .chain(hold_cpus.iter().copied())
+            .collect();
+        if reserved.is_empty() {
+            return;
+        }
+        let online = parse_cpus(&read_trim("/sys/devices/system/cpu/online")).unwrap_or_default();
+        let allowed: Vec<usize> = online
+            .into_iter()
+            .filter(|cpu| !reserved.contains(cpu) && *cpu < libc::CPU_SETSIZE as usize)
+            .collect();
+        if allowed.is_empty() {
+            return;
+        }
+        // SAFETY: cpu_set_t is plain data and every CPU index is in range.
+        unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            for &cpu in &allowed {
+                libc::CPU_SET(cpu, &mut set);
+            }
+            // Best effort: an unpinnable coordinator only adds noise.
+            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+        }
+    }
+
     fn siblings(cpu: usize) -> Vec<usize> {
         let path = format!("/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list");
         parse_cpus(&read_trim(&path)).unwrap_or_else(|_| vec![cpu])
@@ -619,6 +653,7 @@ work cannot run there. Generic servers substitute {port} and
                 "--hold-cpus names CPU {cpu}, which is also a server or client CPU"
             ));
         }
+        reserve_measured_cpus(&args.server_cpus, &args.client_cpus, &args.hold_cpus);
         fs::create_dir_all(&out).map_err(|e| format!("create {}: {e}", out.display()))?;
         fs::write(
             out.join("profile.json"),

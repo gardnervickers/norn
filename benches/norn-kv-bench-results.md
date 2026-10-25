@@ -215,6 +215,34 @@ completed pairs the candidate measured 3804–3829 against 3768–3778, about +1
 which is not resolvable against that A/A spread. Until the ENOBUFS reset is
 fixed, `mixed-4w` comparisons need a quiet host.
 
+## Idle-host preemption sources (2026-10-25)
+
+With no other jobs running (load average 2–5), plain runs still flagged the
+server as preempted 30–80 times/s while it waited only 0.1–0.2% of each
+window. Two causes:
+
+- **The benchmark's own coordinator** sometimes ran on the server CPU's SMT
+  sibling (sibling busy up to 13%). It now restricts itself to CPUs outside
+  the server CPUs, their siblings, and the client and held CPUs; the sibling
+  then measured about 1% busy.
+- **Kernel housekeeping** accounted for the rest: `rcu_preempt` (about 200
+  slices/s system-wide), `kworker/0`, and `ksoftirqd/0`. This needs
+  `isolcpus`/`nohz_full` boot options to remove. The default
+  `max_preemptions_per_s` is now 100/s, and run-queue wait gates the actual
+  cost.
+
+Instruction-count comparisons from the same session, five pairs, plain runs
+with no scope or held CPUs:
+
+| Change | Profile | Capacity `uinst/op` | Capacity `inst/op` |
+| --- | --- | ---: | ---: |
+| foldhash store hasher (#153) | `mixed-1w` | −13.96% (−14.01 .. −13.27) | −4.43% |
+| sharded head replies + pooled reply buffers (#158) | `mixed-4w` | −6.90% (−7.19 .. −6.57) | −3.20% |
+
+Time, cycle, and throughput deltas stayed within the within-build spread
+(about 10% on `mixed-4w`), so neither change has a demonstrated wall-clock
+effect yet.
+
 ## Still to do
 
 - Repeat the A/A and A/B comparisons on a host that stays quiet for their

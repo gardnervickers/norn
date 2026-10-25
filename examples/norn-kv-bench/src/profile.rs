@@ -150,7 +150,10 @@ pub struct Qualification {
 }
 
 fn default_preemptions() -> f64 {
-    20.0
+    // Kernel housekeeping (rcu_preempt, per-CPU kworkers, ksoftirqd) preempts
+    // a saturated server 50-80 times/s on an otherwise idle workstation,
+    // costing about 0.1% of the window; run-queue wait gates the real cost.
+    100.0
 }
 
 fn default_run_delay() -> f64 {
