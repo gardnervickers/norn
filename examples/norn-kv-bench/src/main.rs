@@ -41,7 +41,7 @@ mod linux {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use crate::client::{self, SegStats, Shared};
-    use crate::counters::ProcessCounters;
+    use crate::counters::{self, ProcessCounters};
     use crate::profile::Profile;
     use crate::report::{self, Provenance, RunResult, RESULT_VERSION};
     use crate::server::{self, Kind, Spec};
@@ -51,14 +51,17 @@ mod linux {
 Usage:
   norn-kv-bench run --profile PATH [--server PATH | --address HOST:PORT]
                     [--server-kind norn|generic] [--server-arg ARG]...
-                    [--server-cpus LIST] [--client-cpus LIST]
+                    [--server-cpus LIST] [--client-cpus LIST] [--hold-cpus LIST]
                     [--runs N] [--label NAME] [--out DIR]
   norn-kv-bench compare --profile PATH --baseline PATH --candidate PATH
                     [--pairs N] [--server-kind norn|generic] [--server-arg ARG]...
-                    [--server-cpus LIST] [--client-cpus LIST] [--out DIR]
+                    [--server-cpus LIST] [--client-cpus LIST] [--hold-cpus LIST]
+                    [--out DIR]
 
 CPU lists accept ranges, e.g. 0-3,8. `--server-cpus` must name one CPU per
-server worker for norn-kv-server. Generic servers substitute {port} and
+server worker for norn-kv-server. `--hold-cpus` occupies CPUs, typically the
+SMT siblings of the server CPUs on a shared host, with a `pause` loop so other
+work cannot run there. Generic servers substitute {port} and
 {workers} in --server-arg values, e.g. for memcached:
   --server-kind generic --server \"$(command -v memcached)\" \\
   --server-arg=-p --server-arg={port} --server-arg=-t --server-arg={workers} \\
@@ -76,6 +79,7 @@ server worker for norn-kv-server. Generic servers substitute {port} and
         server_args: Vec<String>,
         server_cpus: Vec<usize>,
         client_cpus: Vec<usize>,
+        hold_cpus: Vec<usize>,
         runs: usize,
         label: Option<String>,
         out: Option<PathBuf>,
@@ -148,6 +152,7 @@ server worker for norn-kv-server. Generic servers substitute {port} and
                 "--server-arg" => args.server_args.push(value()?),
                 "--server-cpus" => args.server_cpus = parse_cpus(&value()?)?,
                 "--client-cpus" => args.client_cpus = parse_cpus(&value()?)?,
+                "--hold-cpus" => args.hold_cpus = parse_cpus(&value()?)?,
                 "--runs" | "--pairs" => {
                     args.runs = value()?.parse().map_err(|_| format!("invalid {name}"))?;
                     if args.runs == 0 {
@@ -241,8 +246,57 @@ server worker for norn-kv-server. Generic servers substitute {port} and
             client_sha256: std::env::current_exe()
                 .map(|p| sha256(&p))
                 .unwrap_or_default(),
+            cgroup: read_trim("/proc/self/cgroup"),
+            load_average: read_trim("/proc/loadavg"),
             ..Default::default()
         }
+    }
+
+    /// Threads that occupy CPUs with a `pause` loop for the duration of a run.
+    struct Holders {
+        stop: Arc<AtomicBool>,
+        threads: Vec<std::thread::JoinHandle<()>>,
+    }
+
+    impl Holders {
+        fn start(cpus: &[usize]) -> Self {
+            let stop = Arc::new(AtomicBool::new(false));
+            let threads = cpus
+                .iter()
+                .map(|&cpu| {
+                    let stop = Arc::clone(&stop);
+                    std::thread::Builder::new()
+                        .name(format!("hold-{cpu}"))
+                        .spawn(move || {
+                            if client::pin_current_thread(cpu).is_err() {
+                                return;
+                            }
+                            while !stop.load(Ordering::Relaxed) {
+                                std::hint::spin_loop();
+                            }
+                        })
+                        .unwrap()
+                })
+                .collect();
+            Self { stop, threads }
+        }
+    }
+
+    impl Drop for Holders {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            for t in self.threads.drain(..) {
+                let _ = t.join();
+            }
+        }
+    }
+
+    fn max(v: Vec<f64>) -> Option<f64> {
+        v.into_iter().reduce(f64::max)
+    }
+
+    fn mean(v: Vec<f64>) -> Option<f64> {
+        (!v.is_empty()).then(|| v.iter().sum::<f64>() / v.len() as f64)
     }
 
     fn siblings(cpu: usize) -> Vec<usize> {
@@ -303,6 +357,7 @@ server worker for norn-kv-server. Generic servers substitute {port} and
         spec: Option<Spec>,
         address: Option<SocketAddr>,
         client_cpus: &'a [usize],
+        hold_cpus: &'a [usize],
         placement_warnings: &'a [String],
         label: String,
         dir: PathBuf,
@@ -317,6 +372,8 @@ server worker for norn-kv-server. Generic servers substitute {port} and
             .map(|s| s.cpus.clone())
             .unwrap_or_default();
         let mut provenance = base_provenance(&server_cpus, plan.client_cpus);
+        provenance.hold_cpus = plan.hold_cpus.to_vec();
+        let _holders = Holders::start(plan.hold_cpus);
         let process = match &plan.spec {
             Some(spec) => {
                 provenance.server_sha256 = sha256(&spec.binary);
@@ -365,6 +422,22 @@ server worker for norn-kv-server. Generic servers substitute {port} and
         *shared.start_ns.lock().unwrap() = start;
         shared.barrier.wait();
 
+        // SMT siblings of the server CPUs that the benchmark does not use.
+        // Work on them shares the server core's execution resources. A held
+        // sibling is busy with the holder; other work there shows up as the
+        // holder's run-queue wait instead.
+        let mut server_siblings: Vec<usize> = server_cpus
+            .iter()
+            .flat_map(|&cpu| siblings(cpu))
+            .filter(|cpu| {
+                !server_cpus.contains(cpu)
+                    && !plan.client_cpus.contains(cpu)
+                    && !plan.hold_cpus.contains(cpu)
+            })
+            .collect();
+        server_siblings.sort_unstable();
+        server_siblings.dedup();
+
         let mut samples = Vec::with_capacity(segments.len());
         for s in &segments {
             if !s.measured || shared.failed.load(Ordering::Acquire) {
@@ -375,17 +448,25 @@ server worker for norn-kv-server. Generic servers substitute {port} and
             let t0 = shared.now_ns();
             let a = counters.as_mut().map(ProcessCounters::snapshot);
             let own_a = own.snapshot();
+            let host_a = counters::cpu_jiffies();
             sleep_until(&shared, start + s.end_ns);
             let t1 = shared.now_ns();
             let b = counters.as_mut().map(ProcessCounters::snapshot);
             let own_b = own.snapshot();
-            let client_preemptions = own
-                .delta(&own_a, &own_b)
-                .involuntary_by_thread
-                .iter()
-                .filter(|(name, _)| name.starts_with("client-"))
-                .map(|(_, n)| n)
-                .sum();
+            let host_b = counters::cpu_jiffies();
+            let own_delta = own.delta(&own_a, &own_b);
+            let client = |by_thread: &'_ std::collections::BTreeMap<String, u64>| {
+                by_thread
+                    .iter()
+                    .filter(|(name, _)| name.starts_with("client-"))
+                    .map(|(_, n)| *n)
+                    .collect::<Vec<u64>>()
+            };
+            let client_preemptions = client(&own_delta.involuntary_by_thread).iter().sum();
+            let client_max_run_delay_ns = client(&own_delta.run_delay_by_thread)
+                .into_iter()
+                .max()
+                .unwrap_or(0);
             let server = counters
                 .as_ref()
                 .zip(a.zip(b))
@@ -393,6 +474,28 @@ server worker for norn-kv-server. Generic servers substitute {port} and
             samples.push(Some(report::Sample {
                 server,
                 client_preemptions,
+                client_max_run_delay_ns,
+                server_sibling_busy: max(counters::fractions(
+                    &server_siblings,
+                    &host_a,
+                    &host_b,
+                    |j| j.busy,
+                )
+                .into_iter()
+                .chain(
+                    own_delta
+                        .run_delay_by_thread
+                        .iter()
+                        .filter(|(name, _)| name.starts_with("hold-"))
+                        .map(|(_, ns)| *ns as f64 / (t1 - t0) as f64),
+                )
+                .collect()),
+                server_cpu_busy: mean(counters::fractions(&server_cpus, &host_a, &host_b, |j| {
+                    j.busy
+                })),
+                server_cpu_irq: mean(counters::fractions(&server_cpus, &host_a, &host_b, |j| {
+                    j.irq
+                })),
             }));
         }
         if let Some(c) = &counters {
@@ -499,6 +602,15 @@ server worker for norn-kv-server. Generic servers substitute {port} and
             &args.server_cpus,
             &args.client_cpus,
         )?;
+        if let Some(cpu) = args
+            .hold_cpus
+            .iter()
+            .find(|c| args.server_cpus.contains(c) || args.client_cpus.contains(c))
+        {
+            return Err(format!(
+                "--hold-cpus names CPU {cpu}, which is also a server or client CPU"
+            ));
+        }
         fs::create_dir_all(&out).map_err(|e| format!("create {}: {e}", out.display()))?;
         fs::write(
             out.join("profile.json"),
@@ -519,6 +631,7 @@ server worker for norn-kv-server. Generic servers substitute {port} and
                         spec: args.server.clone().map(|b| spec_for(&args, b, &profile)),
                         address: args.address,
                         client_cpus: &args.client_cpus,
+                        hold_cpus: &args.hold_cpus,
                         placement_warnings: &placement,
                         label: label.clone(),
                         dir: out.join(format!("run-{n}-{label}")),
@@ -560,6 +673,7 @@ server worker for norn-kv-server. Generic servers substitute {port} and
                             spec: Some(spec_for(&args, binary.clone(), &profile)),
                             address: None,
                             client_cpus: &args.client_cpus,
+                            hold_cpus: &args.hold_cpus,
                             placement_warnings: &placement,
                             label: label.into(),
                             dir: out.join(format!("pair-{pair}-{label}")),
@@ -714,6 +828,7 @@ server worker for norn-kv-server. Generic servers substitute {port} and
                 spec: None,
                 address: Some(address),
                 client_cpus: &[],
+                hold_cpus: &[],
                 placement_warnings: &[],
                 label: name.into(),
                 dir: dir.clone(),

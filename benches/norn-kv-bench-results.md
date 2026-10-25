@@ -99,6 +99,63 @@ conditions as above:
   `mixed-1w` capacity is at least about 525k requests/s when the client is not
   preempted.
 
+## Isolation on a shared host
+
+Later the same day, with the same load (load average 77–118), I traced
+the remaining noise to three causes and adjusted the harness:
+
+1. **Shared cgroup.** The JVM threads (nice 5) and the benchmark both ran in
+   one service cgroup, so the server competed with about 90 runnable threads
+   for CPU time. Running the benchmark under `systemd-run --user --scope`
+   moves it to its own top-level cgroup: capacity-segment server preemptions
+   fell from about 230/s to under 10/s, and client preemptions from about
+   2300 to about 100 per window.
+2. **Uncharged interrupt time.** Server `util` stayed at 71% with almost no
+   voluntary switches or run-queue wait. `/proc/stat` showed the server CPU
+   100% busy, 29% of it in interrupts: the loopback softirq work for the
+   server's sends is charged to no thread. The capacity check now uses the
+   server CPUs' busy time, so it no longer misreports a saturated server as
+   client-bound.
+3. **SMT sibling contention.** Capacity throughput was bimodal (about 320k
+   or 585k requests/s at the same utilization), and the 585k run had IPC 0.51
+   instead of about 0.31. In single runs, the server CPU's sibling (CPU 16)
+   was 94–100% busy, with IPC about 0.30. In one open-250k window where the
+   sibling happened to be 7% busy, IPC was 0.46 and p50 latency 143 us,
+   compared with about 9 ms. The harness now records sibling busy time
+   (`smt-contention`) and run-queue wait (`server-delayed`,
+   `client-delayed`). With `--hold-cpus 16`, a `pause` loop occupies the
+   sibling so no other work runs there.
+
+`compare --pairs 5`, `mixed-1w`, server on CPU 0, client on CPUs 8–11,
+binaries built from `f7b9bfc` (`ad24d02b…`, perturbed `56f25726…`, the same
++1% perturbation as above):
+
+| Setup | Comparison | capacity `uinst/op` pair deltas | Within-build spread | Capacity runs qualified |
+| --- | --- | ---: | ---: | ---: |
+| user scope | A/A | −0.91% .. +0.08% | 0.91% | 0 of 10 (all misreported as client-bound before the fix) |
+| user scope | A/B | +0.94% .. +1.93% | 0.94% | 0 of 10 |
+| user scope + `--hold-cpus 16` | A/A | −0.04% .. +0.12% | 0.26% | 9 of 10 |
+| user scope + `--hold-cpus 16` | A/B | +1.57% .. +1.77% | 0.19% | 5 of 10 |
+
+- With the sibling held, the synthetic 1% change is about ten times the
+  A/A noise in capacity `uinst/op`. Every A/B pair resolved it, and
+  `compare` printed `unqualified/worse` for it and `unqualified/noise` for the
+  A/A run.
+- Capacity throughput still varies by about 7–17% (376k–426k requests/s).
+  A held sibling is more repeatable than a busy one but slower than an idle
+  one.
+- The open-loop segments remain unqualified on this host. When the server
+  wakes from idle it waits behind other work on its own CPU
+  (`server-delayed`, 4–13% of the window), and at 20k/s the client threads
+  are delayed too.
+
+```sh
+XDG_RUNTIME_DIR=/run/user/1000 systemd-run --user --scope -- \
+  target/release/norn-kv-bench compare --profile examples/norn-kv-bench/profiles/mixed-1w.json \
+  --baseline /tmp/kvb/bin2/base --candidate /tmp/kvb/bin2/perturbed \
+  --pairs 5 --server-cpus 0 --client-cpus 8-11 --hold-cpus 16
+```
+
 ## Still to do
 
 - Repeat A/A and A/B on a quiet host. Then calibrate the `mixed-1w` and

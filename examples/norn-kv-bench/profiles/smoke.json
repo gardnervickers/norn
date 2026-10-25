@@ -37,5 +37,11 @@
     "drain_timeout_ms": 5000
   },
   "rates": [5000, 20000],
-  "qualification": { "max_lag_p99_us": 1000.0, "min_capacity_utilization": 0.0 }
+  "qualification": {
+    "max_lag_p99_us": 1000.0,
+    "min_capacity_utilization": 0.0,
+    "max_preemptions_per_s": 1000000.0,
+    "max_run_delay_fraction": 1.0,
+    "max_sibling_busy_fraction": 1.0
+  }
 }

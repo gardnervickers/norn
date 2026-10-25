@@ -23,8 +23,9 @@ Earlier end-to-end harnesses could not resolve changes below about 5%:
 This harness instead reads exact per-thread server counters at phase
 boundaries and normalizes them by validated completions. On the development
 workstation, server user instructions per request in the capacity segment
-repeated within about 1% across runs even while the host was heavily loaded.
-A synthetic +1% per-request cost was visible in individual pairs. See
+repeated within 0.3% across ten runs while the host was heavily loaded
+(isolated as described under [Host preparation](#host-preparation)). A
+synthetic +1% per-request cost measured +1.6–1.8% in every pair. See
 [`benches/norn-kv-bench-results.md`](../../benches/norn-kv-bench-results.md).
 
 ## Quick start
@@ -82,14 +83,24 @@ git), or to `--out DIR`. Each run directory contains:
 The coordinator snapshots every server thread at each measured window's
 boundaries. It records:
 
-- `/proc/PID/task/*/schedstat` for nanosecond CPU time;
+- `/proc/PID/task/*/schedstat` for nanosecond CPU time and run-queue wait
+  (time runnable but waiting for a CPU);
 - the `stat` user/system split;
 - voluntary and involuntary context switches;
 - per-thread `perf_event_open` counters for instructions, user-space
   instructions, and cycles.
 
 Threads created mid-run, such as io-wq workers, are discovered at every
-snapshot.
+snapshot. The coordinator also reads `/proc/stat` for the server CPUs and
+their SMT siblings.
+
+The summary's `util` column is server thread CPU time per worker. `core` is
+the server CPUs' busy time and `irq` its interrupt share. Over loopback,
+the softirq work that delivers the server's sends runs on the server CPU,
+but it is charged to no thread: a saturated single-worker server shows
+`util` near 71% with `core` at 100% and `irq` near 29%. `wait` is the
+largest share of the window a server thread spent runnable but waiting for
+a CPU.
 
 ## Workload
 
@@ -124,7 +135,7 @@ capacity. `done/s` includes churn-connection requests.
 | `inst/op`: user + kernel instructions | Changes to syscall counts, batching, or io_uring usage | Low, with the same batching caveat |
 | `cpu/op` (ns) and `cyc/op` | Real cost, including cache misses, IPC, and frequency | Needs a quiet, pinned host |
 | `csw/op` | Parks per request; wakeup and batching behaviour | Moderate |
-| capacity `done/s` | Throughput ceiling | Needs a quiet host and server `util` ≥ 90% |
+| capacity `done/s` | Throughput ceiling | Needs a quiet host, server `core` ≥ 90%, and idle SMT siblings |
 | per-class `p50`/`p99`/`p99.9` | Latency at fixed offered load, measured from the intended arrival | Needs a quiet host; read the open segments, not `capacity` (closed-loop queueing) |
 
 Cost per request depends strongly on load. At 20k/s nearly every request
@@ -151,13 +162,21 @@ never compared.
 distort the result:
 
 - server and client threads were preempted at most `max_preemptions_per_s`
-  (default 20/s) in every window, which detects a busy host;
+  (default 20/s) in every window, and no thread waited for a CPU for more than
+  `max_run_delay_fraction` (default 1%) of a window. Both detect a busy host;
+  the wait check also catches rare preemptions that each cost tens of
+  milliseconds;
 - open-loop arrival lag p99 ≤ `max_lag_p99_us`;
 - every open-loop segment completed 98–102% of its realized arrivals, with no
   arrivals dropped at `max_outstanding_per_connection`. This detects an
   offered rate above capacity;
-- capacity-segment server utilization ≥ `min_capacity_utilization`. This
-  detects a client-bound capacity measurement;
+- in the capacity segment, the pinned server CPUs were at least
+  `min_capacity_utilization` busy, including interrupt time; unpinned servers
+  use thread CPU time. This detects a client-bound capacity measurement;
+- no unused SMT sibling of a server CPU was more than
+  `max_sibling_busy_fraction` (default 5%) busy. On the development
+  workstation, server IPC was about 0.3 with a busy sibling and about 0.5
+  with a mostly idle one;
 - client and server were pinned, with no shared physical cores.
 
 On an unqualified run, capacity instruction counts are still a useful hint.
@@ -173,10 +192,11 @@ It reports, per metric:
 - the median per-pair delta and its range;
 - the within-build spread.
 
-The verdict is `unqualified` if any run failed qualification for that
-segment. Otherwise it is `better` or `worse` only when every pair agrees in
-sign and the median delta exceeds half the within-build spread, and `noise`
-in all other cases. Fewer than three pairs reports `too few pairs`.
+The verdict is `better` or `worse` only when every pair agrees in sign and
+the median delta exceeds half the within-build spread, and `noise` in all
+other cases. If any run failed qualification for that segment, the verdict
+is prefixed: `unqualified/worse` is a hint for whether a qualified rerun is
+worthwhile, not a result. Fewer than three pairs reports `too few pairs`.
 
 Recommended practice:
 
@@ -202,7 +222,21 @@ Recommended practice:
   `cpu/op` and `cyc/op` comparisons if possible.
 - Hardware counters need `kernel.perf_event_paranoid` ≤ 1 for kernel-inclusive
   instructions. At 2 only `uinst/op` is available.
-- Run on a quiet host. The preemption counters show whether it was.
+- Run on a quiet host. The preemption and run-queue wait counters show
+  whether it was.
+- If other work shares the host, run the benchmark in its own top-level
+  cgroup so the scheduler shares CPU between cgroups rather than between
+  threads, for example
+  `systemd-run --user --scope -- target/release/norn-kv-bench ...`.
+  It cannot match a quiet host, but where the benchmark shared a service
+  cgroup with about 90 runnable nice-5 threads, it reduced
+  server preemptions at capacity from 230/s to under 10/s. Each result
+  records its cgroup and the starting load average in `provenance`.
+- On a shared host, `--hold-cpus` occupies the server CPUs' SMT siblings
+  with a `pause` loop, so other work cannot run there. A held sibling still
+  shares the core, so this is more repeatable than a busy sibling but slower
+  than an idle one. Work that displaces the holder counts toward the sibling
+  check. The held CPUs are recorded in `provenance`.
 
 ## External servers
 

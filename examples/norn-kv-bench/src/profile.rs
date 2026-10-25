@@ -137,10 +137,27 @@ pub struct Qualification {
     /// the client threads before the host is considered disturbed.
     #[serde(default = "default_preemptions")]
     pub max_preemptions_per_s: f64,
+    /// Maximum fraction of a window any server or client thread may spend
+    /// runnable but waiting for a CPU. Rare preemptions can still cost a
+    /// large share of the window when other work holds the CPU.
+    #[serde(default = "default_run_delay")]
+    pub max_run_delay_fraction: f64,
+    /// Maximum busy fraction of an unused SMT sibling of a server CPU.
+    /// Work on a sibling shares the server core and can halve its IPC.
+    #[serde(default = "default_sibling_busy")]
+    pub max_sibling_busy_fraction: f64,
 }
 
 fn default_preemptions() -> f64 {
     20.0
+}
+
+fn default_run_delay() -> f64 {
+    0.01
+}
+
+fn default_sibling_busy() -> f64 {
+    0.05
 }
 
 impl Default for Qualification {
@@ -149,6 +166,8 @@ impl Default for Qualification {
             max_lag_p99_us: 50.0,
             min_capacity_utilization: 0.9,
             max_preemptions_per_s: default_preemptions(),
+            max_run_delay_fraction: default_run_delay(),
+            max_sibling_busy_fraction: default_sibling_busy(),
         }
     }
 }

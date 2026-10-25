@@ -1,7 +1,8 @@
 //! Per-thread server CPU accounting.
 //!
 //! Each snapshot reads, for every thread of the server process:
-//! - `/proc/PID/task/TID/schedstat`: nanosecond on-CPU time,
+//! - `/proc/PID/task/TID/schedstat`: nanosecond on-CPU time and run-queue
+//!   wait (runnable but not running, e.g. behind another task),
 //! - `/proc/PID/task/TID/stat`: user/system tick split,
 //! - `/proc/PID/task/TID/status`: voluntary/involuntary context switches,
 //! - optional hardware counters (instructions, user instructions, cycles)
@@ -19,6 +20,7 @@ use serde::Serialize;
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 pub struct ThreadSample {
     pub cpu_ns: u64,
+    pub run_delay_ns: u64,
     pub utime_ticks: u64,
     pub stime_ticks: u64,
     pub voluntary_switches: u64,
@@ -37,6 +39,8 @@ pub struct Snapshot {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Delta {
     pub cpu_ns: u64,
+    /// Nanoseconds threads were runnable but waiting for a CPU.
+    pub run_delay_ns: u64,
     pub user_ns: u64,
     pub system_ns: u64,
     pub voluntary_switches: u64,
@@ -48,6 +52,8 @@ pub struct Delta {
     pub cpu_ns_by_thread: BTreeMap<String, u64>,
     /// Involuntary context switches (preemptions) per thread name.
     pub involuntary_by_thread: BTreeMap<String, u64>,
+    /// Run-queue wait nanoseconds per thread name.
+    pub run_delay_by_thread: BTreeMap<String, u64>,
 }
 
 struct PerfCounter {
@@ -238,6 +244,7 @@ impl ProcessCounters {
                 tid,
                 ThreadSample {
                     cpu_ns: sched.first().copied().unwrap_or(0),
+                    run_delay_ns: sched.get(1).copied().unwrap_or(0),
                     utime_ticks: utime,
                     stime_ticks: stime,
                     voluntary_switches: voluntary,
@@ -265,6 +272,8 @@ impl ProcessCounters {
             let s = start.threads.get(tid).copied().unwrap_or_default();
             let cpu = e.cpu_ns.saturating_sub(s.cpu_ns);
             delta.cpu_ns += cpu;
+            let run_delay = e.run_delay_ns.saturating_sub(s.run_delay_ns);
+            delta.run_delay_ns += run_delay;
             delta.user_ns += e.utime_ticks.saturating_sub(s.utime_ticks) * tick_ns;
             delta.system_ns += e.stime_ticks.saturating_sub(s.stime_ticks) * tick_ns;
             delta.voluntary_switches += e.voluntary_switches.saturating_sub(s.voluntary_switches);
@@ -302,6 +311,7 @@ impl ProcessCounters {
             *delta.involuntary_by_thread.entry(name.clone()).or_default() += e
                 .involuntary_switches
                 .saturating_sub(s.involuntary_switches);
+            *delta.run_delay_by_thread.entry(name.clone()).or_default() += run_delay;
             *delta.cpu_ns_by_thread.entry(name).or_default() += cpu;
         }
         delta.instructions = instructions.filter(|_| self.perf_available);
@@ -309,4 +319,62 @@ impl ProcessCounters {
         delta.cycles = cycles.filter(|_| self.perf_available);
         delta
     }
+}
+
+/// Jiffies of one CPU from `/proc/stat`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CpuJiffies {
+    /// Everything except idle and iowait.
+    pub busy: u64,
+    /// Hard and soft interrupt time, which is not charged to any thread.
+    pub irq: u64,
+    pub total: u64,
+}
+
+/// Jiffies per CPU from `/proc/stat`.
+pub fn cpu_jiffies() -> BTreeMap<usize, CpuJiffies> {
+    let mut out = BTreeMap::new();
+    let Ok(raw) = fs::read_to_string("/proc/stat") else {
+        return out;
+    };
+    for line in raw.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(cpu) = fields
+            .next()
+            .and_then(|n| n.strip_prefix("cpu"))
+            .and_then(|n| n.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        // user nice system idle iowait irq softirq steal; guest time is
+        // already included in user.
+        let v: Vec<u64> = fields.take(8).filter_map(|f| f.parse().ok()).collect();
+        if v.len() == 8 {
+            out.insert(
+                cpu,
+                CpuJiffies {
+                    busy: v[0] + v[1] + v[2] + v[5] + v[6] + v[7],
+                    irq: v[5] + v[6],
+                    total: v.iter().sum(),
+                },
+            );
+        }
+    }
+    out
+}
+
+/// Per-CPU fractions of `field` between two [`cpu_jiffies`] snapshots.
+pub fn fractions(
+    cpus: &[usize],
+    start: &BTreeMap<usize, CpuJiffies>,
+    end: &BTreeMap<usize, CpuJiffies>,
+    field: fn(&CpuJiffies) -> u64,
+) -> Vec<f64> {
+    cpus.iter()
+        .filter_map(|cpu| {
+            let (s, e) = (start.get(cpu)?, end.get(cpu)?);
+            let total = e.total.saturating_sub(s.total);
+            (total > 0).then(|| field(e).saturating_sub(field(s)) as f64 / total as f64)
+        })
+        .collect()
 }

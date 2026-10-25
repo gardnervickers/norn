@@ -61,6 +61,13 @@ pub struct ServerSegment {
     pub switches_per_op: f64,
     /// Involuntary context switches per second across server threads.
     pub preemptions_per_s: f64,
+    /// Run-queue wait across server threads.
+    #[serde(default)]
+    pub run_delay_ns: u64,
+    /// Largest fraction of the window any server thread spent runnable but
+    /// waiting for a CPU.
+    #[serde(default)]
+    pub run_delay_fraction: f64,
     pub cpu_ns_by_thread: BTreeMap<String, u64>,
 }
 
@@ -92,6 +99,23 @@ pub struct SegmentResult {
     pub server: Option<ServerSegment>,
     /// Involuntary context switches of client threads in the window.
     pub client_preemptions: Option<u64>,
+    /// Largest fraction of the window any client thread spent runnable but
+    /// waiting for a CPU.
+    #[serde(default)]
+    pub client_run_delay_fraction: Option<f64>,
+    /// Largest busy fraction of an unused SMT sibling of a server CPU, from
+    /// `/proc/stat`. Other work there shares the server core.
+    #[serde(default)]
+    pub server_sibling_busy: Option<f64>,
+    /// Mean busy fraction of the server CPUs from `/proc/stat`. Unlike
+    /// `server.utilization`, it includes interrupt time. On loopback the
+    /// softirq work that delivers the server's sends runs on the server's
+    /// CPU but is charged to no thread.
+    #[serde(default)]
+    pub server_cpu_busy: Option<f64>,
+    /// Mean hard and soft interrupt fraction of the server CPUs.
+    #[serde(default)]
+    pub server_cpu_irq: Option<f64>,
     /// No qualification warning applies to this segment (or to the run).
     pub qualified: bool,
     /// Short reason codes, e.g. `server-preempted`.
@@ -114,8 +138,16 @@ pub struct Provenance {
     pub server_threads: Vec<String>,
     pub server_cpus: Vec<usize>,
     pub client_cpus: Vec<usize>,
+    #[serde(default)]
+    pub hold_cpus: Vec<usize>,
     pub client_sha256: String,
     pub perf_counters: bool,
+    /// The coordinator's cgroup; the server and client threads inherit it.
+    #[serde(default)]
+    pub cgroup: String,
+    /// `/proc/loadavg` when the run started.
+    #[serde(default)]
+    pub load_average: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -141,6 +173,14 @@ pub struct Sample {
     /// Server counter delta and the actual sampled wall interval.
     pub server: Option<(Delta, u64)>,
     pub client_preemptions: u64,
+    /// Largest run-queue wait of one client thread, in nanoseconds.
+    pub client_max_run_delay_ns: u64,
+    /// Largest busy fraction of an unused SMT sibling of a server CPU.
+    pub server_sibling_busy: Option<f64>,
+    /// Mean busy fraction of the server CPUs, including interrupt time.
+    pub server_cpu_busy: Option<f64>,
+    /// Mean interrupt fraction of the server CPUs.
+    pub server_cpu_irq: Option<f64>,
 }
 
 pub fn build_segments(
@@ -160,6 +200,9 @@ pub fn build_segments(
             let srv = sample.as_ref().and_then(|v| v.server.as_ref());
             let client_preemptions = sample.as_ref().map(|v| v.client_preemptions);
             let window_ns = s.end_ns - s.measure_start_ns;
+            let client_run_delay_fraction = sample
+                .as_ref()
+                .map(|v| v.client_max_run_delay_ns as f64 / window_ns as f64);
             let window_s = window_ns as f64 / 1e9;
             let mut all = crate::client::new_histogram();
             for h in &st.latency[..churn] {
@@ -198,6 +241,10 @@ pub fn build_segments(
                     },
                     switches_per_op: (d.voluntary_switches + d.involuntary_switches) as f64 / ops,
                     preemptions_per_s: d.involuntary_switches as f64 / (*wall_ns as f64 / 1e9),
+                    run_delay_ns: d.run_delay_ns,
+                    run_delay_fraction: d.run_delay_by_thread.values().copied().max().unwrap_or(0)
+                        as f64
+                        / *wall_ns as f64,
                     cpu_ns_by_thread: d.cpu_ns_by_thread.clone(),
                 }
             });
@@ -223,6 +270,10 @@ pub fn build_segments(
                 classes,
                 server,
                 client_preemptions,
+                client_run_delay_fraction,
+                server_sibling_busy: sample.as_ref().and_then(|v| v.server_sibling_busy),
+                server_cpu_busy: sample.as_ref().and_then(|v| v.server_cpu_busy),
+                server_cpu_irq: sample.as_ref().and_then(|v| v.server_cpu_irq),
                 qualified: true,
                 reasons: Vec::new(),
                 warnings: Vec::new(),
@@ -276,6 +327,46 @@ fn segment_warnings(profile: &Profile, s: &SegmentResult) -> Vec<(&'static str, 
                 ));
             }
         }
+        let server_delayed = s
+            .server
+            .as_ref()
+            .is_some_and(|v| v.run_delay_fraction > q.max_run_delay_fraction);
+        if let Some(server) = s.server.as_ref().filter(|_| server_delayed) {
+            warnings.push((
+                "server-delayed",
+                format!(
+                    "{}: a server thread waited {:.1}% of the window for a CPU",
+                    s.name,
+                    server.run_delay_fraction * 100.0
+                ),
+            ));
+        }
+        if let Some(f) = s
+            .client_run_delay_fraction
+            .filter(|f| *f > q.max_run_delay_fraction)
+        {
+            warnings.push((
+                "client-delayed",
+                format!(
+                    "{}: a client thread waited {:.1}% of the window for a CPU",
+                    s.name,
+                    f * 100.0
+                ),
+            ));
+        }
+        if let Some(f) = s
+            .server_sibling_busy
+            .filter(|f| *f > q.max_sibling_busy_fraction)
+        {
+            warnings.push((
+                "smt-contention",
+                format!(
+                    "{}: an SMT sibling of a server CPU was {:.0}% busy",
+                    s.name,
+                    f * 100.0
+                ),
+            ));
+        }
         if let Some(n) = s.client_preemptions {
             if n as f64 / s.window_s > q.max_preemptions_per_s {
                 warnings.push((
@@ -289,14 +380,21 @@ fn segment_warnings(profile: &Profile, s: &SegmentResult) -> Vec<(&'static str, 
         }
         match s.offered_rate {
             None => {
-                if let Some(server) = &s.server {
-                    if server.utilization < q.min_capacity_utilization {
+                // Prefer the pinned server CPUs' busy time: thread CPU time
+                // omits the interrupt work the server causes on its CPU. A
+                // delayed server is already reported; its low utilization
+                // does not imply a client bottleneck.
+                let busy = s
+                    .server_cpu_busy
+                    .or_else(|| s.server.as_ref().map(|v| v.utilization));
+                if let Some(busy) = busy.filter(|_| !server_delayed) {
+                    if busy < q.min_capacity_utilization {
                         warnings.push((
                             "client-bound",
                             format!(
-                                "{}: server utilization {:.1}% < {:.0}%; the client may be the bottleneck",
+                                "{}: server CPUs {:.1}% busy < {:.0}%; the client may be the bottleneck",
                                 s.name,
-                                server.utilization * 100.0,
+                                busy * 100.0,
                                 q.min_capacity_utilization * 100.0
                             ),
                         ));
@@ -376,11 +474,14 @@ pub fn summary(result: &RunResult) -> String {
     );
     let _ = writeln!(
         out,
-        "{:<12} {:>9} {:>9} {:>6} {:>8} {:>8} {:>8} {:>8} {:>5} {:>7} {:>8} {:>8} {:>8} {:>7}",
+        "{:<12} {:>9} {:>9} {:>6} {:>6} {:>6} {:>6} {:>8} {:>8} {:>8} {:>8} {:>5} {:>7} {:>8} {:>8} {:>8} {:>7}",
         "segment",
         "offered",
         "done/s",
         "util",
+        "wait",
+        "core",
+        "irq",
         "cpu/op",
         "inst/op",
         "uinst/op",
@@ -400,11 +501,14 @@ pub fn summary(result: &RunResult) -> String {
         let srv = s.server.as_ref();
         let _ = writeln!(
             out,
-            "{:<12} {:>9} {:>9} {:>6} {:>8} {:>8} {:>8} {:>8} {:>5} {:>7} {:>8} {:>8} {:>8} {:>7}",
+            "{:<12} {:>9} {:>9} {:>6} {:>6} {:>6} {:>6} {:>8} {:>8} {:>8} {:>8} {:>5} {:>7} {:>8} {:>8} {:>8} {:>7}",
             s.name,
             offered,
             si(s.throughput),
             opt(srv.map(|v| v.utilization), |u| format!("{:.1}%", u * 100.0)),
+            opt(srv.map(|v| v.run_delay_fraction), |u| format!("{:.1}%", u * 100.0)),
+            opt(s.server_cpu_busy, |u| format!("{:.1}%", u * 100.0)),
+            opt(s.server_cpu_irq, |u| format!("{:.1}%", u * 100.0)),
             opt(srv.map(|v| v.cpu_ns_per_op), |v| format!("{v:.0}ns")),
             opt(srv.and_then(|v| v.instructions_per_op), si),
             opt(srv.and_then(|v| v.instructions_user_per_op), si),
@@ -564,14 +668,23 @@ pub fn compare(pairs: &[(RunResult, RunResult)]) -> Vec<MetricComparison> {
                 .iter()
                 .all(|r| r.segments.get(metric.segment).is_some_and(|s| s.qualified))
         });
+        let indicated = if consistent && delta_median.abs() > within / 2.0 {
+            if better {
+                "better"
+            } else {
+                "worse"
+            }
+        } else {
+            "noise"
+        };
+        // An unqualified verdict still shows what the data indicated, as a
+        // hint for whether a qualified rerun is worthwhile.
         let verdict = if pairs.len() < 3 {
             "too few pairs".to_owned()
         } else if !qualified {
-            "unqualified".to_owned()
-        } else if consistent && delta_median.abs() > within / 2.0 {
-            if better { "better" } else { "worse" }.to_owned()
+            format!("unqualified/{indicated}")
         } else {
-            "noise".to_owned()
+            indicated.to_owned()
         };
         out.push(MetricComparison {
             metric: metric.name,
@@ -592,17 +705,17 @@ pub fn comparison_table(rows: &[MetricComparison], pairs: usize) -> String {
     let _ = writeln!(
         out,
         "{pairs} interleaved pairs; delta = median of per-pair candidate/baseline - 1; \
-         `unqualified` = some run failed qualification for this segment"
+         `unqualified/X` = some run failed qualification for this segment; X is only a hint"
     );
     let _ = writeln!(
         out,
-        "{:<34} {:>11} {:>11} {:>8} {:>18} {:>7} {:>8}",
-        "metric", "baseline", "candidate", "delta", "pair range", "spread", "verdict"
+        "{:<34} {:>11} {:>11} {:>8} {:>18} {:>7}  verdict",
+        "metric", "baseline", "candidate", "delta", "pair range", "spread"
     );
     for r in rows {
         let _ = writeln!(
             out,
-            "{:<34} {:>11} {:>11} {:>+7.2}% {:>+8.2}%..{:>+6.2}% {:>6.2}% {:>8}",
+            "{:<34} {:>11} {:>11} {:>+7.2}% {:>+8.2}%..{:>+6.2}% {:>6.2}%  {}",
             r.metric,
             si(r.baseline_median),
             si(r.candidate_median),
