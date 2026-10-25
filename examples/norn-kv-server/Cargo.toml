@@ -5,6 +5,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
+foldhash = "0.1"
 futures-util = "0.3"
 norn-channel = { path = "../../norn-channel" }
 norn-executor = { path = "../../norn-executor" }

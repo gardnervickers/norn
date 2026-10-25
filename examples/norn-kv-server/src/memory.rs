@@ -2,6 +2,8 @@
 
 use std::collections::HashMap;
 
+use foldhash::fast::RandomState;
+
 /// A value stored by [`MemoryStore`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
@@ -33,7 +35,11 @@ pub struct Stats {
 /// A single-threaded in-memory key/value store.
 #[derive(Debug, Default)]
 pub struct MemoryStore {
-    entries: HashMap<Vec<u8>, Entry>,
+    // foldhash rather than std's SipHash: hashing was about 18% of the
+    // server's user-space instructions per request. foldhash is randomly
+    // seeded per process but is not a keyed cryptographic hash, so it is
+    // weaker against deliberate collision attacks.
+    entries: HashMap<Vec<u8>, Entry, RandomState>,
     value_bytes: usize,
 }
 
