@@ -100,6 +100,7 @@ where
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut this = self.project();
+        let mut rechecked_capacity = false;
 
         loop {
             if this.shared.status() != Status::Running {
@@ -109,8 +110,20 @@ where
                 }
                 return Poll::Ready(Err(SubmitError::shutting_down()));
             }
-            if let Some(notify) = this.notify.as_mut().as_pin_mut() {
-                ready!(notify.poll(cx));
+            if let Some(mut notify) = this.notify.as_mut().as_pin_mut() {
+                if notify.as_mut().poll(cx).is_pending() {
+                    if rechecked_capacity {
+                        return Poll::Pending;
+                    }
+                    // SQ space can be freed without a synchronous submit (SQPOLL).
+                    // Hand any visible capacity to waiters in queue order, which may
+                    // include this one, rather than relying on a later submit. Do
+                    // this once per poll: a batch can be woken by space too small
+                    // for it.
+                    rechecked_capacity = true;
+                    this.shared.notify_sq_capacity();
+                    ready!(notify.poll(cx));
+                }
                 Pin::set(&mut this.notify, None);
             }
 

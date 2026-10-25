@@ -176,6 +176,45 @@ impl std::fmt::Debug for OpTarget {
     }
 }
 
+/// A driver-internal asynchronous cancellation of a submitted operation.
+///
+/// The request owns its target's identity until the kernel reports the
+/// cancellation's own terminal CQE. The target allocation, and therefore the
+/// numeric `user_data` the cancellation matches, cannot be reused while the
+/// cancellation can still reach the kernel.
+pub(crate) struct AsyncCancel {
+    target: OpTarget,
+}
+
+impl AsyncCancel {
+    /// Build a detached submission entry cancelling `target`.
+    ///
+    /// The entry carries the only reference to the cancellation request.
+    /// Dropping the entry without pushing it releases the request.
+    pub(crate) fn entry(target: OpTarget) -> ConfiguredEntry {
+        let handle = TypedHandle::new(Self { target });
+        let entry = handle
+            .data_mut()
+            .expect("new cancellation missing data")
+            .configure()
+            .expect("async cancellation configuration is infallible");
+        ConfiguredEntry::new(handle.untyped(), entry)
+    }
+}
+
+// Safety: the entry references no memory; it names its target only by the
+// `user_data` value whose allocation `target` retains through the terminal CQE.
+unsafe impl Operation for AsyncCancel {
+    type Completion = ();
+
+    fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+        let criteria = CancelBuilder::user_data(self.target.user_data());
+        Ok(io_uring::opcode::AsyncCancel2::new(criteria).build())
+    }
+
+    unsafe fn reap(&mut self, _result: CQEResult) -> Self::Completion {}
+}
+
 pin_project_lite::pin_project! {
     /// A lazily-submitted io_uring operation.
     #[must_use = "future does nothing unless you `.await` or poll them"]
@@ -195,9 +234,9 @@ pin_project_lite::pin_project! {
             match this.state {
                 State::Submitted { inner } => {
                     if inner.needs_cancel() {
-                        let user_data = inner.inner.inner.as_raw_usize();
-                        let criteria = CancelBuilder::user_data(user_data as u64);
-                        let _ = this.reactor.cancel(criteria, false);
+                        this.reactor.cancel_op(OpTarget {
+                            handle: inner.inner.inner.clone(),
+                        });
                     }
                 }
                 State::Prepared { .. }
