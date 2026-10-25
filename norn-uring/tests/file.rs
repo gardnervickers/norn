@@ -12,6 +12,37 @@ use std::task::Poll;
 mod util;
 
 #[test]
+fn default_open_options_preserve_creation_permissions() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let dir = util::ThreadNameTestDir::new();
+        let mut modes = Vec::new();
+        for (name, mut options) in [
+            ("default", fs::OpenOptions::default()),
+            ("new", fs::OpenOptions::new()),
+            ("zero", {
+                let mut options = fs::OpenOptions::default();
+                options.mode(0);
+                options
+            }),
+        ] {
+            let path = dir.join(name);
+            options
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .await?
+                .close()
+                .await?;
+            modes.push(fs::metadata(&path).await?.stx_mode as u32 & 0o777);
+        }
+        // Compare under the existing umask without changing process-global state.
+        assert_eq!(modes[0], modes[1]);
+        assert_eq!(modes[2], 0);
+        Ok(())
+    })
+}
+
+#[test]
 fn open_close() -> Result<(), Box<dyn std::error::Error>> {
     util::with_test_env(|| async {
         let dir = util::ThreadNameTestDir::new();
