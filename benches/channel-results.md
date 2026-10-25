@@ -514,9 +514,9 @@ Seven process-isolated baseline/candidate pairs alternated order on the
 existing pinned four-producer, four-lane benchmark:
 
 ```console
+NORN_CHANNEL_CONSUMER_CPU=2 \
+NORN_CHANNEL_PRODUCER_CPUS=4,6,8,10 \
 taskset -c 2,4,6,8,10 \
-  NORN_CHANNEL_CONSUMER_CPU=2 \
-  NORN_CHANNEL_PRODUCER_CPUS=4,6,8,10 \
   <channel-benchmark> \
   throughput/4p1c/sharded/recv_limit=32/messages=262144
 ```
