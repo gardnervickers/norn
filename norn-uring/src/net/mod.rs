@@ -11,4 +11,4 @@ pub use tcp::{
     TcpListener, TcpListenerOptions, TcpRecvBundleMulti, TcpRecvRingMulti, TcpSocket, TcpStream,
     TcpStreamReader, TcpStreamWriter,
 };
-pub use udp::{UdpRecvBundleMulti, UdpRecvRingMulti, UdpSocket};
+pub use udp::{UdpRecvBundleMulti, UdpRecvFromRingMulti, UdpRecvRingMulti, UdpSocket};

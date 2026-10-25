@@ -160,6 +160,7 @@ pub struct Handle {
 struct Shared {
     ring: RefCell<IoUring>,
     backpressure: Notify,
+    receive_shutdown: Notify,
     status: Cell<Status>,
     submit_error: RefCell<Option<(io::ErrorKind, String)>>,
     shutdown_outcome: Cell<Option<ShutdownOutcome>>,
@@ -367,6 +368,26 @@ impl Drop for BufRingReservation {
 }
 
 impl BufRingRegistration {
+    pub(crate) fn is_running(&self) -> bool {
+        self.shared.status() == Status::Running
+    }
+
+    pub(crate) async fn wait_for_shutdown(&self) {
+        use std::future::{poll_fn, Future};
+        use std::pin::pin;
+        let mut notified = pin!(self.shared.receive_shutdown.wait());
+        poll_fn(|cx| {
+            // Register before checking the condition, including reentrant wakeups.
+            let _ = notified.as_mut().poll(cx);
+            if self.is_running() {
+                std::task::Poll::Pending
+            } else {
+                std::task::Poll::Ready(())
+            }
+        })
+        .await
+    }
+
     pub(crate) fn same_driver(&self, handle: &Handle) -> bool {
         Rc::ptr_eq(&self.shared, &handle.shared)
     }
@@ -626,6 +647,7 @@ impl Driver {
             shared: Rc::new(Shared {
                 ring: RefCell::new(ring),
                 backpressure: Notify::default(),
+                receive_shutdown: Notify::default(),
                 status: Cell::new(Status::Running),
                 submit_error: RefCell::new(None),
                 shutdown_outcome: Cell::new(None),
@@ -1071,6 +1093,7 @@ impl Shared {
             // Commit the state before callbacks. A waker may panic, but the
             // CQE that caused this transition has already been consumed and
             // subsequent driver work must observe its new stage.
+            self.receive_shutdown.notify(usize::MAX);
             self.backpressure.notify(usize::MAX);
         }
     }
