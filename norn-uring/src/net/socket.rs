@@ -495,6 +495,14 @@ impl Socket {
         self.fd.submit(op)
     }
 
+    pub(crate) fn recv_tcp_with_flags<B>(&self, buf: B, flags: i32) -> Op<Recv<B, true>>
+    where
+        B: StableBufMut + 'static,
+    {
+        let op = Recv::new(self.fd.lease(), buf, flags);
+        self.fd.submit(op)
+    }
+
     pub(crate) fn send_zc<B>(&self, buf: B) -> Op<SendZc<B>>
     where
         B: StableBuf + 'static,
@@ -839,7 +847,7 @@ struct RecvFrom<B> {
     flags: u32,
     submitted_len: usize,
     msghdr: MaybeUninit<libc::msghdr>,
-    slices: MaybeUninit<[io::IoSliceMut<'static>; 1]>,
+    iovec: MaybeUninit<libc::iovec>,
 }
 
 impl<B> RecvFrom<B>
@@ -857,7 +865,7 @@ where
             flags,
             submitted_len,
             msghdr: MaybeUninit::zeroed(),
-            slices: MaybeUninit::zeroed(),
+            iovec: MaybeUninit::uninit(),
         }
     }
 }
@@ -873,19 +881,16 @@ where
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
 
-        let ptr = this.buf.stable_ptr_mut();
-        let len = this.submitted_len;
-        let slice = io::IoSliceMut::new(unsafe { std::slice::from_raw_parts_mut(ptr, len) });
-        // First we initialize the IoVecMut slice.
-        this.slices.write([slice]);
-        // Safety: We just initialized the slice.
-        let slices = unsafe { this.slices.assume_init_mut() };
+        // The writable region may be uninitialized. Build raw metadata without
+        // creating a Rust slice over it, after the operation has been pinned.
+        this.iovec
+            .write(recv_from_iovec(&mut this.buf, this.submitted_len));
 
         // Next we initialize the msghdr.
         let msghdr = this.msghdr.as_mut_ptr();
         unsafe {
-            (*msghdr).msg_iov = slices.as_mut_ptr().cast();
-            (*msghdr).msg_iovlen = slices.len() as _;
+            (*msghdr).msg_iov = this.iovec.as_mut_ptr();
+            (*msghdr).msg_iovlen = 1;
             (*msghdr).msg_name = this.addr.as_ptr() as *mut libc::c_void;
             (*msghdr).msg_namelen = this.addr.len() as _;
         };
@@ -898,6 +903,13 @@ where
 
     unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
         result
+    }
+}
+
+fn recv_from_iovec<B: StableBufMut>(buf: &mut B, len: usize) -> libc::iovec {
+    libc::iovec {
+        iov_base: buf.stable_ptr_mut().cast(),
+        iov_len: len,
     }
 }
 
@@ -1587,14 +1599,14 @@ impl Singleshot for Shutdown {
     }
 }
 #[derive(Debug)]
-pub(crate) struct Recv<B> {
+pub(crate) struct Recv<B, const TCP: bool = false> {
     fd: NornFd,
     buf: B,
     flags: i32,
     submitted_len: usize,
 }
 
-impl<B> Recv<B>
+impl<B, const TCP: bool> Recv<B, TCP>
 where
     B: StableBufMut,
 {
@@ -1611,13 +1623,19 @@ where
 
 // Safety: `NornFd` retains the socket and the owned `StableBufMut` keeps the
 // writable region stable and exclusive through completion.
-unsafe impl<B> Operation for Recv<B>
+unsafe impl<B, const TCP: bool> Operation for Recv<B, TCP>
 where
     B: StableBufMut,
 {
     type Completion = CQEResult;
 
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+        if TCP && self.flags & libc::MSG_TRUNC != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "MSG_TRUNC is unsupported for TCP receives",
+            ));
+        }
         let len = checked_scalar_len(self.submitted_len, "receive buffer length")?;
         let ptr = self.buf.stable_ptr_mut();
         Ok(opcode::Recv::new(self.fd.fd(), ptr, len)
@@ -1630,7 +1648,7 @@ where
     }
 }
 
-impl<B> Singleshot for Recv<B>
+impl<B, const TCP: bool> Singleshot for Recv<B, TCP>
 where
     B: StableBufMut,
 {
@@ -1992,6 +2010,31 @@ mod tests {
     use norn_executor::LocalExecutor;
 
     use super::*;
+
+    #[test]
+    fn recv_from_iovec_accepts_uninitialized_capacity() {
+        fn check<B: StableBuf + StableBufMut>(mut buf: B) {
+            let len = buf.bytes_remaining();
+            assert!(len >= 4);
+            let iovec = recv_from_iovec(&mut buf, len);
+            assert_eq!(iovec.iov_len, len);
+            // Safety: emulate a kernel write into the owned writable region,
+            // then mark just those bytes initialized after completion.
+            unsafe {
+                std::ptr::copy_nonoverlapping(b"norn".as_ptr(), iovec.iov_base.cast(), 4);
+                buf.set_init(4);
+            }
+            assert_eq!(buf.bytes_init(), 4);
+            // Safety: the simulated completion initialized this prefix.
+            assert_eq!(
+                unsafe { std::slice::from_raw_parts(buf.stable_ptr(), 4) },
+                b"norn"
+            );
+        }
+
+        check(Vec::<u8>::with_capacity(16));
+        check(bytes::BytesMut::with_capacity(16));
+    }
 
     #[test]
     fn unconsumed_reaped_descriptor_closes_directly() {

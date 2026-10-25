@@ -1,6 +1,7 @@
 #![cfg(target_os = "linux")]
 
 use std::future::Future;
+use std::io;
 use std::pin::pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -14,6 +15,90 @@ use norn_uring::bufring::{BufRingBufBundle, RecvBufRing};
 use norn_uring::net::UdpSocket;
 
 mod util;
+
+#[test]
+fn pending_recv_from_initializes_vec_and_bytes_mut() -> Result<(), Box<dyn std::error::Error>> {
+    use norn_uring::buf::{StableBuf, StableBufMut};
+
+    async fn check<B: StableBuf + StableBufMut>(buf: B) -> io::Result<()> {
+        let receiver = UdpSocket::bind("127.0.0.1:0".parse().unwrap()).await?;
+        let sender = UdpSocket::bind("127.0.0.1:0".parse().unwrap()).await?;
+        let mut recv = Box::pin(receiver.recv_from(buf));
+        assert!(futures_util::poll!(recv.as_mut()).is_pending());
+        sender
+            .send_to(b"hello".to_vec(), receiver.local_addr()?)
+            .await
+            .0?;
+        let (result, buf) = recv.await;
+        let (len, addr) = result?;
+        assert_eq!(addr, sender.local_addr()?);
+        assert_eq!(len, 5);
+        assert_eq!(buf.bytes_init(), 5);
+        // Safety: completion has initialized exactly these bytes.
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(buf.stable_ptr(), len) },
+            b"hello"
+        );
+        receiver.close().await?;
+        sender.close().await?;
+        Ok(())
+    }
+
+    util::with_test_env(|| async {
+        check(Vec::<u8>::with_capacity(16)).await?;
+        check(BytesMut::with_capacity(16)).await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn pending_recv_from_can_be_dropped_before_shutdown() -> Result<(), Box<dyn std::error::Error>> {
+    use norn_uring::buf::StableBufMut;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    struct DropTracked {
+        buf: Vec<u8>,
+        dropped: Rc<Cell<bool>>,
+    }
+
+    // Safety: the owned Vec allocation is stable across moves and exposes its
+    // exclusively owned capacity until terminal completion.
+    unsafe impl StableBufMut for DropTracked {
+        fn stable_ptr_mut(&mut self) -> *mut u8 {
+            self.buf.as_mut_ptr()
+        }
+        fn bytes_remaining(&self) -> usize {
+            self.buf.capacity()
+        }
+        unsafe fn set_init(&mut self, len: usize) {
+            unsafe { self.buf.set_len(len) };
+        }
+    }
+
+    impl Drop for DropTracked {
+        fn drop(&mut self) {
+            self.dropped.set(true);
+        }
+    }
+
+    let dropped = Rc::new(Cell::new(false));
+    util::with_test_env(|| async {
+        let receiver = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let mut recv = Box::pin(receiver.recv_from(DropTracked {
+            buf: Vec::with_capacity(16),
+            dropped: Rc::clone(&dropped),
+        }));
+        assert!(futures_util::poll!(recv.as_mut()).is_pending());
+        drop(recv);
+        drop(receiver);
+        Ok(())
+    })?;
+    // Driver shutdown must drain cancellation before releasing the operation's
+    // buffer, fd, and pinned receive metadata.
+    assert!(dropped.get());
+    Ok(())
+}
 
 fn flatten_bundle(bundle: &BufRingBufBundle) -> Vec<u8> {
     bundle
