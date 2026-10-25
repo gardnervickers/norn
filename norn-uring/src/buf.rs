@@ -350,7 +350,17 @@ unsafe impl StableBuf for BytesMut {
 // ownership prevents aliases, and these methods do not resize the allocation.
 unsafe impl StableBufMut for BytesMut {
     fn stable_ptr_mut(&mut self) -> *mut u8 {
-        self.as_mut_ptr()
+        // DerefMut exposes only the initialized prefix, so its slice pointer
+        // cannot be used to write spare capacity. Temporarily shorten the
+        // logical length to obtain a pointer covering the whole allocation.
+        let len = self.len();
+        // Safety: shortening the length does not destroy initialized bytes.
+        unsafe { self.set_len(0) };
+        let ptr = self.spare_capacity_mut().as_mut_ptr().cast();
+        // Safety: these bytes were initialized before the temporary shortening;
+        // no allocation or callback occurs between the two length updates.
+        unsafe { self.set_len(len) };
+        ptr
     }
 
     fn bytes_remaining(&self) -> usize {
@@ -416,7 +426,38 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{set_init_checked, BufCursor, StableBuf};
+    use super::{set_init_checked, BufCursor, StableBuf, StableBufMut};
+
+    #[test]
+    fn bytes_mut_pointer_covers_capacity_and_preserves_length() {
+        for len in [0, 4, 16] {
+            let mut buf = bytes::BytesMut::with_capacity(16);
+            buf.resize(len, 0xa5);
+            let capacity = buf.capacity();
+            let ptr = buf.stable_ptr_mut();
+            assert_eq!(buf.len(), len);
+            // Safety: the initialized prefix still contains the original data.
+            assert_eq!(
+                unsafe { std::slice::from_raw_parts(ptr, len) },
+                vec![0xa5; len]
+            );
+            // Safety: the stable pointer covers the entire writable capacity.
+            unsafe {
+                std::ptr::write_bytes(ptr, 0x5a, capacity);
+                buf.set_init(capacity);
+            }
+            assert_eq!(&buf[..], vec![0x5a; capacity]);
+        }
+
+        // Split allocations must preserve the neighboring buffer's ownership.
+        let mut whole = bytes::BytesMut::from(&b"left-right"[..]);
+        let mut left = whole.split_to(5);
+        let right = whole;
+        let ptr = left.stable_ptr_mut();
+        unsafe { std::ptr::write_bytes(ptr, b'x', left.capacity()) };
+        assert_eq!(&left[..], b"xxxxx");
+        assert_eq!(&right[..], b"right");
+    }
 
     #[test]
     fn cursor_consume_saturates_remaining_len() {

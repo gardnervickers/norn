@@ -109,6 +109,11 @@ struct SlotMeta {
     next_free: Cell<Option<usize>>,
 }
 
+fn fixed_region_ptr(region: &mut [u8]) -> NonNull<u8> {
+    // Derive permission for the entire region, rather than just its first byte.
+    NonNull::new(region.as_mut_ptr()).expect("slice pointers are non-null")
+}
+
 /// Why fixed-buffer registration failed.
 #[derive(Debug)]
 pub enum RegisterErrorKind {
@@ -506,7 +511,7 @@ impl Handle {
                 });
             }
 
-            let ptr = NonNull::from(&mut selected[0]);
+            let ptr = fixed_region_ptr(selected);
             let start = ptr.as_ptr() as usize;
             let end = start
                 .checked_add(selected.len())
@@ -1055,6 +1060,28 @@ fn map_release_error(err: FixedBufReleaseError) -> UnregisterErrorKind {
 mod tests {
     use super::*;
 
+    #[test]
+    fn fixed_region_pointer_covers_whole_projection() {
+        fn check<B: FixedBuffer>(buffer: &mut B) {
+            let region = &mut buffer.fixed_region()[2..6];
+            let len = region.len();
+            let ptr = fixed_region_ptr(region);
+            // Safety: the projection remains exclusively borrowed and live;
+            // these are the same whole-region views used by FixedBuf.
+            unsafe {
+                let full = std::slice::from_raw_parts_mut(ptr.as_ptr(), len);
+                full.copy_from_slice(b"norn");
+                assert_eq!(std::slice::from_raw_parts(ptr.as_ptr(), len), b"norn");
+                std::slice::from_raw_parts_mut(ptr.as_ptr().add(1), len - 1)
+                    .copy_from_slice(b"ice");
+            }
+            assert_eq!(&buffer.fixed_region()[2..6], b"nice");
+        }
+
+        check(&mut vec![0; 8]);
+        check(&mut [0; 8]);
+    }
+
     struct SharedRegion {
         bytes: Rc<UnsafeCell<[u8; 32]>>,
         range: Range<usize>,
@@ -1273,7 +1300,7 @@ mod tests {
             .into_boxed_slice(),
         });
         let selected = storage.buffers[0].get_mut().fixed_region();
-        let ptr = NonNull::from(&mut selected[0]);
+        let ptr = fixed_region_ptr(selected);
         let iovec = libc::iovec {
             iov_base: ptr.as_ptr().cast(),
             iov_len: selected.len(),

@@ -56,13 +56,16 @@ impl Header {
     }
 
     pub(crate) fn set_waker(&self, waker: &Waker) {
-        let waker_slot = unsafe { &mut *self.waker.get() };
-        if let Some(existing) = waker_slot {
-            if !existing.will_wake(waker) {
-                *existing = waker.clone();
-            }
-        } else {
-            *waker_slot = Some(waker.clone());
+        // `will_wake` does not invoke user code. Clone and drop can both
+        // re-enter the task system, so neither may borrow the slot.
+        if unsafe { &*self.waker.get() }
+            .as_ref()
+            .is_some_and(|existing| existing.will_wake(waker))
+        {
+            return;
         }
+        let new_waker = waker.clone();
+        let old_waker = unsafe { &mut *self.waker.get() }.replace(new_waker);
+        drop(old_waker);
     }
 }

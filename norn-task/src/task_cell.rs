@@ -306,14 +306,17 @@ where
         let this = Self::from_raw_header(ptr);
         let state = this.as_ref().state();
 
+        if !state.is_complete() {
+            this.as_ref().header().set_waker(waker);
+        }
+
+        // Waker clone/drop callbacks during registration may complete the task.
+        // Recheck so completion before the new waker was installed cannot lose
+        // the notification.
         if state.is_complete() {
             let future_cell = this.as_ref().future_cell();
             let output = future_cell.take_output();
             *out = Poll::Ready(output);
-        } else {
-            // Set the waker.
-            let header = this.as_ref().header();
-            header.set_waker(waker);
         }
     }
 

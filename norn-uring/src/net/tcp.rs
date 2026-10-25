@@ -427,12 +427,16 @@ impl TcpSocket {
     }
 
     /// Recv data into the given buffer with recv flags.
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] with the buffer unchanged if
+    /// `flags` includes `MSG_TRUNC`. On TCP that flag discards input without
+    /// initializing the buffer, so it is rejected before submission.
     pub fn recv_with_flags<B: StableBufMut>(
         &self,
         buf: B,
         flags: i32,
     ) -> impl crate::Request<Output = (io::Result<usize>, B)> {
-        self.socket.recv_with_flags(buf, flags)
+        self.socket.recv_tcp_with_flags(buf, flags)
     }
 
     /// Send data from the given buffer.

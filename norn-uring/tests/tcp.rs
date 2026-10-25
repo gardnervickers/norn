@@ -15,6 +15,68 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 mod util;
 
+#[test]
+fn msg_trunc_is_rejected_without_modifying_buffers_or_consuming_input(
+) -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let listener = TcpListener::bind("127.0.0.1:0".parse()?, 8).await?;
+        let peer = std::net::TcpStream::connect(listener.local_addr()?)?;
+        let (server, _) = listener.accept().await?;
+        use std::io::Write;
+        let mut peer = peer;
+
+        for flags in [
+            libc::MSG_TRUNC,
+            libc::MSG_TRUNC | libc::MSG_PEEK,
+            libc::MSG_TRUNC | libc::MSG_WAITALL,
+        ] {
+            for initialized in [false, true] {
+                peer.write_all(b"hello")?;
+                let buf = if initialized {
+                    vec![0xa5; 5]
+                } else {
+                    Vec::with_capacity(5)
+                };
+                let ptr = buf.as_ptr();
+                let capacity = buf.capacity();
+                let (result, buf) = server.recv_with_flags(buf, flags).await;
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+                assert_eq!(buf.as_ptr(), ptr);
+                assert_eq!(buf.capacity(), capacity);
+                assert_eq!(
+                    buf,
+                    if initialized {
+                        vec![0xa5; 5]
+                    } else {
+                        Vec::new()
+                    }
+                );
+                let (result, buf) = server.recv_with_flags(buf, libc::MSG_WAITALL).await;
+                assert_eq!(result?, 5);
+                assert_eq!(buf, b"hello");
+
+                peer.write_all(b"hello")?;
+                let mut buf = BytesMut::with_capacity(5);
+                if initialized {
+                    buf.extend_from_slice(&[0xa5; 5]);
+                }
+                let ptr = buf.as_ptr();
+                let capacity = buf.capacity();
+                let (result, buf) = server.recv_with_flags(buf, flags).await;
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+                assert_eq!(buf.as_ptr(), ptr);
+                assert_eq!(buf.capacity(), capacity);
+                assert_eq!(&buf[..], if initialized { &[0xa5; 5][..] } else { &[][..] });
+                let (result, buf) = server.recv_with_flags(buf, libc::MSG_WAITALL).await;
+                assert_eq!(result?, 5);
+                assert_eq!(&buf[..], b"hello");
+            }
+        }
+        server.close().await?;
+        Ok(())
+    })
+}
+
 #[cfg(target_pointer_width = "64")]
 struct OversizedBuf(usize);
 

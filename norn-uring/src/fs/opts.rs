@@ -14,7 +14,7 @@ use crate::fs::File;
 /// call [`OpenOptions::open`], passing the path of the file you're trying to
 /// open. This will give you a [`io::Result`] with a [`File`] inside that you
 /// can further operate on.
-#[derive(Debug, Copy, Clone, Default)]
+#[derive(Debug, Copy, Clone)]
 pub struct OpenOptions {
     pub(crate) read: bool,
     pub(crate) write: bool,
@@ -28,15 +28,30 @@ pub struct OpenOptions {
     pub(crate) mode: u32,
 }
 
+impl Default for OpenOptions {
+    fn default() -> Self {
+        Self {
+            read: false,
+            write: false,
+            append: false,
+            truncate: false,
+            create: false,
+            create_new: false,
+            direct: false,
+            sync: false,
+            dsync: false,
+            mode: 0o666,
+        }
+    }
+}
+
 impl OpenOptions {
     /// Creates a blank new set of options ready for configuration.
     ///
-    /// All options are initially set to `false`.
+    /// All options are initially set to `false`, with a creation mode of 0666
+    /// before applying the process umask.
     pub fn new() -> Self {
-        Self {
-            mode: 0o666,
-            ..Default::default()
-        }
+        Self::default()
     }
 
     /// Sets the option for read access.
@@ -204,5 +219,17 @@ impl OpenOptions {
         };
 
         Ok(res)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_creation_mode_matches_new_and_allows_explicit_zero() {
+        assert_eq!(OpenOptions::default().mode, 0o666);
+        assert_eq!(OpenOptions::new().mode, 0o666);
+        assert_eq!(OpenOptions::default().mode(0).mode, 0);
     }
 }
