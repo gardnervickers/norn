@@ -156,11 +156,69 @@ XDG_RUNTIME_DIR=/run/user/1000 systemd-run --user --scope -- \
   --pairs 5 --server-cpus 0 --client-cpus 8-11 --hold-cpus 16
 ```
 
+## Quiet-host calibration
+
+The unrelated jobs stopped for about ten minutes (21:51–22:01, load average
+about 4). Plain runs, no scope or held CPUs, binaries as above.
+
+`mixed-1w` (server CPU 0, client CPUs 8–11). In the first run every segment
+qualified:
+
+| Segment | done/s | core | irq | `uinst/op` | `cpu/op` | IPC | p50 | p99 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| capacity | 589.0k | 100% | 27% | 1301 | 1237 ns | 0.51 | 1.7 ms | 2.0 ms |
+| open-20k | 21.7k | 17% | 4% | 2161 | 4375 ns | 0.47 | 41 us | 112 us |
+| open-100k | 102.1k | 48% | 11% | 1960 | 3174 ns | 0.48 | 42 us | 103 us |
+| open-250k | 251.8k | 89% | 24% | 1814 | 2437 ns | 0.50 | 65 us | 1.4 ms |
+
+- Capacity was 586k–610k in four further runs, with `uinst/op` 1301–1304.
+- **Open-loop knee.** At 320k the CPU was 99% busy with p50 258 us; at 380k,
+  p50 was 2.3 ms. The knee (about 300k) is about half of closed-loop capacity,
+  because closed-loop queues keep 1024 requests in flight. Cost per request
+  falls from about 2.4 us in the open-loop segments to 1.2 us at capacity.
+  The rates are now 30k/120k/240k, about 10%, 40%, and 80% of the knee.
+
+`mixed-4w` (server CPUs 0–3, client CPUs 8–15):
+
+| Segment | done/s | core | `uinst/op` | `cpu/op` | p50 | p99 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| capacity | 1.06M | 99.9% | 3760 | 2847 ns | 1.9 ms | 3.1 ms |
+| open-500k | 503.3k | 85% | 5115 | 4831 ns | 82 us | 233 us |
+| open-680k | 682.8k | 94.5% | 4792 | 4027 ns | 117 us | 400 us |
+
+- The workers were balanced, with 3750–3784 ms of CPU each in the capacity
+  window. No ENOBUFS resets occurred up to 680k on the quiet host.
+- **The sharded path costs 2.9 times the single-worker server's user
+  instructions per request** (3760 vs 1301 at capacity). That is the largest
+  optimization target the benchmark has shown; see the review's sharded
+  response-copy findings.
+- The rates are now 70k/280k/560k. A slower shared host reached the ENOBUFS
+  reset at 640k, so the top rate keeps a margin until that is fixed.
+
+**A/A, `mixed-1w`, five pairs.** The jobs restarted during the last pairs.
+Capacity `uinst/op` deltas were −0.22% to +0.51% (spread 0.65%), and 8 of 10
+capacity runs qualified.
+
+**A/B, `mixed-1w`, five pairs**, shared host again (load average about 50), user
+scope plus `--hold-cpus 16`: capacity `uinst/op` +1.40% to +1.66% in every
+pair (spread 0.38%), 9 of 10 capacity runs qualified. This agrees with the
+earlier isolated A/B (+1.57% to +1.77%). With the sibling held, 240k is past
+the knee: p50 was 3 ms, so the harness now also disqualifies an open-loop
+segment whose server CPUs are at least 98% busy (`saturated`).
+
+**A/A and A/B, `mixed-4w`, five pairs**, shared host (load average 50–62),
+user scope plus `--hold-cpus 16-19`. The four-worker layout gives other work
+far more CPUs to interfere on: only 1 of 10 A/A capacity runs qualified, and
+capacity `uinst/op` spread 2.1% (3761–3840). The A/B stopped after three
+pairs, because pair 4's baseline hit the ENOBUFS reset at 560k. In the
+completed pairs the candidate measured 3804–3829 against 3768–3778, about +1%,
+which is not resolvable against that A/A spread. Until the ENOBUFS reset is
+fixed, `mixed-4w` comparisons need a quiet host.
+
 ## Still to do
 
-- Repeat A/A and A/B on a quiet host. Then calibrate the `mixed-1w` and
-  `mixed-4w` open-loop rates to about 10%, 40%, and 80% of the measured
-  capacity, and check that the capacity segment reaches ≥ 90% server
-  utilization with the profile's client threads.
+- Repeat the A/A and A/B comparisons on a host that stays quiet for their
+  whole duration. Time, throughput, and latency metrics have not yet been
+  qualified across a full comparison.
 - Fix the sharded ENOBUFS overload reset. The 4-worker profile can then
   include a deliberate overload segment that checks recovery.

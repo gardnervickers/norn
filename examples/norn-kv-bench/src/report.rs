@@ -346,6 +346,9 @@ pub fn qualify(
 /// are counted over the actual interval, but a late boundary shifts the
 /// window into the neighbouring segment's load.
 const MAX_SAMPLE_SKEW: f64 = 0.005;
+/// Server CPU busy fraction at which an open-loop segment counts as
+/// saturated.
+const MAX_OPEN_LOOP_BUSY: f64 = 0.98;
 /// Smallest acceptable perf counter coverage before scaling estimates
 /// dominate the counts.
 const MIN_PERF_COVERAGE: f64 = 0.99;
@@ -447,17 +450,10 @@ fn segment_warnings(profile: &Profile, s: &SegmentResult) -> Vec<(&'static str, 
                 ),
             ));
         }
-        if let Some(n) = s.client_preemptions {
-            if n as f64 / s.window_s > q.max_preemptions_per_s {
-                warnings.push((
-                    "client-preempted",
-                    format!(
-                        "{}: client threads preempted {n} times; host is not quiet",
-                        s.name
-                    ),
-                ));
-            }
-        }
+        // Client preemptions are recorded but not gated: brief preemptions by
+        // unrelated short tasks are common even on a quiet host, and their
+        // effect on the schedule is already measured by client run-queue
+        // wait and open-loop arrival lag.
         match s.offered_rate {
             None => {
                 // Prefer the pinned server CPUs' busy time: thread CPU time
@@ -488,6 +484,22 @@ fn segment_warnings(profile: &Profile, s: &SegmentResult) -> Vec<(&'static str, 
                         format!(
                             "{}: {} arrivals dropped at the per-connection cap; offered rate exceeds capacity",
                             s.name, s.dropped
+                        ),
+                    ));
+                }
+                // A saturated server queues arrivals without bound, so the
+                // segment no longer measures a fixed load. A delayed server's
+                // CPUs are busy with other work; that is reported already.
+                if let Some(busy) = s
+                    .server_cpu_busy
+                    .filter(|b| *b >= MAX_OPEN_LOOP_BUSY && !server_delayed)
+                {
+                    warnings.push((
+                        "saturated",
+                        format!(
+                            "{}: server CPUs {:.1}% busy at offered {rate}/s; the rate is at or past the open-loop knee",
+                            s.name,
+                            busy * 100.0
                         ),
                     ));
                 }

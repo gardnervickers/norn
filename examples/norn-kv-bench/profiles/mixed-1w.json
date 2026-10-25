@@ -98,11 +98,7 @@
     "segment_ms": 5000,
     "drain_timeout_ms": 10000
   },
-  "rates": [
-    20000,
-    100000,
-    250000
-  ],
+  "rates": [30000, 120000, 240000],
   "qualification": {
     "max_lag_p99_us": 50.0,
     "min_capacity_utilization": 0.9,

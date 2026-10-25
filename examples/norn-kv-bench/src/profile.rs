@@ -133,8 +133,9 @@ pub struct Qualification {
     /// Minimum server CPU utilization in the capacity segment before the
     /// result is considered server-bound.
     pub min_capacity_utilization: f64,
-    /// Maximum involuntary context switches per second of the server or of
-    /// the client threads before the host is considered disturbed.
+    /// Maximum involuntary context switches per second of the server threads
+    /// before the host is considered disturbed. Preemption changes how much
+    /// work each server wakeup batches.
     #[serde(default = "default_preemptions")]
     pub max_preemptions_per_s: f64,
     /// Maximum fraction of a window any server or client thread may spend

@@ -167,15 +167,18 @@ never compared.
 `qualified` additionally requires a measurement environment that did not
 distort the result:
 
-- server and client threads were preempted at most `max_preemptions_per_s`
-  (default 20/s) in every window, and no thread waited for a CPU for more than
-  `max_run_delay_fraction` (default 1%) of a window. Both detect a busy host;
-  the wait check also catches rare preemptions that each cost tens of
-  milliseconds;
+- server threads were preempted at most `max_preemptions_per_s` (default
+  20/s) in every window, and no server or client thread waited for a CPU for
+  more than `max_run_delay_fraction` (default 1%) of a window. Both detect a
+  busy host; the wait check also catches rare preemptions that each cost tens
+  of milliseconds. Client preemptions are recorded but not gated: brief
+  preemptions by unrelated short tasks are common even on a quiet host, and
+  their effect shows up in client wait and arrival lag;
 - open-loop arrival lag p99 ≤ `max_lag_p99_us`;
 - every open-loop segment completed 98–102% of its realized arrivals, with no
-  arrivals dropped at `max_outstanding_per_connection`. This detects an
-  offered rate above capacity;
+  arrivals dropped at `max_outstanding_per_connection`, and the pinned server
+  CPUs below 98% busy. This detects an offered rate at or above the
+  open-loop knee;
 - in the capacity segment, the pinned server CPUs were at least
   `min_capacity_utilization` busy, including interrupt time; unpinned servers
   use thread CPU time. This detects a client-bound capacity measurement;
@@ -272,10 +275,17 @@ counters.
 - In `mixed-4w`, `SO_REUSEPORT` places connections on workers by hash, which
   varies from run to run. Check `cpu_ns_by_thread` in `result.json` for
   imbalance before trusting a 4-worker time metric.
-- The offered rates are calibrated for the development workstation. On
-  another host, measure `capacity` first and choose rates around 10%, 40%,
-  and 80% of it, then freeze them in a copied profile.
-- An open-loop rate above capacity drives the server into overload. The
+- The offered rates are calibrated for the development workstation (quiet
+  Ryzen 9 5950X): about 10%, 40%, and 80% of the *open-loop* knee, the rate
+  at which server CPUs reach 100% busy under Poisson arrivals. The knee is
+  well below closed-loop `capacity`, because closed-loop queues keep 1024
+  requests in flight and the server amortizes each wakeup over large
+  batches: `mixed-1w` capacity is about 600k requests/s but its knee is
+  about 300k; `mixed-4w` capacity is about 1.06M, with the CPUs about 94%
+  busy at 680k. Its top rate is set lower (560k) so that a slower, shared
+  host does not reach the sharded server's `ENOBUFS` reset (below). On another host, find the knee with a few trial rates
+  (watch `core` and p50), then freeze the rates in a copied profile.
+- An open-loop rate above the knee drives the server into overload. The
   sharded server currently resets connections when multishot receive
   exhausts its provided-buffer ring (`ENOBUFS`), which makes the run invalid.
 

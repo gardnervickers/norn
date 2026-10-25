@@ -75,11 +75,16 @@ impl Process {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(stderr);
-        if !spec.cpus.is_empty() {
-            let cpus = spec.cpus.clone();
-            // SAFETY: the closure only calls async-signal-safe libc functions.
-            unsafe {
-                command.pre_exec(move || {
+        let cpus = spec.cpus.clone();
+        // SAFETY: the closure only calls async-signal-safe libc functions.
+        unsafe {
+            command.pre_exec(move || {
+                // Do not outlive a coordinator that is killed before it can
+                // stop the server.
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if !cpus.is_empty() {
                     let mut set: libc::cpu_set_t = std::mem::zeroed();
                     for &cpu in &cpus {
                         libc::CPU_SET(cpu, &mut set);
@@ -88,9 +93,9 @@ impl Process {
                     {
                         return Err(io::Error::last_os_error());
                     }
-                    Ok(())
-                });
-            }
+                }
+                Ok(())
+            });
         }
         let mut child = command
             .spawn()
