@@ -3,13 +3,13 @@ use std::collections::VecDeque;
 use std::pin::Pin;
 use std::ptr;
 use std::task::Waker;
-use std::time::Duration;
 
 use cordyceps::List;
 
-use crate::{entry, error, level, MAX_DURATION, NUM_LEVELS};
+use crate::{entry, error, level, Clock, MAX_DURATION, NUM_LEVELS};
 
 pub(crate) struct Wheels {
+    clock: Clock,
     elapsed: Cell<u64>,
     shutdown: Cell<bool>,
     levels: UnsafeCell<[level::Level; NUM_LEVELS]>,
@@ -37,13 +37,14 @@ impl Drop for WakeBatch {
 }
 
 impl Wheels {
-    pub(crate) fn add(&self, entry: Pin<&mut entry::Entry>, duration: Duration) {
-        let expiration = self.elapsed().saturating_add(duration.as_millis() as u64);
-        self.add_at(entry, expiration);
-    }
-
     pub(crate) fn add_at(&self, entry: Pin<&mut entry::Entry>, expiration: u64) {
-        if expiration <= self.elapsed() {
+        if self.shutdown.get() {
+            entry.as_ref().fire(Err(error::Error::Shutdown));
+            return;
+        }
+        // Consult the clock so a sleep that became due before the wheel last
+        // advanced completes without waiting for the driver to park.
+        if expiration <= self.elapsed() || expiration <= self.clock.tick() {
             entry.as_ref().fire(Ok(()));
             return;
         }
@@ -52,8 +53,9 @@ impl Wheels {
         Wheels::insert(self, entry);
     }
 
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(clock: Clock) -> Self {
         Self {
+            clock,
             elapsed: Cell::new(0),
             shutdown: Cell::new(false),
             levels: UnsafeCell::new(std::array::from_fn(level::Level::new)),
@@ -61,6 +63,10 @@ impl Wheels {
             next_expiration_dirty: Cell::new(false),
             wake_storage: RefCell::new(VecDeque::new()),
         }
+    }
+
+    pub(crate) fn clock(&self) -> &Clock {
+        &self.clock
     }
 
     /// Expensive operation to count the number of registered timers.
@@ -174,12 +180,22 @@ impl Wheels {
         let now = self.elapsed.get();
         // Safety: Scanning is local-only and does not call user code.
         let levels = unsafe { &mut *self.levels.get() };
-        for level in levels.iter_mut() {
-            if let Some(expiration) = level.next_expiration(now) {
-                return Some(expiration);
+        let (lowest, mut next) = levels
+            .iter_mut()
+            .enumerate()
+            .find_map(|(index, level)| Some((index, level.next_expiration(now)?)))?;
+        // Slots are taken at their earliest deadline rather than when elapsed
+        // time enters them. A higher level's current slot can therefore still
+        // hold a deadline before every lower-level timer; its later slots
+        // cannot.
+        for level in &mut levels[lowest + 1..] {
+            if let Some(current) = level.current_expiration(now) {
+                if current.deadline() < next.deadline() {
+                    next = current;
+                }
             }
         }
-        None
+        Some(next)
     }
 
     /// Set the amount of ticks which have elapsed since the creation of this Wheel, if `when`
@@ -282,7 +298,7 @@ mod tests {
     #[test]
     fn timer_fires_immediately() {
         let mut cx = futures_test::task::noop_context();
-        let timer = Driver::new((), Clock::system());
+        let timer = Driver::new((), Clock::simulated());
         let handle = timer.handle();
         let sleep = pin!(handle.sleep(Duration::from_millis(0)));
         assert!(sleep.poll(&mut cx).is_ready());
@@ -291,7 +307,7 @@ mod tests {
     #[test]
     fn future_timer_does_not_fire() {
         let mut cx = futures_test::task::noop_context();
-        let timer = Driver::new((), Clock::system());
+        let timer = Driver::new((), Clock::simulated());
         let handle = timer.handle();
         let mut sleep = pin!(handle.sleep(Duration::from_millis(1)));
         assert!(sleep.as_mut().poll(&mut cx).is_pending());
@@ -307,7 +323,7 @@ mod tests {
     #[test]
     fn timer_drop() {
         let mut cx = futures_test::task::noop_context();
-        let timer = Driver::new((), Clock::system());
+        let timer = Driver::new((), Clock::simulated());
         let handle = timer.handle();
         {
             let mut sleep = pin!(handle.sleep(Duration::from_millis(1)));
@@ -319,7 +335,7 @@ mod tests {
     #[test]
     fn timer_fire() {
         let mut cx = futures_test::task::noop_context();
-        let timer = Driver::new((), Clock::system());
+        let timer = Driver::new((), Clock::simulated());
         let handle = timer.handle();
         let mut sleep = pin!(handle.sleep(Duration::from_millis(20)));
         assert!(sleep.as_mut().poll(&mut cx).is_pending());
@@ -336,7 +352,7 @@ mod tests {
     #[test]
     fn higher_level_timer_reports_exact_deadline() {
         let mut cx = futures_test::task::noop_context();
-        let timer = Driver::new((), Clock::system());
+        let timer = Driver::new((), Clock::simulated());
         let handle = timer.handle();
         let mut sleep = pin!(handle.sleep(Duration::from_millis(1000)));
         assert!(sleep.as_mut().poll(&mut cx).is_pending());
@@ -358,7 +374,7 @@ mod tests {
     #[test]
     fn removing_earliest_timer_updates_slot_deadline() {
         let mut cx = futures_test::task::noop_context();
-        let timer = Driver::new((), Clock::system());
+        let timer = Driver::new((), Clock::simulated());
         let handle = timer.handle();
         let mut second = pin!(handle.sleep(Duration::from_millis(1020)));
 
@@ -389,7 +405,7 @@ mod tests {
     #[test]
     fn removing_multiple_earliest_timers_preserves_exact_deadline() {
         let mut cx = futures_test::task::noop_context();
-        let timer = Driver::new((), Clock::system());
+        let timer = Driver::new((), Clock::simulated());
         let handle = timer.handle();
         let mut first = Box::pin(handle.sleep(Duration::from_millis(4096)));
         let mut second = Box::pin(handle.sleep(Duration::from_millis(4097)));

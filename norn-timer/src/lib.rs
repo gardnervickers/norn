@@ -63,13 +63,12 @@ const MAX_DURATION: u64 = (1 << (NUM_LEVELS.pow(2))) - 1;
 pub struct Driver<P> {
     wheels: Rc<wheels::Wheels>,
     inner: P,
-    clock: Clock,
 }
 
 impl<P> std::fmt::Debug for Driver<P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Driver")
-            .field("clock", &self.clock)
+            .field("clock", self.wheels.clock())
             .finish()
     }
 }
@@ -80,13 +79,12 @@ impl<P> std::fmt::Debug for Driver<P> {
 #[derive(Clone)]
 pub struct Handle {
     wheels: Rc<wheels::Wheels>,
-    clock: Clock,
 }
 
 impl std::fmt::Debug for Handle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Handle")
-            .field("clock", &self.clock)
+            .field("clock", self.wheels.clock())
             .finish()
     }
 }
@@ -94,24 +92,31 @@ impl std::fmt::Debug for Handle {
 impl Handle {
     /// Create a new timer with the specified duration.
     ///
-    /// Once the duration has elapsed, the timer will fire.
+    /// The duration starts at construction. Once it has elapsed, the timer
+    /// will fire. Nonzero durations round up to the timer wheel's millisecond
+    /// tick. Deadlines beyond `u64::MAX` milliseconds since the clock origin
+    /// saturate at that final tick. See [`Handle::sleep_until`] for an absolute
+    /// deadline.
     pub fn sleep(&self, duration: Duration) -> Sleep {
         Sleep::new(self.wheels.clone(), duration)
     }
 
     /// Create a new timer that completes at an absolute deadline.
     ///
-    /// If the deadline has already elapsed, the sleep completes on its next
-    /// poll. The deadline uses the same clock as this handle, so simulated
-    /// clocks can be advanced after constructing the sleep without changing
-    /// its target time.
+    /// If the deadline has already elapsed at construction, the sleep completes
+    /// on its next poll. The deadline uses the same clock as this handle, so
+    /// simulated clocks can be advanced after constructing the sleep without
+    /// changing its target time. Future absolute deadlines round up to the
+    /// timer wheel's millisecond tick and saturate at `u64::MAX` milliseconds
+    /// since the clock origin.
     pub fn sleep_until(&self, deadline: Instant) -> Sleep {
-        Sleep::new_at(self.wheels.clone(), self.clock.instant_to_tick(deadline))
+        let deadline = self.wheels.clock().instant_to_tick(deadline);
+        Sleep::new_at(self.wheels.clone(), deadline)
     }
 
     /// Get the clock used by the timer.
     pub fn clock(&self) -> &Clock {
-        &self.clock
+        self.wheels.clock()
     }
 
     /// Get a handle to the current timer.
@@ -129,16 +134,14 @@ impl<P> Driver<P> {
     /// The clock will be used to determine the current time.
     pub fn new(inner: P, clock: Clock) -> Self {
         Self {
-            wheels: Rc::new(wheels::Wheels::new()),
+            wheels: Rc::new(wheels::Wheels::new(clock)),
             inner,
-            clock,
         }
     }
 
     /// Get a handle to the timer driver.
     pub fn handle(&self) -> Handle {
         Handle {
-            clock: self.clock.clone(),
             wheels: self.wheels.clone(),
         }
     }
@@ -161,7 +164,8 @@ where
     type Guard = (context::ContextGuard, P::Guard);
 
     fn park(&mut self, mut mode: ParkMode) -> Result<(), std::io::Error> {
-        let ticks = self.clock.tick();
+        let clock = self.wheels.clock();
+        let ticks = clock.tick();
 
         let (fired, next_expiration) = self.wheels.advance(ticks);
         if fired > 0 {
@@ -169,11 +173,15 @@ where
         }
         if let Some(expiration) = next_expiration {
             let delta = expiration.deadline().saturating_sub(ticks);
-            let duration = self.clock.tick_to_duration(delta);
-            if let ParkMode::Timeout(timeout) = mode {
-                mode = ParkMode::Timeout(timeout.min(duration));
-            } else {
-                mode = ParkMode::Timeout(duration)
+            let duration = clock.tick_to_duration(delta);
+            match mode {
+                ParkMode::NoPark => {}
+                ParkMode::Timeout(timeout) => {
+                    mode = ParkMode::Timeout(timeout.min(duration));
+                }
+                ParkMode::NextCompletion => {
+                    mode = ParkMode::Timeout(duration);
+                }
             }
         }
         self.inner.park(mode)

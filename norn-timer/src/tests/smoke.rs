@@ -69,10 +69,10 @@ fn reset_preserves_sleep_until_deadline() {
     executor.block_on(async {
         let handle = Handle::current();
         let deadline = handle.clock().now() + Duration::from_secs(1);
-        let mut sleep = handle.sleep_until(deadline);
+        let mut sleep = Box::pin(handle.sleep_until(deadline));
 
         handle.clock().advance(Duration::from_millis(250));
-        sleep.reset();
+        sleep.as_mut().reset();
         sleep.await.unwrap();
 
         assert!(handle.clock().now() >= deadline);

@@ -22,8 +22,8 @@ pin_project_lite::pin_project! {
         wheels: Rc<Wheels>,
         #[pin]
         entry: Entry,
-        duration: Duration,
-        deadline: Option<u64>,
+        deadline: u64,
+        relative: Option<Duration>,
     }
 
     impl PinnedDrop for Sleep {
@@ -59,11 +59,7 @@ impl Future for Sleep {
                 State::Unregistered => {
                     debug_assert!(!me.entry.is_registered());
 
-                    if let Some(deadline) = *me.deadline {
-                        me.wheels.add_at(me.entry.as_mut(), deadline);
-                    } else {
-                        me.wheels.add(me.entry.as_mut(), *me.duration);
-                    }
+                    me.wheels.add_at(me.entry.as_mut(), *me.deadline);
                     continue;
                 }
                 State::Registered => {
@@ -92,10 +88,10 @@ impl Future for Sleep {
 impl Sleep {
     pub(crate) fn new(wheels: Rc<Wheels>, duration: Duration) -> Self {
         Self {
+            deadline: wheels.clock().deadline_after(duration),
             wheels,
             entry: Entry::new(),
-            duration,
-            deadline: None,
+            relative: Some(duration),
         }
     }
 
@@ -103,32 +99,35 @@ impl Sleep {
         Self {
             wheels,
             entry: Entry::new(),
-            duration: Duration::ZERO,
-            deadline: Some(deadline),
+            deadline,
+            relative: None,
         }
     }
 
     /// Reset this [`Sleep`] instance.
     ///
-    /// This will unlink it from the timer if it is currently registered,
-    /// and reset the timer entry. Future calls to [`Sleep::poll`] will then
-    /// re-register the sleep using its initial relative duration or absolute
-    /// deadline.
-    pub fn reset(&mut self) {
-        self.reset_entry();
-    }
-
-    fn reset_entry(&mut self) {
-        if self.entry.is_registered() {
-            let entry = ptr::NonNull::from(&mut self.entry);
-            self.wheels.remove(entry);
+    /// This will unlink it from the timer if it is currently registered and
+    /// reset the timer entry. Relative sleeps restart their original duration
+    /// from the current clock; absolute sleeps retain their original deadline.
+    pub fn reset(self: Pin<&mut Self>) {
+        let mut me = self.project();
+        if let Some(duration) = me.relative {
+            *me.deadline = me.wheels.clock().deadline_after(*duration);
         }
-        debug_assert!(!self.entry.is_registered());
-        self.entry.state.set(State::Unregistered);
-        self.entry.complete.set(Ok(()));
-        self.entry.deadline.set(0);
+        if me.entry.is_registered() {
+            // Safety: We are not moving the entry, so it is safe to construct
+            // a `NonNull` from this pinned reference.
+            unsafe {
+                let entry = ptr::NonNull::from(Pin::into_inner_unchecked(me.entry.as_mut()));
+                me.wheels.remove(entry);
+            }
+        }
+        me.entry.state.set(State::Unregistered);
+        debug_assert!(!me.entry.is_registered());
+        me.entry.complete.set(Ok(()));
+        me.entry.deadline.set(0);
         // Safety: Reset has exclusive access to the sleep and entry.
-        unsafe { (*self.entry.waker.get()).take() };
+        unsafe { (*me.entry.waker.get()).take() };
     }
 }
 
