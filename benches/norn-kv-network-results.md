@@ -1,5 +1,10 @@
 # Norn KV networking performance
 
+> Historical log. The Norn load generator (`norn-kv-loadgen`) and
+> `hack/bench-norn-kv-network.sh` referenced below were removed in favour of
+> [`norn-kv-bench`](../examples/norn-kv-bench/README.md); recover them from
+> git history to reproduce these results.
+
 ## Goal
 
 - Target: steady-state single-thread Norn TCP and Memcached-binary protocol

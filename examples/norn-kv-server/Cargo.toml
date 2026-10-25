@@ -20,7 +20,3 @@ norn-uring = { path = "../../norn-uring" }
 [[bin]]
 name = "norn-kv-server"
 path = "src/main.rs"
-
-[[bin]]
-name = "norn-kv-loadgen"
-path = "src/bin/network-loadgen.rs"

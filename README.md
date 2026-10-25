@@ -62,9 +62,16 @@ still be built on macOS.
 - [`norn-nursery` crate documentation](norn-nursery/src/lib.rs) demonstrates
   scoped borrowing, nested child tasks, and early termination.
 
+[`examples/norn-kv-bench`](examples/norn-kv-bench/) is the end-to-end
+benchmark for runtime optimization. It drives `norn-kv-server` with a mixed
+memcached-binary workload and reports validated, low-noise server cost per
+request (instructions, CPU time, context switches) at saturation and at fixed
+offered rates, per-class latency, and paired baseline/candidate comparisons.
+
 The [`benches`](benches/) package contains focused task, executor, timer,
-channel, HTTP, buffer, and `io_uring` benchmarks. Results and methodology are
-recorded alongside the benchmarks.
+channel, HTTP, buffer, and `io_uring` benchmarks that diagnose why an
+end-to-end number moved. Results and methodology are recorded alongside the
+benchmarks.
 
 ## Building and checking documentation
 

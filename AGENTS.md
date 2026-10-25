@@ -18,6 +18,7 @@ The project is intentionally not general-purpose today; APIs are still in flux i
 - `norn-timer/`: timer wheel + `Clock::{system, simulated}` as a `Park` wrapper.
 - `norn-uring/`: `io_uring` reactor, operation lifecycle, stable buffers, bufring, fs, tcp/udp.
 - `benches/`: `bencher` harness (`schedule_task`, `noop_submit`, `timers`, `hyper`).
+- `examples/norn-kv-bench/`: end-to-end mixed-workload benchmark driver for `norn-kv-server` (independent epoll client; Linux only).
 - `hack/`: helper scripts (`miri.sh`, `coverage.sh`).
 - `.github/workflows/`: CI (`cargo build`, `cargo test`, `nix build` on Ubuntu).
 
@@ -115,6 +116,12 @@ The project is intentionally not general-purpose today; APIs are still in flux i
 ## Benchmarking Methodology (Performance Changes)
 
 - Always benchmark before and after with the same command/filter.
+- For changes that can affect end-to-end server cost, run
+  `norn-kv-bench compare` (see `examples/norn-kv-bench/README.md`) with frozen
+  baseline/candidate binaries. Prefer server user instructions per request for
+  code-path changes; time, throughput, and latency metrics require a
+  qualified (quiet, pinned) run. Use `benches/` micro-benchmarks to explain
+  the movement.
 - Use the `bencher` harness filters for focused cases (for example `bench_spawn/num_tasks=1024`).
 - Collect a baseline full matrix first, then repeat key hot cases at least 3 times and compare medians.
 - Keep runtime checks consistent for perf branches:
