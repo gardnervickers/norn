@@ -699,9 +699,12 @@ impl Driver {
             && self.shared.has_sq_demand()
         {
             // Work waiting for SQ space needs capacity, not a completion. Blocking
-            // for a CQE could strand it behind long-lived operations, so submit
-            // without waiting and let the next park queue it.
-            return self.shared.submit(ParkMode::NoPark);
+            // for a CQE could strand it behind long-lived operations, so submit,
+            // wait only for SQ capacity, and hand that capacity to the waiters.
+            let submitted = self.shared.submit(ParkMode::NoPark)?;
+            self.shared.wait_for_sq_capacity()?;
+            self.shared.notify_sq_capacity();
+            return Ok(submitted);
         }
         // If we're going to park, then prepare the unparker.
         if matches!(mode, ParkMode::Timeout(_) | ParkMode::NextCompletion) && !self.prepare_park() {
@@ -1237,9 +1240,7 @@ impl Shared {
         loop {
             match self.submit_once(mode) {
                 Ok(submitted) => {
-                    if submitted > 0 {
-                        self.backpressure.notify(submitted);
-                    }
+                    self.notify_sq_capacity();
                     return Ok(submitted);
                 }
                 Err(err) if err.raw_os_error() == Some(libc::EINTR) => {
@@ -1299,6 +1300,43 @@ impl Shared {
         let mut sq = ring.submission();
         sq.sync();
         sq.len()
+    }
+
+    /// Wake SQ-capacity waiters for the free space currently visible in the SQ.
+    ///
+    /// Capacity is observed from the SQ head rather than inferred from a
+    /// submit count: with `IORING_SETUP_SQPOLL` the kernel thread consumes
+    /// entries asynchronously, so an enter can free space while reporting
+    /// nothing, or no enter happens at all.
+    fn notify_sq_capacity(&self) {
+        if self.backpressure.waiters() == 0 {
+            return;
+        }
+        let free = {
+            let mut ring = self.ring.borrow_mut();
+            let sq = ring.submission();
+            sq.capacity() - sq.len()
+        };
+        if free > 0 {
+            self.backpressure.notify(free);
+        }
+    }
+
+    /// With SQPOLL, wait until the kernel thread frees SQ space.
+    ///
+    /// The caller must already have submitted, which wakes an idle kernel
+    /// thread. Without SQPOLL a submit consumes the SQ synchronously, so this
+    /// returns immediately.
+    fn wait_for_sq_capacity(&self) -> io::Result<()> {
+        let mut ring = self.ring.borrow_mut();
+        if !ring.params().is_setup_sqpoll() || !ring.submission().is_full() {
+            return Ok(());
+        }
+        match ring.submitter().squeue_wait() {
+            Ok(_) => Ok(()),
+            Err(err) if err.raw_os_error() == Some(libc::EINTR) => Ok(()),
+            Err(err) => Err(err),
+        }
     }
 
     /// Returns true when queued work is waiting for SQ space.
