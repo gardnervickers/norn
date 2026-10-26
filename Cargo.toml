@@ -8,6 +8,7 @@ members = [
     "examples/ping-pong-grpc",
     "norn-channel",
     "norn-executor",
+    "norn-multicore",
     "norn-nursery",
     "norn-task",
     "norn-timer",
@@ -16,6 +17,7 @@ members = [
 default-members = [
     "norn-channel",
     "norn-executor",
+    "norn-multicore",
     "norn-nursery",
     "norn-task",
     "norn-timer",
