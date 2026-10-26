@@ -465,7 +465,8 @@ impl TcpSocket {
     /// Send data from the given buffer using `io_uring` zerocopy send.
     ///
     /// A successful result reports both the number of bytes sent and whether
-    /// the kernel copied any part of the payload.
+    /// the kernel copied any part of the payload. Usage reporting requires
+    /// Linux 6.2 or newer; earlier kernels reject the request with `EINVAL`.
     ///
     /// This method does not fall back to regular send if zerocopy is unsupported.
     /// Callers should enable `SO_ZEROCOPY` with [`TcpSocket::set_zerocopy`] first.
@@ -479,7 +480,8 @@ impl TcpSocket {
     /// Send a message from the given buffer using `io_uring` zerocopy sendmsg.
     ///
     /// A successful result reports both the number of bytes sent and whether
-    /// the kernel copied any part of the payload.
+    /// the kernel copied any part of the payload. Usage reporting requires
+    /// Linux 6.2 or newer; earlier kernels reject the request with `EINVAL`.
     ///
     /// This method does not fall back to regular sendmsg if zerocopy is unsupported.
     /// Callers should enable `SO_ZEROCOPY` with [`TcpSocket::set_zerocopy`] first.

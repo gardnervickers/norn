@@ -206,7 +206,8 @@ impl UdpSocket {
     /// Sends a single datagram on a connected socket using `io_uring` zerocopy send.
     ///
     /// A successful result reports both the number of bytes sent and whether
-    /// the kernel copied any part of the payload.
+    /// the kernel copied any part of the payload. Usage reporting requires
+    /// Linux 6.2 or newer; earlier kernels reject the request with `EINVAL`.
     ///
     /// This method does not fall back to regular send if zerocopy is unsupported.
     /// Callers should enable `SO_ZEROCOPY` with [`UdpSocket::set_zerocopy`] first.
@@ -270,7 +271,8 @@ impl UdpSocket {
     /// Sends a message on a connected socket using `io_uring` zerocopy sendmsg.
     ///
     /// A successful result reports both the number of bytes sent and whether
-    /// the kernel copied any part of the payload.
+    /// the kernel copied any part of the payload. Usage reporting requires
+    /// Linux 6.2 or newer; earlier kernels reject the request with `EINVAL`.
     ///
     /// This method does not fall back to regular sendmsg if zerocopy is unsupported.
     /// Callers should enable `SO_ZEROCOPY` with [`UdpSocket::set_zerocopy`] first.
