@@ -58,6 +58,7 @@
 
 use std::any::Any;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::future::{poll_fn, Future};
@@ -162,40 +163,69 @@ impl ShutdownRemote {
     }
 }
 
+#[derive(Debug, Default)]
+struct ShutdownWaiters {
+    next_key: u64,
+    wakers: HashMap<u64, Waker>,
+}
+
 #[derive(Debug)]
 struct ShutdownState {
     remote: Arc<ShutdownRemote>,
-    wakers: RefCell<Vec<Waker>>,
+    waiters: RefCell<ShutdownWaiters>,
 }
 
 impl ShutdownState {
     fn new(remote: Arc<ShutdownRemote>) -> Self {
         Self {
             remote,
-            wakers: RefCell::new(Vec::new()),
+            waiters: RefCell::default(),
         }
     }
 
     fn deliver(&self) {
-        let wakers = std::mem::take(&mut *self.wakers.borrow_mut());
-        for waker in wakers {
+        let wakers = std::mem::take(&mut self.waiters.borrow_mut().wakers);
+        for waker in wakers.into_values() {
             waker.wake();
         }
     }
 
-    fn poll_requested(&self, cx: &Context<'_>) -> Poll<()> {
+    fn poll_requested(&self, key: &mut Option<u64>, cx: &Context<'_>) -> Poll<()> {
         if self.remote.is_requested() {
+            self.unregister(key);
             return Poll::Ready(());
         }
 
-        let mut wakers = self.wakers.borrow_mut();
-        if self.remote.is_requested() {
-            return Poll::Ready(());
-        }
-        if !wakers.iter().any(|waker| waker.will_wake(cx.waker())) {
-            wakers.push(cx.waker().clone());
+        // Shutdown is delivered on this thread, so it cannot race with the
+        // registration below. Waker callbacks run outside the borrow.
+        let registered = key.is_some_and(|key| {
+            self.waiters
+                .borrow()
+                .wakers
+                .get(&key)
+                .is_some_and(|waker| waker.will_wake(cx.waker()))
+        });
+        if !registered {
+            let waker = cx.waker().clone();
+            let replaced = {
+                let mut waiters = self.waiters.borrow_mut();
+                let key = *key.get_or_insert_with(|| {
+                    let key = waiters.next_key;
+                    waiters.next_key += 1;
+                    key
+                });
+                waiters.wakers.insert(key, waker)
+            };
+            drop(replaced);
         }
         Poll::Pending
+    }
+
+    fn unregister(&self, key: &mut Option<u64>) {
+        if let Some(key) = key.take() {
+            let removed = self.waiters.borrow_mut().wakers.remove(&key);
+            drop(removed);
+        }
     }
 }
 
@@ -217,13 +247,21 @@ impl GroupControl {
 #[must_use = "shutdown requests are observed only when this future is awaited or polled"]
 pub struct ShutdownRequested {
     state: Rc<ShutdownState>,
+    key: Option<u64>,
 }
 
 impl Future for ShutdownRequested {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.state.poll_requested(cx)
+        let this = self.get_mut();
+        this.state.poll_requested(&mut this.key, cx)
+    }
+}
+
+impl Drop for ShutdownRequested {
+    fn drop(&mut self) {
+        self.state.unregister(&mut self.key);
     }
 }
 
@@ -259,6 +297,7 @@ impl WorkerContext {
     pub fn shutdown_requested(&self) -> ShutdownRequested {
         ShutdownRequested {
             state: Rc::clone(&self.shutdown),
+            key: None,
         }
     }
 
@@ -407,6 +446,8 @@ pub enum StartError {
     },
     /// At least one worker failed before the atomic startup gate opened.
     Worker(JoinError),
+    /// The configured thread name prefix contains a NUL byte.
+    InvalidThreadName,
 }
 
 impl fmt::Display for StartError {
@@ -419,6 +460,7 @@ impl fmt::Display for StartError {
                 write!(f, "failed to spawn worker {worker}: {source}")
             }
             Self::Worker(error) => write!(f, "worker startup failed: {error}"),
+            Self::InvalidThreadName => f.write_str("thread name prefix contains a NUL byte"),
         }
     }
 }
@@ -428,7 +470,7 @@ impl Error for StartError {
         match self {
             Self::Spawn { source, .. } => Some(source),
             Self::Worker(source) => Some(source),
-            Self::Unconfigured(_) => None,
+            Self::Unconfigured(_) | Self::InvalidThreadName => None,
         }
     }
 }
@@ -573,7 +615,9 @@ impl Builder {
 
     /// Set the prefix used for worker OS thread names.
     ///
-    /// Worker indices are appended as `"<prefix>-<index>"`.
+    /// Worker indices are appended as `"<prefix>-<index>"`. A prefix containing
+    /// a NUL byte makes [`Builder::start`] return
+    /// [`StartError::InvalidThreadName`].
     pub fn thread_name_prefix(&mut self, prefix: impl Into<String>) -> &mut Self {
         self.thread_name_prefix = prefix.into();
         self
@@ -713,6 +757,11 @@ impl Builder {
             .collect();
         if !unconfigured.is_empty() {
             return Err(StartError::Unconfigured(unconfigured));
+        }
+        // Spawning a thread with an interior NUL in its name panics. Reject it
+        // before any worker exists, so none is left waiting at the gate.
+        if self.thread_name_prefix.contains('\0') {
+            return Err(StartError::InvalidThreadName);
         }
 
         let gate = Arc::new(StartGate::new());
@@ -1070,6 +1119,46 @@ mod tests {
             ready_rx.recv().unwrap();
         }
         group.shutdown().unwrap();
+    }
+
+    #[test]
+    fn dropped_shutdown_waiters_are_unregistered() {
+        let driver = DriverBuilder::new();
+        let (signal, _shutdown) = channel::bounded(driver.endpoint(), 1);
+        let state = Rc::new(ShutdownState::new(Arc::new(ShutdownRemote::new(signal))));
+        let mut cx = Context::from_waker(Waker::noop());
+
+        for _ in 0..3 {
+            let mut waiter = pin!(ShutdownRequested {
+                state: Rc::clone(&state),
+                key: None,
+            });
+            assert!(waiter.as_mut().poll(&mut cx).is_pending());
+            assert!(waiter.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(state.waiters.borrow().wakers.len(), 1);
+        }
+        assert!(state.waiters.borrow().wakers.is_empty());
+    }
+
+    #[test]
+    fn nul_thread_name_prefix_is_rejected_before_spawning() {
+        let mut builder = Builder::new(2);
+        let ran = Arc::new(AtomicBool::new(false));
+        for worker in builder.worker_ids().collect::<Vec<_>>() {
+            let ran = Arc::clone(&ran);
+            builder
+                .worker(worker, move |_| async move {
+                    ran.store(true, Ordering::Release);
+                })
+                .unwrap();
+        }
+        builder.thread_name_prefix("bad\0name");
+
+        assert!(matches!(
+            builder.start(),
+            Err(StartError::InvalidThreadName)
+        ));
+        assert!(!ran.load(Ordering::Acquire));
     }
 
     #[derive(Debug)]
