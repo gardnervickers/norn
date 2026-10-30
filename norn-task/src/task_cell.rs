@@ -276,6 +276,10 @@ where
         let state = this.as_ref().state();
         let result = state.update(state::State::drop_join_handle);
 
+        // Nothing will read the output through this waker again. Release it
+        // now so an incomplete task does not keep the joining task alive.
+        drop(this.as_ref().header().take_waker());
+
         if matches!(result, state::DropJoinHandleResult::DropOutput) {
             // The state update must finish before destroying user output, whose
             // destructor may re-enter the task system.
