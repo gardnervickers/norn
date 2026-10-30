@@ -303,9 +303,19 @@ impl File {
     ///
     /// # Errors
     ///
-    /// Returns an error if `len` cannot be represented by `off_t` or the
-    /// kernel rejects the advice.
+    /// Returns [`io::ErrorKind::InvalidInput`] if `len` exceeds `u32::MAX`,
+    /// because the submission entry carries a 32-bit length; pass `0` to
+    /// advise through the end of the file. Returns an error if the kernel
+    /// rejects the advice.
     pub async fn advise(&self, offset: u64, len: u64, advice: i32) -> io::Result<()> {
+        // A wider length would be truncated, and a truncated length of zero
+        // means "to the end of the file" to posix_fadvise.
+        if len > u64::from(u32::MAX) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "fadvise length exceeds the 32-bit io_uring length field",
+            ));
+        }
         let len = u64_to_off_t(len, "fadvise length")?;
         let op = Advise::new(self.fd.lease(), offset, len, advice);
         self.fd.submit(op).await

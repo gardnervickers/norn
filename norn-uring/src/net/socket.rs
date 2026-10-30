@@ -999,7 +999,16 @@ unsafe impl Operation for RecvFromRing {
 
     unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
         let (result, flags) = result.into_parts();
-        result.and_then(|n| self.ring.get_buf(n, flags))
+        result.and_then(|n| {
+            // The kernel recycles the selected buffer when nothing was
+            // received: a stream EOF or an empty datagram completes with no
+            // buffer id. Report that as an empty buffer, not ring corruption.
+            if n == 0 && io_uring::cqueue::buffer_select(flags).is_none() {
+                Ok(BufRingBuf::empty(self.ring.clone()))
+            } else {
+                self.ring.get_buf(n, flags)
+            }
+        })
     }
 }
 
