@@ -593,4 +593,49 @@ mod tests {
         }));
         assert!(result.is_err(), "block_on should panic on park error");
     }
+
+    #[test]
+    fn spawn_on_a_closed_queue_may_reenter_the_executor_context() {
+        struct EntersExecutor;
+
+        impl Drop for EntersExecutor {
+            fn drop(&mut self) {
+                // Runs while `spawn` cancels this future on a closed queue.
+                // Entering a nested executor panics because a context is
+                // already set; each panic is caught so none escapes into the
+                // task system's abort-on-panic destructor guard.
+                let mut nested = LocalExecutor::new(SpinPark);
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    nested.block_on(async {});
+                }));
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                    drop(nested);
+                }));
+            }
+        }
+
+        struct SpawnsOnDrop;
+
+        impl Drop for SpawnsOnDrop {
+            fn drop(&mut self) {
+                let guard = EntersExecutor;
+                spawn(async move {
+                    let _guard = &guard;
+                    future::pending::<()>().await
+                })
+                .detach();
+            }
+        }
+
+        let executor = LocalExecutor::new(SpinPark);
+        let task = SpawnsOnDrop;
+        executor
+            .handle()
+            .spawn(async move {
+                let _task = &task;
+                future::pending::<()>().await
+            })
+            .detach();
+        drop(executor);
+    }
 }

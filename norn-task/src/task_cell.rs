@@ -133,8 +133,7 @@ where
                 // `wake` consumes this waker, so we can transfer its refcount
                 // directly into the scheduled runnable instead of clone+drop.
                 let taskref = TaskRef::from_ptr(p);
-                let scheduler = this.as_ref().scheduler();
-                scheduler.schedule(crate::Runnable::from(taskref));
+                Self::schedule_owned(p, this, taskref);
             }
         }
     }
@@ -221,13 +220,27 @@ where
             }
             PollResult::Done => {}
             PollResult::Notified => {
-                let scheduler = this.as_ref().scheduler();
                 // Transfer the runnable's existing task reference back to the
-                // scheduler. `schedule` owns it even if it unwinds, so this
-                // path needs no compensating clone and drop.
-                scheduler.schedule(crate::Runnable::from(taskref));
+                // scheduler. `schedule` owns it even if it unwinds.
+                Self::schedule_owned(ptr, this, taskref);
             }
         }
+    }
+
+    /// Hand `taskref` to the scheduler when it may be the caller's only
+    /// reference to this task.
+    ///
+    /// `schedule` borrows the scheduler from inside this allocation. A
+    /// scheduler may run or drop the runnable before returning, so without
+    /// another reference the task could be freed while `&S` is still live.
+    /// Hold a guard reference for the duration of the call.
+    unsafe fn schedule_owned(ptr: NonNull<header::Header>, this: NonNull<Self>, taskref: TaskRef) {
+        this.as_ref().state().update(state::State::clone_ref);
+        let guard = TaskRef::from_ptr(ptr);
+        this.as_ref()
+            .scheduler()
+            .schedule(crate::Runnable::from(taskref));
+        drop(guard);
     }
 
     unsafe fn complete_task(ptr: NonNull<header::Header>) {

@@ -198,3 +198,55 @@ fn shutdown_wakes_previously_polled_join() {
     queue.shutdown();
     assert_eq!(wake_counter.0.load(Ordering::Relaxed), 1);
 }
+
+/// A scheduler that runs tasks inline and then reads its own state, which
+/// lives inside the task allocation it just ran.
+#[test]
+fn inline_scheduler_may_run_the_last_task_reference() {
+    use crate::{RegisteredTask, Runnable, Schedule, TaskSet};
+
+    struct Inline {
+        set: TaskSet,
+        runs: Cell<usize>,
+    }
+
+    struct InlineScheduler(Rc<Inline>);
+
+    impl Schedule for InlineScheduler {
+        fn schedule(&self, runnable: Runnable) {
+            runnable.run();
+            self.0.runs.set(self.0.runs.get() + 1);
+        }
+
+        fn unbind(&self, registered: &RegisteredTask) {
+            unsafe { self.0.set.remove(registered) };
+        }
+    }
+
+    let waker = Rc::new(RefCell::new(None::<Waker>));
+    let task_waker = Rc::clone(&waker);
+    let mut first = true;
+    let future = std::future::poll_fn(move |cx| {
+        if std::mem::take(&mut first) {
+            *task_waker.borrow_mut() = Some(cx.waker().clone());
+            Poll::Pending
+        } else {
+            Poll::Ready(())
+        }
+    });
+
+    let inline = Rc::new(Inline {
+        set: TaskSet::new(),
+        runs: Cell::new(0),
+    });
+    let (runnable, handle) =
+        unsafe { inline.set.bind(future, InlineScheduler(Rc::clone(&inline))) };
+    drop(handle);
+    runnable.unwrap().run();
+
+    // Waking by value transfers the waker's reference into the runnable.
+    // The scheduler completes the task inline before it returns.
+    let waker = waker.borrow_mut().take().unwrap();
+    waker.wake();
+    assert_eq!(inline.runs.get(), 1);
+}

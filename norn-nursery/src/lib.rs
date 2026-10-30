@@ -684,4 +684,54 @@ mod tests {
         drop(fut);
         assert!(dropped.get());
     }
+
+    #[test]
+    fn scope_waker_may_drop_the_scope_while_a_child_is_scheduled() {
+        use std::cell::RefCell;
+        use std::future::poll_fn;
+        use std::task::{RawWaker, RawWakerVTable};
+
+        type Body = Pin<Box<dyn Future<Output = ()>>>;
+
+        thread_local! {
+            static BODY: RefCell<Option<Body>> = const { RefCell::new(None) };
+            static CHILD_WAKER: RefCell<Option<Waker>> = const { RefCell::new(None) };
+        }
+
+        fn drop_body() {
+            let body = BODY.with(|body| body.borrow_mut().take());
+            drop(body);
+        }
+
+        unsafe fn clone(ptr: *const ()) -> RawWaker {
+            RawWaker::new(ptr, &VTABLE)
+        }
+        unsafe fn wake(_: *const ()) {
+            drop_body();
+        }
+        unsafe fn noop(_: *const ()) {}
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake, noop);
+
+        // The scope waker drops the whole scope when a child is scheduled.
+        let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
+        let mut body: Body = Box::pin(crate::scope!(|scope| {
+            std::mem::drop(scope.spawn(async move |_| {
+                poll_fn(|cx: &mut Context<'_>| {
+                    CHILD_WAKER.with(|slot| *slot.borrow_mut() = Some(cx.waker().clone()));
+                    Poll::<()>::Pending
+                })
+                .await
+            }));
+            pending::<()>().await
+        }));
+        assert!(body
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending());
+        BODY.with(|slot| *slot.borrow_mut() = Some(body));
+
+        let child = CHILD_WAKER.with(|slot| slot.borrow_mut().take()).unwrap();
+        child.wake();
+        assert!(BODY.with(|slot| slot.borrow().is_none()));
+    }
 }
