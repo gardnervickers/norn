@@ -34,7 +34,7 @@ use smallvec::SmallVec;
 use crate::codec::{DecodeStatus, DecodedFrame, FrameDecoder, ResponseEncoder};
 use crate::handler::{ConnectionAction, HandlerConfig, MemoryHandler};
 use crate::protocol::{Command, EncodeError, RequestHeader, Status, HEADER_LEN};
-use crate::server::{RecvMode, ServerConfig};
+use crate::server::{close_rejected, recover_from_accept_error, RecvMode, ServerConfig};
 
 const INLINE_KEY_LEN: usize = 32;
 const DEFAULT_PAIR_CAPACITY: usize = 1_024;
@@ -791,14 +791,20 @@ async fn serve_worker(
                         "reuse-port listener ended",
                     ));
                 };
-                let socket = next?;
+                let socket = match next {
+                    Ok(socket) => socket,
+                    Err(error) => {
+                        recover_from_accept_error(error).await?;
+                        continue;
+                    }
+                };
                 let admitted = active.try_update(
                     Ordering::AcqRel,
                     Ordering::Acquire,
                     |current| (current < config.max_connections).then_some(current + 1),
                 );
                 if admitted.is_err() {
-                    socket.close().await?;
+                    close_rejected(socket).await;
                     continue;
                 }
                 let connection = next_connection.fetch_add(1, Ordering::Relaxed);
