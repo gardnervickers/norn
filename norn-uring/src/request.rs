@@ -74,7 +74,15 @@ pub trait Request: Future + Sized + private::Chainable {
     ///
     /// The returned future resolves to this request's output. If the timeout
     /// expires first, the linked request is canceled and its output reflects
-    /// that cancellation. Call [`WithTimeout::control`] before moving the
+    /// that cancellation.
+    ///
+    /// The timeout bounds only the **final** request in a chain.
+    /// `IORING_OP_LINK_TIMEOUT` applies to the entry immediately before it,
+    /// and the kernel starts its timer only once that entry is issued. In
+    /// `a.then(b).timeout(d)`, a never-completing `a` is not bounded: `b` is
+    /// never issued and the timer never starts. To bound a whole chain, race
+    /// it against [`Handle::timeout`](crate::Handle::timeout) and drop the
+    /// chain on expiry. Call [`WithTimeout::control`] before moving the
     /// future if the deadline may need to be reset while the request is active.
     fn timeout(self, duration: Duration) -> WithTimeout<Self> {
         WithTimeout::new(self, duration)
