@@ -771,9 +771,11 @@ impl tokio::io::AsyncWrite for TcpStreamWriter {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.project();
-        let n = ready!(this
-            .inner
-            .poll_op(cx, |sock| sock.send(buf), socket::WRITE_FLAGS as u32))?;
+        let n = ready!(this.inner.poll_op(
+            cx,
+            |sock| sock.send_with_flags(buf, libc::MSG_NOSIGNAL),
+            socket::WRITE_FLAGS as u32
+        ))?;
         Poll::Ready(Ok(n))
     }
 
@@ -804,7 +806,7 @@ impl tokio::io::AsyncWrite for TcpStreamWriter {
         let this = self.project();
         let n = ready!(this.inner.poll_op(
             cx,
-            |sock| sock.send_vectored(bufs),
+            |sock| sock.send_vectored_with_flags(bufs, libc::MSG_NOSIGNAL),
             socket::WRITE_FLAGS as u32
         ))?;
         Poll::Ready(Ok(n))
@@ -887,5 +889,56 @@ impl ReadyStream {
                 this.armed.set(Some(this.inner.poll_readiness(flags)));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::poll_fn;
+    use std::pin::pin;
+
+    use norn_executor::LocalExecutor;
+    use tokio::io::AsyncWrite;
+
+    use super::*;
+
+    #[test]
+    fn stream_write_to_closed_peer_fails_instead_of_raising_sigpipe() {
+        crate::test_util::run_isolated(
+            "net::tcp::tests::stream_write_to_closed_peer_fails_instead_of_raising_sigpipe",
+            || {
+                // Hosts that restore the default disposition die on SIGPIPE.
+                unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+                let driver = crate::Driver::new(io_uring::IoUring::builder(), 32).unwrap();
+                let mut executor = LocalExecutor::new(driver);
+                executor.block_on(async {
+                    let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap(), 8)
+                        .await
+                        .unwrap();
+                    let peer =
+                        std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+                    let (socket, _) = listener.accept().await.unwrap();
+                    drop(peer);
+
+                    let mut stream = pin!(socket.into_stream());
+                    let mut error = None;
+                    for _ in 0..64 {
+                        let result = poll_fn(|cx| stream.as_mut().poll_write(cx, b"payload")).await;
+                        if let Err(err) = result {
+                            error = Some(err);
+                            break;
+                        }
+                    }
+                    let error = error.expect("writes to a closed peer should eventually fail");
+                    assert!(
+                        matches!(
+                            error.kind(),
+                            io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+                        ),
+                        "unexpected error: {error}"
+                    );
+                });
+            },
+        );
     }
 }
