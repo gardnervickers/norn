@@ -101,17 +101,18 @@ impl fmt::Display for WorkerId {
 
 mod output {
     use super::BoxError;
-    use std::error::Error;
 
     pub trait Sealed {}
 
     impl Sealed for () {}
 
-    impl<E> Sealed for Result<(), E> where E: Error + Send + Sync + 'static {}
+    impl<E> Sealed for Result<(), E> where E: Into<BoxError> {}
 
     /// Converts an async worker main's output into its lifecycle result.
     ///
-    /// This trait is sealed and implemented for `()` and `Result<(), E>`.
+    /// This trait is sealed and implemented for `()` and `Result<(), E>`
+    /// where `E` converts into [`BoxError`]. That covers concrete error types,
+    /// [`BoxError`] itself, and error types such as `anyhow::Error`.
     pub trait WorkerOutput: Sealed {
         /// Convert the worker output into a type-erased result.
         fn into_result(self) -> Result<(), BoxError>;
@@ -125,10 +126,10 @@ mod output {
 
     impl<E> WorkerOutput for Result<(), E>
     where
-        E: Error + Send + Sync + 'static,
+        E: Into<BoxError>,
     {
         fn into_result(self) -> Result<(), BoxError> {
-            self.map_err(|error| Box::new(error) as BoxError)
+            self.map_err(Into::into)
         }
     }
 }
@@ -875,6 +876,11 @@ struct WorkerThread {
 }
 
 /// A running fixed group of process-local Norn runtime threads.
+///
+/// Call [`RuntimeGroup::join`] or [`RuntimeGroup::shutdown`] to observe worker
+/// failures. Dropping the group requests shutdown and waits for the workers
+/// to exit, but it cannot report their failures.
+#[must_use = "dropping a RuntimeGroup discards worker failures; call `join` or `shutdown`"]
 pub struct RuntimeGroup {
     control: Arc<GroupControl>,
     workers: Vec<WorkerThread>,
@@ -939,6 +945,15 @@ impl RuntimeGroup {
 impl Drop for RuntimeGroup {
     fn drop(&mut self) {
         self.request_shutdown();
+        // Detached workers could outlive the owner and be killed mid-I/O at
+        // process exit. A group dropped on one of its own workers cannot join
+        // that thread, so it leaves only that worker running.
+        let current = thread::current().id();
+        let (own, others): (Vec<_>, Vec<_>) = std::mem::take(&mut self.workers)
+            .into_iter()
+            .partition(|worker| worker.join.thread().id() == current);
+        drop(own);
+        join_worker_threads(others);
     }
 }
 
@@ -1052,6 +1067,36 @@ mod tests {
             .unwrap();
 
         builder.start().unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn worker_mains_may_return_boxed_errors() {
+        let mut builder = Builder::new(1);
+        builder
+            .worker(WorkerId::new(0), |_| async move {
+                Err::<(), BoxError>("worker failed".into())
+            })
+            .unwrap();
+        let error = builder.start().unwrap().join().unwrap_err();
+        assert_eq!(error.failures().len(), 1);
+        assert!(error.failures()[0].to_string().contains("worker failed"));
+    }
+
+    #[test]
+    fn dropping_the_group_waits_for_workers() {
+        let finished = Arc::new(AtomicBool::new(false));
+        let mut builder = Builder::new(1);
+        let worker_finished = Arc::clone(&finished);
+        builder
+            .worker(WorkerId::new(0), move |context| async move {
+                context.shutdown_requested().await;
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                worker_finished.store(true, Ordering::Release);
+            })
+            .unwrap();
+
+        drop(builder.start().unwrap());
+        assert!(finished.load(Ordering::Acquire));
     }
 
     #[test]
