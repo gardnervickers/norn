@@ -18,6 +18,37 @@ use crate::protocol::{EncodeError, RequestHeader, HEADER_LEN};
 const RECV_RING_BUFFERS: u16 = 8_192;
 const RECV_BUFFER_LEN: usize = 8 * 1024;
 const MAX_READY_RECEIVES_PER_BATCH: usize = 16;
+const ACCEPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Decide whether an accept failure should stop the listener.
+///
+/// Descriptor and memory exhaustion are load conditions: back off briefly so
+/// pending connections can drain instead of retrying in a hot loop. Errors
+/// that concern only the connection being accepted are skipped. Anything else
+/// is returned to the caller.
+pub(crate) async fn recover_from_accept_error(error: io::Error) -> io::Result<()> {
+    match error.raw_os_error() {
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM) => {
+            eprintln!("accept failed: {error}; backing off");
+            norn_uring::Handle::current()
+                .timeout(ACCEPT_BACKOFF)
+                .await?;
+            Ok(())
+        }
+        Some(libc::ECONNABORTED | libc::EPROTO | libc::EPERM | libc::EINTR) => Ok(()),
+        _ => Err(error),
+    }
+}
+
+/// Close a connection refused by the connection limit.
+///
+/// A failed close affects only that connection, so it is reported and the
+/// listener keeps running.
+pub(crate) async fn close_rejected(socket: TcpSocket) {
+    if let Err(error) = socket.close().await {
+        eprintln!("closing rejected connection failed: {error}");
+    }
+}
 
 /// Socket receive strategy used by the networking experiment.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -111,9 +142,15 @@ pub async fn serve(
     };
     let mut incoming = pin!(listener.incoming());
     while let Some(next) = incoming.next().await {
-        let socket = next?;
+        let socket = match next {
+            Ok(socket) => socket,
+            Err(error) => {
+                recover_from_accept_error(error).await?;
+                continue;
+            }
+        };
         if active.get() >= config.max_connections {
-            socket.close().await?;
+            close_rejected(socket).await;
             continue;
         }
 
@@ -459,6 +496,23 @@ mod tests {
     use crate::protocol::{
         Status, OP_GET, OP_NOOP, OP_QUIT, OP_SET, REQUEST_MAGIC, RESPONSE_MAGIC,
     };
+
+    #[test]
+    fn accept_errors_back_off_skip_or_stop_the_listener() {
+        use norn_executor::LocalExecutor;
+
+        let driver = norn_uring::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let mut executor = LocalExecutor::new(driver);
+        executor.block_on(async {
+            for errno in [libc::EMFILE, libc::ENFILE, libc::ECONNABORTED, libc::EPROTO] {
+                recover_from_accept_error(io::Error::from_raw_os_error(errno))
+                    .await
+                    .unwrap_or_else(|error| panic!("errno {errno} stopped the listener: {error}"));
+            }
+            let fatal = recover_from_accept_error(io::Error::from_raw_os_error(libc::EBADF)).await;
+            assert_eq!(fatal.unwrap_err().raw_os_error(), Some(libc::EBADF));
+        });
+    }
 
     #[test]
     fn small_frame_limit_allows_budgeted_pipeline_and_incomplete_tail() {
