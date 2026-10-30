@@ -70,7 +70,7 @@
               pkgs.memtier-benchmark
               rust-toolchain-nightly
             ]
-            ++ pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.util-linux ];
+            ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.util-linux ];
         };
       }
     );

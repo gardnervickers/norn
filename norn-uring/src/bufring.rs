@@ -1279,7 +1279,7 @@ mod tests {
         let mut first = Box::pin(ring.clone().wait_for_return(epoch));
         assert!(first.as_mut().poll(&mut cx).is_pending());
         ring.rc.notify_return();
-        let mut second = Box::pin(ring.clone().wait_for_return(ring.return_epoch()));
+        let mut second = std::pin::pin!(ring.clone().wait_for_return(ring.return_epoch()));
         assert!(second.as_mut().poll(&mut cx).is_pending());
         drop(first); // Transfer an old publication's notification to second.
         assert!(second.as_mut().poll(&mut cx).is_pending());
@@ -1302,7 +1302,7 @@ mod tests {
         let ring = RecvBufRing::builder(1).buf_cnt(1).buf_len(8).build()?;
         let (waker, count) = futures_test::task::new_count_waker();
         let mut cx = Context::from_waker(&waker);
-        let mut wait = Box::pin(ring.clone().wait_for_return(ring.return_epoch()));
+        let mut wait = std::pin::pin!(ring.clone().wait_for_return(ring.return_epoch()));
         assert!(wait.as_mut().poll(&mut cx).is_pending());
         let _ = ring.rc.poison("test quarantine");
         assert_eq!(count.get(), 1);

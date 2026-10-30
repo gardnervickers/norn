@@ -333,7 +333,7 @@ mod tests {
         let mut cx = Context::from_waker(&waker);
         let notify = Notify::default();
         let mut notified1 = Box::pin(notify.wait());
-        let mut notified2 = Box::pin(notify.wait());
+        let mut notified2 = std::pin::pin!(notify.wait());
 
         // Poll once to register the notified with the list.
         assert!(notified1.as_mut().poll(&mut cx).is_pending());
@@ -354,8 +354,8 @@ mod tests {
         let (waker, _) = futures_test::task::new_count_waker();
         let mut cx = Context::from_waker(&waker);
         let notify = Notify::default();
-        let mut notified1 = Box::pin(notify.wait());
-        let mut notified2 = Box::pin(notify.wait());
+        let mut notified1 = std::pin::pin!(notify.wait());
+        let mut notified2 = std::pin::pin!(notify.wait());
 
         assert!(notified1.as_mut().poll(&mut cx).is_pending());
         assert!(notified2.as_mut().poll(&mut cx).is_pending());

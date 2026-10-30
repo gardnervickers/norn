@@ -215,7 +215,7 @@ impl LinkedTimeoutControl {
 }
 
 pin_project_lite::pin_project! {
-    /// A lazy, standalone io_uring timeout.
+    /// A lazy, standalone `io_uring` timeout.
     ///
     /// Construct one with [`crate::Handle::timeout`]. Normal expiration resolves
     /// to [`TimeoutOutcome::Expired`] rather than surfacing the kernel's expected

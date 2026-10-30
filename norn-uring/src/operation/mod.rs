@@ -216,7 +216,7 @@ unsafe impl Operation for AsyncCancel {
 }
 
 pin_project_lite::pin_project! {
-    /// A lazily-submitted io_uring operation.
+    /// A lazily-submitted `io_uring` operation.
     #[must_use = "future does nothing unless you `.await` or poll them"]
     pub struct Op<T>
     where

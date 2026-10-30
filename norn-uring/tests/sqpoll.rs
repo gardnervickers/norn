@@ -97,8 +97,8 @@ fn sqpoll_wakes_sq_waiter_after_kernel_consumes_queue() {
     bounded("nop", || {
         let mut driver = sqpoll_driver(1);
         let handle = driver.handle();
-        let mut first = Box::pin(handle.submit(Nop));
-        let mut second = Box::pin(handle.submit(Nop));
+        let mut first = std::pin::pin!(handle.submit(Nop));
+        let mut second = std::pin::pin!(handle.submit(Nop));
         let (waker, wakes) = futures_test::task::new_count_waker();
         let mut cx = Context::from_waker(&waker);
         assert!(poll(first.as_mut(), &mut cx).is_pending());
@@ -132,8 +132,8 @@ fn sqpoll_repoll_observes_capacity_without_a_park() {
     bounded("repoll", || {
         let driver = sqpoll_driver(1);
         let handle = driver.handle();
-        let mut first = Box::pin(handle.submit(Nop));
-        let mut second = Box::pin(handle.submit(Nop));
+        let mut first = std::pin::pin!(handle.submit(Nop));
+        let mut second = std::pin::pin!(handle.submit(Nop));
         let waker = futures_test::task::noop_waker();
         let mut cx = Context::from_waker(&waker);
         assert!(poll(first.as_mut(), &mut cx).is_pending());
@@ -165,7 +165,7 @@ fn sqpoll_waiting_park_does_not_strand_waiter_behind_long_lived_sqe() {
             reader,
             buf: Box::new([0; 8]),
         }));
-        let mut nop = Box::pin(handle.submit(Nop));
+        let mut nop = std::pin::pin!(handle.submit(Nop));
         let waker = futures_test::task::noop_waker();
         let mut cx = Context::from_waker(&waker);
         assert!(poll(read.as_mut(), &mut cx).is_pending());
@@ -195,9 +195,9 @@ fn sqpoll_dropped_waiter_hands_notification_to_next() {
     bounded("handoff", || {
         let mut driver = sqpoll_driver(1);
         let handle = driver.handle();
-        let mut first = Box::pin(handle.submit(Nop));
+        let mut first = std::pin::pin!(handle.submit(Nop));
         let mut second = Box::pin(handle.submit(Nop));
-        let mut third = Box::pin(handle.submit(Nop));
+        let mut third = std::pin::pin!(handle.submit(Nop));
         let waker = futures_test::task::noop_waker();
         let mut cx = Context::from_waker(&waker);
         assert!(poll(first.as_mut(), &mut cx).is_pending());

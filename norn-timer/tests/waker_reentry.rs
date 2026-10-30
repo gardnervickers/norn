@@ -36,7 +36,7 @@ impl Drop for ShutdownTimerOnDrop {
 #[test]
 fn replacing_sleep_waker_allows_old_waker_destructor_to_drop_driver() {
     let driver = Driver::new(RecordPark(Rc::default()), Clock::simulated());
-    let mut sleep = Box::pin(driver.handle().sleep(Duration::from_secs(1)));
+    let mut sleep = std::pin::pin!(driver.handle().sleep(Duration::from_secs(1)));
     SHUTDOWN_DRIVER.with(|slot| *slot.borrow_mut() = Some(driver));
     let old_waker = Waker::from(std::sync::Arc::new(ShutdownTimerOnDrop));
     assert!(sleep
@@ -97,7 +97,7 @@ fn replacing_sleep_waker_allows_clone_callback_to_drop_driver() {
     }
 
     let driver = Driver::new(RecordPark(Rc::default()), Clock::simulated());
-    let mut sleep = Box::pin(driver.handle().sleep(Duration::from_secs(1)));
+    let mut sleep = std::pin::pin!(driver.handle().sleep(Duration::from_secs(1)));
     let mut cx = Context::from_waker(Waker::noop());
     assert!(sleep.as_mut().poll(&mut cx).is_pending());
     SHUTDOWN_DRIVER.with(|slot| *slot.borrow_mut() = Some(driver));

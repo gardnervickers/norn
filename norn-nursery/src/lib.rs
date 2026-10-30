@@ -643,7 +643,7 @@ mod tests {
 
         let polls = Rc::new(Cell::new(0));
         let polls_by_child = Rc::clone(&polls);
-        let mut scope = Box::pin(crate::scope!(|scope| {
+        let mut scope = std::pin::pin!(crate::scope!(|scope| {
             std::mem::drop(scope.spawn(async move |_| {
                 SelfWaker {
                     polls: polls_by_child,

@@ -33,7 +33,7 @@ fn drop_another_timer(shutdown: bool, other_deadline: Duration) {
         .is_pending());
     OTHER_SLEEP.with(|sleep| *sleep.borrow_mut() = Some(other));
 
-    let mut firing = Box::pin(handle.sleep(Duration::from_millis(1000)));
+    let mut firing = std::pin::pin!(handle.sleep(Duration::from_millis(1000)));
     let waker = Waker::from(Arc::new(DropOtherSleep));
     let mut cx = Context::from_waker(&waker);
     assert!(firing.as_mut().poll(&mut cx).is_pending());
@@ -86,14 +86,14 @@ fn panic_preserves_other_wakes(shutdown: bool) {
     let clock = Clock::simulated();
     let mut driver = Driver::new(SpinPark, clock.clone());
     let handle = driver.handle();
-    let mut other = Box::pin(handle.sleep(Duration::from_millis(1)));
+    let mut other = std::pin::pin!(handle.sleep(Duration::from_millis(1)));
     let count = Arc::new(CountWake(AtomicUsize::new(0)));
     let count_waker = Waker::from(count.clone());
     assert!(other
         .as_mut()
         .poll(&mut Context::from_waker(&count_waker))
         .is_pending());
-    let mut first = Box::pin(handle.sleep(Duration::from_millis(1)));
+    let mut first = std::pin::pin!(handle.sleep(Duration::from_millis(1)));
     let panic_waker = Waker::from(Arc::new(PanicWake));
     assert!(first
         .as_mut()

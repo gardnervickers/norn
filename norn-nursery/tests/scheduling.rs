@@ -44,7 +44,7 @@ impl Wake for WakeCounter {
 fn nursery_yields_and_notifies_while_children_keep_rescheduling() {
     let polls = Rc::new(Cell::new(0));
     let polls_by_child = Rc::clone(&polls);
-    let mut nursery = Box::pin(async move {
+    let mut nursery = std::pin::pin!(async move {
         norn_nursery::scope!(|scope| {
             std::mem::drop(scope.spawn(async move |_| {
                 SelfWake {

@@ -1,0 +1,204 @@
+io_uring feature audit — 2026-10-29
+
+Integration note (2026-10-30): this audit describes base 53c9cbb. Subsequent
+master commit 796deba adds zero-copy send usage reporting. That part of the
+recommendation is now partially implemented; the fixed-buffer send extension
+remains separate. Recheck the current tree before implementing older findings.
+
+Recommendation
+
+Upgrade and measure the compiler/dependencies first. Then add capability
+discovery, followed by incremental receive buffers and fixed-buffer zero-copy
+sends. Evaluate CompletionStatus as an isolated scheduling experiment. Registered
+files/direct descriptors are a larger follow-up. Hardware zero-copy receive
+needs its own design and a real-NIC benchmark.
+
+These priorities are engineering judgments based on Norn's current architecture
+and workloads. No performance gain from an unimplemented feature is established.
+
+Evidence and scope
+
+Repository: 53c9cbbf608d95582b9320c0d03aeedca0e7837d, clean before audit.
+Locked dependency: io-uring 0.7.13. Latest published version checked: 0.7.15,
+released 2026-09-07 [1]. Compared the published crate source, not just master.
+Diffs of opcode/types/submit/lib/cqueue/squeue are saved locally under
+bench-output/io-uring-feature-audit-2026-10-29/.
+
+A temporary empty ring on this host (Linux 6.18.55) reported feature mask
+0x3ffff and opcode support for 0 through 62. That includes RECV_ZC (58),
+READV_FIXED (60), WRITEV_FIXED (61), and PIPE (62). MIN_TIMEOUT, receive/send
+bundles, registered-ring registration, and NO_IOWAIT feature bits are present.
+This probe does not prove individual flag combinations, registration success,
+device support, or useful performance. It submitted no I/O and closed the ring.
+Raw result and probe source are in the same ignored output directory.
+
+Existing support
+
+Norn already implements multishot accept, recv and recvmsg; receive bundles;
+SEND_ZC and SENDMSG_ZC with notification lifetime handling; ordinary vectored
+file I/O; owned fixed buffers and scalar fixed reads/writes; explicit linked
+requests and linked timeout/update/cancel; bind/listen; filesystem metadata,
+xattrs, splice/tee; block discard; and a single-completion URING_CMD16 extension.
+
+Do not treat those as missing features. NO_SQARRAY and single-issuer/deferred
+taskrun can already be selected through the Builder passed to Driver::new.
+Their defaults/tuning are separate from implementing missing API support.
+
+What actually changes in io-uring 0.7.13 -> 0.7.15
+
+* Submission now observes SQ_TASKRUN, uses acquire ordering for SQ flags, and
+  requests GETEVENTS when deferred task work requires it. This is an upstream
+  behavior change to validate during the dependency update, even without new
+  Norn APIs. Exercise deferred taskrun, SQPOLL, CQ overflow, and shutdown.
+* CompletionStatus exposes a cheap CQ snapshot without borrowing the ring.
+  It is not a kernel feature. Its unsafe lifetime contract requires the ring
+  to outlive every access. Norn's current needs_park deliberately uses SQ demand
+  instead of reading CQ indices after every runnable; see perf-notes.md's
+  Cheap Driver::needs_park entry. Benchmark the new mechanism before adopting.
+* register_ring_fd/unregister_ring_fd add a registered ring index for enter
+  and supported register calls. This is distinct from registered I/O files.
+  The index lives in a particular Submitter; Norn creates temporary submitters.
+  Calling registration on a temporary alone would not activate the fast path
+  on later temporary submitters and could retain a kernel registration.
+  Integration needs explicit registration ownership and teardown.
+* Write stream IDs are added to write/writev/fixed write builders (documented
+  as Linux 6.16+, including NVMe FDP use). Fsync adds offset/length fields.
+  Expose these only for a concrete storage workload and supported semantics.
+* Generic entry user_data accessors and CQ eventfd notification controls are
+  additions, but do not justify a new application API by themselves. CQ eventfd
+  notification control is different from Norn's eventfd read for remote unpark.
+
+Prioritized gaps
+
+1. Capability discovery and explicit unsupported-feature behavior
+
+   Cache opcode probes and ring feature bits per driver; provide useful
+   diagnostics for optional operations. A supported opcode does not establish
+   support for every ioprio flag, buffer mode, or device command. For newer
+   kernels, evaluate REGISTER_QUERY, which can report finer capability data [2],
+   with legacy probing when unavailable. The 0.7.15 Submitter surface does not
+   provide that query helper; upstream binding work may be needed.
+
+   Preserve genuine I/O errors instead of treating every EINVAL as missing
+   kernel support. Tests should cover unsupported flags, malformed input, and
+   feature absence without requiring old hardware for every test.
+
+2. Incrementally consumed provided buffers (Linux 6.12+) [3]
+
+   Kernel: IOU_PBUF_RING_INC; CQE_F_BUF_MORE reports that a buffer can produce
+   further completions. Bindings already exist in 0.7.13. Norn registers its
+   buffer rings with flags=0 and claims whole publications today.
+
+   Expected use: small TCP messages sharing larger receive allocations, reducing
+   buffer turnover/publication work. Actual benefit needs measurement.
+
+   Requires a new ownership model: track per-publication byte ranges, kernel
+   retention, and outstanding user slices independently. CQE_F_BUF_MORE is not
+   CQE_F_MORE: buffer reuse and request termination are separate events. Recycle
+   only after kernel use and every user claim end. Do not add a raw builder flag
+   to the existing whole-buffer tracker.
+
+   Validate interleaved completions, cancellation while a buffer is partial,
+   dropped queued results, escaped slices, driver shutdown, and ENOBUFS rearm.
+   Benchmark small-frame TCP, buffer pressure, and the mixed KV workload.
+
+3. Fixed-buffer zero-copy sends and useful usage reporting [4]
+
+   Norn has send_zc, but its operation does not select a registered fixed-buffer
+   index. Connect the existing FixedBuf lease/driver checks to SEND_ZC fixed
+   mode; retain registration and memory until the final notification. Support
+   dedicated copy-fallback reporting if useful, rather than exposing raw flags.
+
+   Measure large persistent TCP payloads on a real NIC as well as loopback.
+   A zero-copy request can copy internally; the primary send CQE alone is not
+   permission to recycle the memory. Keep notification results distinct from
+   the byte count of the primary send completion.
+
+4. Registered files and direct descriptors [5]
+
+   This is an older kernel feature that Norn still lacks. It can remove repeated
+   file-table lookups and allow direct accept/open. Current NornFd stores only
+   types::Fd and several socket paths perform ordinary syscalls on that fd.
+
+   Requires driver-owned slot generations, operation leases, direct-close,
+   dropped-accept result cleanup, and an explicit ordinary-fd installation path
+   for interoperability. Never pass a direct index to libc or socket2 as an fd.
+   Benchmark connection churn, long-lived socket I/O, and file queue-depth cases.
+
+5. Opt-in batched completion waits (Linux 6.12+) [6]
+
+   min_wait_usec and feature detection already exist in the locked crate.
+   Norn currently waits for one completion. A batch target plus bounded minimum
+   wait is worth an experiment under saturation; it trades latency for batching.
+   Preserve ParkMode::NoPark, timer deadlines, runnable fairness, and immediate
+   remote unpark behavior. Check low-rate p99 as well as saturated instructions
+   per request. Keep this opt-in until measurements justify a default.
+
+6. Send-side provided buffers/bundles and vectorized send [7]
+
+   Receive bundles exist; send bundles do not. SendBundle is already in 0.7.13.
+   A transmit queue could amortize sends, but needs a separate TX publication
+   owner and correct partial-send accounting. Do not republish live receive
+   buffers as writable receive storage while the kernel reads them for send.
+   The newer SEND_VECTORIZED path is another option to investigate against
+   owned sendmsg vectors; binding availability must be checked separately.
+   Require a runtime benchmark benefit before changing application batching.
+
+7. Fixed vectored file I/O [8]
+
+   READV_FIXED/WRITEV_FIXED are present in 0.7.13 and supported by the local
+   opcode probe. Norn currently has scalar fixed I/O and ordinary vectored I/O.
+   Add dedicated APIs if fragmented registered I/O becomes a workload. Every
+   iovec must lie within the selected registered region; a vector of unrelated
+   fixed-buffer indices is not equivalent. Retain pinned iovecs and the region
+   lease through completion, and validate disjoint writable subranges.
+
+8. Hardware zero-copy receive (RECV_ZC, Linux 6.15+) [9]
+
+   A separate project. The locked crate already exposes RecvZc and interface
+   queue registration, but Norn's driver is fixed to 16-byte CQ entries.
+   Kernel documentation requires CQE32 or a mixed CQ, a receive area/refill ring,
+   and NIC header/data split, flow steering, and RSS configuration.
+
+   Requires a larger-completion dispatch path, receive-area lifetime/refill
+   ownership, cancellation/drain proofs, and tests against supported hardware.
+   The local opcode probe cannot establish NIC suitability. Current loopback
+   benchmarks cannot measure the intended hardware receive-copy elimination.
+
+Later / workload-dependent
+
+Multishot reads are useful for pollable files such as pipes and tun devices,
+not ordinary regular-file storage [10]. Async PIPE is available but Norn's
+synchronous pipe2 constructor is already functional. Futex/waitid/epoll_wait
+should follow actual integration demand. MSG_RING could be studied for remote
+unpark without moving thread-affine Norn wakers across threads.
+
+SQE128/CQE32 device commands, mixed entries, ring resizing, and registered waits
+need explicit driver representation and lifetime work, not generic raw flag
+forwarding. cBPF ring filters are a policy feature for a future sandbox use case
+[11], not required to refresh dependencies. Do not enable CQE_SKIP_SUCCESS for
+owned Norn operations: lifecycle cleanup currently depends on terminal CQEs.
+
+Validation when implementation begins
+
+Keep the frozen baseline at bench-output/rust-deps-baseline-2026-10-29/.
+Measure the toolchain/dependency refresh before adding features. Each feature
+then gets its own focused before/after measurement and cancellation/drop tests.
+Use the frozen independent KV client for paired server comparisons; include
+large-payload or real-NIC workloads when the existing loopback profile cannot
+exercise the intended mechanism. This audit changes no runtime code or locks.
+
+Primary sources (checked 2026-10-29)
+
+[1] https://docs.rs/crate/io-uring/0.7.15
+    Published source: https://static.crates.io/crates/io-uring/io-uring-0.7.15.crate
+[2] https://raw.githubusercontent.com/axboe/liburing/master/man/io_uring_register_query.3
+[3] https://raw.githubusercontent.com/axboe/liburing/master/man/io_uring_register_buf_ring.3
+[4] https://raw.githubusercontent.com/axboe/liburing/master/man/io_uring_prep_send_zc.3
+[5] https://docs.rs/io-uring/0.7.15/io_uring/struct.Submitter.html
+[6] https://raw.githubusercontent.com/axboe/liburing/master/man/io_uring_submit_and_wait_min_timeout.3
+[7] https://raw.githubusercontent.com/axboe/liburing/master/man/io_uring_prep_send.3
+[8] https://raw.githubusercontent.com/axboe/liburing/master/man/io_uring_prep_readv_fixed.3
+[9] https://docs.kernel.org/networking/iou-zcrx.html
+[10] https://raw.githubusercontent.com/axboe/liburing/master/man/io_uring_prep_read_multishot.3
+[11] https://raw.githubusercontent.com/axboe/liburing/master/man/io_uring_register_bpf_filter.3

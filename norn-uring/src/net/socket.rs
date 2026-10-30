@@ -5,7 +5,7 @@
 use io_uring::opcode;
 use io_uring::squeue::Flags;
 use libc::{SOCK_CLOEXEC, SOCK_NONBLOCK};
-use socket2::{Domain, Protocol, SockAddr, Type};
+use socket2::{Domain, Protocol, SockAddr, SockAddrStorage, Type};
 use std::io;
 use std::mem::{ManuallyDrop, MaybeUninit};
 use std::net::SocketAddr;
@@ -626,7 +626,7 @@ impl Socket {
                         buf.stable_ptr().cast(),
                         buf.bytes_init(),
                         flags,
-                        addr.as_ptr(),
+                        addr.as_ptr().cast(),
                         addr.len(),
                     )
                 };
@@ -1321,10 +1321,13 @@ fn socket_addr_from_name(name: &[u8]) -> io::Result<SocketAddr> {
             "recvmsg completion source address exceeded storage size",
         ));
     }
-    let mut storage = std::mem::MaybeUninit::<libc::sockaddr_storage>::zeroed();
+    let mut storage = SockAddrStorage::zeroed();
     unsafe {
-        std::ptr::copy_nonoverlapping(name.as_ptr(), storage.as_mut_ptr() as *mut u8, name.len());
-        let storage = storage.assume_init();
+        std::ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            std::ptr::from_mut(storage.view_as::<libc::sockaddr_storage>()).cast(),
+            name.len(),
+        );
         let addr = SockAddr::new(storage, name.len() as libc::socklen_t);
         addr.as_socket().ok_or_else(|| {
             io::Error::new(

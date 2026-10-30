@@ -1,8 +1,8 @@
 //! Owned fixed buffers registered with an io_uring driver.
 //!
-//! A [`FixedBufPool`](crate::fixedbuf::FixedBufPool) owns a dense immutable
+//! A [`FixedBufPool`] owns a dense immutable
 //! table of caller-provided buffers. Each registered slot can be acquired as
-//! one non-cloneable [`FixedBuf`](crate::fixedbuf::FixedBuf) which fixed I/O
+//! one non-cloneable [`FixedBuf`] which fixed I/O
 //! operations consume and return.
 //!
 //! `Vec<u8>` and `BytesMut` expose only their initialized lengths. Resize them

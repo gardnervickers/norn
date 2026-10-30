@@ -52,7 +52,7 @@ fn assert_sleeps_due_at_construction_complete(elapsed: Duration) {
     let handle = driver.handle();
     clock.advance(elapsed);
 
-    let mut relative = Box::pin(handle.sleep(Duration::ZERO));
+    let mut relative = std::pin::pin!(handle.sleep(Duration::ZERO));
     assert_eq!(
         relative
             .as_mut()
@@ -60,7 +60,7 @@ fn assert_sleeps_due_at_construction_complete(elapsed: Duration) {
         Poll::Ready(Ok(()))
     );
 
-    let mut absolute = Box::pin(handle.sleep_until(clock.now()));
+    let mut absolute = std::pin::pin!(handle.sleep_until(clock.now()));
     assert_eq!(
         absolute
             .as_mut()
@@ -81,7 +81,7 @@ fn relative_sleep_starts_at_construction_not_first_poll() {
     let modes = Rc::new(RefCell::new(Vec::new()));
     let mut driver = Driver::new(RecordPark(Rc::clone(&modes)), clock.clone());
     let handle = driver.handle();
-    let mut sleep = Box::pin(handle.sleep(Duration::from_millis(100)));
+    let mut sleep = std::pin::pin!(handle.sleep(Duration::from_millis(100)));
 
     clock.advance(Duration::from_millis(50));
     driver.park(ParkMode::NoPark).unwrap();
@@ -102,7 +102,7 @@ fn relative_sleep_uses_clock_when_wheel_elapsed_is_stale() {
     let handle = driver.handle();
 
     clock.advance(Duration::from_millis(500));
-    let mut sleep = Box::pin(handle.sleep(Duration::from_millis(50)));
+    let mut sleep = std::pin::pin!(handle.sleep(Duration::from_millis(50)));
     poll_pending(sleep.as_mut());
     driver.park(ParkMode::NoPark).unwrap();
     poll_pending(sleep.as_mut());
@@ -122,7 +122,7 @@ fn fractional_relative_deadlines_round_up_without_expiring_early() {
     let handle = driver.handle();
 
     clock.advance(Duration::from_micros(500));
-    let mut sleep = Box::pin(handle.sleep(Duration::from_millis(1)));
+    let mut sleep = std::pin::pin!(handle.sleep(Duration::from_millis(1)));
     poll_pending(sleep.as_mut());
     clock.advance(Duration::from_micros(999));
     driver.park(ParkMode::NoPark).unwrap();
@@ -139,7 +139,7 @@ fn fractional_relative_deadlines_round_up_without_expiring_early() {
 
     let clock = Clock::simulated();
     let mut driver = Driver::new(RecordPark(Rc::new(RefCell::new(Vec::new()))), clock.clone());
-    let mut sleep = Box::pin(driver.handle().sleep(Duration::from_nanos(1)));
+    let mut sleep = std::pin::pin!(driver.handle().sleep(Duration::from_nanos(1)));
     poll_pending(sleep.as_mut());
     clock.advance(Duration::from_nanos(999_999));
     driver.park(ParkMode::NoPark).unwrap();
@@ -157,7 +157,7 @@ fn relative_reset_restarts_duration_from_reset() {
     let clock = Clock::simulated();
     let mut driver = Driver::new(RecordPark(Rc::new(RefCell::new(Vec::new()))), clock.clone());
     let handle = driver.handle();
-    let mut sleep = Box::pin(handle.sleep(Duration::from_millis(100)));
+    let mut sleep = std::pin::pin!(handle.sleep(Duration::from_millis(100)));
     poll_pending(sleep.as_mut());
 
     clock.advance(Duration::from_millis(50));
@@ -183,7 +183,7 @@ fn absolute_reset_retains_original_deadline() {
     let mut driver = Driver::new(RecordPark(Rc::new(RefCell::new(Vec::new()))), clock.clone());
     let handle = driver.handle();
     let deadline = handle.clock().now() + Duration::from_millis(100);
-    let mut sleep = Box::pin(handle.sleep_until(deadline));
+    let mut sleep = std::pin::pin!(handle.sleep_until(deadline));
 
     clock.advance(Duration::from_millis(50));
     sleep.as_mut().reset();
@@ -204,7 +204,7 @@ fn dropping_a_registered_reset_sleep_does_not_affect_other_timers() {
     let mut driver = Driver::new(RecordPark(Rc::new(RefCell::new(Vec::new()))), clock.clone());
     let handle = driver.handle();
     let mut reset = Box::pin(handle.sleep(Duration::from_millis(100)));
-    let mut other = Box::pin(handle.sleep(Duration::from_millis(100)));
+    let mut other = std::pin::pin!(handle.sleep(Duration::from_millis(100)));
     poll_pending(reset.as_mut());
     poll_pending(other.as_mut());
 
@@ -223,7 +223,7 @@ fn no_park_is_never_replaced_by_a_future_timer_deadline() {
     let clock = Clock::simulated();
     let modes = Rc::new(RefCell::new(Vec::new()));
     let mut driver = Driver::new(RecordPark(Rc::clone(&modes)), clock);
-    let mut sleep = Box::pin(driver.handle().sleep(Duration::from_secs(1)));
+    let mut sleep = std::pin::pin!(driver.handle().sleep(Duration::from_secs(1)));
     poll_pending(sleep.as_mut());
 
     driver.park(ParkMode::NoPark).unwrap();
@@ -236,8 +236,8 @@ fn firing_a_timer_does_not_park_for_a_later_timer() {
     let modes = Rc::new(RefCell::new(Vec::new()));
     let mut driver = Driver::new(RecordPark(Rc::clone(&modes)), clock.clone());
     let handle = driver.handle();
-    let mut early = Box::pin(handle.sleep(Duration::from_millis(1)));
-    let mut late = Box::pin(handle.sleep(Duration::from_secs(1)));
+    let mut early = std::pin::pin!(handle.sleep(Duration::from_millis(1)));
+    let mut late = std::pin::pin!(handle.sleep(Duration::from_secs(1)));
     poll_pending(early.as_mut());
     poll_pending(late.as_mut());
 
@@ -253,13 +253,13 @@ fn shutdown_wins_over_new_zero_duration_sleep() {
     let deadline = handle.clock().now();
     drop(driver);
 
-    let mut sleep = Box::pin(handle.sleep(Duration::ZERO));
+    let mut sleep = std::pin::pin!(handle.sleep(Duration::ZERO));
     assert_eq!(
         sleep.as_mut().poll(&mut Context::from_waker(Waker::noop())),
         Poll::Ready(Err(Error::Shutdown))
     );
 
-    let mut sleep = Box::pin(handle.sleep_until(deadline));
+    let mut sleep = std::pin::pin!(handle.sleep_until(deadline));
     assert_eq!(
         sleep.as_mut().poll(&mut Context::from_waker(Waker::noop())),
         Poll::Ready(Err(Error::Shutdown))
@@ -271,7 +271,7 @@ fn duration_beyond_u64_milliseconds_does_not_expire_early() {
     let clock = Clock::simulated();
     let mut driver = Driver::new(RecordPark(Rc::new(RefCell::new(Vec::new()))), clock.clone());
     let duration = Duration::from_secs((u64::MAX / 1_000) + 1);
-    let mut sleep = Box::pin(driver.handle().sleep(duration));
+    let mut sleep = std::pin::pin!(driver.handle().sleep(duration));
     poll_pending(sleep.as_mut());
 
     clock.advance(Duration::from_millis(385));
@@ -283,7 +283,7 @@ fn duration_beyond_u64_milliseconds_does_not_expire_early() {
 fn maximum_duration_uses_ticks_without_instant_overflow() {
     let clock = Clock::simulated();
     let mut driver = Driver::new(RecordPark(Rc::new(RefCell::new(Vec::new()))), clock.clone());
-    let mut sleep = Box::pin(driver.handle().sleep(Duration::MAX));
+    let mut sleep = std::pin::pin!(driver.handle().sleep(Duration::MAX));
     poll_pending(sleep.as_mut());
 
     clock.advance(Duration::MAX);
@@ -303,9 +303,9 @@ fn saturated_deadline_does_not_block_an_earlier_top_level_timer() {
     clock.advance(Duration::from_millis(TOP_LEVEL_WRAP - 500));
     driver.park(ParkMode::NoPark).unwrap();
     let handle = driver.handle();
-    let mut saturated = Box::pin(handle.sleep(Duration::MAX));
+    let mut saturated = std::pin::pin!(handle.sleep(Duration::MAX));
     let nearer_duration = Duration::from_millis((1 << 30) + 1_000);
-    let mut nearer = Box::pin(handle.sleep(nearer_duration));
+    let mut nearer = std::pin::pin!(handle.sleep(nearer_duration));
     poll_pending(saturated.as_mut());
     poll_pending(nearer.as_mut());
 
@@ -327,14 +327,14 @@ fn lower_level_timer_does_not_hide_an_earlier_higher_level_deadline() {
     let mut driver = Driver::new(RecordPark(Rc::clone(&modes)), clock.clone());
     let handle = driver.handle();
 
-    let mut earlier = Box::pin(handle.sleep(Duration::from_millis(5000)));
+    let mut earlier = std::pin::pin!(handle.sleep(Duration::from_millis(5000)));
     poll_pending(earlier.as_mut());
     clock.advance(Duration::from_millis(4100));
     driver.park(ParkMode::NoPark).unwrap();
 
-    let mut later = Box::pin(handle.sleep(Duration::from_millis(4000)));
+    let mut later = std::pin::pin!(handle.sleep(Duration::from_millis(4000)));
     poll_pending(later.as_mut());
-    let mut unrelated = Box::pin(handle.sleep(Duration::from_millis(100)));
+    let mut unrelated = std::pin::pin!(handle.sleep(Duration::from_millis(100)));
     poll_pending(unrelated.as_mut());
     clock.advance(Duration::from_millis(100));
     driver.park(ParkMode::NoPark).unwrap();

@@ -42,7 +42,7 @@ fn shutdown_queue() {
 fn replacing_join_waker_allows_old_waker_destructor_to_shutdown_queue() {
     let queue = TaskQueue::new();
     SHUTDOWN_QUEUE.with(|slot| *slot.borrow_mut() = Some(queue.clone()));
-    let mut join = Box::pin(queue.spawn(pending::<()>()));
+    let mut join = std::pin::pin!(queue.spawn(pending::<()>()));
     let old_waker = Waker::from(Arc::new(ShutdownOnDrop));
     assert!(join
         .as_mut()
@@ -82,7 +82,7 @@ static SHUTDOWN_ON_CLONE: RawWakerVTable = RawWakerVTable::new(
 #[test]
 fn cloning_join_waker_can_complete_before_registration() {
     let queue = TaskQueue::new();
-    let mut join = Box::pin(queue.spawn(pending::<()>()));
+    let mut join = std::pin::pin!(queue.spawn(pending::<()>()));
     let old_waker = Waker::from(Arc::new(CountWake(AtomicUsize::new(0))));
     assert!(join
         .as_mut()

@@ -5,7 +5,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
-crc-fast = { version = "=1.9.0", default-features = false, features = ["std"] }
+crc-fast = { version = "=1.10.0", default-features = false, features = ["std"] }
 futures.workspace = true
 thiserror.workspace = true
 

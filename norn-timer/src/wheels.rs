@@ -409,7 +409,7 @@ mod tests {
         let handle = timer.handle();
         let mut first = Box::pin(handle.sleep(Duration::from_millis(4096)));
         let mut second = Box::pin(handle.sleep(Duration::from_millis(4097)));
-        let mut third = Box::pin(handle.sleep(Duration::from_millis(4098)));
+        let mut third = std::pin::pin!(handle.sleep(Duration::from_millis(4098)));
 
         assert!(first.as_mut().poll(&mut cx).is_pending());
         assert!(second.as_mut().poll(&mut cx).is_pending());

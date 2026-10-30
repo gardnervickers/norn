@@ -178,7 +178,7 @@ fn pending_task_can_shutdown_its_queue_and_is_cancelled_after_poll() {
 #[test]
 fn shutdown_wakes_previously_polled_join() {
     let queue = TaskQueue::new();
-    let mut handle = Box::pin(queue.spawn(std::future::pending::<()>()));
+    let mut handle = std::pin::pin!(queue.spawn(std::future::pending::<()>()));
     let wake_counter = Arc::new(WakeCounter(AtomicUsize::new(0)));
     let waker = Waker::from(Arc::clone(&wake_counter));
     let mut cx = Context::from_waker(&waker);
