@@ -56,6 +56,12 @@ impl std::fmt::Debug for PipeWriter {
 /// operation to make a single attempt that returns
 /// [`io::ErrorKind::WouldBlock`] instead.
 ///
+/// Without `SPLICE_F_NONBLOCK`, [`io::ErrorKind::WouldBlock`] means the
+/// awaited pipe ends were ready but the operation still could not proceed
+/// several times in a row: the other descriptor is not ready (for example a
+/// nonblocking socket wrapped as a [`File`]), or other operations on the same
+/// pipe keep taking the data or space first.
+///
 /// # Errors
 ///
 /// Returns an error if the operating system cannot create the pipe.
