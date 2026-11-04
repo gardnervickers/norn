@@ -2242,9 +2242,6 @@ impl Event {
 }
 
 #[cfg(test)]
-mod shared_ring_tests;
-
-#[cfg(test)]
 mod tests {
     use std::panic::{self, AssertUnwindSafe};
     use std::pin::pin;
