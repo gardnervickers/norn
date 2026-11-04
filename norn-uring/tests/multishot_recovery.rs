@@ -255,3 +255,55 @@ fn udp_recvmsg_drop_recycles_unconsumed_completions() -> Result<(), Box<dyn std:
         Ok(())
     })
 }
+
+/// Receive one item, failing instead of hanging when the stream stalls.
+async fn next_within<S: Stream + Unpin>(stream: &mut S) -> S::Item {
+    use futures_util::future::{select, Either};
+    let timeout = norn_uring::Handle::current().timeout(std::time::Duration::from_secs(5));
+    match select(stream.next(), std::pin::pin!(timeout)).await {
+        Either::Left((item, _)) => item.expect("stream ended"),
+        Either::Right(_) => panic!("receive stalled"),
+    }
+}
+
+#[test]
+fn stalled_consumer_pauses_without_starving_its_ring() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        // Without a limit, the stalled stream would take all 32 buffers.
+        let ring = RecvBufRing::builder(1)
+            .buf_cnt(32)
+            .buf_len(64)
+            .max_unconsumed_per_receive(8)
+            .build()?;
+        let (stalled_server, stalled_client) = tcp_pair().await?;
+        stalled_client.set_nodelay(true).await?;
+        let mut stalled = Box::pin(stalled_server.recv_ring_multi(&ring));
+        assert_waiting(stalled.as_mut()).await;
+        let mut expected = Vec::new();
+        for index in 0..64_u8 {
+            let segment = vec![index; 16];
+            expected.extend_from_slice(&segment);
+            stalled_client.send(segment).await.0?;
+            for _ in 0..4 {
+                norn_uring::noop().await;
+            }
+        }
+
+        let (server, client) = tcp_pair().await?;
+        let mut stream = Box::pin(server.recv_ring_multi(&ring));
+        for index in 0..64_u8 {
+            client.send(vec![index; 16]).await.0?;
+            let received = next_within(&mut stream).await?;
+            assert_eq!(&received[..], &[index; 16]);
+        }
+
+        let mut received = Vec::new();
+        while received.len() < expected.len() {
+            received.extend_from_slice(&next_within(&mut stalled).await?);
+        }
+        assert_eq!(received, expected);
+        stalled_client.send(b"after".to_vec()).await.0?;
+        assert_eq!(&next_within(&mut stalled).await?[..], b"after");
+        Ok(())
+    })
+}

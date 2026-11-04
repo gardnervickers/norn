@@ -398,6 +398,12 @@ impl BufRingRegistration {
     pub(crate) fn same_driver(&self, handle: &Handle) -> bool {
         Rc::ptr_eq(&self.shared, &handle.shared)
     }
+
+    /// Request cancellation of a receive on this ring without entering the
+    /// kernel; see [`Handle::cancel_op`].
+    pub(crate) fn cancel_op(&self, target: OpTarget) {
+        self.shared.cancel_op(target)
+    }
 }
 
 impl Drop for BufRingRegistration {

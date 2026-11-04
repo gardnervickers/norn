@@ -38,6 +38,9 @@ pin_project_lite::pin_project! {
     /// work, can therefore take every buffer of a ring it shares with
     /// other streams, which then wait for a buffer return. Dropping the
     /// stream returns those buffers but discards the data they hold.
+    /// [`Builder::max_unconsumed_per_receive`](crate::bufring::Builder::max_unconsumed_per_receive)
+    /// bounds the buffers a stream holds: at the bound it pauses receiving,
+    /// without losing data, until it is polled again.
     pub struct UdpRecvRingMulti {
         #[pin]
         inner: socket::RecvRingStream,
@@ -78,6 +81,9 @@ pin_project_lite::pin_project! {
     /// work, can therefore take every buffer of a ring it shares with
     /// other streams, which then wait for a buffer return. Dropping the
     /// stream returns those buffers but discards the data they hold.
+    /// [`Builder::max_unconsumed_per_receive`](crate::bufring::Builder::max_unconsumed_per_receive)
+    /// bounds the buffers a stream holds: at the bound it pauses receiving,
+    /// without losing data, until it is polled again.
     pub struct UdpRecvBundleMulti {
         #[pin]
         inner: socket::RecvRingBundleStream,
@@ -117,6 +123,9 @@ pin_project_lite::pin_project! {
     /// work, can therefore take every buffer of a ring it shares with
     /// other streams, which then wait for a buffer return. Dropping the
     /// stream returns those buffers but discards the data they hold.
+    /// [`Builder::max_unconsumed_per_receive`](crate::bufring::Builder::max_unconsumed_per_receive)
+    /// bounds the buffers a stream holds: at the bound it pauses receiving,
+    /// without losing data, until it is polled again.
     pub struct UdpRecvFromRingMulti {
         #[pin]
         inner: socket::RecvFromRingStream,

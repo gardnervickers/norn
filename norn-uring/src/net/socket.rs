@@ -16,11 +16,69 @@ use std::task::{ready, Context, Poll as TaskPoll};
 use crate::buf::{set_init_checked, StableBuf, StableBufMut};
 use crate::bufring::{BufRingBuf, BufRingBufBundle, RecvBufRing};
 use crate::fd::{NornFd, UringFd};
-use crate::operation::{CQEResult, Multishot, Op, Operation, Singleshot};
+use crate::operation::{CQEResult, Multishot, Op, Operation, OperationId, Singleshot};
 
 pub(crate) struct RingRecvCompletion<T> {
     result: io::Result<T>,
     terminal: bool,
+    // The terminal cancellation of a receive that paused itself at its ring's
+    // `max_unconsumed_per_receive` limit. The stream re-arms instead of
+    // yielding it.
+    paused: bool,
+}
+
+/// Buffers a multishot receive has reaped but its stream has not yet yielded.
+///
+/// The count changes only in the receive's own `reap` and `update`, which run
+/// on the driver thread, so it needs no synchronization.
+#[derive(Debug, Default)]
+struct ReceiveBacklog {
+    unconsumed: usize,
+    pause_requested: bool,
+}
+
+impl ReceiveBacklog {
+    /// Count the buffers of one reaped completion, and pause the receive
+    /// once its backlog reaches the ring's limit while the kernel keeps it
+    /// armed.
+    ///
+    /// # Safety
+    ///
+    /// `id` must come from the completion being reaped.
+    unsafe fn reaped(&mut self, ring: &RecvBufRing, id: Option<OperationId>, buffers: usize) {
+        self.unconsumed += buffers;
+        let Some(limit) = ring.max_unconsumed_per_receive() else {
+            return;
+        };
+        if self.pause_requested || self.unconsumed < limit {
+            return;
+        }
+        // A terminal completion has no id: the receive is ending anyway.
+        let Some(id) = id else {
+            return;
+        };
+        self.pause_requested = true;
+        // Safety: the caller is reaping the non-terminal completion `id` came
+        // from. The cancellation is queued, never submitted from here, so
+        // this does not re-enter the kernel or the completion drain.
+        ring.pause_receive(unsafe { id.target() });
+    }
+
+    fn yielded(&mut self, buffers: usize) {
+        self.unconsumed -= buffers;
+    }
+
+    /// Whether a terminal error ends a receive that paused itself.
+    ///
+    /// A terminal that races the cancellation wins: end of stream, a socket
+    /// error, or `ENOBUFS` is handled as if no pause had been requested.
+    /// Shutdown also cancels with `ECANCELED`; the stream then sees the
+    /// stopped driver before it re-arms.
+    fn is_pause(&self, terminal: bool, result: &io::Result<impl Sized>) -> bool {
+        self.pause_requested
+            && terminal
+            && matches!(result, Err(error) if error.raw_os_error() == Some(libc::ECANCELED))
+    }
 }
 
 pub(crate) trait RingReceive:
@@ -116,6 +174,11 @@ impl<T: RingReceive> futures_core::Stream for RingRecvStream<T> {
                         // and consumed its terminal CQE. Only now may it be
                         // replaced; cancellation alone would not suffice.
                         this.current.set(None);
+                    }
+                    if completion.paused {
+                        // The consumer has taken every buffer received before
+                        // the pause and is asking for more: re-arm.
+                        continue;
                     }
                     match completion.result {
                         Ok(buffer) => return TaskPoll::Ready(Some(Ok(buffer))),
@@ -1133,6 +1196,7 @@ pub(crate) struct RecvFromRingMulti {
     ring: RecvBufRing,
     addr: SockAddr,
     msghdr: MaybeUninit<libc::msghdr>,
+    backlog: ReceiveBacklog,
 }
 
 impl RecvFromRingMulti {
@@ -1144,6 +1208,7 @@ impl RecvFromRingMulti {
             ring,
             addr,
             msghdr: MaybeUninit::zeroed(),
+            backlog: ReceiveBacklog::default(),
         }
     }
 
@@ -1195,12 +1260,18 @@ unsafe impl Operation for RecvFromRingMulti {
     }
 
     unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+        let id = result.operation_id();
         let (result, flags) = result.into_parts();
+        let result = result
+            .map_err(|error| self.ring.release_failed(error, flags))
+            .and_then(|n| self.ring.get_buf(n, flags));
+        let terminal = !io_uring::cqueue::more(flags);
+        // Safety: `id` came from the completion being reaped.
+        unsafe { self.backlog.reaped(&self.ring, id, buffer_count(&result)) };
         RingRecvCompletion {
-            result: result
-                .map_err(|error| self.ring.release_failed(error, flags))
-                .and_then(|n| self.ring.get_buf(n, flags)),
-            terminal: !io_uring::cqueue::more(flags),
+            paused: self.backlog.is_pause(terminal, &result),
+            result,
+            terminal,
         }
     }
 }
@@ -1209,9 +1280,11 @@ impl Multishot for RecvFromRingMulti {
     type Item = RingRecvCompletion<(RecvMsgRingBuf, SocketAddr)>;
 
     fn update(&mut self, completion: Self::Completion) -> Self::Item {
+        self.backlog.yielded(buffer_count(&completion.result));
         RingRecvCompletion {
             result: self.recv_item(completion.result),
             terminal: completion.terminal,
+            paused: completion.paused,
         }
     }
 
@@ -1225,11 +1298,17 @@ pub(crate) struct RecvRingMulti {
     fd: NornFd,
     ring: RecvBufRing,
     flags: i32,
+    backlog: ReceiveBacklog,
 }
 
 impl RecvRingMulti {
     pub(crate) fn new(fd: NornFd, ring: RecvBufRing, flags: i32) -> Self {
-        Self { fd, ring, flags }
+        Self {
+            fd,
+            ring,
+            flags,
+            backlog: ReceiveBacklog::default(),
+        }
     }
 }
 
@@ -1248,6 +1327,7 @@ unsafe impl Operation for RecvRingMulti {
     }
 
     unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+        let id = result.operation_id();
         let (result, flags) = result.into_parts();
         let result = result.map_err(|error| self.ring.release_failed(error, flags));
         let result = result.and_then(|n| {
@@ -1257,9 +1337,13 @@ unsafe impl Operation for RecvRingMulti {
                 self.ring.get_buf(n, flags)
             }
         });
+        let terminal = !io_uring::cqueue::more(flags);
+        // Safety: `id` came from the completion being reaped.
+        unsafe { self.backlog.reaped(&self.ring, id, buffer_count(&result)) };
         RingRecvCompletion {
+            paused: self.backlog.is_pause(terminal, &result),
             result,
-            terminal: !io_uring::cqueue::more(flags),
+            terminal,
         }
     }
 }
@@ -1268,6 +1352,7 @@ impl Multishot for RecvRingMulti {
     type Item = RingRecvCompletion<BufRingBuf>;
 
     fn update(&mut self, completion: Self::Completion) -> Self::Item {
+        self.backlog.yielded(buffer_count(&completion.result));
         completion
     }
 
@@ -1325,11 +1410,17 @@ pub(crate) struct RecvRingBundleMulti {
     fd: NornFd,
     ring: RecvBufRing,
     flags: i32,
+    backlog: ReceiveBacklog,
 }
 
 impl RecvRingBundleMulti {
     pub(crate) fn new(fd: NornFd, ring: RecvBufRing, flags: i32) -> Self {
-        Self { fd, ring, flags }
+        Self {
+            fd,
+            ring,
+            flags,
+            backlog: ReceiveBacklog::default(),
+        }
     }
 }
 
@@ -1349,6 +1440,7 @@ unsafe impl Operation for RecvRingBundleMulti {
     }
 
     unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+        let id = result.operation_id();
         let (result, flags) = result.into_parts();
         let result = result.map_err(|error| self.ring.release_failed(error, flags));
         let result = result.and_then(|n| {
@@ -1358,9 +1450,14 @@ unsafe impl Operation for RecvRingBundleMulti {
                 self.ring.get_buf_bundle(n, flags)
             }
         });
+        let terminal = !io_uring::cqueue::more(flags);
+        let buffers = result.as_ref().map_or(0, BufRingBufBundle::buffer_count);
+        // Safety: `id` came from the completion being reaped.
+        unsafe { self.backlog.reaped(&self.ring, id, buffers) };
         RingRecvCompletion {
+            paused: self.backlog.is_pause(terminal, &result),
             result,
-            terminal: !io_uring::cqueue::more(flags),
+            terminal,
         }
     }
 }
@@ -1369,11 +1466,24 @@ impl Multishot for RecvRingBundleMulti {
     type Item = RingRecvCompletion<BufRingBufBundle>;
 
     fn update(&mut self, completion: Self::Completion) -> Self::Item {
+        let buffers = completion
+            .result
+            .as_ref()
+            .map_or(0, BufRingBufBundle::buffer_count);
+        self.backlog.yielded(buffers);
         completion
     }
 
     fn complete(self, completion: Self::Completion) -> Option<Self::Item> {
         Some(completion)
+    }
+}
+
+/// The ring buffers a single-buffer receive completion holds.
+fn buffer_count(result: &io::Result<BufRingBuf>) -> usize {
+    match result {
+        Ok(buffer) if buffer.capacity() != 0 => 1,
+        _ => 0,
     }
 }
 
@@ -2121,6 +2231,9 @@ impl Event {
         (self.events & libc::POLLPRI) != 0
     }
 }
+
+#[cfg(test)]
+mod shared_ring_tests;
 
 #[cfg(test)]
 mod tests {

@@ -143,6 +143,9 @@ pub struct CQEResult {
     pub(crate) result: io::Result<u32>,
     pub(crate) flags: u32,
     source: CompletionSource,
+    // The CQE's user_data, or zero when the completion did not come from a
+    // drained kernel CQE.
+    user_data: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,6 +160,14 @@ impl CQEResult {
             result,
             flags,
             source: CompletionSource::Kernel,
+            user_data: 0,
+        }
+    }
+
+    pub(crate) fn from_cqe(result: io::Result<u32>, flags: u32, user_data: usize) -> Self {
+        Self {
+            user_data,
+            ..Self::new(result, flags)
         }
     }
 
@@ -165,7 +176,14 @@ impl CQEResult {
             result,
             flags: 0,
             source: CompletionSource::Synthetic,
+            user_data: 0,
         }
+    }
+
+    /// Return the identity of the operation that produced this non-terminal
+    /// kernel completion, for use while the completion is being reaped.
+    pub(crate) fn operation_id(&self) -> Option<OperationId> {
+        (self.user_data != 0 && self.more()).then_some(OperationId(self.user_data))
     }
 
     /// Return whether the runtime generated this completion without submitting the operation.
@@ -211,6 +229,30 @@ impl CQEResult {
 
     pub(crate) fn notif(&self) -> bool {
         io_uring::cqueue::notif(self.flags)
+    }
+}
+
+/// The `user_data` of an operation whose non-terminal completion is being
+/// reaped.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OperationId(usize);
+
+impl OperationId {
+    /// Return an owned target for a later control request, such as a
+    /// cancellation, against this operation.
+    ///
+    /// # Safety
+    ///
+    /// The caller must be reaping the non-terminal completion this identity
+    /// came from. The kernel then still holds its reference to the operation
+    /// (see [`RawOpRef::reap`]), so the allocation is live.
+    pub(crate) unsafe fn target(self) -> super::OpTarget {
+        // Safety: upheld by the caller. The kernel's reference is borrowed,
+        // not consumed: only the clone below is owned.
+        let kernel = mem::ManuallyDrop::new(unsafe { RawOpRef::from_raw_usize(self.0) });
+        super::OpTarget {
+            handle: RawOpRef::clone(&kernel),
+        }
     }
 }
 

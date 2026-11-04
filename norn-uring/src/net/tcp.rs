@@ -68,6 +68,9 @@ pin_project_lite::pin_project! {
     /// shares with other streams, which then wait for a buffer return.
     /// Dropping the stream returns those buffers but discards the data they
     /// hold.
+    /// [`Builder::max_unconsumed_per_receive`](crate::bufring::Builder::max_unconsumed_per_receive)
+    /// bounds the buffers a stream holds: at the bound it pauses receiving,
+    /// without losing data, until it is polled again.
     pub struct TcpRecvRingMulti {
         #[pin]
         inner: Option<socket::RecvRingStream>,
@@ -123,6 +126,9 @@ pin_project_lite::pin_project! {
     /// shares with other streams, which then wait for a buffer return.
     /// Dropping the stream returns those buffers but discards the data they
     /// hold.
+    /// [`Builder::max_unconsumed_per_receive`](crate::bufring::Builder::max_unconsumed_per_receive)
+    /// bounds the buffers a stream holds: at the bound it pauses receiving,
+    /// without losing data, until it is polled again.
     pub struct TcpRecvBundleMulti {
         #[pin]
         inner: Option<socket::RecvRingBundleStream>,
