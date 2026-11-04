@@ -60,7 +60,7 @@ The project is intentionally not general-purpose today; APIs are still in flux i
 
 ### `norn-uring` model
 
-- `Driver` owns ring + backpressure notifier + status (`Running`, `Closing`,
+- `Driver` owns ring + overflow queue + status (`Running`, `Closing`,
   `Draining`, `Shutdown`).
 - `Shared::in_flight` counts pushed entries (operations, cancellations, the
   eventfd read, closes) until their terminal CQE is dispatched. Every new
@@ -68,7 +68,7 @@ The project is intentionally not general-purpose today; APIs are still in flux i
   counting helper; only the fallback drain barrier is uncounted.
 - `Driver::new` rejects `IORING_SETUP_IOPOLL` and kernels without
   `IORING_FEAT_EXT_ARG`, and enables `IORING_SETUP_R_DISABLED` rings.
-- Submission queue pressure is handled by `PushFuture` waiting on `Notify`.
+- Entries that do not fit in the SQ wait in the driver's overflow queue.
 - Driver park loop drains the CQ before parking and treats `EBUSY`, `EAGAIN`
   and `ENOMEM` from `io_uring_enter` as transient: drain and retry, or yield.
   `EINTR` retries the enter, except in a timed park, which returns early so a

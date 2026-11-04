@@ -27,13 +27,11 @@ pub(crate) use crate::registered_buffers::{
     Retention as FixedBufRetention,
 };
 use crate::util::notify::Notify;
-pub(crate) use futures::{PushBatchFuture, PushFuture};
 
 #[cfg(test)]
 use crate::registered_buffers::State as FixedBufState;
 
 mod context;
-mod futures;
 mod unpark;
 
 const LOG: &str = "norn_uring::driver";
@@ -163,7 +161,14 @@ pub struct Handle {
 
 struct Shared {
     ring: RefCell<IoUring>,
-    backpressure: Notify,
+    /// Entries that did not fit in the SQ, in submission order.
+    ///
+    /// The driver owns each entry once it is queued, so its operation counts as
+    /// submitted. Parks move entries into the SQ before entering the kernel,
+    /// and a linked group moves only whole. While this is non-empty, new
+    /// entries queue behind it. Shutdown completes what remains with the
+    /// shutdown error.
+    overflow: RefCell<VecDeque<Queued>>,
     receive_shutdown: Notify,
     status: Cell<Status>,
     /// Cancellations of dropped operations that did not fit in the SQ.
@@ -283,10 +288,19 @@ enum ShutdownOutcome {
     CleanDrained,
 }
 
-pub(crate) enum TryPush {
-    Submitted,
-    Full(ConfiguredEntry),
-    Failed(SubmitError),
+/// An entry waiting in [`Shared::overflow`] because the SQ was full.
+struct Queued {
+    entry: ConfiguredEntry,
+    /// Whether the next queued entry is linked behind this one.
+    linked: bool,
+}
+
+/// The length of the linked group at the front of the overflow queue.
+fn overflow_group_len(overflow: &VecDeque<Queued>) -> Option<usize> {
+    overflow
+        .iter()
+        .position(|queued| !queued.linked)
+        .map(|last| last + 1)
 }
 
 #[derive(Debug)]
@@ -542,39 +556,37 @@ impl Handle {
         self.shared.cancel_op(target, predecessor)
     }
 
-    /// Attempt to push a new entry into the submission queue.
-    ///
-    /// If the submission queue is full, this will block until there
-    /// is space or the driver has shutdown.
-    pub(crate) fn push(&self, entry: ConfiguredEntry) -> PushFuture {
-        PushFuture::new(Rc::clone(&self.shared), entry)
-    }
-
-    pub(crate) fn try_push(&self, entry: ConfiguredEntry) -> TryPush {
+    /// Hand an entry to the driver, which pushes it into the SQ or, when the
+    /// SQ is full, queues it for parks to drain. Either way it owns the entry.
+    pub(crate) fn submit_entry(&self, entry: ConfiguredEntry) -> Result<(), SubmitError> {
         if self.shared.status() != Status::Running {
-            let err = if let Some(err) = self.shared.health_error() {
-                SubmitError::broken(err)
-            } else {
-                SubmitError::shutting_down()
-            };
-            return TryPush::Failed(err);
+            return Err(self.shared.closed_error());
         }
-        match self.shared.try_push(entry) {
-            Ok(()) => TryPush::Submitted,
-            Err(entry) => TryPush::Full(entry),
-        }
+        self.shared.push_or_queue(entry);
+        Ok(())
     }
 
-    /// Attempt to push a new batch of entries into the submission queue.
-    ///
-    /// If the submission queue is full, this will block until there
-    /// is space or the driver has shutdown.
-    pub(crate) fn push_batch(&self, entries: SmallVec<[ConfiguredEntry; 4]>) -> PushBatchFuture {
-        PushBatchFuture::new_batch(Rc::clone(&self.shared), entries)
+    /// Hand a linked batch to the driver, which pushes or queues it whole.
+    pub(crate) fn submit_batch(
+        &self,
+        entries: SmallVec<[ConfiguredEntry; 4]>,
+    ) -> Result<(), SubmitError> {
+        if self.shared.status() != Status::Running {
+            return Err(self.shared.closed_error());
+        }
+        self.shared.validate_batch_len(entries.len())?;
+        self.shared.push_or_queue_batch(entries);
+        Ok(())
     }
 
     pub(crate) fn close_fd(&self, fd: types::Fd) -> Result<(), CloseFdError> {
         self.shared.close_fd(fd)
+    }
+
+    /// The number of entries waiting in the overflow queue.
+    #[cfg(test)]
+    pub(crate) fn queued_entries(&self) -> usize {
+        self.shared.overflow.borrow().len()
     }
 
     /// Whether shutdown may have cancelled any submitted request.
@@ -742,7 +754,7 @@ impl Driver {
             options,
             shared: Rc::new(Shared {
                 ring: RefCell::new(ring),
-                backpressure: Notify::default(),
+                overflow: RefCell::new(VecDeque::new()),
                 receive_shutdown: Notify::default(),
                 status: Cell::new(Status::Running),
                 deferred_cancels: RefCell::new(VecDeque::new()),
@@ -840,10 +852,10 @@ impl Driver {
         if waiting && self.shared.has_sq_demand() {
             // Work waiting for SQ space needs capacity, not a completion. Blocking
             // for a CQE could strand it behind long-lived operations, so submit,
-            // wait only for SQ capacity, and hand that capacity to the waiters.
+            // wait only for SQ capacity, and refill the SQ from the overflow queue.
             let submitted = self.shared.submit(ParkMode::NoPark)?;
             self.shared.wait_for_sq_capacity()?;
-            self.shared.notify_sq_capacity();
+            self.shared.flush_overflow();
             return Ok(submitted);
         }
         let mut submitted = 0;
@@ -1036,6 +1048,7 @@ impl Driver {
         }
         self.shared.retry_cancels();
         self.shared.flush_deferred_cancels();
+        self.shared.flush_overflow();
 
         loop {
             match self.submit(mode) {
@@ -1114,6 +1127,8 @@ impl Driver {
                 Status::Running => self.shared.set_status(Status::Closing),
                 Status::Closing => {
                     self.unparker.wake();
+                    // Queued entries never reached the kernel; fail them as before.
+                    self.shared.fail_overflow();
                     // Queue deferred cancellations before the synchronous cancel so
                     // they still apply on kernels without synchronous cancellation.
                     self.shared.flush_deferred_cancels();
@@ -1323,7 +1338,130 @@ impl Shared {
             // CQE that caused this transition has already been consumed and
             // subsequent driver work must observe its new stage.
             self.receive_shutdown.notify(usize::MAX);
-            self.backpressure.notify(usize::MAX);
+        }
+    }
+
+    /// The error for a request the driver can no longer accept.
+    #[cold]
+    fn closed_error(&self) -> SubmitError {
+        match self.health_error() {
+            Some(err) => SubmitError::broken(err),
+            None => SubmitError::shutting_down(),
+        }
+    }
+
+    /// Push `entry` into the SQ, or queue it behind the entries waiting for room.
+    #[inline]
+    fn push_or_queue(&self, entry: ConfiguredEntry) {
+        if self.overflow.borrow().is_empty() {
+            let mut ring = self.ring.borrow_mut();
+            let mut sq = ring.submission();
+            if !sq.is_full() {
+                let entry = entry.into_entry_with_flags(Flags::empty());
+                // Safety: the entry carries its operation's kernel reference,
+                // which keeps what it points to alive until its terminal CQE.
+                unsafe { sq.push(&entry) }.unwrap();
+                self.in_flight.set(self.in_flight.get() + 1);
+                return;
+            }
+        }
+        self.queue(entry);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn queue(&self, entry: ConfiguredEntry) {
+        entry.mark_queued();
+        self.overflow.borrow_mut().push_back(Queued {
+            entry,
+            linked: false,
+        });
+    }
+
+    /// Push a linked batch into the SQ whole, or queue it whole.
+    fn push_or_queue_batch(&self, mut entries: SmallVec<[ConfiguredEntry; 4]>) {
+        if self.overflow.borrow().is_empty() && self.try_push_batch(&mut entries) {
+            return;
+        }
+        let len = entries.len();
+        let mut overflow = self.overflow.borrow_mut();
+        for (idx, entry) in entries.into_iter().enumerate() {
+            entry.mark_queued();
+            overflow.push_back(Queued {
+                entry,
+                linked: idx + 1 < len,
+            });
+        }
+    }
+
+    /// Move queued entries into the SQ, in order, while they fit.
+    ///
+    /// A group in which an operation was cancelled while it waited completes
+    /// with `ECANCELED` without reaching the kernel. A group's members are
+    /// dropped together, and the kernel fails the rest of a cancelled chain
+    /// anyway. Once the driver stops accepting work, queued entries fail with
+    /// the shutdown error instead.
+    fn flush_overflow(&self) {
+        loop {
+            if self.overflow.borrow().is_empty() {
+                return;
+            }
+            if self.status() != Status::Running {
+                self.fail_overflow();
+                return;
+            }
+            let mut cancelled = SmallVec::<[ConfiguredEntry; 4]>::new();
+            {
+                let mut overflow = self.overflow.borrow_mut();
+                let mut ring = self.ring.borrow_mut();
+                let mut sq = ring.submission();
+                while let Some(len) = overflow_group_len(&overflow) {
+                    if overflow
+                        .iter()
+                        .take(len)
+                        .any(|queued| queued.entry.cancelled_while_queued())
+                    {
+                        cancelled.extend(overflow.drain(..len).map(|queued| queued.entry));
+                        continue;
+                    }
+                    if sq.capacity() - sq.len() < len {
+                        break;
+                    }
+                    for queued in overflow.drain(..len) {
+                        queued.entry.mark_dequeued();
+                        let flags = if queued.linked {
+                            Flags::IO_LINK
+                        } else {
+                            Flags::empty()
+                        };
+                        let entry = queued.entry.into_entry_with_flags(flags);
+                        // Safety: as for `push_or_queue`.
+                        unsafe { sq.push(&entry) }.unwrap();
+                    }
+                    self.in_flight.set(self.in_flight.get() + len);
+                }
+            }
+            if cancelled.is_empty() {
+                return;
+            }
+            // Completing runs the operations' callbacks and destructors, so do it
+            // without holding the queue or the ring.
+            for entry in cancelled {
+                entry.complete_unsubmitted(io::Error::from_raw_os_error(libc::ECANCELED));
+            }
+        }
+    }
+
+    /// Complete every queued entry with the shutdown error. None of them
+    /// reached the kernel.
+    fn fail_overflow(&self) {
+        loop {
+            let Some(queued) = self.overflow.borrow_mut().pop_front() else {
+                return;
+            };
+            queued
+                .entry
+                .complete_unsubmitted(self.closed_error().to_io_error());
         }
     }
 
@@ -1514,10 +1652,7 @@ impl Shared {
         let mut ebusy_retries = 0usize;
         loop {
             match self.submit_once(mode) {
-                Ok(submitted) => {
-                    self.notify_sq_capacity();
-                    return Ok(submitted);
-                }
+                Ok(submitted) => return Ok(submitted),
                 Err(err)
                     if matches!(mode, ParkMode::Timeout(_))
                         && err.raw_os_error() == Some(libc::ETIME) =>
@@ -1597,26 +1732,6 @@ impl Shared {
         sq.len()
     }
 
-    /// Wake SQ-capacity waiters for the free space currently visible in the SQ.
-    ///
-    /// Capacity is observed from the SQ head rather than inferred from a
-    /// submit count: with `IORING_SETUP_SQPOLL` the kernel thread consumes
-    /// entries asynchronously, so an enter can free space while reporting
-    /// nothing, or no enter happens at all.
-    fn notify_sq_capacity(&self) {
-        if self.backpressure.waiters() == 0 {
-            return;
-        }
-        let free = {
-            let mut ring = self.ring.borrow_mut();
-            let sq = ring.submission();
-            sq.capacity() - sq.len()
-        };
-        if free > 0 {
-            self.backpressure.notify(free);
-        }
-    }
-
     /// With SQPOLL, wait until the kernel thread frees SQ space.
     ///
     /// The caller must already have submitted, which wakes an idle kernel
@@ -1643,7 +1758,7 @@ impl Shared {
 
     /// Returns true when queued work is waiting for SQ space.
     fn has_sq_demand(&self) -> bool {
-        self.backpressure.waiters() > 0 || self.has_deferred_cancels()
+        !self.overflow.borrow().is_empty() || self.has_deferred_cancels()
     }
 
     fn has_deferred_cancels(&self) -> bool {
@@ -1664,7 +1779,9 @@ impl Shared {
     /// cancellation finds nothing because the kernel has not yet issued
     /// `target`, it is retried once after the issue must have happened.
     fn cancel_op(self: &Rc<Self>, target: OpTarget, predecessor: Option<OpTarget>) {
-        if target.is_complete() {
+        // A target still in the overflow queue is cancelled there, so it never
+        // reaches the kernel.
+        if target.is_complete() || target.cancel_if_queued() {
             return;
         }
         let cancel = PendingCancel {
@@ -1950,8 +2067,8 @@ impl Shared {
     }
 
     fn needs_park(&self) -> bool {
-        // A registered waiter or deferred cancellation proves that work observed
-        // a full SQ and needs the driver to submit queued work. The executor task quantum
+        // A queued entry or deferred cancellation proves that work observed a
+        // full SQ and needs the driver to submit queued work. The executor task quantum
         // bounds all other driver work without inspecting the shared SQ/CQ
         // indices after every task poll.
         self.has_sq_demand()
@@ -2515,7 +2632,7 @@ mod tests {
     #[test]
     fn status_transition_commits_before_panicking_waiter() {
         let driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
-        let mut panicking_waiter = pin!(driver.shared.backpressure.wait());
+        let mut panicking_waiter = pin!(driver.shared.receive_shutdown.wait());
         let panic_waker = Waker::from(Arc::new(PanicOnce(AtomicBool::new(false))));
         assert!(Future::poll(
             panicking_waiter.as_mut(),
@@ -2524,7 +2641,7 @@ mod tests {
         .is_pending());
 
         let (waker, wake_count) = futures_test::task::new_count_waker();
-        let mut following_waiter = pin!(driver.shared.backpressure.wait());
+        let mut following_waiter = pin!(driver.shared.receive_shutdown.wait());
         assert!(
             Future::poll(following_waiter.as_mut(), &mut Context::from_waker(&waker)).is_pending()
         );
