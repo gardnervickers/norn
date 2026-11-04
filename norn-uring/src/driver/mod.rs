@@ -1673,27 +1673,25 @@ impl Shared {
 
     /// Queue a close of `fd` without waiting for its completion.
     ///
-    /// Once shutdown has drained the operations this refuses with
+    /// Once the driver has begun shutting down this refuses with
     /// [`CloseFdError::NeverQueued`], so the caller closes the descriptor
-    /// directly. Shutdown submits `IO_DRAIN` sentinels, which can make the
-    /// kernel defer a new close until ring teardown, and teardown cancels it:
-    /// the descriptor would stay open forever. That covers a close issued after
-    /// the driver has shut down and one generated while the resources drain is
-    /// still pending (reaping can destroy operations whose destructors drop
-    /// descriptors after the final marker was queued). By then every operation
-    /// is terminal, so nothing retains the descriptor and a direct close cannot
-    /// race an in-flight request; and nothing reaps a queued close. Any other
-    /// code that submits to a ring in this state without waiting for the result
-    /// has the same hazard.
+    /// directly. A close queued during shutdown is exposed to three hazards:
+    /// the `IO_DRAIN` sentinels can make the kernel defer it until ring
+    /// teardown, which cancels it; the synchronous `ANY` cancel and the
+    /// re-cancels that follow it can cancel a close that io-wq has not started,
+    /// and there is no "all except closes" form; and nothing reaps it. Any of
+    /// these leaves the descriptor open forever.
+    ///
+    /// A direct close is safe in every phase: this runs when the last
+    /// reference to the descriptor is dropped, and every operation that uses it
+    /// holds a reference until its terminal completion is reaped, so no request
+    /// can still be using it. Closes queued before shutdown began are not
+    /// covered. Any other code that submits to a shutting-down ring without
+    /// waiting for the result has the same hazards.
     fn close_fd(&self, fd: types::Fd) -> Result<(), CloseFdError> {
-        if self.shutdown_outcome().is_some()
-            || matches!(
-                self.status(),
-                Status::ClosingResources | Status::DrainingResources | Status::Shutdown
-            )
-        {
+        if self.shutdown_outcome().is_some() || self.status() != Status::Running {
             return Err(CloseFdError::NeverQueued(io::Error::other(
-                "driver has drained its operations",
+                "driver is shutting down",
             )));
         }
         let entry = opcode::Close::new(fd)
