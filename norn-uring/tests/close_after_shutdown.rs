@@ -14,12 +14,13 @@ fn fd_count() -> usize {
 
 /// Resources that outlive the executor must not leak their descriptors.
 ///
-/// Driver shutdown submits `IOSQE_IO_DRAIN` sentinels, which leave the ring in
-/// drain mode for the rest of its life. A `NornFd` dropped after shutdown still
-/// queues `IORING_OP_CLOSE` on that ring (`Inner::drop` -> `Shared::close_fd`).
-/// Drain mode forces the close onto the deferred/io-wq path, so it does not run
-/// inline; dropping the last `Handle` then closes the ring, and ring exit
-/// cancels the not-yet-run close. The descriptor stays open forever.
+/// Driver shutdown used to submit `IOSQE_IO_DRAIN` sentinels, which leave the
+/// ring in drain mode for the rest of its life, and a `NornFd` dropped after
+/// shutdown still queued `IORING_OP_CLOSE` on that ring (`Inner::drop` ->
+/// `Shared::close_fd`). Drain mode forced the close onto the deferred/io-wq
+/// path, so it did not run inline; dropping the last `Handle` then closed the
+/// ring, and ring exit cancelled the not-yet-run close. The descriptor stayed
+/// open forever.
 #[test]
 fn descriptors_dropped_after_driver_shutdown_are_closed() {
     let before = fd_count();
