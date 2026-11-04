@@ -103,7 +103,7 @@ impl TaskSet {
             let Some(task) = task else {
                 break;
             };
-            if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| task.shutdown())) {
+            if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(move || task.shutdown())) {
                 first_panic.get_or_insert(payload);
             }
         }
