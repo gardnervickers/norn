@@ -377,6 +377,23 @@ fn recv_ring_buf_can_be_echoed_directly() -> Result<(), Box<dyn std::error::Erro
 }
 
 #[test]
+fn recv_ring_reports_orderly_peer_close_as_empty_buffer() -> Result<(), Box<dyn std::error::Error>>
+{
+    util::with_test_env(|| async {
+        let (server, client) = connected_pair().await?;
+        let ring = RecvBufRing::builder(14).buf_cnt(1).buf_len(1024).build()?;
+        client.close().await?;
+
+        let (buf, _) = server.recv_ring(&ring).await?;
+        assert!(buf.is_empty(), "EOF should yield an empty buffer");
+
+        drop(buf);
+        server.close().await?;
+        Ok(())
+    })
+}
+
+#[test]
 fn recv_ring_multi_ends_on_orderly_peer_close() -> Result<(), Box<dyn std::error::Error>> {
     util::with_test_env(|| async {
         let (server, client) = connected_pair().await?;

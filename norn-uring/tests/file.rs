@@ -621,6 +621,13 @@ fn advise_and_xattr_ops() -> Result<(), Box<dyn std::error::Error>> {
         let file = opts.open(&path).await?;
         file.write_at(&b"payload"[..], 0).await.0?;
         file.advise(0, 0, libc::POSIX_FADV_SEQUENTIAL).await?;
+        file.advise(0, u64::from(u32::MAX), libc::POSIX_FADV_WILLNEED)
+            .await?;
+        let err = file
+            .advise(0, 1 << 32, libc::POSIX_FADV_DONTNEED)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
 
         let fd_name = b"user.norn.fd";
         let fd_expected = b"fd-value";
