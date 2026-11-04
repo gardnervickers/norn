@@ -61,8 +61,9 @@ pin_project_lite::pin_project! {
     /// errors remain terminal.
     ///
     /// The kernel keeps the receive armed while the stream is not polled.
-    /// Each arriving segment takes a whole ring buffer, however small, and
-    /// the stream holds that buffer until a later `poll_next` yields it. A
+    /// Each receive completion takes at least one whole ring buffer, however
+    /// few bytes arrived, and the stream holds it until a later `poll_next`
+    /// yields it. A
     /// stream whose task stops polling, for example while one of its sends
     /// is blocked, can therefore take every buffer of a ring it shares with
     /// other streams, which then wait for a buffer return. Dropping the
@@ -115,8 +116,9 @@ pin_project_lite::pin_project! {
     /// errors remain terminal.
     ///
     /// The kernel keeps the receive armed while the stream is not polled.
-    /// Each arriving segment takes a whole ring buffer, however small, and
-    /// the stream holds that buffer until a later `poll_next` yields it. A
+    /// Each receive completion takes at least one whole ring buffer, however
+    /// few bytes arrived, and the stream holds it until a later `poll_next`
+    /// yields it. A
     /// stream whose task stops polling, for example while one of its sends
     /// is blocked, can therefore take every buffer of a ring it shares with
     /// other streams, which then wait for a buffer return. Dropping the

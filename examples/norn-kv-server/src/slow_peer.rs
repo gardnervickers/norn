@@ -63,7 +63,16 @@ where
             Ok(())
         })
     });
-    let address = address_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let address = match address_rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(address) => address,
+        // The server thread ended before announcing its address.
+        Err(mpsc::RecvTimeoutError::Disconnected) => match server.join() {
+            Ok(Err(error)) => panic!("server failed to start: {error}"),
+            Ok(Ok(())) => panic!("server exited without announcing its address"),
+            Err(panic) => std::panic::resume_unwind(panic),
+        },
+        Err(mpsc::RecvTimeoutError::Timeout) => panic!("server did not announce its address"),
+    };
 
     let mut hog = TcpStream::connect(address).unwrap();
     hog.set_nodelay(true).unwrap();
@@ -72,8 +81,13 @@ where
     let mut sent = 0;
     for sequence in 0..HOG_SEGMENTS {
         let key = format!("k{sequence}");
-        match hog.write(&request(OP_GET, key.as_bytes(), sequence)) {
-            Ok(_) => sent += 1,
+        let bytes = request(OP_GET, key.as_bytes(), sequence);
+        match hog.write(&bytes) {
+            Ok(written) => {
+                // A partial write would split a request across segments.
+                assert_eq!(written, bytes.len(), "hog request {sequence} was split");
+                sent += 1;
+            }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
             Err(error) => panic!("hog send failed: {error}"),
         }

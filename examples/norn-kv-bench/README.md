@@ -296,7 +296,7 @@ counters.
   worker's connections share one ring of 8192 receive buffers of 8 KiB. A
   connection whose task stops polling its multishot receive keeps taking a
   whole buffer for every arriving segment: in the sharded server while it
-  waits for a pair credit, holds 32 remote replies, or blocks in a send; in
+  waits for a pair credit, has 32 replies in flight, or blocks in a send; in
   the single-worker server while it blocks in a send. When the ring runs out,
   norn-uring no longer resets connections (`ENOBUFS`); every receive on that
   worker waits for a buffer return instead. Overload runs therefore stay
