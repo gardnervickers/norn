@@ -957,3 +957,28 @@ fn flush_after_abandoned_write_does_not_wait_for_writability(
         panic!("flush is still waiting for POLLOUT from a peer that does not read");
     })
 }
+
+/// Leading empty slices must not eat the `IOV_MAX` cap: a vectored write with
+/// data after more than `IOV_MAX` empty slices writes that data instead of
+/// returning `Ok(0)`, which writers treat as a failure.
+#[test]
+fn write_vectored_skips_leading_empty_slices_before_capping(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::future::poll_fn;
+    use tokio::io::AsyncWrite;
+
+    util::with_test_env(|| async {
+        let listener = TcpListener::bind("127.0.0.1:0".parse()?, 8).await?;
+        let peer = std::net::TcpStream::connect(listener.local_addr()?)?;
+        let (server, _) = listener.accept().await?;
+        let mut stream = pin!(server.into_stream());
+
+        let empty: &[u8] = &[];
+        let mut slices: Vec<io::IoSlice<'_>> = vec![io::IoSlice::new(empty); 1500];
+        slices.push(io::IoSlice::new(b"data"));
+        let written = poll_fn(|cx| stream.as_mut().poll_write_vectored(cx, &slices)).await?;
+        assert_eq!(written, 4);
+        drop(peer);
+        Ok(())
+    })
+}

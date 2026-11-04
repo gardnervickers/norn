@@ -224,10 +224,10 @@ fn validate_recv_bundle_flags(flags: i32) -> io::Result<()> {
             "MSG_PEEK is unsupported for receive bundles because a kernel bundle retry peeks the start of the queue again",
         ));
     }
-    // A partial `MSG_WAITALL` bundle retries inside the kernel. Before Linux's
-    // `io_net_kbuf_can_retry` fix (absent from 6.18.58), that retry can commit a
-    // different number of buffers than the final completion reports, so the
-    // kernel later reselects a buffer the returned bundle still owns.
+    // A partial `MSG_WAITALL` bundle retries inside the kernel. On the kernels
+    // this was tested against (Linux 6.18.58), that retry can commit a different
+    // number of buffers than the final completion reports, so the kernel later
+    // reselects a buffer the returned bundle still owns.
     if flags & libc::MSG_WAITALL != 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,

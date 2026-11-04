@@ -814,6 +814,10 @@ impl tokio::io::AsyncWrite for TcpStreamWriter {
         let this = self.project();
         // The kernel rejects more than IOV_MAX iovecs with EMSGSIZE. Like
         // `std`, pass only the first IOV_MAX slices; a short write is valid.
+        // Skip leading empty slices first, so non-empty input never caps down
+        // to a prefix of empty slices and reports `Ok(0)`.
+        let skip = bufs.iter().take_while(|buf| buf.is_empty()).count();
+        let bufs = &bufs[skip..];
         let bufs = &bufs[..bufs.len().min(IOV_MAX)];
         let n = ready!(this.inner.poll_op(
             cx,
