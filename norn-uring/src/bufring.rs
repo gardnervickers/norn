@@ -27,6 +27,9 @@ use tracker::{BufferToken, BundleClaim, PublicationTracker, TrackerError};
 /// ownership is tracked ring-wide, so completions may be reaped in a different
 /// order from kernel buffer selection.
 ///
+/// A multishot receive stream keeps selecting buffers while its task is not
+/// polling it, so one stalled consumer can hold every buffer of a shared ring.
+///
 /// # Example
 ///
 /// ```no_run

@@ -30,6 +30,14 @@ pin_project_lite::pin_project! {
     /// Drop held buffers to allow progress. Ring quarantine yields a terminal
     /// error; driver shutdown ends a stream waiting for buffers. Other socket
     /// errors remain terminal.
+    ///
+    /// The kernel keeps the receive armed while the stream is not polled.
+    /// Each arriving datagram takes a whole ring buffer, however small, and
+    /// the stream holds that buffer until a later `poll_next` yields it. A
+    /// stream whose task stops polling, for example while one of its sends
+    /// is blocked, can therefore take every buffer of a ring it shares with
+    /// other streams, which then wait for a buffer return. Dropping the
+    /// stream returns those buffers but discards the data they hold.
     pub struct UdpRecvRingMulti {
         #[pin]
         inner: socket::RecvRingStream,
@@ -62,6 +70,14 @@ pin_project_lite::pin_project! {
     /// Drop held buffers to allow progress. Ring quarantine yields a terminal
     /// error; driver shutdown ends a stream waiting for buffers. Other socket
     /// errors remain terminal.
+    ///
+    /// The kernel keeps the receive armed while the stream is not polled.
+    /// Each arriving datagram takes a whole ring buffer, however small, and
+    /// the stream holds that buffer until a later `poll_next` yields it. A
+    /// stream whose task stops polling, for example while one of its sends
+    /// is blocked, can therefore take every buffer of a ring it shares with
+    /// other streams, which then wait for a buffer return. Dropping the
+    /// stream returns those buffers but discards the data they hold.
     pub struct UdpRecvBundleMulti {
         #[pin]
         inner: socket::RecvRingBundleStream,
@@ -93,6 +109,14 @@ pin_project_lite::pin_project! {
     /// Drop held buffers to allow progress. Ring quarantine yields a terminal
     /// error; driver shutdown ends a stream waiting for buffers. Other socket
     /// errors remain terminal.
+    ///
+    /// The kernel keeps the receive armed while the stream is not polled.
+    /// Each arriving datagram takes a whole ring buffer, however small, and
+    /// the stream holds that buffer until a later `poll_next` yields it. A
+    /// stream whose task stops polling, for example while one of its sends
+    /// is blocked, can therefore take every buffer of a ring it shares with
+    /// other streams, which then wait for a buffer return. Dropping the
+    /// stream returns those buffers but discards the data they hold.
     pub struct UdpRecvFromRingMulti {
         #[pin]
         inner: socket::RecvFromRingStream,
