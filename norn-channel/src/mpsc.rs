@@ -366,8 +366,9 @@ impl<T> Sender<T> {
     /// # Errors
     ///
     /// Returns [`TrySendError::Full`] when the bounded queue has no remaining
-    /// capacity, or [`TrySendError::Closed`] when the receiver had closed
-    /// before this send began publishing.
+    /// capacity, or [`TrySendError::Closed`] when this send observed the
+    /// receiver closed, either before publishing or after finding the queue
+    /// full.
     pub fn try_send(&self, value: T) -> Result<(), TrySendError<T>> {
         if self.is_closed() {
             return Err(TrySendError::Closed(value));
@@ -562,7 +563,7 @@ impl<T> Receiver<T> {
 
     /// Close the receiving side while retaining access to buffered messages.
     ///
-    /// Sends that begin after this call fail with [`TrySendError::Closed`].
+    /// Sends that observe the close fail with [`TrySendError::Closed`].
     /// Receive operations may continue to drain buffered messages and then
     /// report closure.
     ///
@@ -578,8 +579,9 @@ impl<T> Receiver<T> {
     /// leaked.
     ///
     /// Driver shutdown (dropping the [`Driver`](crate::Driver) or calling
-    /// `Park::shutdown`) closes every registered receiver and has exactly the
-    /// same semantics as calling this method.
+    /// `Park::shutdown`) closes every registered receiver. It has the same
+    /// effect on the channel as calling this method, and also wakes a pending
+    /// receive.
     ///
     /// Unlike `tokio::sync::mpsc::Receiver::close`, `close` followed by
     /// draining to `None` is therefore not a lossless handshake. See the
@@ -970,8 +972,8 @@ impl<T> ShardedSender<T> {
     /// # Errors
     ///
     /// Returns [`TrySendError::Full`] when this lane has no remaining capacity,
-    /// or [`TrySendError::Closed`] when the receiver had closed before this
-    /// send began publishing.
+    /// or [`TrySendError::Closed`] when this send observed the receiver
+    /// closed, either before publishing or after finding the lane full.
     pub fn try_send(&self, value: T) -> Result<(), TrySendError<T>> {
         if self.is_closed() {
             return Err(TrySendError::Closed(value));
@@ -1097,7 +1099,7 @@ impl<T> ShardedReceiver<T> {
 
     /// Close the receiver while retaining access to buffered messages.
     ///
-    /// Sends that begin after this call fail with [`TrySendError::Closed`].
+    /// Sends that observe the close fail with [`TrySendError::Closed`].
     /// Receive operations may continue to drain buffered messages and then
     /// report closure.
     ///
@@ -1113,8 +1115,9 @@ impl<T> ShardedReceiver<T> {
     /// is dropped. It is never leaked.
     ///
     /// Driver shutdown (dropping the [`Driver`](crate::Driver) or calling
-    /// `Park::shutdown`) closes every registered receiver and has exactly the
-    /// same semantics as calling this method.
+    /// `Park::shutdown`) closes every registered receiver. It has the same
+    /// effect on the channel as calling this method, and also wakes a pending
+    /// receive.
     ///
     /// Unlike `tokio::sync::mpsc::Receiver::close`, `close` followed by
     /// draining to `None` is therefore not a lossless handshake. See the
