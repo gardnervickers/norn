@@ -78,6 +78,15 @@ impl TaskQueue {
     ///
     /// If the queue has already been shut down, the returned [`JoinHandle`]
     /// resolves immediately with cancellation.
+    ///
+    /// # Aborts
+    ///
+    /// The task belongs to the thread that runs it. Cloning, waking or dropping
+    /// its waker from any other thread aborts the process (after printing a
+    /// message), so a future must not hand its waker to another thread or to
+    /// something completed there, such as a `std::thread` or a cross-thread
+    /// channel. The process also aborts, instead of unwinding, if dropping the
+    /// future or its output panics, or if the task's reference count overflows.
     pub fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
     where
         F: Future + 'static,

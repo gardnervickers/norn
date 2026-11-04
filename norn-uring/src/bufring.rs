@@ -891,7 +891,9 @@ impl BufRingStorage {
         // https://man7.org/linux/man-pages/man2/mmap.2.html
         let ring_start = AnonymousMmap::new(ring_size)?;
 
-        let buf_list = (0..buf_cnt).map(|_| KernelBuffer::new(buf_len)).collect();
+        let buf_list = (0..buf_cnt)
+            .map(|_| KernelBuffer::new(buf_len))
+            .collect::<io::Result<Vec<_>>>()?;
 
         let ring_entries_mask = ring_entries - 1;
         assert!((ring_entries & ring_entries_mask) == 0);
@@ -1155,12 +1157,31 @@ struct KernelBuffer {
 }
 
 impl KernelBuffer {
-    fn new(len: usize) -> Self {
-        let bytes = Box::into_raw(vec![0; len].into_boxed_slice());
+    /// Allocates a zeroed buffer, reporting allocation failure as an error
+    /// instead of aborting the process.
+    fn new(len: usize) -> io::Result<Self> {
+        let bytes: *mut [u8] = if len == 0 {
+            Box::into_raw(Vec::<u8>::new().into_boxed_slice())
+        } else {
+            let layout = std::alloc::Layout::array::<u8>(len)
+                .map_err(|err| io::Error::new(io::ErrorKind::OutOfMemory, err))?;
+            // Safety: `layout` has a nonzero size.
+            let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+            if ptr.is_null() {
+                return Err(io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    "failed to allocate a buffer ring buffer",
+                ));
+            }
+            // Safety: `ptr` is a live allocation of `len` zeroed bytes from the
+            // global allocator with the layout of `[u8; len]`, which is what
+            // `Box<[u8]>` deallocates with.
+            Box::into_raw(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len)) })
+        };
         // Safety: `UnsafeCell` has the same layout as its contents, including
         // dynamically sized slices, so this preserves the allocation metadata.
         let bytes = unsafe { Box::from_raw(bytes as *mut UnsafeCell<[u8]>) };
-        Self { bytes }
+        Ok(Self { bytes })
     }
 
     fn as_ptr(&self) -> *const u8 {
@@ -1239,7 +1260,7 @@ impl ops::Deref for BufRingBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{selected_bid_from_flags, BufRingStorage, RecvBufRing};
+    use super::{selected_bid_from_flags, BufRingStorage, KernelBuffer, RecvBufRing};
     use std::io;
     use std::rc::Rc;
 
@@ -1472,5 +1493,19 @@ mod tests {
         drop(replacement);
         assert_eq!(handle.test_registered_buf_rings(), 0);
         Ok(())
+    }
+
+    #[test]
+    fn kernel_buffer_allocation_failure_is_an_error() {
+        // No allocator can satisfy this; the result must be an error, not an abort.
+        let err = KernelBuffer::new(usize::MAX / 2)
+            .err()
+            .expect("allocation must fail");
+        assert_eq!(err.kind(), io::ErrorKind::OutOfMemory);
+        assert!(KernelBuffer::new(0).is_ok());
+        let ok = KernelBuffer::new(64).unwrap();
+        assert!(unsafe { std::slice::from_raw_parts(ok.as_ptr(), 64) }
+            .iter()
+            .all(|byte| *byte == 0));
     }
 }
