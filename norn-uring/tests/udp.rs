@@ -1007,3 +1007,38 @@ fn drop_bufring_outside_runtime() -> Result<(), Box<dyn std::error::Error>> {
     drop(ring);
     Ok(())
 }
+
+#[test]
+fn readiness_stream_survives_a_full_completion_queue() -> Result<(), Box<dyn std::error::Error>> {
+    // A two-entry CQ fills while datagrams keep arriving: the kernel cannot
+    // post another multishot poll CQE and ends the poll without an error.
+    // The socket is still healthy, so the stream must not end.
+    let mut builder = io_uring::IoUring::builder();
+    builder.setup_cqsize(2);
+    let driver = norn_uring::Driver::new(builder, 2)?;
+    let mut ex = norn_executor::LocalExecutor::new(driver);
+    ex.block_on(async {
+        let receiver = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0")?;
+        let address = receiver.local_addr()?;
+        let mut readiness = pin!(receiver.poll_readiness_multi(libc::POLLIN as u32));
+        assert!(futures_util::poll!(readiness.next()).is_pending());
+        norn_uring::noop().await?;
+        for round in 0..16 {
+            // Several wakeups before the driver reaps any of their CQEs.
+            for _ in 0..4 {
+                sender.send_to(b"x", address)?;
+            }
+            let event = readiness
+                .next()
+                .await
+                .unwrap_or_else(|| panic!("readiness stream ended in round {round}"))?;
+            assert!(event.is_readable());
+            for _ in 0..4 {
+                let (received, _) = receiver.recv_from(BytesMut::with_capacity(8)).await;
+                received?;
+            }
+        }
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })
+}
