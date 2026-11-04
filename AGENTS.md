@@ -68,6 +68,16 @@ The project is intentionally not general-purpose today; APIs are still in flux i
   retry, or yield. Other enter errors are recorded as a health error and close
   the driver.
 - Remote unpark is eventfd-based (`driver/unpark.rs`).
+- A `NoPark` park with an empty SQ skips `io_uring_enter` only while the SQ
+  flags report neither CQ overflow nor pending task work; otherwise it calls
+  `Submitter::submit`, which adds `GETEVENTS` for either flag (io-uring
+  >= 0.7.15), so those completions are posted. While the flag is up, a
+  non-empty `NoPark` submit carries `GETEVENTS` as well and runs task work.
+- The driver adds `IORING_SETUP_TASKRUN_FLAG` when the ring setup accepts it,
+  because `DEFER_TASKRUN` work is otherwise invisible to userspace. It probes
+  by building with the flag first; builders without `COOP_TASKRUN` or
+  `DEFER_TASKRUN` (including the default) or with SQPOLL get `EINVAL` from
+  that one extra `io_uring_setup` and are then built as configured.
 - `Driver::drop` calls `Park::shutdown`; shutdown path uses cancellation + IO_DRAIN token.
 - Special CQE user_data tokens are reserved (`<= 1024`).
 
