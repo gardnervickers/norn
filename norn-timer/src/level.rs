@@ -48,6 +48,10 @@ pub(crate) struct Level {
     level: usize,
     bitfield: u64,
     dirty_slots: u64,
+    /// Slots whose entries are ordered by non-increasing deadline from front
+    /// to back. The back entry of such a slot holds its minimum, so refreshing
+    /// a dirty slot's deadline needs no scan.
+    sorted_slots: u64,
     slots: [cordyceps::List<Entry>; Self::LEVEL_MULT],
     slot_deadlines: [Option<u64>; Self::LEVEL_MULT],
 }
@@ -60,6 +64,7 @@ impl Level {
             level,
             bitfield: 0,
             dirty_slots: 0,
+            sorted_slots: 0,
             slots: std::array::from_fn(|_| cordyceps::List::new()),
             slot_deadlines: std::array::from_fn(|_| None),
         }
@@ -118,7 +123,23 @@ impl Level {
     fn slot_deadline(&mut self, slot: usize) -> u64 {
         let slot_bit = occupied_bit(slot);
         if self.dirty_slots & slot_bit != 0 {
-            self.slot_deadlines[slot] = self.slots[slot].iter().map(Entry::expiration).min();
+            self.slot_deadlines[slot] = if self.sorted_slots & slot_bit != 0 {
+                self.slots[slot].back().map(|entry| entry.expiration())
+            } else {
+                // Note whether the scanned entries are ordered, so the next
+                // refresh can read the minimum from the back instead.
+                let mut minimum = u64::MAX;
+                let mut sorted = true;
+                for entry in self.slots[slot].iter() {
+                    let expiration = entry.expiration();
+                    sorted &= expiration <= minimum;
+                    minimum = minimum.min(expiration);
+                }
+                if sorted {
+                    self.sorted_slots |= slot_bit;
+                }
+                Some(minimum)
+            };
             self.dirty_slots &= !slot_bit;
         }
         self.slot_deadlines[slot].expect("occupied slot must have a tracked minimum deadline")
@@ -140,9 +161,20 @@ impl Level {
     pub(crate) fn add_entry(&mut self, item: ptr::NonNull<Entry>) -> Expiration {
         let expiration = unsafe { item.as_ref().expiration() };
         let slot = slot_for(expiration, self.level);
+        let slot_bit = occupied_bit(slot);
+        // Timers with the same relative timeout are registered in deadline
+        // order, so pushing each one to the front keeps the slot sorted.
+        let sorted = match self.slots[slot].front() {
+            None => true,
+            Some(front) => self.sorted_slots & slot_bit != 0 && expiration >= front.expiration(),
+        };
+        if sorted {
+            self.sorted_slots |= slot_bit;
+        } else {
+            self.sorted_slots &= !slot_bit;
+        }
         unsafe { item.as_ref().set_location(self.level, slot) };
         self.slots[slot].push_front(item);
-        let slot_bit = occupied_bit(slot);
         self.bitfield |= slot_bit;
         let deadline = if self.dirty_slots & slot_bit == 0 {
             let deadline =
@@ -173,6 +205,7 @@ impl Level {
             );
             self.bitfield &= !slot_bit;
             self.dirty_slots &= !slot_bit;
+            self.sorted_slots &= !slot_bit;
             self.slot_deadlines[slot] = None;
         } else if removed.is_some() && self.slot_deadlines[slot] == Some(expiration) {
             self.dirty_slots |= slot_bit;
@@ -184,6 +217,7 @@ impl Level {
         let slot_bit = occupied_bit(slot);
         self.bitfield &= !slot_bit;
         self.dirty_slots &= !slot_bit;
+        self.sorted_slots &= !slot_bit;
         self.slot_deadlines[slot] = None;
         self.slots[slot].split_off(0)
     }
