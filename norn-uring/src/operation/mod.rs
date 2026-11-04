@@ -38,9 +38,13 @@ use crate::error::SubmitError;
 /// - [`Operation::reap`] must convert every kernel CQE or synthetic completion into an owned
 ///   value that accounts for all resources created, selected, or otherwise transferred by the
 ///   kernel. Dropping that value must release those resources without consulting the operation
-///   again; and
+///   again;
 /// - [`Operation::reap`] must not unwind. A CQE cannot be replayed after it has been removed from
-///   the kernel completion queue.
+///   the kernel completion queue; and
+/// - an entry that sets `IOSQE_BUFFER_SELECT` must select from a buffer group the implementation
+///   owns. A buffer selected from a group registered through
+///   [`RecvBufRing`](crate::bufring::RecvBufRing) is never returned to that ring, so it is lost to
+///   every other receive.
 ///
 /// The runtime places the operation at a stable address before calling
 /// [`Operation::configure`] and does not move it while the entry may be submitted or accessed by
@@ -422,9 +426,13 @@ where
         let handle = TypedHandle::new(data);
         let mut data = handle.data_mut().expect("operation already completed");
 
-        let entry = T::configure(&mut data)
-            .and_then(reject_reserved_flags)
-            .map(|entry| ConfiguredEntry::new(handle.untyped(), entry));
+        // Check the entry by reference: threading it through `Result`
+        // combinators moves the 64-byte SQE several times on the hot path.
+        let entry = match T::configure(&mut data) {
+            Ok(entry) if has_reserved_flags(&entry) => Err(reserved_flags_error()),
+            Ok(entry) => Ok(ConfiguredEntry::new(handle.untyped(), entry)),
+            Err(err) => Err(err),
+        };
         drop(data);
         (handle, entry)
     }
@@ -660,15 +668,20 @@ const RESERVED_SQE_FLAGS: Flags = Flags::IO_LINK
     .union(Flags::IO_HARDLINK)
     .union(Flags::SKIP_SUCCESS);
 
-fn reject_reserved_flags(entry: io_uring::squeue::Entry) -> io::Result<io_uring::squeue::Entry> {
-    if sqe_flags(&entry).intersects(RESERVED_SQE_FLAGS) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "operations may not set IO_LINK, IO_HARDLINK, or CQE_SKIP_SUCCESS; \
-             link requests with Request::then",
-        ));
-    }
-    Ok(entry)
+/// Whether a configured SQE sets a runtime-owned flag.
+#[inline]
+fn has_reserved_flags(entry: &io_uring::squeue::Entry) -> bool {
+    sqe_flags(entry).intersects(RESERVED_SQE_FLAGS)
+}
+
+#[cold]
+#[inline(never)]
+fn reserved_flags_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "operations may not set IO_LINK, IO_HARDLINK, or CQE_SKIP_SUCCESS; \
+         link requests with Request::then",
+    )
 }
 
 /// Return the flags byte of a configured SQE.
@@ -802,8 +815,7 @@ mod tests {
             let entry = io_uring::opcode::Nop::new()
                 .build()
                 .flags(reserved | Flags::ASYNC);
-            let error = reject_reserved_flags(entry).unwrap_err();
-            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(has_reserved_flags(&entry), "{reserved:?} must be rejected");
         }
         for allowed in [
             Flags::empty(),
@@ -813,8 +825,9 @@ mod tests {
             Flags::BUFFER_SELECT,
         ] {
             let entry = io_uring::opcode::Nop::new().build().flags(allowed);
-            assert!(reject_reserved_flags(entry).is_ok());
+            assert!(!has_reserved_flags(&entry), "{allowed:?} must be accepted");
         }
+        assert_eq!(reserved_flags_error().kind(), io::ErrorKind::InvalidInput);
     }
 
     #[derive(Debug, Default)]
