@@ -2,7 +2,7 @@
 use std::future::Future;
 use std::panic::{self, AssertUnwindSafe};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Wake, Waker};
 
@@ -16,15 +16,12 @@ impl Wake for CountWake {
     }
 }
 
-/// Panics on the first `unbind` only, so dropping the set can unlink the task.
-struct PanicOnUnbind(AtomicBool);
+struct PanicOnUnbind;
 
 impl Schedule for PanicOnUnbind {
     fn schedule(&self, _runnable: Runnable) {}
     fn unbind(&self, _registered: &RegisteredTask) {
-        if self.0.swap(false, Ordering::SeqCst) {
-            panic!("unbind panicked");
-        }
+        panic!("unbind panicked");
     }
 }
 
@@ -32,7 +29,7 @@ impl Schedule for PanicOnUnbind {
 #[test]
 fn unbind_panic_still_wakes_join_handle() {
     let set = TaskSet::new();
-    let (runnable, mut join) = unsafe { set.bind(async {}, PanicOnUnbind(AtomicBool::new(true))) };
+    let (runnable, mut join) = unsafe { set.bind(async {}, PanicOnUnbind) };
     let counter = Arc::new(CountWake(AtomicUsize::new(0)));
     let waker = Waker::from(Arc::clone(&counter));
     assert!(Pin::new(&mut join)
