@@ -43,7 +43,8 @@ const COMPLETION_DRAIN_BATCH: usize = 32;
 
 const DEFAULT_COMPLETION_DRAIN_BUDGET: NonZeroUsize = NonZeroUsize::new(32).unwrap();
 
-/// Maximum time each shutdown cancellation attempt waits for the kernel.
+/// Maximum time each shutdown cancellation attempt, and each wait for
+/// outstanding requests to complete, waits for the kernel.
 ///
 /// `IORING_REGISTER_SYNC_CANCEL` accepts a timeout, so teardown can retry without
 /// entering one unbounded syscall when a request cannot be cancelled.
@@ -80,6 +81,9 @@ impl Default for DriverOptions {
 /// Shutdown stops accepting new requests, cancels outstanding work, and waits
 /// for every kernel-owned operation to reach a terminal completion. Teardown
 /// retries unclassified cancellation errors and submission errors indefinitely.
+/// While it waits, it cancels again after every bounded wait that completes
+/// nothing, so a request that the kernel issues only after the first
+/// cancellation, such as a linked dependent, is reclaimed too.
 /// Kernels without synchronous cancellation proceed directly to the drain
 /// barriers, which can still block forever behind an operation that cannot
 /// complete without cancellation.
@@ -89,8 +93,8 @@ pub struct Driver {
     unparker: Arc<unpark::Unparker>,
     /// Storage passed to the kernel for the eventfd read.
     ///
-    /// [`Driver::drop`] releases the buffer only after the drain sentinel proves
-    /// every earlier request, including the eventfd read, is terminal.
+    /// [`Driver::drop`] releases the buffer only after shutdown proves every
+    /// request, including the eventfd read, is terminal.
     unparker_buf: mem::ManuallyDrop<UnparkerBuffer>,
     /// CQEs copied out of the kernel ring but not dispatched because a wake
     /// callback unwound. This is empty on the normal path.
@@ -166,11 +170,32 @@ struct Shared {
     ///
     /// Each target retains its operation's identity until the cancellation is
     /// queued. Parks retry these after draining completions.
-    deferred_cancels: RefCell<VecDeque<OpTarget>>,
+    deferred_cancels: RefCell<VecDeque<PendingCancel>>,
     /// Set once shutdown has requested cancellation of every outstanding request.
     cancel_all_requested: Cell<bool>,
+    /// Linked requests whose first cancellation found nothing (ENOENT).
+    ///
+    /// A request linked behind another is invisible to cancellation until the
+    /// kernel issues it, which happens in task work after its predecessor
+    /// completes. Each entry is cancelled once more, after that point. Unlike
+    /// `deferred_cancels`, these do not represent SQ demand.
+    cancel_retries: RefCell<Vec<CancelRetry>>,
     submit_error: RefCell<Option<(io::ErrorKind, String)>>,
     shutdown_outcome: Cell<Option<ShutdownOutcome>>,
+    /// Entries pushed to the SQ whose terminal CQE has not been dispatched.
+    ///
+    /// Operations (including cancellations), the eventfd read, and descriptor
+    /// closes are counted. Each posts exactly one terminal CQE: custom
+    /// operations cannot skip theirs (see `RESERVED_SQE_FLAGS`). Shutdown is
+    /// complete once this reaches zero.
+    in_flight: Cell<usize>,
+    /// Set once shutdown finds the count untrusted: it wrapped, or the kernel
+    /// dropped CQEs. Shutdown then proves reclamation with an `IO_DRAIN`
+    /// barrier instead.
+    accounting_broken: Cell<bool>,
+    /// Whether that fallback barrier is in the SQ or the kernel, or has
+    /// completed. Cleared only when it fails.
+    drain_barrier_pushed: Cell<bool>,
     #[cfg(test)]
     shutdown_test: ShutdownTest,
     // These fields must be declared after `ring`: fields are dropped in declaration
@@ -184,9 +209,8 @@ struct Shared {
 struct ShutdownTest {
     cancel_all_failures: RefCell<std::collections::VecDeque<i32>>,
     cancel_all_attempts: Cell<usize>,
-    drain_failures: RefCell<std::collections::VecDeque<usize>>,
-    operations_drain_attempts: Cell<usize>,
-    resources_drain_attempts: Cell<usize>,
+    drain_failures: Cell<usize>,
+    drain_attempts: Cell<usize>,
     submit_failures: RefCell<std::collections::VecDeque<i32>>,
     submit_limits: RefCell<std::collections::VecDeque<(usize, usize)>>,
 }
@@ -208,6 +232,31 @@ pub(crate) struct BufRingRegistration {
     registration: Rc<RegisteredBufRing>,
 }
 
+/// A cancellation waiting for SQ space.
+struct PendingCancel {
+    target: OpTarget,
+    /// The request linked immediately before `target`, if any. Only a
+    /// first cancellation of a linked request carries it; it allows one retry.
+    predecessor: Option<OpTarget>,
+}
+
+/// One allowed retry of a linked request's cancellation that found nothing.
+pub(crate) struct CancelRetry {
+    shared: Weak<Shared>,
+    target: Option<OpTarget>,
+    predecessor: OpTarget,
+}
+
+impl CancelRetry {
+    /// Queue the retry for `target` with a later park.
+    pub(crate) fn schedule(mut self, target: OpTarget) {
+        self.target = Some(target);
+        if let Some(shared) = self.shared.upgrade() {
+            shared.cancel_retries.borrow_mut().push(self);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct FixedBufDriver {
     shared: Weak<Shared>,
@@ -220,12 +269,9 @@ pub(super) enum Status {
     Running,
     /// The driver is closing and will not accept new requests.
     Closing,
-    /// The driver is waiting for all admitted operations to become terminal.
-    DrainingOperations,
-    /// Operation completions have been reaped and resource-release work is being flushed.
-    ClosingResources,
-    /// The driver is waiting for resource-release work to become terminal.
-    DrainingResources,
+    /// Every outstanding request has been cancelled, and the driver is waiting
+    /// for each counted entry's terminal completion.
+    Draining,
     /// The driver has shutdown and will not accept new requests.
     Shutdown,
 }
@@ -233,7 +279,7 @@ pub(super) enum Status {
 /// Describes whether shutdown reached the normal reclamation boundary.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum ShutdownOutcome {
-    /// The drain sentinel completed, so every earlier request reached a terminal CQE.
+    /// Every request the driver queued reached its terminal CQE.
     CleanDrained,
 }
 
@@ -482,8 +528,11 @@ impl Handle {
     /// This never enters the kernel. The cancellation is queued in the SQ, or
     /// deferred in driver-owned state when the SQ is full, and is submitted
     /// by a later park.
-    pub(crate) fn cancel_op(&self, target: OpTarget) {
-        self.shared.cancel_op(target)
+    ///
+    /// `predecessor` is the request linked immediately before `target`, if
+    /// `target` was submitted as a later member of a linked batch.
+    pub(crate) fn cancel_op(&self, target: OpTarget, predecessor: Option<OpTarget>) {
+        self.shared.cancel_op(target, predecessor)
     }
 
     /// Attempt to push a new entry into the submission queue.
@@ -613,8 +662,9 @@ impl Handle {
 }
 
 impl Driver {
-    /// Signals that all operations admitted before shutdown are terminal.
-    const OPERATIONS_DRAIN_TOKEN: usize = 0x01;
+    /// Marks the `IO_DRAIN` barrier that proves reclamation when the in-flight
+    /// count cannot be trusted.
+    const DRAIN_TOKEN: usize = 0x01;
 
     /// [`Driver::UNPARKER_WAKE_TOKEN`] is a special token which is used to signal unparker wake events.
     const UNPARKER_WAKE_TOKEN: usize = 0x02;
@@ -624,9 +674,6 @@ impl Driver {
 
     /// [`Driver::CLOSE_FD_TOKEN`] is a special token which is used to signal close fd events.
     const CLOSE_FD_TOKEN: usize = 0x04;
-
-    /// Signals that all work generated while reaping operation completions is terminal.
-    const RESOURCES_DRAIN_TOKEN: usize = 0x05;
 
     /// Create a new [`Driver`] with the provided size from the provided [`io_uring::Builder`].
     ///
@@ -651,10 +698,17 @@ impl Driver {
     /// is then built as configured. Such builders therefore make one extra,
     /// failing `io_uring_setup` call.
     ///
+    /// A ring set up disabled (`IORING_SETUP_R_DISABLED`) is enabled, because
+    /// nothing else can reach it to do so.
+    ///
     /// # Errors
     ///
     /// Returns an error if the `io_uring` instance or its eventfd-based
-    /// unparker cannot be created.
+    /// unparker cannot be created. It also returns `InvalidInput` if the
+    /// builder sets `IORING_SETUP_IOPOLL` (such a ring runs only polled block
+    /// I/O, while the driver needs timers, sockets, and an eventfd read to
+    /// unpark), and `Unsupported` if the kernel lacks `IORING_FEAT_EXT_ARG`
+    /// (Linux 5.11), which every waiting park uses.
     pub fn new_with_options(
         mut builder: io_uring::Builder,
         size: u32,
@@ -669,6 +723,7 @@ impl Driver {
             Err(err) if err.raw_os_error() == Some(libc::EINVAL) => builder.build(size)?,
             ring => ring?,
         };
+        Self::check_setup(&ring)?;
         Ok(Self {
             options,
             shared: Rc::new(Shared {
@@ -678,8 +733,12 @@ impl Driver {
                 status: Cell::new(Status::Running),
                 deferred_cancels: RefCell::new(VecDeque::new()),
                 cancel_all_requested: Cell::new(false),
+                cancel_retries: RefCell::new(Vec::new()),
                 submit_error: RefCell::new(None),
                 shutdown_outcome: Cell::new(None),
+                in_flight: Cell::new(0),
+                accounting_broken: Cell::new(false),
+                drain_barrier_pushed: Cell::new(false),
                 #[cfg(test)]
                 shutdown_test: ShutdownTest::default(),
                 registered_buf_rings: RegisteredBufRings::new(),
@@ -689,6 +748,28 @@ impl Driver {
             unparker_buf: mem::ManuallyDrop::new(UnparkerBuffer::new()),
             deferred_cqes: RefCell::new(VecDeque::new()),
         })
+    }
+
+    /// Reject ring setups the driver cannot run with, and enable a disabled ring.
+    fn check_setup(ring: &IoUring) -> io::Result<()> {
+        if ring.params().is_setup_iopoll() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "IORING_SETUP_IOPOLL rings run only polled block I/O; \
+                 the driver needs timers, sockets, and an eventfd read",
+            ));
+        }
+        if !ring.params().is_feature_ext_arg() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "the kernel lacks IORING_FEAT_EXT_ARG (Linux 5.11), which parks use",
+            ));
+        }
+        match ring.submitter().register_enable_rings() {
+            // EBADFD: the ring was not set up disabled.
+            Err(err) if err.raw_os_error() != Some(libc::EBADFD) => Err(err),
+            _ => Ok(()),
+        }
     }
 
     /// Returns a handle to the driver.
@@ -818,62 +899,69 @@ impl Driver {
     }
 
     fn dispatch_cqe(&self, cqe: &cqueue::Entry) {
-        let user_data = cqe.user_data() as usize;
-        if user_data == Self::OPERATIONS_DRAIN_TOKEN {
-            debug_assert_eq!(self.shared.status(), Status::DrainingOperations);
-            if cqe.result() < 0 {
-                let err = io::Error::from_raw_os_error(-cqe.result());
-                warn!(target: LOG, "drain.operations.failed {err:?}");
-                self.shared.set_status(Status::Closing);
-            } else {
-                trace!(target: LOG, "drain.operations.token");
-                self.shared.set_status(Status::ClosingResources);
-            }
+        if cqe.user_data() <= 1024 {
+            self.dispatch_token_cqe(cqe);
             return;
         }
-        if user_data == Self::RESOURCES_DRAIN_TOKEN {
-            debug_assert_eq!(self.shared.status(), Status::DrainingResources);
+        // Account before reaping: the CQE is consumed even if a callback unwinds.
+        if !cqueue::more(cqe.flags()) {
+            self.shared.complete_in_flight();
+        }
+        // Safety: This is being called on a completion queue entry which has been generated
+        // by a prior submission.
+        unsafe { reap_operation(cqe) }
+    }
+
+    /// Dispatch a CQE carrying one of the driver's reserved tokens.
+    ///
+    /// Kept out of line so that the operation path stays small.
+    #[inline(never)]
+    fn dispatch_token_cqe(&self, cqe: &cqueue::Entry) {
+        let user_data = cqe.user_data() as usize;
+        if user_data == Self::DRAIN_TOKEN {
+            debug_assert_eq!(self.shared.status(), Status::Draining);
             if cqe.result() < 0 {
                 let err = io::Error::from_raw_os_error(-cqe.result());
-                warn!(target: LOG, "drain.resources.failed {err:?}");
-                self.shared.set_status(Status::ClosingResources);
+                warn!(target: LOG, "drain.failed {err:?}");
+                self.shared.drain_barrier_pushed.set(false);
             } else {
-                trace!(target: LOG, "drain.resources.token");
+                trace!(target: LOG, "drain.token");
+                // Every earlier request is terminal, so the remaining deferred
+                // cancellations and retries are moot.
+                drop(self.shared.take_deferred_cancels());
+                drop(self.shared.cancel_retries.take());
                 self.shared.finish_shutdown(ShutdownOutcome::CleanDrained);
             }
             return;
         }
         if user_data == Self::UNPARKER_WAKE_TOKEN {
-            trace!(target: LOG, "drain.token");
+            trace!(target: LOG, "unparker.token");
+            self.shared.complete_in_flight();
             self.unparker.reset();
             return;
         }
 
         if user_data == Self::CANCELLATION_TOKEN {
+            // Raw filler entries pushed by tests; never counted.
             trace!(target: LOG, "cancellation.token");
             return;
         }
 
         if user_data == Self::CLOSE_FD_TOKEN {
             trace!(target: LOG, "close_fd.token");
+            self.shared.complete_in_flight();
             return;
         }
 
-        if user_data <= 1024 {
-            let result = cqe.result();
-            let result = if result >= 0 {
-                Ok(result as u32)
-            } else {
-                Err(io::Error::from_raw_os_error(-result))
-            };
-            warn!(target: LOG, "drain.invalid_user_data {result:?}");
-            // Surely nothing in our heap is going to be allocated at < 1024!
-            // We are keeping this space reserved for additional operations.
-            return;
-        }
-        // Safety: This is being called on a completion queue entry which has been generated
-        // by a prior submission.
-        unsafe { reap_operation(cqe) }
+        let result = cqe.result();
+        let result = if result >= 0 {
+            Ok(result as u32)
+        } else {
+            Err(io::Error::from_raw_os_error(-result))
+        };
+        warn!(target: LOG, "drain.invalid_user_data {result:?}");
+        // Surely nothing in our heap is going to be allocated at < 1024!
+        // We are keeping this space reserved for additional operations.
     }
 
     fn retry_shutdown(&self, stage: &'static str, err: &io::Error) {
@@ -885,9 +973,18 @@ impl Driver {
         }
     }
 
-    fn drain_sentinel(&self, token: usize) -> io_uring::squeue::Entry {
+    /// Push the `IO_DRAIN` barrier, uncounted: its CQE is not a request's.
+    fn try_push_drain_barrier(&self) -> bool {
+        let barrier = self.drain_barrier();
+        let mut ring = self.shared.ring.borrow_mut();
+        let mut sq = ring.submission();
+        // Safety: the barrier references no memory.
+        unsafe { sq.push(&barrier) }.is_ok()
+    }
+
+    fn drain_barrier(&self) -> io_uring::squeue::Entry {
         #[cfg(test)]
-        let opcode = if self.shared.fail_drain_sentinel(token) {
+        let opcode = if self.shared.fail_drain_barrier() {
             opcode::Close::new(types::Fd(-1)).build()
         } else {
             opcode::Nop::new().build()
@@ -897,7 +994,7 @@ impl Driver {
 
         opcode
             .flags(io_uring::squeue::Flags::IO_DRAIN)
-            .user_data(token as u64)
+            .user_data(Self::DRAIN_TOKEN as u64)
     }
 
     fn drain_normal(&self, remaining: &mut Option<usize>) -> usize {
@@ -923,6 +1020,7 @@ impl Driver {
             trace!(target: LOG, "park.drained {}", drained);
             mode = ParkMode::NoPark;
         }
+        self.shared.retry_cancels();
         self.shared.flush_deferred_cancels();
 
         loop {
@@ -990,9 +1088,9 @@ impl Driver {
         // Once an SQE may have reached the kernel, returning before its terminal CQE
         // is unsafe: the operation can retain buffers, descriptors, and this driver.
         // Teardown therefore retries every cancellation error that does not prove
-        // the operation unsupported. If synchronous cancellation is unsupported,
-        // the drain barrier itself becomes the proof; it can block forever, but
-        // shutdown cannot abandon memory still owned by the kernel.
+        // the operation unsupported, then waits until no counted entry is in
+        // flight. If synchronous cancellation is unsupported, that wait can block
+        // forever, but shutdown cannot abandon memory still owned by the kernel.
         loop {
             if let Some(outcome) = self.shared.shutdown_outcome() {
                 return outcome;
@@ -1012,69 +1110,112 @@ impl Driver {
                     if self.shared.has_deferred_cancels() {
                         continue;
                     }
+                    // Issue linked dependents whose heads have already completed, so
+                    // the synchronous cancel can find them. Under DEFER_TASKRUN only a
+                    // GETEVENTS enter runs that task work.
+                    self.shared.run_all_task_work();
 
                     if let Err(err) = self.shared.cancel_all() {
                         if Self::sync_cancel_unsupported(&err) {
-                            // The drain barrier remains the reclamation proof. Without
-                            // synchronous cancellation it completes immediately for an
-                            // idle ring, but safely waits behind any outstanding operation.
+                            // Without synchronous cancellation, draining waits for each
+                            // outstanding request to finish on its own, and the
+                            // asynchronous cancellations queued by drops still apply.
                             warn!(target: LOG, "shutdown.cancel_all.unsupported {err:?}");
                         } else if err.raw_os_error() != Some(libc::ENOENT) {
                             self.retry_shutdown("cancel_all", &err);
                             continue;
                         }
                     }
+                    self.shared.set_status(Status::Draining);
+                }
+                Status::Draining => self.drain_for_shutdown(),
+            }
+        }
+    }
 
-                    let opcode = self.drain_sentinel(Self::OPERATIONS_DRAIN_TOKEN);
-                    if unsafe { self.shared.try_push_raw(&opcode) }.is_ok() {
-                        self.shared.set_status(Status::DrainingOperations);
-                    } else {
-                        let drained = self.drain_exhaustive();
-                        trace!(target: LOG, "shutdown.push_operations_drain.retry drained={drained}");
-                        if drained == 0 {
-                            std::thread::sleep(Duration::from_millis(1));
-                        }
-                    }
-                }
-                Status::DrainingOperations => {
-                    if let Err(err) =
-                        self.park_with_completion_budget(ParkMode::NextCompletion, None)
-                    {
-                        self.retry_shutdown("park", &err);
-                    }
-                }
-                Status::ClosingResources => {
-                    // Every admitted operation is terminal, so any remaining deferred
-                    // cancellation is moot. Release its target identity here, inside
-                    // the driver context, so that destroying the target can queue its
-                    // resource-release work ahead of the final barrier.
-                    drop(self.shared.take_deferred_cancels());
-                    // Reaping the first barrier can destroy RawOps. Their destructors may
-                    // enqueue close SQEs or other resource-release work after that barrier,
-                    // so flush the complete userspace SQ before ordering a final drain behind it.
-                    if let Err(err) = self.shared.submit_all_pending() {
-                        self.retry_shutdown("submit_cleanup", &err);
-                        continue;
-                    }
+    /// One step of waiting for every counted entry's terminal completion.
+    fn drain_for_shutdown(&mut self) {
+        if self.shared.accounting_broken() {
+            self.drain_behind_barrier();
+            return;
+        }
+        if self.drain_exhaustive() > 0 {
+            return;
+        }
+        if self.shared.in_flight() == 0 {
+            // Every admitted operation is terminal, so remaining deferred
+            // cancellations and retries are moot. Dropping their targets may
+            // destroy operations, and that may queue more counted work, such
+            // as a cancellation, so look again before finishing.
+            drop(self.shared.take_deferred_cancels());
+            drop(self.shared.cancel_retries.take());
+            if self.shared.in_flight() == 0 {
+                trace!(target: LOG, "shutdown.drained");
+                self.shared.finish_shutdown(ShutdownOutcome::CleanDrained);
+            }
+            return;
+        }
+        // A head can still complete after the synchronous cancel, and its linked
+        // dependent is issued only then. Wait for a bounded time, and cancel again
+        // if nothing completed.
+        if let Err(err) =
+            self.park_with_completion_budget(ParkMode::Timeout(SHUTDOWN_CANCEL_TIMEOUT), None)
+        {
+            self.retry_shutdown("park", &err);
+            return;
+        }
+        if self.drain_exhaustive() == 0 && self.shared.in_flight() > 0 {
+            // Like the first cancel, this matches every request. That includes a
+            // drop-close (`CLOSE_FD_TOKEN`) still queued in io-wq, which only
+            // happens for files whose close flushes (FUSE, NFS); cancelling one
+            // leaks its descriptor. This runs only after a full timeout with no
+            // completion.
+            debug!(
+                target: LOG,
+                "shutdown.recancel in_flight={}",
+                self.shared.in_flight()
+            );
+            if let Err(err) = self.shared.cancel_all() {
+                trace!(target: LOG, "shutdown.recancel {err:?}");
+            }
+        }
+    }
 
-                    let opcode = self.drain_sentinel(Self::RESOURCES_DRAIN_TOKEN);
-                    if unsafe { self.shared.try_push_raw(&opcode) }.is_ok() {
-                        self.shared.set_status(Status::DrainingResources);
-                    } else {
-                        let drained = self.drain_exhaustive();
-                        trace!(target: LOG, "shutdown.push_resources_drain.retry drained={drained}");
-                        if drained == 0 {
-                            std::thread::sleep(Duration::from_millis(1));
-                        }
-                    }
-                }
-                Status::DrainingResources => {
-                    if let Err(err) =
-                        self.park_with_completion_budget(ParkMode::NextCompletion, None)
-                    {
-                        self.retry_shutdown("park_cleanup", &err);
-                    }
-                }
+    /// Wait for an `IO_DRAIN` barrier instead of the count.
+    ///
+    /// The barrier completes once every earlier SQE has completed in the
+    /// kernel, whether or not its CQE reached userspace, and no later SQE starts
+    /// before it completes. Cancellations are not queued behind it (see
+    /// `Shared::try_push_cancel`), and nothing else is pushed during shutdown,
+    /// so its CQE proves the kernel holds nothing. An operation whose CQE was
+    /// lost is never reaped, so its allocation leaks rather than being freed
+    /// while the kernel might still use it.
+    fn drain_behind_barrier(&mut self) {
+        if !self.shared.drain_barrier_pushed.get() {
+            if let Err(err) = self.shared.submit_all_pending() {
+                self.retry_shutdown("submit_barrier", &err);
+                return;
+            }
+            if self.try_push_drain_barrier() {
+                warn!(target: LOG, "shutdown.drain_barrier");
+                self.shared.drain_barrier_pushed.set(true);
+            } else if self.drain_exhaustive() == 0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            return;
+        }
+        if let Err(err) =
+            self.park_with_completion_budget(ParkMode::Timeout(SHUTDOWN_CANCEL_TIMEOUT), None)
+        {
+            self.retry_shutdown("park_barrier", &err);
+            return;
+        }
+        // The barrier also waits behind requests issued after the synchronous
+        // cancel, so cancel again whenever a bounded wait completes nothing, as
+        // `drain_for_shutdown` does.
+        if self.drain_exhaustive() == 0 && self.shared.status() == Status::Draining {
+            if let Err(err) = self.shared.cancel_all() {
+                trace!(target: LOG, "shutdown.recancel_barrier {err:?}");
             }
         }
     }
@@ -1183,6 +1324,7 @@ impl Shared {
         } else {
             let entry = entry.into_entry_with_flags(Flags::empty());
             unsafe { sq.push(&entry) }.unwrap();
+            self.in_flight.set(self.in_flight.get() + 1);
             Ok(())
         }
     }
@@ -1202,6 +1344,7 @@ impl Shared {
             let entry = entries.pop().expect("singleton batch missing entry");
             let entry = entry.into_entry_with_flags(Flags::empty());
             unsafe { sq.push(&entry) }.unwrap();
+            self.in_flight.set(self.in_flight.get() + 1);
             return true;
         }
 
@@ -1216,16 +1359,57 @@ impl Shared {
             raw_entries.push(entry.into_entry_with_flags(flags));
         }
         unsafe { sq.push_multiple(raw_entries.as_slice()) }.unwrap();
+        self.in_flight.set(self.in_flight.get() + len);
         true
     }
 
-    /// Attempt to push a new raw entry into the submission queue.
+    /// Attempt to push a new raw entry into the submission queue, and count it
+    /// in flight.
     ///
-    /// If the submission queue is full, this will return an error.
+    /// The entry must post exactly one terminal CQE. Only the drain barrier is
+    /// pushed uncounted. If the submission queue is full, this will return an
+    /// error.
     unsafe fn try_push_raw(&self, entry: &io_uring::squeue::Entry) -> Result<(), PushError> {
         let mut ring = self.ring.borrow_mut();
         let mut sq = ring.submission();
-        sq.push(entry)
+        sq.push(entry)?;
+        self.in_flight.set(self.in_flight.get() + 1);
+        Ok(())
+    }
+
+    fn in_flight(&self) -> usize {
+        self.in_flight.get()
+    }
+
+    /// Account for one counted entry's terminal CQE.
+    ///
+    /// This runs for every completion, so release builds do not check for
+    /// underflow. A terminal CQE the count never covered wraps it, which
+    /// [`Shared::accounting_broken`] reports unless later pushes wrap it back.
+    #[inline]
+    fn complete_in_flight(&self) {
+        let count = self.in_flight.get();
+        debug_assert!(
+            count > 0,
+            "a terminal CQE the in-flight count never covered"
+        );
+        self.in_flight.set(count.wrapping_sub(1));
+    }
+
+    /// Whether the in-flight count can no longer prove reclamation.
+    ///
+    /// The count wraps if it missed an entry, and an entry whose CQE the kernel
+    /// dropped (it failed to allocate an overflow entry) stays counted forever.
+    fn accounting_broken(&self) -> bool {
+        if !self.accounting_broken.get() {
+            let wrapped = self.in_flight.get() > isize::MAX as usize;
+            let dropped = self.ring.borrow_mut().completion().overflow();
+            if wrapped || dropped > 0 {
+                warn!(target: LOG, "in_flight.untrusted wrapped={wrapped} cqes_dropped={dropped}");
+                self.accounting_broken.set(true);
+            }
+        }
+        self.accounting_broken.get()
     }
 
     fn with_submitter<U>(&self, f: impl FnOnce(&Submitter<'_>) -> U) -> U {
@@ -1452,7 +1636,7 @@ impl Shared {
         !self.deferred_cancels.borrow().is_empty()
     }
 
-    fn take_deferred_cancels(&self) -> VecDeque<OpTarget> {
+    fn take_deferred_cancels(&self) -> VecDeque<PendingCancel> {
         mem::take(&mut *self.deferred_cancels.borrow_mut())
     }
 
@@ -1461,54 +1645,178 @@ impl Shared {
     /// The cancellation SQE follows the target's SQE in the queue, so it cannot
     /// reach the kernel first. If the SQ is full, the target is retained in
     /// driver-owned state and retried by later parks.
-    fn cancel_op(&self, target: OpTarget) {
+    ///
+    /// `predecessor` is the request linked immediately before `target`. If the
+    /// cancellation finds nothing because the kernel has not yet issued
+    /// `target`, it is retried once after the issue must have happened.
+    fn cancel_op(self: &Rc<Self>, target: OpTarget, predecessor: Option<OpTarget>) {
         if target.is_complete() {
             return;
         }
+        let cancel = PendingCancel {
+            target,
+            predecessor,
+        };
         if self.has_deferred_cancels() {
-            self.deferred_cancels.borrow_mut().push_back(target);
+            self.deferred_cancels.borrow_mut().push_back(cancel);
             return;
         }
-        if let Err(target) = self.try_push_cancel(target) {
+        if let Err(cancel) = self.try_push_cancel(cancel) {
             trace!(target: LOG, "cancel.deferred");
-            self.deferred_cancels.borrow_mut().push_back(target);
+            self.deferred_cancels.borrow_mut().push_back(cancel);
         }
     }
 
-    fn try_push_cancel(&self, target: OpTarget) -> Result<(), OpTarget> {
-        if self.ring.borrow_mut().submission().is_full() {
-            return Err(target);
+    fn try_push_cancel(self: &Rc<Self>, cancel: PendingCancel) -> Result<(), PendingCancel> {
+        if self.drain_barrier_pushed.get() {
+            // A cancellation behind the drain barrier could not start until
+            // every request it could target is terminal. Dropping it keeps the
+            // barrier the last entry the kernel holds.
+            return Ok(());
         }
-        let entry = AsyncCancel::entry(target.clone());
+        if self.ring.borrow_mut().submission().is_full() {
+            return Err(cancel);
+        }
+        let retry = cancel.predecessor.clone().map(|predecessor| CancelRetry {
+            shared: Rc::downgrade(self),
+            target: None,
+            predecessor,
+        });
+        let entry = AsyncCancel::entry(cancel.target.clone(), retry);
         match self.try_push(entry) {
             Ok(()) => Ok(()),
             Err(entry) => {
                 drop(entry);
-                Err(target)
+                Err(cancel)
             }
         }
     }
 
     /// Queue as many deferred cancellations as the SQ can hold.
-    fn flush_deferred_cancels(&self) {
+    fn flush_deferred_cancels(self: &Rc<Self>) {
         loop {
-            let Some(target) = self.deferred_cancels.borrow_mut().pop_front() else {
+            let Some(cancel) = self.deferred_cancels.borrow_mut().pop_front() else {
                 return;
             };
-            if target.is_complete() {
+            if cancel.target.is_complete() {
                 // Dropping a completed target may destroy its operation, so do it
                 // without holding the deferred queue.
-                drop(target);
+                drop(cancel);
                 continue;
             }
-            if let Err(target) = self.try_push_cancel(target) {
-                self.deferred_cancels.borrow_mut().push_front(target);
+            if let Err(cancel) = self.try_push_cancel(cancel) {
+                self.deferred_cancels.borrow_mut().push_front(cancel);
                 return;
             }
         }
     }
 
+    /// Issue each due retry of a linked request's cancellation.
+    ///
+    /// A linked request is issued from task work queued when its predecessor
+    /// completes. A retry is therefore due once the predecessor's terminal CQE
+    /// has been reaped. Before sending it, the driver runs pending task work
+    /// with a non-blocking GETEVENTS enter, so the retry reaches the kernel
+    /// after the target was issued; a second ENOENT then means the target is
+    /// issued but not cancellable, and there is no further retry.
+    ///
+    /// Retries run only while the driver accepts work. Shutdown reclaims the
+    /// remaining targets through synchronous cancellation and its drain
+    /// barriers instead.
+    #[inline]
+    fn retry_cancels(self: &Rc<Self>) {
+        if self.cancel_retries.borrow().is_empty() {
+            return;
+        }
+        self.retry_cancels_slow();
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn retry_cancels_slow(self: &Rc<Self>) {
+        let retries = self.cancel_retries.take();
+        if self.status() != Status::Running {
+            // Dropping a target may destroy its operation, so do it without
+            // holding the retry queue.
+            drop(retries);
+            return;
+        }
+        let mut waiting = Vec::new();
+        let mut due = Vec::new();
+        for retry in retries {
+            let target = retry.target.as_ref().expect("scheduled retry has a target");
+            if target.is_complete() {
+                continue;
+            }
+            if retry.predecessor.is_complete() {
+                due.push(retry);
+            } else {
+                waiting.push(retry);
+            }
+        }
+        if !due.is_empty() {
+            if self.run_task_work() {
+                for mut retry in due {
+                    let target = retry.target.take().expect("scheduled retry has a target");
+                    self.cancel_op(target, None);
+                }
+            } else {
+                // Task work is still pending; the next park tries again.
+                waiting.extend(due);
+            }
+        }
+        if !waiting.is_empty() {
+            self.cancel_retries.borrow_mut().extend(waiting);
+        }
+    }
+
+    /// Run pending task work without waiting for completions.
+    ///
+    /// Returns true when the enter succeeded and the kernel reports no task
+    /// work still pending. The kernel reports pending work (`IORING_SQ_TASKRUN`)
+    /// only for rings set up with `IORING_SETUP_TASKRUN_FLAG`; on other rings a
+    /// successful enter is taken to have run it all.
+    fn run_task_work(&self) -> bool {
+        const IORING_ENTER_GETEVENTS: u32 = 1;
+        let mut ring = self.ring.borrow_mut();
+        // Safety: the enter submits nothing, waits for nothing and passes no
+        // argument; with GETEVENTS it only runs task work and flushes the CQ.
+        let entered = unsafe {
+            ring.submitter()
+                .enter::<libc::sigset_t>(0, 0, IORING_ENTER_GETEVENTS, None)
+        };
+        match entered {
+            Ok(_) => !ring.submission().taskrun(),
+            Err(err) => {
+                trace!(target: LOG, "cancel.retry.run_task_work {err}");
+                false
+            }
+        }
+    }
+
+    /// Queue a close of `fd` without waiting for its completion.
+    ///
+    /// Once the driver has begun shutting down this refuses with
+    /// [`CloseFdError::NeverQueued`], so the caller closes the descriptor
+    /// directly. A close queued during shutdown is exposed to three hazards:
+    /// the fallback `IO_DRAIN` barrier can make the kernel defer it until ring
+    /// teardown, which cancels it; the synchronous `ANY` cancel and the
+    /// re-cancels that follow it can cancel a close that io-wq has not started,
+    /// and there is no "all except closes" form; and nothing reaps it. Any of
+    /// these leaves the descriptor open forever.
+    ///
+    /// A direct close is safe in every phase: this runs when the last
+    /// reference to the descriptor is dropped, and every operation that uses it
+    /// holds a reference until its terminal completion is reaped, so no request
+    /// can still be using it. Closes queued before shutdown began are not
+    /// covered. Any other code that submits to a shutting-down ring without
+    /// waiting for the result has the same hazards.
     fn close_fd(&self, fd: types::Fd) -> Result<(), CloseFdError> {
+        if self.shutdown_outcome().is_some() || self.status() != Status::Running {
+            return Err(CloseFdError::NeverQueued(io::Error::other(
+                "driver is shutting down",
+            )));
+        }
         let entry = opcode::Close::new(fd)
             .build()
             .user_data(Driver::CLOSE_FD_TOKEN as u64);
@@ -1529,6 +1837,22 @@ impl Shared {
         self.submit(ParkMode::NoPark)
             .map_err(CloseFdError::Queued)?;
         Ok(())
+    }
+
+    /// Run deferred task work until the kernel reports none left.
+    ///
+    /// The kernel issues a linked dependent from task work once its head
+    /// completes, and an enter that waits for nothing runs a bounded batch of
+    /// that work (20 items in 6.18). Without `IORING_SETUP_TASKRUN_FLAG` one
+    /// enter is taken to have run it all, and the bounded re-cancel while
+    /// draining covers what is left.
+    fn run_all_task_work(&self) {
+        const MAX_ENTERS: usize = 64;
+        for _ in 0..MAX_ENTERS {
+            if self.run_task_work() {
+                return;
+            }
+        }
     }
 
     /// Cancel all outstanding requests synchronously.
@@ -1572,33 +1896,21 @@ impl Shared {
     }
 
     #[cfg(test)]
-    fn fail_next_drain_sentinel(&self, token: usize) {
-        assert!(matches!(
-            token,
-            Driver::OPERATIONS_DRAIN_TOKEN | Driver::RESOURCES_DRAIN_TOKEN
-        ));
-        self.shutdown_test
-            .drain_failures
-            .borrow_mut()
-            .push_back(token);
+    fn fail_next_drain_barrier(&self) {
+        let failures = &self.shutdown_test.drain_failures;
+        failures.set(failures.get() + 1);
     }
 
     #[cfg(test)]
-    fn fail_drain_sentinel(&self, token: usize) -> bool {
-        let attempts = match token {
-            Driver::OPERATIONS_DRAIN_TOKEN => &self.shutdown_test.operations_drain_attempts,
-            Driver::RESOURCES_DRAIN_TOKEN => &self.shutdown_test.resources_drain_attempts,
-            _ => unreachable!("unknown drain sentinel token"),
-        };
+    fn fail_drain_barrier(&self) -> bool {
+        let attempts = &self.shutdown_test.drain_attempts;
         attempts.set(attempts.get() + 1);
-
-        let should_fail = self.shutdown_test.drain_failures.borrow().front() == Some(&token);
-        if should_fail {
-            self.shutdown_test.drain_failures.borrow_mut().pop_front();
-            true
-        } else {
-            false
+        let failures = &self.shutdown_test.drain_failures;
+        let fail = failures.get() > 0;
+        if fail {
+            failures.set(failures.get() - 1);
         }
+        fail
     }
 
     #[cfg(test)]
@@ -1662,9 +1974,11 @@ impl Drop for Driver {
     fn drop(&mut self) {
         let outcome = self.shutdown_with_outcome();
         if outcome == ShutdownOutcome::CleanDrained {
-            // Safety: observing the IO_DRAIN sentinel proves the kernel has
-            // finished every earlier SQE. In particular, no eventfd read can
-            // still reference this buffer. Driver is dropping, so this is the
+            // Safety: a clean shutdown proves the kernel has finished every
+            // request: each counted entry reached its terminal CQE, or the
+            // fallback drain barrier completed behind them. Eventfd reads are
+            // counted and are not armed during shutdown, so none can still
+            // reference this buffer. Driver is dropping, so this is the
             // buffer's only explicit release.
             unsafe { mem::ManuallyDrop::drop(&mut self.unparker_buf) };
         }
@@ -1814,29 +2128,14 @@ mod tests {
             driver.shared.fail_next_cancel_all(libc::EIO);
             let outcome = driver.shutdown_with_outcome();
             let cancel_all_attempts = driver.shared.shutdown_test.cancel_all_attempts.get();
-            let operations_drain_attempts =
-                driver.shared.shutdown_test.operations_drain_attempts.get();
-            let resources_drain_attempts =
-                driver.shared.shutdown_test.resources_drain_attempts.get();
+            let drain_attempts = driver.shared.shutdown_test.drain_attempts.get();
             let shared_refs = Rc::strong_count(&driver.shared);
             drop(driver);
-            tx.send((
-                outcome,
-                cancel_all_attempts,
-                operations_drain_attempts,
-                resources_drain_attempts,
-                shared_refs,
-            ))
-            .unwrap();
+            tx.send((outcome, cancel_all_attempts, drain_attempts, shared_refs))
+                .unwrap();
         });
 
-        let (
-            outcome,
-            cancel_all_attempts,
-            operations_drain_attempts,
-            resources_drain_attempts,
-            shared_refs,
-        ) = rx
+        let (outcome, cancel_all_attempts, drain_attempts, shared_refs) = rx
             .recv_timeout(Duration::from_secs(2))
             .expect("shutdown did not recover from the injected cancellation failure");
         assert_eq!(outcome, ShutdownOutcome::CleanDrained);
@@ -1845,12 +2144,8 @@ mod tests {
             "a transient cancellation failure must be retried before draining"
         );
         assert_eq!(
-            operations_drain_attempts, 1,
-            "the dropped-operation async cancel must be compatible with IO_DRAIN"
-        );
-        assert_eq!(
-            resources_drain_attempts, 1,
-            "the cleanup drain barrier must succeed on its first attempt"
+            drain_attempts, 0,
+            "the in-flight count proves reclamation without a drain barrier"
         );
         assert_eq!(
             shared_refs, 1,
@@ -1904,7 +2199,7 @@ mod tests {
             .unwrap();
         });
         rx.recv_timeout(Duration::from_secs(2))
-            .expect("shutdown did not reach the drain barriers")
+            .expect("shutdown did not drain")
     }
 
     #[test]
@@ -1941,38 +2236,134 @@ mod tests {
     }
 
     #[test]
-    fn failed_drain_sentinels_retry_without_advancing_shutdown() {
+    fn broken_accounting_falls_back_to_a_drain_barrier_and_retries_it() {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let mut driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
-            driver
-                .shared
-                .fail_next_drain_sentinel(Driver::OPERATIONS_DRAIN_TOKEN);
-            driver
-                .shared
-                .fail_next_drain_sentinel(Driver::RESOURCES_DRAIN_TOKEN);
+            let handle = driver.handle();
+            let dropped = Arc::new(AtomicBool::new(false));
+            let mut read = Box::pin(long_lived_read(&handle, &dropped));
+            let waker = futures_test::task::noop_waker();
+            assert!(read
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending());
+            driver.park(ParkMode::NoPark).unwrap();
+            // As if a CQE had been lost: the count no longer proves anything.
+            driver.shared.accounting_broken.set(true);
+            driver.shared.fail_next_drain_barrier();
 
             let outcome = driver.shutdown_with_outcome();
+            let attempts = driver.shared.shutdown_test.drain_attempts.get();
+            let in_flight = driver.shared.in_flight();
+            drop(read);
+            drop(handle);
             tx.send((
                 outcome,
-                driver.shared.shutdown_test.operations_drain_attempts.get(),
-                driver.shared.shutdown_test.resources_drain_attempts.get(),
+                attempts,
+                in_flight,
+                dropped.load(Ordering::Acquire),
             ))
             .unwrap();
         });
 
-        let (outcome, operations_attempts, resources_attempts) = rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("shutdown did not retry failed drain sentinels");
+        let (outcome, attempts, in_flight, dropped) = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("shutdown did not retry a failed drain barrier");
         assert_eq!(outcome, ShutdownOutcome::CleanDrained);
+        assert_eq!(attempts, 2, "a failed barrier must be retried");
+        assert_eq!(in_flight, 0, "the cancelled read was still reaped");
+        assert!(dropped, "the read is reclaimed once its future drops");
+    }
+
+    #[test]
+    fn cancellations_are_not_queued_behind_the_drain_barrier() {
+        let mut driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let handle = driver.handle();
+        let waker = futures_test::task::noop_waker();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut read = Box::pin(long_lived_read(&handle, &dropped));
+        assert!(read
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending());
+        driver.park(ParkMode::NoPark).unwrap();
+        let in_flight = driver.shared.in_flight();
+
+        // As if the fallback barrier were queued: a cancellation behind it could
+        // not start before its target is terminal.
+        driver.shared.drain_barrier_pushed.set(true);
+        drop(read);
         assert_eq!(
-            operations_attempts, 2,
-            "a failed operations barrier must be retried"
+            driver.shared.in_flight(),
+            in_flight,
+            "no cancellation queued"
         );
+
+        // The synchronous cancel still reclaims the read.
+        driver.shared.drain_barrier_pushed.set(false);
+        drop(handle);
         assert_eq!(
-            resources_attempts, 2,
-            "a failed resources barrier must be retried"
+            driver.shutdown_with_outcome(),
+            ShutdownOutcome::CleanDrained
         );
+        assert!(dropped.load(Ordering::Acquire));
+        assert_eq!(driver.shared.in_flight(), 0);
+    }
+
+    #[test]
+    fn iopoll_rings_are_rejected() {
+        let mut builder = io_uring::IoUring::builder();
+        builder.setup_iopoll();
+        let error =
+            Driver::new(builder, 8).expect_err("an IOPOLL ring cannot run timers or sockets");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn disabled_rings_are_enabled() {
+        let mut builder = io_uring::IoUring::builder();
+        builder.setup_r_disabled();
+        let driver = Driver::new(builder, 8).unwrap();
+        let mut ex = norn_executor::LocalExecutor::new(driver);
+        ex.block_on(crate::noop());
+    }
+
+    #[test]
+    fn in_flight_counts_each_entry_until_its_terminal_completion() {
+        let mut driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let handle = driver.handle();
+        let waker = futures_test::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut read = Box::pin(long_lived_read(&handle, &dropped));
+        assert!(read.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(driver.shared.in_flight(), 1, "a queued entry is counted");
+
+        // Parking arms the eventfd read, which is counted too.
+        driver
+            .park(ParkMode::Timeout(Duration::from_millis(1)))
+            .unwrap();
+        assert_eq!(driver.shared.in_flight(), 2);
+
+        // Dropping the read queues a cancellation, a counted entry of its own.
+        drop(read);
+        assert_eq!(driver.shared.in_flight(), 3);
+        assert!(park_until(&mut driver, 100, || dropped.load(Ordering::Acquire)));
+        assert_eq!(
+            driver.shared.in_flight(),
+            1,
+            "the read and its cancellation have completed; the eventfd read remains"
+        );
+
+        drop(handle);
+        assert_eq!(
+            driver.shutdown_with_outcome(),
+            ShutdownOutcome::CleanDrained
+        );
+        assert_eq!(driver.shared.in_flight(), 0);
+        assert_eq!(driver.shared.shutdown_test.drain_attempts.get(), 0);
     }
 
     #[test]
@@ -2125,11 +2516,11 @@ mod tests {
         assert!(panic.is_err(), "the waiter panic must propagate");
         assert_eq!(driver.shared.status(), Status::Closing);
 
-        driver.shared.set_status(Status::DrainingOperations);
+        driver.shared.set_status(Status::Draining);
         assert_eq!(wake_count.get(), 1);
 
-        // This unit test transitions the status directly, without submitting
-        // the drain sentinel that would normally establish this state.
+        // This unit test transitions the status directly, without the
+        // cancellation that would normally establish this state.
         driver.shared.finish_shutdown(ShutdownOutcome::CleanDrained);
     }
 
@@ -2197,16 +2588,7 @@ mod tests {
     #[test]
     fn prepare_park_sq_full_clears_parked_state() {
         let driver = Driver::new(io_uring::IoUring::builder(), 2).unwrap();
-        let entry = io_uring::opcode::Nop::new()
-            .build()
-            .user_data(Driver::CANCELLATION_TOKEN as u64);
-
-        loop {
-            // Safety: test-only queue filling with a trivially valid NOP entry.
-            if unsafe { driver.shared.try_push_raw(&entry) }.is_err() {
-                break;
-            }
-        }
+        fill_sq(&driver);
 
         assert!(!driver.unparker.state().is_parked());
 
@@ -2412,22 +2794,12 @@ mod tests {
     }
 
     fn shutdown_waits_for_cleanup_generated_close_before_returning_isolated() {
+        // Shutdown cancels this operation and reaps it, and dropping it then
+        // closes its descriptor. That close must finish before shutdown returns.
         #[derive(Debug)]
         struct PendingFdOp {
             _fd: fd::NornFd,
             timeout: Timespec,
-            shared: Weak<Shared>,
-        }
-
-        impl Drop for PendingFdOp {
-            fn drop(&mut self) {
-                // Force the NornFd field's subsequent close submission to remain in
-                // userspace until the shutdown finalization pass retries it.
-                self.shared
-                    .upgrade()
-                    .expect("driver shared state dropped before operation cleanup")
-                    .fail_next_submit(libc::EIO);
-            }
         }
 
         // Safety: RawOp keeps the timeout storage stable until the terminal CQE.
@@ -2466,13 +2838,11 @@ mod tests {
         let duplicate_fd = spare_fds[0];
 
         let mut driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
-        let weak_shared = Rc::downgrade(&driver.shared);
         let guard = driver.enter();
         let handle = driver.handle();
         let mut op = Box::pin(handle.submit(PendingFdOp {
             _fd: fd::NornFd::from_fd(owned_fd),
             timeout: Timespec::new().sec(3_600),
-            shared: weak_shared,
         }));
         let waker = futures_test::task::noop_waker();
         let mut cx = std::task::Context::from_waker(&waker);
@@ -2485,21 +2855,10 @@ mod tests {
 
         Park::shutdown(&mut driver);
 
-        assert!(driver
-            .shared
-            .shutdown_test
-            .submit_failures
-            .borrow()
-            .is_empty());
         assert_eq!(
-            driver.shared.shutdown_test.operations_drain_attempts.get(),
-            1,
-            "the operations drain barrier must succeed on its first attempt"
-        );
-        assert_eq!(
-            driver.shared.shutdown_test.resources_drain_attempts.get(),
-            1,
-            "the cleanup-generated close must be compatible with IO_DRAIN"
+            driver.shared.shutdown_test.drain_attempts.get(),
+            0,
+            "the in-flight count proves reclamation without a drain barrier"
         );
         crate::test_util::assert_pipe_reader_closed(write_fd);
         assert_open(duplicate_fd);
@@ -2853,6 +3212,97 @@ mod tests {
         );
     }
 
+    fn shutdown_reclaims_hard_linked_read(builder: io_uring::Builder) {
+        // A hard link issues its dependent even when the head fails. Shutdown's
+        // synchronous cancel stops the head, which issues the read only
+        // afterwards, so only a later cancellation can reclaim it.
+        #[derive(Debug)]
+        struct Head {
+            timeout: Timespec,
+        }
+
+        // Safety: the timespec lives in the operation through its terminal CQE.
+        unsafe impl Operation for Head {
+            type Completion = CQEResult;
+
+            fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+                Ok(opcode::Timeout::new(&self.timeout).build())
+            }
+
+            unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+                result
+            }
+        }
+
+        impl Singleshot for Head {
+            type Output = io::Result<u32>;
+
+            fn complete(self, completion: Self::Completion) -> Self::Output {
+                completion.into_result()
+            }
+        }
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut driver = Driver::new(builder, 8).unwrap();
+            let handle = driver.handle();
+            let dropped = Arc::new(AtomicBool::new(false));
+            let mut head = Box::pin(handle.submit(Head {
+                timeout: Timespec::new().sec(3_600),
+            }));
+            let mut read = Box::pin(long_lived_read(&handle, &dropped));
+            let mut batch = SmallVec::new();
+            assert!(head.as_mut().prepare_batch(&mut batch));
+            assert!(read.as_mut().prepare_batch(&mut batch));
+            let mut batch = batch.into_iter();
+            let head_entry = batch
+                .next()
+                .unwrap()
+                .into_entry_with_flags(Flags::IO_HARDLINK);
+            let read_entry = batch.next().unwrap().into_entry_with_flags(Flags::empty());
+            // Safety: both entries come from live operations whose kernel
+            // references they carry.
+            unsafe {
+                driver.shared.try_push_raw(&head_entry).unwrap();
+                driver.shared.try_push_raw(&read_entry).unwrap();
+            }
+            head.as_mut().finish_submit();
+            read.as_mut().finish_submit();
+            driver.park(ParkMode::NoPark).unwrap();
+
+            // The operations stay alive, so only shutdown cancels them.
+            let outcome = driver.shutdown_with_outcome();
+            let attempts = driver.shared.shutdown_test.cancel_all_attempts.get();
+            let reclaimed = dropped.load(Ordering::Acquire);
+            drop((head, read));
+            tx.send((outcome, attempts, reclaimed)).unwrap();
+        });
+        let (outcome, attempts, reclaimed) = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("shutdown never reclaimed the hard-linked read");
+        assert_eq!(outcome, ShutdownOutcome::CleanDrained);
+        assert!(
+            attempts >= 2,
+            "the read is issued after the first synchronous cancel and needs another ({attempts})"
+        );
+        assert!(!reclaimed, "the operation outlives shutdown in this test");
+    }
+
+    #[test]
+    fn shutdown_recancels_a_request_issued_after_the_sync_cancel() {
+        shutdown_reclaims_hard_linked_read(io_uring::IoUring::builder());
+    }
+
+    #[test]
+    fn shutdown_recancels_a_request_issued_after_the_sync_cancel_with_defer_taskrun() {
+        let mut builder = io_uring::IoUring::builder();
+        builder
+            .setup_coop_taskrun()
+            .setup_defer_taskrun()
+            .setup_single_issuer();
+        shutdown_reclaims_hard_linked_read(builder);
+    }
+
     fn long_lived_read(handle: &Handle, dropped: &Arc<AtomicBool>) -> Op<LongLivedOp> {
         let (reader, writer) = UnixStream::pair().unwrap();
         handle.submit(LongLivedOp {
@@ -2867,11 +3317,16 @@ mod tests {
     }
 
     /// Fill the userspace SQ with NOPs whose completions the driver ignores.
+    ///
+    /// They are not counted in flight, as their completions are not.
     fn fill_sq(driver: &Driver) {
         let nop = opcode::Nop::new()
             .build()
             .user_data(Driver::CANCELLATION_TOKEN as u64);
-        while unsafe { driver.shared.try_push_raw(&nop) }.is_ok() {}
+        let mut ring = driver.shared.ring.borrow_mut();
+        let mut sq = ring.submission();
+        // Safety: the filler NOP references no memory.
+        while unsafe { sq.push(&nop) }.is_ok() {}
     }
 
     fn park_until(driver: &mut Driver, max_parks: usize, done: impl Fn() -> bool) -> bool {
@@ -3168,6 +3623,132 @@ mod tests {
             reaped, 1,
             "operation never completed after {parks} NextCompletion parks \
              (CQ overflow still pending: {overflow})"
+        );
+    }
+
+    #[test]
+    fn dropped_linked_request_is_cancelled_after_its_head_completes() {
+        // Once a link head completes, the kernel issues its dependent from task
+        // work. Under DEFER_TASKRUN that work runs only in a GETEVENTS enter,
+        // after the SQEs of that enter are issued. A cancellation queued by Drop
+        // in that window finds nothing (ENOENT) and must be retried once that
+        // work has run, or the abandoned dependent stays in flight until shutdown.
+        let mut builder = io_uring::IoUring::builder();
+        builder
+            .setup_coop_taskrun()
+            .setup_defer_taskrun()
+            .setup_single_issuer();
+        let Ok(mut driver) = Driver::new(builder, 8) else {
+            eprintln!("skipping: the kernel does not support DEFER_TASKRUN");
+            return;
+        };
+        let handle = driver.handle();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let head_reaped = Arc::new(AtomicUsize::new(0));
+        let mut chain = Box::pin(
+            handle
+                .submit(TrackedNop {
+                    reaped: Arc::clone(&head_reaped),
+                    completions_dropped: Arc::new(AtomicUsize::new(0)),
+                    operations_dropped: Arc::new(AtomicUsize::new(0)),
+                })
+                .then(long_lived_read(&handle, &dropped)),
+        );
+        let waker = futures_test::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(chain.as_mut().poll(&mut cx).is_pending());
+
+        // Submit the linked pair. The head completes inline; the dependent read
+        // is queued for issue.
+        driver.park(ParkMode::NoPark).unwrap();
+        driver.park(ParkMode::NoPark).unwrap();
+        assert_eq!(head_reaped.load(Ordering::SeqCst), 1);
+
+        // The application abandons the request, which must cancel the read.
+        drop(chain);
+        for _ in 0..20 {
+            if dropped.load(Ordering::Acquire) {
+                break;
+            }
+            driver
+                .park(ParkMode::Timeout(Duration::from_millis(5)))
+                .unwrap();
+        }
+        let released = dropped.load(Ordering::Acquire);
+        // The retry found its target, so none remains queued.
+        let retrying = !driver.shared.cancel_retries.borrow().is_empty();
+        drop(handle);
+        assert_eq!(
+            driver.shutdown_with_outcome(),
+            ShutdownOutcome::CleanDrained
+        );
+        assert!(
+            released,
+            "the abandoned linked read was still in flight after 20 parks"
+        );
+        assert!(!retrying, "a completed target must not be retried");
+    }
+
+    #[test]
+    fn dropped_link_before_head_cqe_is_reaped_is_cancelled_without_an_unrelated_wake() {
+        // Drop the chain after its head completed in the kernel but before the
+        // driver reaped the head's CQE, then park with a long timeout as an
+        // idle executor would. The retry must not wait for some other wake.
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut builder = io_uring::IoUring::builder();
+            builder
+                .setup_coop_taskrun()
+                .setup_defer_taskrun()
+                .setup_single_issuer();
+            let Ok(mut driver) = Driver::new(builder, 8) else {
+                eprintln!("skipping: the kernel does not support DEFER_TASKRUN");
+                tx.send(None).unwrap();
+                return;
+            };
+            let handle = driver.handle();
+            let dropped = Arc::new(AtomicBool::new(false));
+            let mut chain = Box::pin(
+                handle
+                    .submit(TrackedNop {
+                        reaped: Arc::new(AtomicUsize::new(0)),
+                        completions_dropped: Arc::new(AtomicUsize::new(0)),
+                        operations_dropped: Arc::new(AtomicUsize::new(0)),
+                    })
+                    .then(long_lived_read(&handle, &dropped)),
+            );
+            let waker = futures_test::task::noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            assert!(chain.as_mut().poll(&mut cx).is_pending());
+            // Submit the pair. The NOP head completes inline; its CQE is not
+            // reaped yet.
+            driver.park(ParkMode::NoPark).unwrap();
+            drop(chain);
+            let start = std::time::Instant::now();
+            let mut parks = 0;
+            while !dropped.load(Ordering::Acquire) && parks < 10 {
+                driver
+                    .park(ParkMode::Timeout(Duration::from_secs(2)))
+                    .unwrap();
+                parks += 1;
+            }
+            tx.send(Some((
+                dropped.load(Ordering::Acquire),
+                start.elapsed(),
+                parks,
+            )))
+            .unwrap();
+            drop(handle);
+            let _ = driver.shutdown_with_outcome();
+        });
+        let Some((released, elapsed, parks)) = rx.recv_timeout(Duration::from_secs(30)).unwrap()
+        else {
+            return;
+        };
+        assert!(released, "the abandoned linked read was never released");
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "released only after {elapsed:?} ({parks} parks): the retry waited for an unrelated wake"
         );
     }
 }

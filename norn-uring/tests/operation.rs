@@ -140,7 +140,7 @@ fn skipped_success_completions_are_rejected_and_shutdown_completes() {
                 .await
         });
         // A skipped success CQE would leave the operation in flight forever,
-        // and would disable the IO_DRAIN barriers that shutdown waits on.
+        // so shutdown, which waits for every terminal CQE, would never finish.
         drop(ex);
         done.send(output).unwrap();
     });

@@ -61,7 +61,13 @@ The project is intentionally not general-purpose today; APIs are still in flux i
 ### `norn-uring` model
 
 - `Driver` owns ring + backpressure notifier + status (`Running`, `Closing`,
-  `DrainingOperations`, `ClosingResources`, `DrainingResources`, `Shutdown`).
+  `Draining`, `Shutdown`).
+- `Shared::in_flight` counts pushed entries (operations, cancellations, the
+  eventfd read, closes) until their terminal CQE is dispatched. Every new
+  internal SQE must post exactly one terminal CQE and be pushed through a
+  counting helper; only the fallback drain barrier is uncounted.
+- `Driver::new` rejects `IORING_SETUP_IOPOLL` and kernels without
+  `IORING_FEAT_EXT_ARG`, and enables `IORING_SETUP_R_DISABLED` rings.
 - Submission queue pressure is handled by `PushFuture` waiting on `Notify`.
 - Driver park loop drains the CQ before parking, loops on `EINTR`, and treats
   `EBUSY`, `EAGAIN` and `ENOMEM` from `io_uring_enter` as transient: drain and
@@ -78,7 +84,11 @@ The project is intentionally not general-purpose today; APIs are still in flux i
   by building with the flag first; builders without `COOP_TASKRUN` or
   `DEFER_TASKRUN` (including the default) or with SQPOLL get `EINVAL` from
   that one extra `io_uring_setup` and are then built as configured.
-- `Driver::drop` calls `Park::shutdown`; shutdown path uses cancellation + IO_DRAIN token.
+- `Driver::drop` calls `Park::shutdown`. Shutdown stops admitting work, runs
+  task work, cancels synchronously, then reaps until `in_flight` is zero,
+  re-cancelling after each idle wait. If the count cannot be trusted (it
+  wrapped, or the kernel dropped CQEs), it waits on one `IO_DRAIN` barrier
+  instead and queues no cancellation behind it.
 - Special CQE user_data tokens are reserved (`<= 1024`).
 
 ### `norn-uring` operation lifecycle
@@ -87,6 +97,11 @@ The project is intentionally not general-purpose today; APIs are still in flux i
   - `Unsubmitted` (waiting for SQ space),
   - `Submitted` (awaiting completions).
 - Dropping submitted `Op` attempts cancellation (`cancel(user_data)`).
+  Cancellations that report ENOENT are not retried, except once for a later
+  member of a linked batch: the kernel issues it from task work after its
+  predecessor completes, so a drop can race ahead of that issue. ENOENT also
+  means "issued but not cancellable" (e.g. a zero-copy send awaiting its
+  notification), so unbounded retries would spin the driver.
 - `Operation::reap` converts each kernel or synthetic completion into an owned
   value; dropping an unconsumed value releases any resources represented by it.
 - Submission failures (including a driver that stopped accepting work) are
