@@ -9,7 +9,7 @@ use std::{io, mem};
 
 use io_uring::squeue::{Flags, PushError};
 use io_uring::types::{self, CancelBuilder, SubmitArgs, Timespec};
-use io_uring::{cqueue, opcode, IoUring, Submitter};
+use io_uring::{cqueue, opcode, EnterFlags, IoUring, Submitter};
 use log::{debug, trace, warn};
 use norn_executor::park::{Park, ParkMode};
 use smallvec::SmallVec;
@@ -43,7 +43,8 @@ const COMPLETION_DRAIN_BATCH: usize = 32;
 
 const DEFAULT_COMPLETION_DRAIN_BUDGET: NonZeroUsize = NonZeroUsize::new(32).unwrap();
 
-/// Maximum time each shutdown cancellation attempt waits for the kernel.
+/// Maximum time each shutdown cancellation attempt, and each wait on the
+/// operations drain barrier, waits for the kernel.
 ///
 /// `IORING_REGISTER_SYNC_CANCEL` accepts a timeout, so teardown can retry without
 /// entering one unbounded syscall when a request cannot be cancelled.
@@ -80,6 +81,9 @@ impl Default for DriverOptions {
 /// Shutdown stops accepting new requests, cancels outstanding work, and waits
 /// for every kernel-owned operation to reach a terminal completion. Teardown
 /// retries unclassified cancellation errors and submission errors indefinitely.
+/// While it waits, it cancels again after every bounded wait that completes
+/// nothing, so a request that the kernel issues only after the first
+/// cancellation, such as a linked dependent, is reclaimed too.
 /// Kernels without synchronous cancellation proceed directly to the drain
 /// barriers, which can still block forever behind an operation that cannot
 /// complete without cancellation.
@@ -1049,6 +1053,10 @@ impl Driver {
                     if self.shared.has_deferred_cancels() {
                         continue;
                     }
+                    // Issue linked dependents whose heads have already completed, so
+                    // the synchronous cancel can find them. Under DEFER_TASKRUN only a
+                    // GETEVENTS enter runs that task work.
+                    self.shared.run_task_work();
 
                     if let Err(err) = self.shared.cancel_all() {
                         if Self::sync_cancel_unsupported(&err) {
@@ -1074,10 +1082,26 @@ impl Driver {
                     }
                 }
                 Status::DrainingOperations => {
-                    if let Err(err) =
-                        self.park_with_completion_budget(ParkMode::NextCompletion, None)
-                    {
+                    if self.drain_exhaustive() > 0 {
+                        continue;
+                    }
+                    // A head can still complete after the synchronous cancel, and its
+                    // linked dependent is issued only then. An unbounded wait would
+                    // leave the barrier stuck behind that request, so wait for a
+                    // bounded time and cancel again if nothing completed.
+                    if let Err(err) = self.park_with_completion_budget(
+                        ParkMode::Timeout(SHUTDOWN_CANCEL_TIMEOUT),
+                        None,
+                    ) {
                         self.retry_shutdown("park", &err);
+                        continue;
+                    }
+                    if self.drain_exhaustive() == 0
+                        && self.shared.status() == Status::DrainingOperations
+                    {
+                        if let Err(err) = self.shared.cancel_all() {
+                            trace!(target: LOG, "shutdown.recancel {err:?}");
+                        }
                     }
                 }
                 Status::ClosingResources => {
@@ -1685,6 +1709,23 @@ impl Shared {
         self.submit(ParkMode::NoPark)
             .map_err(CloseFdError::Queued)?;
         Ok(())
+    }
+
+    /// Run deferred task work without waiting for a completion.
+    ///
+    /// The kernel issues a linked dependent from task work once its head
+    /// completes. Under `DEFER_TASKRUN` that work runs only in an enter with
+    /// `GETEVENTS`; the completions it posts are reaped by later drains.
+    fn run_task_work(&self) {
+        let ring = self.ring.borrow();
+        // Safety: no extended argument is passed, and no entries are submitted.
+        let result = unsafe {
+            ring.submitter()
+                .enter::<libc::sigset_t>(0, 0, EnterFlags::GETEVENTS.bits(), None)
+        };
+        if let Err(err) = result {
+            trace!(target: LOG, "shutdown.run_task_work {err:?}");
+        }
     }
 
     /// Cancel all outstanding requests synchronously.
