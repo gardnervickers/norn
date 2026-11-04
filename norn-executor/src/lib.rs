@@ -127,7 +127,7 @@ impl<P: park::Park> LocalExecutor<P> {
     /// ### Panics
     /// Panics if [`park::Park::park`] returns an error, or if an executor is
     /// already running on this thread: `block_on` and [`try_block_on`] cannot
-    /// be nested, including from inside a spawned task. Over a timer or io_uring
+    /// be nested, including from inside a spawned task. Over a timer or `io_uring`
     /// park the panic comes from that driver, which is entered first, and says
     /// "driver" rather than "executor".
     ///
