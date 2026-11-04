@@ -138,7 +138,7 @@ impl Future for Notified<'_> {
         match entry.state.get() {
             State::Unregistered => {
                 entry.state.set(State::Linked);
-                entry.waker.borrow_mut().replace(cx.waker().clone());
+                entry.set_waker(cx.waker());
                 let ptr = unsafe {
                     let entry = Pin::into_inner_unchecked(entry);
                     ptr::NonNull::from(entry)
@@ -148,7 +148,7 @@ impl Future for Notified<'_> {
                 Poll::Pending
             }
             State::Linked => {
-                entry.waker.borrow_mut().replace(cx.waker().clone());
+                entry.set_waker(cx.waker());
                 Poll::Pending
             }
             State::Fired => {
@@ -191,6 +191,24 @@ impl Entry {
     fn fire(&self) -> Option<Waker> {
         self.state.set(State::Fired);
         self.waker.borrow_mut().take()
+    }
+
+    /// Store `waker` unless the stored one already wakes the same task.
+    fn set_waker(&self, waker: &Waker) {
+        if self
+            .waker
+            .borrow()
+            .as_ref()
+            .is_some_and(|stored| stored.will_wake(waker))
+        {
+            return;
+        }
+        let new = waker.clone();
+        // Dropping a waker runs arbitrary code that may re-enter this Notify
+        // and fire this entry, so release the borrow before dropping the old
+        // one.
+        let old = self.waker.borrow_mut().replace(new);
+        drop(old);
     }
 }
 
@@ -274,6 +292,58 @@ mod tests {
         assert!(notified.as_mut().poll(&mut cx).is_ready());
         // The notified should be unregistered now.
         assert_eq!(notify.waiters(), 0);
+    }
+
+    struct NotifyOnDrop {
+        notify: *const Notify,
+    }
+
+    // Safety: this test waker is only dropped synchronously on the thread that
+    // owns `notify`, which outlives it.
+    unsafe impl Send for NotifyOnDrop {}
+    unsafe impl Sync for NotifyOnDrop {}
+
+    impl Wake for NotifyOnDrop {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    impl Drop for NotifyOnDrop {
+        fn drop(&mut self) {
+            unsafe { (*self.notify).notify(1) };
+        }
+    }
+
+    #[test]
+    fn replaced_waiter_waker_is_dropped_outside_the_waker_borrow() {
+        let notify = Notify::default();
+        let old_waker = Waker::from(Arc::new(NotifyOnDrop { notify: &notify }));
+        let (new_waker, count) = futures_test::task::new_count_waker();
+        let mut old_cx = Context::from_waker(&old_waker);
+        let mut new_cx = Context::from_waker(&new_waker);
+        let mut notified = pin!(notify.wait());
+
+        assert!(notified.as_mut().poll(&mut old_cx).is_pending());
+        drop(old_cx);
+        drop(old_waker);
+        // Replacing the waker drops the old one, which fires this same entry.
+        assert!(notified.as_mut().poll(&mut new_cx).is_pending());
+
+        assert_eq!(count, 1);
+        assert!(notified.as_mut().poll(&mut new_cx).is_ready());
+    }
+
+    #[test]
+    fn polling_with_the_same_waker_keeps_the_registration() {
+        let notify = Notify::default();
+        let (waker, count) = futures_test::task::new_count_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut notified = pin!(notify.wait());
+
+        assert!(notified.as_mut().poll(&mut cx).is_pending());
+        assert!(notified.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(notify.waiters(), 1);
+        assert_eq!(notify.notify(1), 1);
+        assert_eq!(count, 1);
     }
 
     #[test]
