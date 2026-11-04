@@ -2431,9 +2431,9 @@ mod tests {
             assert_ne!(unsafe { libc::fcntl(raw_fd, libc::F_GETFD) }, -1);
         }
 
-        // `owned_fd` is the only read end of its pipe, so observing its writer
-        // fail with POLLERR shows the driver closed it. Probing the closed
-        // descriptor number would race with other tests reusing that number.
+        // Observing the writer checks the pipe the driver closed, not the
+        // descriptor number. The number is safe to probe only because this test
+        // runs isolated, which the dup2 below also relies on.
         let pipe_fds = crate::test_util::pipe_cloexec();
         let owned_fd = pipe_fds[0];
         let write_fd = pipe_fds[1];
@@ -2756,12 +2756,7 @@ mod tests {
             // submit failure and reach the kernel on the next park.
             // Closure is observed through the pipe's write end rather than by
             // probing `raw_fd`, which a concurrent test could have reused.
-            let mut pipe_fds = [0; 2];
-            assert_eq!(
-                unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) },
-                0
-            );
-            let [raw_fd, write_end] = pipe_fds;
+            let [raw_fd, write_end] = crate::test_util::pipe_cloexec();
             driver.shared.fail_next_submit(errno);
             let result = driver.shared.close_fd(types::Fd(raw_fd));
             assert!(matches!(result, Err(CloseFdError::Queued(_))));
