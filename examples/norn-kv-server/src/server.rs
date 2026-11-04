@@ -5,7 +5,7 @@ use std::io;
 use std::pin::pin;
 use std::rc::Rc;
 
-use futures_util::{FutureExt, StreamExt};
+use futures_util::{FutureExt, Stream, StreamExt};
 use norn_executor::spawn;
 use norn_uring::buf::{BufCursor, StableBuf, StableBufMut};
 use norn_uring::bufring::{BufRingBuf, RecvBufRing};
@@ -209,52 +209,69 @@ async fn serve_connection_multishot(
 
     loop {
         response.clear();
-        let mut commands = 0;
-        let mut close = false;
+        let outcome =
+            fill_batch(&mut incoming, &handler, config, &mut pending, &mut response).await;
 
-        if !pending.is_empty() {
-            close = process_pending(&handler, config, &mut pending, &mut response, &mut commands)?;
-        }
-
-        for selected_count in 0..MAX_READY_RECEIVES_PER_BATCH {
-            if close || batch_full(config, commands, response.len()) {
-                break;
-            }
-
-            let next = if selected_count == 0 && commands == 0 {
-                incoming.next().await
-            } else {
-                let Some(next) = incoming.next().now_or_never() else {
-                    break;
-                };
-                next
-            };
-            let Some(next) = next else {
-                if pending.is_empty() {
-                    close = true;
-                } else {
-                    return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
-                }
-                break;
-            };
-            close = process_selected_buffer(
-                next?,
-                &handler,
-                config,
-                &mut pending,
-                &mut response,
-                &mut commands,
-            )?;
-        }
-
+        // Replies already in the batch belong to requests that were executed.
+        // Send them before acting on a close or a fatal protocol error, so a
+        // rejected or truncated frame does not discard earlier replies.
         if !response.is_empty() {
             response = send_all(&socket, response).await?;
         }
-        if close {
+        if !matches!(outcome, Ok(false)) {
             drop(incoming);
-            return Ok(());
+            return outcome.map(drop);
         }
     }
+}
+
+/// Execute one batch of buffered and newly received frames.
+///
+/// Replies are appended to `response`. Returns whether the connection should
+/// close after the batch. On error, `response` still holds the replies of the
+/// frames executed before the failure, and the caller sends them before
+/// failing the connection.
+async fn fill_batch<S>(
+    incoming: &mut S,
+    handler: &MemoryHandler,
+    config: ServerConfig,
+    pending: &mut Vec<u8>,
+    response: &mut Vec<u8>,
+) -> io::Result<bool>
+where
+    S: Stream<Item = io::Result<BufRingBuf>> + Unpin,
+{
+    let mut commands = 0;
+    let mut close = false;
+
+    if !pending.is_empty() {
+        close = process_pending(handler, config, pending, response, &mut commands)?;
+    }
+
+    for selected_count in 0..MAX_READY_RECEIVES_PER_BATCH {
+        if close || batch_full(config, commands, response.len()) {
+            break;
+        }
+
+        let next = if selected_count == 0 && commands == 0 {
+            incoming.next().await
+        } else {
+            let Some(next) = incoming.next().now_or_never() else {
+                break;
+            };
+            next
+        };
+        let Some(next) = next else {
+            if pending.is_empty() {
+                close = true;
+            } else {
+                return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+            }
+            break;
+        };
+        close = process_selected_buffer(next?, handler, config, pending, response, &mut commands)?;
+    }
+    Ok(close)
 }
 
 fn process_selected_buffer(
