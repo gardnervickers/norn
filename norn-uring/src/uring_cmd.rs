@@ -207,8 +207,7 @@ mod tests {
 
     #[test]
     fn configures_uring_command_opcode() {
-        let mut fds: [RawFd; 2] = [0; 2];
-        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let fds: [RawFd; 2] = crate::test_util::pipe_cloexec();
         let mut operation = CommandOp::new(NornFd::from_fd(fds[0]), TestCommand);
 
         let entry = operation.configure().unwrap();
