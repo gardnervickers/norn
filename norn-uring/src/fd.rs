@@ -155,11 +155,13 @@ impl NornFd {
             ));
         }
         if let Some(handle) = &self.inner.handle {
-            // The flag describes only the close submitted below. A close future
-            // dropped earlier already had its `CloseFd` released (that is what
-            // the sole-ownership check above establishes), so a stale flag would
-            // make a genuine -ECANCELED from this close look runtime-cancelled
-            // and trigger a close by fd number.
+            // The flag describes only the close submitted below. A submitted
+            // close that is dropped is still reaped, which sets `closed`. The
+            // flag goes stale when the future is dropped before its entry
+            // reaches the SQ (while the push waits for space): the guard below
+            // set it, nothing was submitted, and the descriptor is still open.
+            // A genuine -ECANCELED from a later close would then look
+            // runtime-cancelled and trigger a close by fd number.
             self.inner.close_canceled.set(false);
             // Dropping this future before completion cancels a submitted close.
             // Record that before its terminal CQE can be reaped.
@@ -577,7 +579,8 @@ mod tests {
         let driver = crate::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
         let [read_end, write_end] = pipe();
         let fd = NornFd::from_fd_on(read_end, driver.handle());
-        // Model an earlier close future that was dropped after being submitted.
+        // Model an earlier close future dropped before its entry reached the SQ:
+        // its guard set the flag, nothing was submitted, the descriptor is open.
         fd.inner.close_canceled.set(true);
         let inner = Rc::downgrade(&fd.inner);
 
