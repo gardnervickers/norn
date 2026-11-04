@@ -16,6 +16,9 @@ use crate::net::socket::{self, Event, RecvMsgRingBuf, SendZcResult};
 ///
 /// After creating a `UdpSocket` by [`UdpSocket::bind`]ing it to a socket address, data can be
 /// [sent to] and [received from] any other socket address.
+///
+/// Dropping a pending receive may lose a datagram the kernel already
+/// delivered into it. See [Cancellation](crate#cancellation).
 pub struct UdpSocket {
     inner: socket::Socket,
 }

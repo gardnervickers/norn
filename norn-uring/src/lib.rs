@@ -10,6 +10,17 @@
 //! them and return those buffers with the completion result. See [`buf`] for
 //! the stable-address contracts that make this safe.
 //!
+//! # Cancellation
+//!
+//! Dropping a pending operation cancels it and discards its outcome. Because
+//! `io_uring` cancellation races with completion, that outcome may already
+//! exist: a receive may have consumed data, a send or write may have
+//! transferred bytes, and an accept may have created a connection, which is
+//! then closed. Completion-based methods are therefore not cancellation safe,
+//! for example inside a `select!` branch. Use [`Request::cancel`] to cancel and
+//! still learn what the operation did. [`net::TcpStream`] implements
+//! `AsyncRead` and `AsyncWrite` with readiness polling, and is safe to drop.
+//!
 //! # Example
 //!
 //! ```no_run
@@ -94,7 +105,7 @@ pub use driver::{Driver, DriverOptions, Handle};
 pub use fd::UringFd;
 pub use operation::{CQEResult, Multishot, Op, Operation, Singleshot};
 pub use request::{
-    LinkedTimeoutControl, Map, Request, Then, ThenAux, Timeout, TimeoutControl, TimeoutOutcome,
-    TimeoutRemove, TimeoutUpdate, WithTimeout,
+    Cancel, LinkedTimeoutControl, Map, Request, Then, ThenAux, Timeout, TimeoutControl,
+    TimeoutOutcome, TimeoutRemove, TimeoutUpdate, WithTimeout,
 };
 pub use util::noop;

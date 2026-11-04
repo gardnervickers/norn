@@ -8,6 +8,8 @@ pub(crate) enum SubmitError {
     Broken(#[source] io::Error),
     #[error("request batch of {batch_len} SQEs exceeds submission queue capacity {capacity}")]
     BatchTooLarge { batch_len: usize, capacity: usize },
+    #[error("request cancelled before it reached the kernel")]
+    Cancelled,
 }
 
 impl SubmitError {
@@ -17,6 +19,10 @@ impl SubmitError {
 
     pub(crate) fn broken(err: io::Error) -> Self {
         Self::Broken(err)
+    }
+
+    pub(crate) fn cancelled() -> Self {
+        Self::Cancelled
     }
 
     pub(crate) fn batch_too_large(batch_len: usize, capacity: usize) -> Self {
@@ -41,6 +47,8 @@ impl SubmitError {
                     "request batch of {batch_len} SQEs exceeds submission queue capacity {capacity}"
                 ),
             ),
+            // The same error the kernel reports for a cancelled operation.
+            Self::Cancelled => io::Error::from_raw_os_error(libc::ECANCELED),
         }
     }
 }
@@ -61,6 +69,7 @@ impl From<SubmitError> for io::Error {
                     "request batch of {batch_len} SQEs exceeds submission queue capacity {capacity}"
                 ),
             ),
+            SubmitError::Cancelled => io::Error::from_raw_os_error(libc::ECANCELED),
         }
     }
 }

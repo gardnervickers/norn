@@ -237,13 +237,7 @@ pin_project_lite::pin_project! {
         fn drop(me: Pin<&mut Self>) {
             let this = me.project();
             match this.state {
-                State::Submitted { inner } => {
-                    if inner.needs_cancel() {
-                        this.reactor.cancel_op(OpTarget {
-                            handle: inner.inner.inner.clone(),
-                        });
-                    }
-                }
+                State::Submitted { inner } => inner.cancel(this.reactor),
                 State::Prepared { .. } | State::Waiting { .. } | State::Done => {}
             }
         }
@@ -408,6 +402,30 @@ where
     pub(crate) fn fail_submit(mut self: Pin<&mut Self>, err: &SubmitError) {
         let this = self.as_mut().project();
         this.state.fail_submit(err);
+    }
+
+    /// Request cancellation while keeping the operation's outcome.
+    ///
+    /// An operation that has not reached the SQ completes with `ECANCELED`
+    /// without being submitted. A submitted one is cancelled asynchronously and
+    /// completes with whatever the kernel reports, which may be success if the
+    /// operation finished first. A linked batch that holds this operation's
+    /// entry cancels it through [`Op::fail_submit`] instead.
+    pub(crate) fn request_cancel(mut self: Pin<&mut Self>) {
+        let mut this = self.as_mut().project();
+        if this.submit.is_some() {
+            // Dropping the push future drops the entry before the kernel sees it.
+            this.submit.set(None);
+            this.state.fail_submit(&SubmitError::cancelled());
+            return;
+        }
+        match this.state {
+            State::Prepared { .. } => {
+                this.state.cancel_unsubmitted();
+            }
+            State::Submitted { inner } => inner.cancel(this.reactor),
+            State::Waiting { .. } | State::Done => {}
+        }
     }
 
     fn poll_submit(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
@@ -591,6 +609,15 @@ impl<T> SubmittedOp<T> {
         // before a queued cancellation reaches the kernel.
         !self.inner.inner.is_complete()
     }
+
+    /// Queue cancellation of the operation once, unless it is already terminal.
+    fn cancel(&self, reactor: &crate::Handle) {
+        if self.needs_cancel() && self.inner.inner.header().request_cancel() {
+            reactor.cancel_op(OpTarget {
+                handle: self.inner.inner.clone(),
+            });
+        }
+    }
 }
 
 impl<T> SubmittedOp<T>
@@ -679,6 +706,17 @@ mod tests {
         fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
             unimplemented!()
         }
+    }
+
+    #[test]
+    fn cancellation_is_requested_once_per_operation() {
+        let op = TypedHandle::new(TestOp::default());
+        let header = op.inner.header();
+        assert!(header.request_cancel(), "the first request cancels");
+        assert!(
+            !header.request_cancel(),
+            "later requests must not cancel again"
+        );
     }
 
     #[test]

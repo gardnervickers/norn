@@ -13,6 +13,7 @@ pub(crate) struct Header {
     refcount: Cell<usize>,
     waker: RefCell<Option<Waker>>,
     complete: Cell<bool>,
+    cancel_requested: Cell<bool>,
     pub(crate) vtable: &'static VTable,
 }
 
@@ -60,6 +61,7 @@ impl Header {
             refcount: Cell::new(1),
             waker: Default::default(),
             complete: Cell::new(false),
+            cancel_requested: Cell::new(false),
             vtable,
         }
     }
@@ -97,6 +99,14 @@ impl Header {
     /// must have returned false for it.
     pub(crate) unsafe fn set_complete(&self) {
         self.complete.set(true);
+    }
+
+    /// Record that cancellation of this operation was requested.
+    ///
+    /// Returns true only for the first request, so each operation is cancelled
+    /// at most once whether it is dropped, cancelled explicitly, or both.
+    pub(crate) fn request_cancel(&self) -> bool {
+        !self.cancel_requested.replace(true)
     }
 
     /// Take the waker from the header.

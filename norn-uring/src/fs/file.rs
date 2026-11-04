@@ -12,6 +12,9 @@ use crate::fs::opts;
 use crate::operation::{CQEResult, Operation, Singleshot};
 
 /// A reference to an open file on the filesystem.
+///
+/// Dropping a pending write may still leave its data written. See
+/// [Cancellation](crate#cancellation).
 pub struct File {
     fd: UringFd,
 }

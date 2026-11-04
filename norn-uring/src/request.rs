@@ -34,6 +34,9 @@ mod private {
         fn cancel_unsubmitted(self: Pin<&mut Self>);
         fn finish_submit(self: Pin<&mut Self>);
         fn fail_submit(self: Pin<&mut Self>, err: &SubmitError);
+        /// Request cancellation of every operation that has not completed,
+        /// without discarding any outcome.
+        fn request_cancel(self: Pin<&mut Self>);
     }
 }
 
@@ -87,9 +90,106 @@ pub trait Request: Future + Sized + private::Chainable {
     fn timeout(self, duration: Duration) -> WithTimeout<Self> {
         WithTimeout::new(self, duration)
     }
+
+    /// Cancel this request and wait for its outcome.
+    ///
+    /// Dropping a request also cancels it, but throws away whatever it already
+    /// did. Cancellation races with completion, so a dropped receive may have
+    /// consumed data, a dropped send may have transferred bytes, and a dropped
+    /// accept may have created a connection. `cancel` instead requests
+    /// cancellation of every operation in the request that has not completed,
+    /// then resolves to the request's normal output, which reports what each
+    /// operation actually did:
+    ///
+    /// - an operation that never reached the kernel completes with `ECANCELED`;
+    /// - an operation the kernel stops completes with `ECANCELED`;
+    /// - an operation that finished first keeps its result.
+    ///
+    /// A few operations cannot be stopped once started, such as a zero-copy
+    /// send waiting for its notification. `cancel` then resolves when they
+    /// finish.
+    ///
+    /// ```no_run
+    /// use std::future::Future;
+    /// use std::pin::pin;
+    /// use std::task::Poll;
+    /// use std::time::Duration;
+    ///
+    /// use norn_uring::net::TcpSocket;
+    /// use norn_uring::{Handle, Request};
+    ///
+    /// # async fn example(socket: &TcpSocket) -> std::io::Result<()> {
+    /// let mut recv = pin!(socket.recv(vec![0; 4096]));
+    /// let mut deadline = pin!(Handle::current().timeout(Duration::from_secs(1)));
+    /// let raced = std::future::poll_fn(|cx| {
+    ///     if let Poll::Ready(output) = recv.as_mut().poll(cx) {
+    ///         return Poll::Ready(Some(output));
+    ///     }
+    ///     deadline.as_mut().poll(cx).map(|_| None)
+    /// })
+    /// .await;
+    /// // On timeout, cancel, and still get any bytes that arrived first.
+    /// let (received, buffer) = match raced {
+    ///     Some(output) => output,
+    ///     None => recv.cancel().await,
+    /// };
+    /// # let _ = (received, buffer);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// The returned future panics when polled if the request has already
+    /// completed.
+    fn cancel(self: Pin<&mut Self>) -> Cancel<'_, Self> {
+        Cancel {
+            request: self,
+            requested: false,
+        }
+    }
 }
 
 impl<T> Request for T where T: Future + Sized + private::Chainable {}
+
+/// A future that cancels a request and resolves to its outcome.
+///
+/// Returned by [`Request::cancel`].
+#[must_use = "futures do nothing unless you `.await` or poll them"]
+pub struct Cancel<'a, R>
+where
+    R: Request,
+{
+    request: Pin<&'a mut R>,
+    requested: bool,
+}
+
+impl<R> std::fmt::Debug for Cancel<'_, R>
+where
+    R: Request,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Cancel")
+            .field("requested", &self.requested)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<R> Future for Cancel<'_, R>
+where
+    R: Request,
+{
+    type Output = R::Output;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = &mut *self;
+        if !this.requested {
+            this.requested = true;
+            this.request.as_mut().request_cancel();
+        }
+        this.request.as_mut().poll(cx)
+    }
+}
 
 pin_project_lite::pin_project! {
     /// A linked request that yields both inner results.
@@ -483,6 +583,10 @@ where
     fn fail_submit(self: Pin<&mut Self>, err: &SubmitError) {
         Op::fail_submit(self, err);
     }
+
+    fn request_cancel(self: Pin<&mut Self>) {
+        Op::request_cancel(self);
+    }
 }
 
 impl<A, B> private::Chainable for Then<A, B>
@@ -573,6 +677,32 @@ where
         left.as_mut().fail_submit(err);
         right.as_mut().fail_submit(err);
         *submitted = true;
+    }
+
+    fn request_cancel(self: Pin<&mut Self>) {
+        let this = self.project();
+        let ThenStateProj::Pending {
+            mut left,
+            mut right,
+            mut submit,
+            left_output,
+            right_output,
+            submitted,
+        } = this.state.project()
+        else {
+            return;
+        };
+        if !*submitted {
+            cancel_unsubmitted_pair(left.as_mut(), right.as_mut(), submit.as_mut());
+            *submitted = true;
+            return;
+        }
+        if left_output.is_none() {
+            left.as_mut().request_cancel();
+        }
+        if right_output.is_none() {
+            right.as_mut().request_cancel();
+        }
     }
 }
 
@@ -665,6 +795,56 @@ where
         right.as_mut().fail_submit(err);
         *submitted = true;
     }
+
+    fn request_cancel(self: Pin<&mut Self>) {
+        let this = self.project();
+        let ThenAuxStateProj::Pending {
+            mut left,
+            mut right,
+            mut submit,
+            left_output,
+            right_done,
+            submitted,
+        } = this.state.project()
+        else {
+            return;
+        };
+        if !*submitted {
+            cancel_unsubmitted_pair(left.as_mut(), right.as_mut(), submit.as_mut());
+            *submitted = true;
+            return;
+        }
+        if left_output.is_none() {
+            left.as_mut().request_cancel();
+        }
+        if !*right_done {
+            right.as_mut().request_cancel();
+        }
+    }
+}
+
+/// Cancel both halves of a linked pair that has not been submitted.
+///
+/// A batch waiting for SQ space is dropped with its entries, so neither half
+/// reaches the kernel. Halves that were never prepared complete as cancelled
+/// without being configured.
+fn cancel_unsubmitted_pair<A, B>(
+    mut left: Pin<&mut A>,
+    mut right: Pin<&mut B>,
+    mut submit: Pin<&mut Option<PushBatchFuture>>,
+) where
+    A: Request,
+    B: Request,
+{
+    if submit.is_some() {
+        submit.set(None);
+        let err = SubmitError::cancelled();
+        left.as_mut().fail_submit(&err);
+        right.as_mut().fail_submit(&err);
+    } else {
+        left.as_mut().cancel_unsubmitted();
+        right.as_mut().cancel_unsubmitted();
+    }
 }
 
 impl<R, F, U> private::Chainable for Map<R, F>
@@ -694,6 +874,10 @@ where
 
     fn fail_submit(self: Pin<&mut Self>, err: &SubmitError) {
         self.project().inner.fail_submit(err);
+    }
+
+    fn request_cancel(self: Pin<&mut Self>) {
+        self.project().inner.request_cancel();
     }
 }
 

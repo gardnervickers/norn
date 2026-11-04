@@ -45,6 +45,11 @@ pub struct TcpListenerOptions {
 /// [`TcpSocket::into_stream`].
 /// [`TcpStream`] is a stateful wrapper around [`TcpSocket`] that implements
 /// [`AsyncRead`](tokio::io::AsyncRead) and [`AsyncWrite`](tokio::io::AsyncWrite).
+///
+/// Sends and receives are completion-based: dropping one that is pending may
+/// lose received data or hide bytes already sent. Use
+/// [`Request::cancel`](crate::Request::cancel) to abandon one safely. See
+/// [Cancellation](crate#cancellation).
 pub struct TcpSocket {
     socket: socket::Socket,
 }

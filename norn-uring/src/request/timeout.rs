@@ -377,6 +377,15 @@ impl private::Chainable for Timeout {
             }
         }
     }
+
+    fn request_cancel(self: Pin<&mut Self>) {
+        let this = self.project();
+        match this.control.target.state.lifecycle.get() {
+            TimeoutLifecycle::Prepared => this.control.target.state.mark_canceled_before_submit(),
+            TimeoutLifecycle::Queued | TimeoutLifecycle::Submitted => this.inner.request_cancel(),
+            TimeoutLifecycle::CanceledBeforeSubmit | TimeoutLifecycle::Complete => {}
+        }
+    }
 }
 
 impl crate::Handle {
@@ -546,6 +555,10 @@ impl private::Chainable for LinkedTimeout {
             }
         }
     }
+
+    fn request_cancel(self: Pin<&mut Self>) {
+        self.project().inner.request_cancel();
+    }
 }
 
 #[derive(Debug)]
@@ -618,6 +631,18 @@ where
     /// Return a controller that can reset this request's linked deadline.
     pub fn control(&self) -> LinkedTimeoutControl {
         self.control.clone()
+    }
+
+    /// Cancel the request and its deadline, and wait for the request's outcome.
+    ///
+    /// See [`Request::cancel`].
+    ///
+    /// # Panics
+    ///
+    /// The returned future panics when polled if the request has already
+    /// completed.
+    pub fn cancel(self: Pin<&mut Self>) -> impl Future<Output = R::Output> + '_ {
+        Request::cancel(self.project().inner)
     }
 }
 
@@ -843,6 +868,18 @@ impl private::Chainable for TimeoutRemove {
             inner.fail_submit(err);
         }
     }
+
+    fn request_cancel(self: Pin<&mut Self>) {
+        // A control request answered locally has no operation left to cancel.
+        if self.local_result.is_some() {
+            return;
+        }
+        if self.inner.is_none() {
+            private::Chainable::cancel_unsubmitted(self);
+        } else if let Some(inner) = self.project().inner.as_pin_mut() {
+            inner.request_cancel();
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1024,6 +1061,18 @@ impl private::Chainable for TimeoutUpdate {
     fn fail_submit(self: Pin<&mut Self>, err: &SubmitError) {
         if let Some(inner) = self.project().inner.as_pin_mut() {
             inner.fail_submit(err);
+        }
+    }
+
+    fn request_cancel(self: Pin<&mut Self>) {
+        // A control request answered locally has no operation left to cancel.
+        if self.local_result.is_some() {
+            return;
+        }
+        if self.inner.is_none() {
+            private::Chainable::cancel_unsubmitted(self);
+        } else if let Some(inner) = self.project().inner.as_pin_mut() {
+            inner.request_cancel();
         }
     }
 }
