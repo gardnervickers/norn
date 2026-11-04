@@ -1062,6 +1062,7 @@ unsafe impl Operation for RecvRing {
 
     unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
         let (result, flags) = result.into_parts();
+        let result = result.map_err(|error| self.ring.release_failed(error, flags));
         result.and_then(|n| {
             // A stream EOF completes with no buffer id; see `RecvFromRing`.
             if n == 0 && io_uring::cqueue::buffer_select(flags).is_none() {
