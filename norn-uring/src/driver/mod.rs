@@ -1644,18 +1644,27 @@ impl Shared {
 
     /// Queue a close of `fd` without waiting for its completion.
     ///
-    /// Once the driver has shut down this refuses with
+    /// Once shutdown has drained the operations this refuses with
     /// [`CloseFdError::NeverQueued`], so the caller closes the descriptor
-    /// directly. Shutdown has already submitted its `IO_DRAIN` sentinels, which
-    /// can make the kernel defer a new close until ring teardown, and teardown
-    /// cancels it: the descriptor would stay open forever. Nothing is left to
-    /// retain the descriptor, and nothing reaps this close. Any other code that
-    /// submits to a shut-down ring and does not wait for the result has the same
-    /// hazard.
+    /// directly. Shutdown submits `IO_DRAIN` sentinels, which can make the
+    /// kernel defer a new close until ring teardown, and teardown cancels it:
+    /// the descriptor would stay open forever. That covers a close issued after
+    /// the driver has shut down and one generated while the resources drain is
+    /// still pending (reaping can destroy operations whose destructors drop
+    /// descriptors after the final marker was queued). By then every operation
+    /// is terminal, so nothing retains the descriptor and a direct close cannot
+    /// race an in-flight request; and nothing reaps a queued close. Any other
+    /// code that submits to a ring in this state without waiting for the result
+    /// has the same hazard.
     fn close_fd(&self, fd: types::Fd) -> Result<(), CloseFdError> {
-        if self.shutdown_outcome().is_some() {
+        if self.shutdown_outcome().is_some()
+            || matches!(
+                self.status(),
+                Status::ClosingResources | Status::DrainingResources | Status::Shutdown
+            )
+        {
             return Err(CloseFdError::NeverQueued(io::Error::other(
-                "driver has shut down",
+                "driver has drained its operations",
             )));
         }
         let entry = opcode::Close::new(fd)
