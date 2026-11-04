@@ -446,9 +446,10 @@ impl BufRingRegistration {
     }
 
     /// Request cancellation of a receive on this ring without entering the
-    /// kernel; see [`Handle::cancel_op`].
+    /// kernel; see [`Handle::cancel_op`]. A receive is never a later member of
+    /// a linked batch, so it has no predecessor.
     pub(crate) fn cancel_op(&self, target: OpTarget) {
-        self.shared.cancel_op(target)
+        self.shared.cancel_op(target, None)
     }
 }
 
