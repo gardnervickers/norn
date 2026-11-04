@@ -2251,19 +2251,12 @@ mod tests {
 
     #[test]
     fn unconsumed_reaped_descriptor_closes_directly() {
-        let mut fds = [0; 2];
-        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let fds = crate::test_util::pipe_cloexec();
 
         let completion = reap_owned_fd(CQEResult::new(Ok(fds[0] as u32), 0)).unwrap();
         drop(completion);
 
-        let mut pollfd = libc::pollfd {
-            fd: fds[1],
-            events: libc::POLLOUT,
-            revents: 0,
-        };
-        assert_eq!(unsafe { libc::poll(&mut pollfd, 1, 0) }, 1);
-        assert_ne!(pollfd.revents & libc::POLLERR, 0);
+        crate::test_util::assert_pipe_reader_closed(fds[1]);
         assert_eq!(unsafe { libc::close(fds[1]) }, 0);
     }
 
