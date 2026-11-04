@@ -14,6 +14,11 @@ pub(crate) struct Header {
     waker: RefCell<Option<Waker>>,
     complete: Cell<bool>,
     queue: Cell<QueueState>,
+    /// Whether the link from this operation to the next one in its batch is
+    /// an `IO_HARDLINK`.
+    hard_link: Cell<bool>,
+    /// Whether dropping the operation leaves it to run instead of cancelling it.
+    detached: Cell<bool>,
     pub(crate) vtable: &'static VTable,
 }
 
@@ -75,6 +80,8 @@ impl Header {
             waker: Default::default(),
             complete: Cell::new(false),
             queue: Cell::new(QueueState::Idle),
+            hard_link: Cell::new(false),
+            detached: Cell::new(false),
             vtable,
         }
     }
@@ -120,6 +127,22 @@ impl Header {
 
     pub(crate) fn set_queue_state(&self, state: QueueState) {
         self.queue.set(state);
+    }
+
+    pub(crate) fn hard_link(&self) -> bool {
+        self.hard_link.get()
+    }
+
+    pub(crate) fn set_hard_link(&self) {
+        self.hard_link.set(true);
+    }
+
+    pub(crate) fn is_detached(&self) -> bool {
+        self.detached.get()
+    }
+
+    pub(crate) fn detach(&self) {
+        self.detached.set(true);
     }
 
     /// Take the waker from the header.

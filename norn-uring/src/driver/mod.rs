@@ -295,6 +295,42 @@ struct Queued {
     linked: bool,
 }
 
+/// Split a queued group in which an operation was cancelled.
+///
+/// A member fails if it was cancelled, or if it is soft-linked behind a member
+/// that failed; failed members go to `cancelled`. The rest are returned as one
+/// group. A survivor that follows failed members runs whatever the survivor
+/// before it does, so the link between them becomes a hard link.
+fn split_cancelled_group(
+    group: SmallVec<[Queued; 4]>,
+    cancelled: &mut SmallVec<[ConfiguredEntry; 4]>,
+) -> SmallVec<[Queued; 4]> {
+    let mut survivors = SmallVec::<[Queued; 4]>::new();
+    let mut previous_failed = false;
+    let mut hard_into = false;
+    let mut gap = false;
+    for queued in group {
+        let failed = queued.entry.cancelled_while_queued() || (previous_failed && !hard_into);
+        hard_into = queued.linked && queued.entry.link_flags() == Flags::IO_HARDLINK;
+        previous_failed = failed;
+        if failed {
+            gap = true;
+            cancelled.push(queued.entry);
+            continue;
+        }
+        if let Some(last) = survivors.last_mut().filter(|_| gap) {
+            last.entry.set_hard_link();
+        }
+        gap = false;
+        survivors.push(queued);
+    }
+    let count = survivors.len();
+    for (idx, queued) in survivors.iter_mut().enumerate() {
+        queued.linked = idx + 1 < count;
+    }
+    survivors
+}
+
 /// The length of the linked group at the front of the overflow queue.
 fn overflow_group_len(overflow: &VecDeque<Queued>) -> Option<usize> {
     overflow
@@ -1396,11 +1432,12 @@ impl Shared {
 
     /// Move queued entries into the SQ, in order, while they fit.
     ///
-    /// A group in which an operation was cancelled while it waited completes
-    /// with `ECANCELED` without reaching the kernel. A group's members are
-    /// dropped together, and the kernel fails the rest of a cancelled chain
-    /// anyway. Once the driver stops accepting work, queued entries fail with
-    /// the shutdown error instead.
+    /// An operation cancelled while it waited completes with `ECANCELED`
+    /// without reaching the kernel, and so does every member the kernel would
+    /// fail with it: one soft-linked to a failed member. The members left run
+    /// as one group, so a member hard-linked behind a cancelled one still
+    /// runs after the members before it. Once the driver stops accepting
+    /// work, queued entries fail with the shutdown error instead.
     fn flush_overflow(&self) {
         loop {
             if self.overflow.borrow().is_empty() {
@@ -1421,7 +1458,13 @@ impl Shared {
                         .take(len)
                         .any(|queued| queued.entry.cancelled_while_queued())
                     {
-                        cancelled.extend(overflow.drain(..len).map(|queued| queued.entry));
+                        let group: SmallVec<[Queued; 4]> = overflow.drain(..len).collect();
+                        for queued in split_cancelled_group(group, &mut cancelled)
+                            .into_iter()
+                            .rev()
+                        {
+                            overflow.push_front(queued);
+                        }
                         continue;
                     }
                     if sq.capacity() - sq.len() < len {
@@ -1430,7 +1473,7 @@ impl Shared {
                     for queued in overflow.drain(..len) {
                         queued.entry.mark_dequeued();
                         let flags = if queued.linked {
-                            Flags::IO_LINK
+                            queued.entry.link_flags()
                         } else {
                             Flags::empty()
                         };
@@ -1506,7 +1549,7 @@ impl Shared {
             let flags = if idx + 1 == len {
                 Flags::empty()
             } else {
-                Flags::IO_LINK
+                entry.link_flags()
             };
             raw_entries.push(entry.into_entry_with_flags(flags));
         }
@@ -2445,6 +2488,90 @@ mod tests {
         );
         assert!(dropped.load(Ordering::Acquire));
         assert_eq!(driver.shared.in_flight(), 0);
+    }
+
+    /// A NOP that records whether it was synthetic and whether it succeeded.
+    struct RecordedNop(Rc<Cell<Option<(bool, bool)>>>);
+
+    // Safety: a NOP references no memory and posts one terminal CQE.
+    unsafe impl Operation for RecordedNop {
+        type Completion = ();
+
+        fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+            Ok(opcode::Nop::new().build())
+        }
+
+        unsafe fn reap(&mut self, result: CQEResult) {
+            self.0
+                .set(Some((result.is_synthetic(), result.result.is_ok())));
+        }
+    }
+
+    impl Singleshot for RecordedNop {
+        type Output = ();
+
+        fn complete(self, _: ()) {}
+    }
+
+    #[test]
+    fn dropping_a_submitted_then_always_chain_cancels_only_its_first_request() {
+        let mut driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let handle = driver.handle();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let outcome = Rc::new(Cell::new(None));
+        let mut chain = Box::pin(
+            long_lived_read(&handle, &dropped)
+                .then_always(handle.submit(RecordedNop(Rc::clone(&outcome)))),
+        );
+        let waker = futures_test::task::noop_waker();
+        assert!(chain
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending());
+        driver.park(ParkMode::NoPark).unwrap();
+
+        drop(chain);
+        assert!(park_until(&mut driver, 20, || dropped
+            .load(Ordering::Acquire)
+            && outcome.get().is_some()));
+        assert_eq!(
+            outcome.get(),
+            Some((false, true)),
+            "the NOP ran in the kernel once the read was cancelled"
+        );
+    }
+
+    #[test]
+    fn a_queued_then_always_chain_dropped_still_runs_its_second_request() {
+        for always in [true, false] {
+            let mut driver = Driver::new(io_uring::IoUring::builder(), 2).unwrap();
+            let handle = driver.handle();
+            fill_sq(&driver);
+            let dropped = Arc::new(AtomicBool::new(false));
+            let outcome = Rc::new(Cell::new(None));
+            let read = long_lived_read(&handle, &dropped);
+            let nop = handle.submit(RecordedNop(Rc::clone(&outcome)));
+            let waker = futures_test::task::noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            if always {
+                let mut chain = pin!(read.then_always(nop));
+                assert!(chain.as_mut().poll(&mut cx).is_pending());
+                assert_eq!(handle.queued_entries(), 2);
+            } else {
+                let mut chain = pin!(read.then(nop));
+                assert!(chain.as_mut().poll(&mut cx).is_pending());
+                assert_eq!(handle.queued_entries(), 2);
+            }
+
+            // The read is cancelled where it waits. A hard-linked NOP still
+            // reaches the kernel; a soft-linked one fails with it.
+            assert!(park_until(&mut driver, 20, || dropped
+                .load(Ordering::Acquire)
+                && outcome.get().is_some()));
+            let expected = if always { (false, true) } else { (true, false) };
+            assert_eq!(outcome.get(), Some(expected), "always={always}");
+            assert_eq!(handle.queued_entries(), 0);
+        }
     }
 
     #[test]
