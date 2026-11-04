@@ -225,11 +225,15 @@ where
         self.shared.taskset.shutdown();
         self.shared.runqueue.borrow_mut().clear();
         self.shared.active.set(0);
-        self.shared.waker.borrow_mut().take();
+        // Drop the old waker after releasing the borrow: its destructor may
+        // schedule a child, which re-enters `wake_scope`.
+        let old = self.shared.waker.take();
+        drop(old);
     }
 
     fn set_waker(&self, waker: &Waker) {
-        *self.shared.waker.borrow_mut() = Some(waker.clone());
+        let old = self.shared.waker.replace(Some(waker.clone()));
+        drop(old);
     }
 
     fn take_terminated(&self) -> Option<R> {
