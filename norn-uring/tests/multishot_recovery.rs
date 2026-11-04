@@ -20,7 +20,7 @@ async fn assert_waiting<S: Stream + ?Sized>(
     let mut cx = Context::from_waker(&waker);
     for _ in 0..16 {
         assert!(stream.as_mut().poll_next(&mut cx).is_pending());
-        norn_uring::noop().await;
+        norn_uring::noop().await.unwrap();
     }
     let wakes = count.get();
     for _ in 0..64 {
@@ -126,7 +126,7 @@ fn udp_multishot_recovers_all_variants() -> Result<(), Box<dyn std::error::Error
                 // Terminal ENOBUFS has been reaped, but the stream has not yet
                 // consumed it or registered its buffer-return waiter.
                 for _ in 0..16 {
-                    norn_uring::noop().await;
+                    norn_uring::noop().await.unwrap();
                 }
                 drop(held);
             } else {
@@ -242,7 +242,7 @@ fn udp_recvmsg_drop_recycles_unconsumed_completions() -> Result<(), Box<dyn std:
         // Reap two owned completions followed by terminal ENOBUFS without
         // consuming any stream item. Dropping must recycle both selected buffers.
         for _ in 0..16 {
-            norn_uring::noop().await;
+            norn_uring::noop().await.unwrap();
         }
         drop(stream);
         let mut replacement = Box::pin(server.recv_from_ring_multi(&ring));

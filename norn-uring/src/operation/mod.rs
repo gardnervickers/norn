@@ -189,6 +189,14 @@ impl std::fmt::Debug for OpTarget {
 
 /// A driver-internal asynchronous cancellation of a submitted operation.
 ///
+/// The cancellation names its target by `user_data`, so it can match only that
+/// one request. It is not the `IORING_ASYNC_CANCEL_FD` or `_ANY` form, which
+/// match every request on a descriptor or every request at all (shutdown uses
+/// the latter through the driver's `cancel_all`). Its own completion
+/// says only whether the kernel found the target (`0`, `-ENOENT`,
+/// `-EALREADY`), not how the target finished; the target's own CQE is
+/// authoritative.
+///
 /// The request owns its target's identity until the kernel reports the
 /// cancellation's own terminal CQE. The target allocation, and therefore the
 /// numeric `user_data` the cancellation matches, cannot be reused while the

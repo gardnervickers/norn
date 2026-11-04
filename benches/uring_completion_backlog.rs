@@ -69,7 +69,7 @@ impl bencher::TDynBenchFn for SteadyMultishotBench {
             drop(ring);
             drop(receiver);
             drop(sender);
-            norn_uring::noop().await;
+            norn_uring::noop().await.unwrap();
         });
     }
 }

@@ -931,6 +931,16 @@ impl RuntimeGroup {
     /// other worker and leaves the calling worker running. The calling
     /// worker's outcome cannot be observed here, so it is never reported in
     /// the returned [`JoinError`].
+    ///
+    /// # Blocking
+    ///
+    /// This is a blocking thread join. Called from a worker, it blocks that
+    /// worker's runtime thread: its executor stops polling tasks and parking
+    /// its driver until every other worker exits. If another worker waits on
+    /// the caller before returning, for example on a reply over a channel
+    /// whose receiver the caller polls, or for the caller to drain shared
+    /// credits, the two deadlock. Call it from outside the group, or only
+    /// once no other worker depends on the calling worker making progress.
     pub fn join(mut self) -> Result<(), JoinError> {
         let failures = collect_worker_failures(self.take_other_workers());
         if failures.is_empty() {
@@ -944,6 +954,14 @@ impl RuntimeGroup {
     ///
     /// Like [`join`](Self::join), this does not wait for or report the
     /// calling worker when called on one of the group's own workers.
+    ///
+    /// # Blocking
+    ///
+    /// Waiting blocks the calling thread, as [`join`](Self::join) does. On a
+    /// worker this deadlocks if another worker's shutdown path waits on the
+    /// calling worker, for example for the calling worker to drain a channel
+    /// that the other worker sends on. Dropping the group requests shutdown
+    /// and then blocks the same way.
     pub fn shutdown(self) -> Result<(), JoinError> {
         self.request_shutdown();
         self.join()

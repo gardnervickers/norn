@@ -22,7 +22,10 @@ impl Context {
             // Safety: This context is thread-local and only accessed on the
             // current thread.
             let old = unsafe { &mut *current.handle.get() };
-            assert!(old.is_none(), "executor already set");
+            assert!(
+                old.is_none(),
+                "a timer driver is already entered on this thread; drivers cannot be nested, which includes a nested `block_on` over a timer driver"
+            );
             *old = Some(handle);
         });
         ContextGuard {
@@ -57,11 +60,17 @@ impl Context {
     }
 
     /// Returns a reference to the current executor.
+    ///
+    /// Returns `None` when no timer is set, including when thread-local storage
+    /// has already been destroyed (a destructor running at thread exit).
     pub(crate) fn handle() -> Option<Handle> {
-        CURRENT.with(|c| {
-            // Safety: See [`Context::enter`].
-            unsafe { (*c.handle.get()).clone() }
-        })
+        CURRENT
+            .try_with(|c| {
+                // Safety: See [`Context::enter`].
+                unsafe { (*c.handle.get()).clone() }
+            })
+            .ok()
+            .flatten()
     }
 }
 

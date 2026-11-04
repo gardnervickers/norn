@@ -86,6 +86,14 @@ impl UringFd {
     /// Returns [`io::ErrorKind::WouldBlock`] if an operation or another
     /// internal socket view still retains the descriptor. Other errors are
     /// reported by the kernel close operation.
+    ///
+    /// Dropping an in-flight operation (an unfinished write, or an `incoming()`
+    /// stream) only requests its cancellation. The operation keeps its reference
+    /// to the descriptor until the kernel reports its terminal completion, which
+    /// the driver reaps on a later turn, so a `close` called right after such a
+    /// drop can still return `WouldBlock`. Yield to the driver (for example with
+    /// [`noop`](crate::noop)) and retry, or let the last owner's drop close the
+    /// descriptor.
     pub async fn close(self) -> io::Result<()> {
         self.inner.close().await
     }
@@ -102,7 +110,8 @@ struct Inner {
     fd: types::Fd,
     handle: Option<Handle>,
     closed: Cell<bool>,
-    /// Set when the runtime requests cancellation of an explicit close.
+    /// Set when the runtime requests cancellation of an explicit close, and
+    /// cleared when the next explicit close starts.
     close_canceled: Cell<bool>,
 }
 
@@ -158,6 +167,14 @@ impl NornFd {
             ));
         }
         if let Some(handle) = &self.inner.handle {
+            // The flag describes only the close submitted below. A submitted
+            // close that is dropped is still reaped, which sets `closed`. The
+            // flag goes stale when the future is dropped before its entry
+            // reaches the SQ (while the push waits for space): the guard below
+            // set it, nothing was submitted, and the descriptor is still open.
+            // A genuine -ECANCELED from a later close would then look
+            // runtime-cancelled and trigger a close by fd number.
+            self.inner.close_canceled.set(false);
             // Dropping this future before completion cancels a submitted close.
             // Record that before its terminal CQE can be reaped.
             let mut cancel = RecordCloseCancel(Some(&self.inner.close_canceled));
@@ -560,6 +577,36 @@ mod tests {
         // cancellation can match it.
         driver.park(ParkMode::NoPark).unwrap();
         assert_pipe_reader_closed(write_end);
+        unsafe { libc::close(write_end) };
+    }
+
+    #[test]
+    fn starting_a_close_clears_a_stale_cancellation_flag() {
+        use std::future::Future;
+        use std::task::{Context, Waker};
+
+        let driver = crate::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let [read_end, write_end] = pipe();
+        let fd = NornFd::from_fd_on(read_end, driver.handle());
+        // Model an earlier close future dropped before its entry reached the SQ:
+        // its guard set the flag, nothing was submitted, the descriptor is open.
+        fd.inner.close_canceled.set(true);
+        let inner = Rc::downgrade(&fd.inner);
+
+        let mut close = Box::pin(async move { fd.close().await });
+        assert!(close
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+
+        let submitted = inner.upgrade().expect("submitted close retains descriptor");
+        assert!(
+            !submitted.close_canceled.get(),
+            "a new close must not inherit the previous close's cancellation"
+        );
+        drop(submitted);
+        drop(close);
+        drop(driver);
         unsafe { libc::close(write_end) };
     }
 

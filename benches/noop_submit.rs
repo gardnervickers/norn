@@ -42,7 +42,7 @@ impl bencher::TDynBenchFn for NoopBench {
                 for _ in 0..tasks {
                     let handle = spawn(async move {
                         for _ in 0..n {
-                            noop().await;
+                            noop().await.unwrap();
                         }
                     });
                     handles.push(handle);
