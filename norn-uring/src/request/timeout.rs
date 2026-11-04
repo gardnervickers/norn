@@ -301,11 +301,8 @@ impl Future for Timeout {
                 Poll::Ready(output)
             }
             Poll::Pending => {
-                if this.inner.as_ref().get_ref().is_submitted() {
-                    this.control.target.state.mark_submitted();
-                } else {
-                    this.control.target.state.mark_queued();
-                }
+                // A pending operation has been handed to the driver.
+                this.control.target.state.mark_submitted();
                 Poll::Pending
             }
         }
@@ -1471,7 +1468,7 @@ mod tests {
     }
 
     #[test]
-    fn cancel_waits_while_timeout_is_queued_for_sq_capacity() {
+    fn cancel_of_a_timeout_waiting_for_sq_space_queues_behind_it() {
         let mut driver = crate::Driver::new(io_uring::IoUring::builder(), 1).unwrap();
         let handle = driver.handle();
         let waker = noop_waker();
@@ -1480,42 +1477,26 @@ mod tests {
         let mut filler = std::pin::pin!(handle.submit(Nop));
         assert!(Future::poll(filler.as_mut(), &mut cx).is_pending());
 
+        // The driver owns the queued timeout entry, so the timeout counts as
+        // submitted, and its removal queues behind it.
         let timeout = handle.timeout(Duration::from_secs(60));
         let control = timeout.control();
         let mut timeout = std::pin::pin!(timeout);
         assert!(Future::poll(timeout.as_mut(), &mut cx).is_pending());
         assert_eq!(
             control.target.state.lifecycle.get(),
-            TimeoutLifecycle::Queued
+            TimeoutLifecycle::Submitted
         );
-
-        let mut abandoned_cancel = Box::pin(control.cancel());
-        assert!(Future::poll(abandoned_cancel.as_mut(), &mut cx).is_pending());
-        assert_eq!(control.target.state.waiters.borrow().len(), 1);
-        drop(abandoned_cancel);
-        assert!(control.target.state.waiters.borrow().is_empty());
+        assert_eq!(handle.queued_entries(), 1);
 
         let mut cancel = std::pin::pin!(control.cancel());
         assert!(Future::poll(cancel.as_mut(), &mut cx).is_pending());
-        assert_eq!(control.target.state.waiters.borrow().len(), 1);
-
-        driver.park(ParkMode::NoPark).unwrap();
-        assert!(Future::poll(timeout.as_mut(), &mut cx).is_pending());
-        assert_eq!(
-            control.target.state.lifecycle.get(),
-            TimeoutLifecycle::Submitted
-        );
-        assert!(control.target.state.waiters.borrow().is_empty());
-
-        assert!(Future::poll(cancel.as_mut(), &mut cx).is_pending());
-
-        driver.park(ParkMode::NoPark).unwrap();
-        assert!(Future::poll(cancel.as_mut(), &mut cx).is_pending());
+        assert_eq!(handle.queued_entries(), 2);
 
         let mut cancel_output = None;
         let mut timeout_output = None;
-        for _ in 0..3 {
-            driver.park(ParkMode::NextCompletion).unwrap();
+        for _ in 0..6 {
+            driver.park(ParkMode::NoPark).unwrap();
             if cancel_output.is_none() {
                 if let Poll::Ready(output) = Future::poll(cancel.as_mut(), &mut cx) {
                     cancel_output = Some(output);
@@ -1556,10 +1537,7 @@ mod tests {
         let control = timeout.control();
         let mut target = std::pin::pin!(handle.submit(Nop).then(timeout));
         assert!(Future::poll(target.as_mut(), &mut cx).is_pending());
-        assert_eq!(
-            control.target.state.lifecycle.get(),
-            TimeoutLifecycle::Queued
-        );
+        assert_eq!(handle.queued_entries(), 2, "the batch is queued whole");
 
         // A locally canceled timeout contributes no SQE, leaving this as a
         // one-entry chain while still exercising recursive batch readiness.
@@ -1592,7 +1570,6 @@ mod tests {
         let mut cancel_output = None;
         let mut target_output = None;
         for _ in 0..4 {
-            driver.park(ParkMode::NextCompletion).unwrap();
             if cancel_output.is_none() {
                 if let Poll::Ready(output) = Future::poll(local_then_cancel.as_mut(), &mut cx) {
                     cancel_output = Some(output);
@@ -1606,6 +1583,8 @@ mod tests {
             if cancel_output.is_some() && target_output.is_some() {
                 break;
             }
+            // Wait only while a completion is still outstanding.
+            driver.park(ParkMode::NextCompletion).unwrap();
         }
 
         let (local, canceled) = cancel_output.expect("control chain did not complete");
@@ -1617,7 +1596,7 @@ mod tests {
     }
 
     #[test]
-    fn reset_updates_timeout_waiting_for_sq_capacity() {
+    fn reset_of_a_timeout_waiting_for_sq_space_updates_it_behind_it() {
         let mut driver = crate::Driver::new(io_uring::IoUring::builder(), 1).unwrap();
         let handle = driver.handle();
         let waker = noop_waker();
@@ -1630,29 +1609,31 @@ mod tests {
         let control = timeout.control();
         let mut timeout = std::pin::pin!(timeout);
         assert!(Future::poll(timeout.as_mut(), &mut cx).is_pending());
-        assert_eq!(
-            control.target.state.lifecycle.get(),
-            TimeoutLifecycle::Queued
-        );
+        assert_eq!(handle.queued_entries(), 1);
 
         let mut reset = std::pin::pin!(control.reset(Duration::from_millis(1)));
-        assert!(poll_ready(reset.as_mut()).unwrap());
-        assert_eq!(
-            control.target.state.duration.get(),
-            Duration::from_millis(1)
-        );
+        assert!(Future::poll(reset.as_mut(), &mut cx).is_pending());
+        assert_eq!(handle.queued_entries(), 2, "the update queues behind it");
 
-        driver.park(ParkMode::NoPark).unwrap();
-        assert!(Future::poll(timeout.as_mut(), &mut cx).is_pending());
-
+        let mut reset_output = None;
         let mut timeout_output = None;
-        for _ in 0..3 {
+        for _ in 0..6 {
             driver.park(ParkMode::NextCompletion).unwrap();
-            if let Poll::Ready(output) = Future::poll(timeout.as_mut(), &mut cx) {
-                timeout_output = Some(output);
+            if reset_output.is_none() {
+                if let Poll::Ready(output) = Future::poll(reset.as_mut(), &mut cx) {
+                    reset_output = Some(output);
+                }
+            }
+            if timeout_output.is_none() {
+                if let Poll::Ready(output) = Future::poll(timeout.as_mut(), &mut cx) {
+                    timeout_output = Some(output);
+                }
+            }
+            if reset_output.is_some() && timeout_output.is_some() {
                 break;
             }
         }
+        assert!(reset_output.expect("reset did not complete").unwrap());
         assert_eq!(
             timeout_output
                 .expect("reset timeout did not complete")

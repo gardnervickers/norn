@@ -128,9 +128,9 @@ fn sqpoll_wakes_sq_waiter_after_kernel_consumes_queue() {
 }
 
 #[test]
-fn sqpoll_repoll_observes_capacity_without_a_park() {
-    bounded("repoll", || {
-        let driver = sqpoll_driver(1);
+fn sqpoll_park_moves_a_queued_entry_into_a_slot_the_kernel_freed() {
+    bounded("queued", || {
+        let mut driver = sqpoll_driver(1);
         let handle = driver.handle();
         let mut first = std::pin::pin!(handle.submit(Nop));
         let mut second = std::pin::pin!(handle.submit(Nop));
@@ -138,20 +138,17 @@ fn sqpoll_repoll_observes_capacity_without_a_park() {
         let mut cx = Context::from_waker(&waker);
         assert!(poll(first.as_mut(), &mut cx).is_pending());
         assert!(poll(second.as_mut(), &mut cx).is_pending());
-        // Polling the driver once wakes the kernel thread if it is idle; after
-        // that, a waiter re-poll must notice the free slot by itself.
-        let mut driver = driver;
-        driver.park(ParkMode::NoPark).unwrap();
+        // The second entry waits in the driver's overflow queue, which asks
+        // for a park until one moves it into a slot the kernel thread freed.
+        assert!(driver.needs_park());
         for _ in 0..500 {
-            // A poll that submits returns Pending awaiting the CQE; reaching
-            // that state proves the waiter left the SQ backpressure queue.
-            let _ = poll(second.as_mut(), &mut cx);
+            driver.park(ParkMode::NoPark).unwrap();
             if !driver.needs_park() {
                 return;
             }
             std::thread::sleep(Duration::from_millis(2));
         }
-        panic!("re-polled waiter never observed free SQ capacity");
+        panic!("the queued entry never reached the SQ");
     });
 }
 

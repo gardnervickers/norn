@@ -1,12 +1,14 @@
 use std::cell::RefMut;
 use std::future::Future;
 use std::pin::Pin;
-use std::task::{ready, Context, Poll, Waker};
+use std::task::{Context, Poll, Waker};
 use std::{io, mem};
 
 mod header;
 mod queue;
 mod raw;
+
+use header::QueueState;
 
 use io_uring::types::CancelBuilder;
 pub use raw::CQEResult;
@@ -15,7 +17,7 @@ pub(crate) use raw::{OperationId, RawOpRef};
 use io_uring::squeue::Flags;
 use smallvec::SmallVec;
 
-use crate::driver::{CancelRetry, PushFuture, TryPush};
+use crate::driver::CancelRetry;
 use crate::error::SubmitError;
 
 /// Low-level request customization for advanced `io_uring` users.
@@ -157,6 +159,29 @@ impl ConfiguredEntry {
     pub(crate) fn new(handle: RawOpRef, entry: io_uring::squeue::Entry) -> Self {
         Self { entry, handle }
     }
+
+    /// Record that the driver queued this entry because the SQ was full.
+    pub(crate) fn mark_queued(&self) {
+        self.handle.header().set_queue_state(QueueState::Queued);
+    }
+
+    /// Whether the operation was cancelled while this entry was queued.
+    pub(crate) fn cancelled_while_queued(&self) -> bool {
+        self.handle.header().queue_state() == QueueState::Cancelled
+    }
+
+    /// Record that this entry left the driver's queue for the SQ.
+    pub(crate) fn mark_dequeued(&self) {
+        self.handle.header().set_queue_state(QueueState::Idle);
+    }
+
+    /// Complete an entry that never reached the kernel.
+    pub(crate) fn complete_unsubmitted(self, err: io::Error) {
+        self.mark_dequeued();
+        // Safety: this entry holds the operation's kernel reference and was
+        // never pushed, so this synthetic completion is its only terminal one.
+        unsafe { self.handle.reap(CQEResult::synthetic(Err(err))) };
+    }
 }
 
 /// An owned identity for an operation submitted through this driver.
@@ -175,6 +200,17 @@ impl OpTarget {
 
     pub(crate) fn is_complete(&self) -> bool {
         self.handle.is_complete()
+    }
+
+    /// Cancel the operation where it waits, if its entry is still in the
+    /// driver's overflow queue. Returns false once the entry has left it.
+    pub(crate) fn cancel_if_queued(&self) -> bool {
+        let header = self.handle.header();
+        if header.queue_state() == QueueState::Idle {
+            return false;
+        }
+        header.set_queue_state(QueueState::Cancelled);
+        true
     }
 }
 
@@ -264,8 +300,6 @@ pin_project_lite::pin_project! {
     where
         T: 'static,
     {
-        #[pin]
-        submit: Option<PushFuture>,
         state: State<T>,
         reactor: crate::Handle,
         // The request linked immediately before this one, when it was
@@ -304,10 +338,11 @@ where
 {
     /// Not configured yet.
     Prepared { handle: TypedHandle<T> },
-    /// Configured; the entry is waiting for SQ space in the operation's push
-    /// future or in a linked batch.
+    /// Configured as a member of a linked batch that has not been handed to
+    /// the driver yet.
     Waiting { handle: TypedHandle<T> },
-    /// Queued to the kernel, or completed without it by a synthetic completion.
+    /// Handed to the driver, which pushes it to the SQ or queues it until there
+    /// is room, or completed without the kernel by a synthetic completion.
     Submitted { inner: SubmittedOp<T> },
     /// Placeholder while moving between states.
     Done,
@@ -403,7 +438,6 @@ where
 {
     pub(crate) fn new(data: T, reactor: crate::Handle) -> Self {
         Self {
-            submit: None,
             state: State::Prepared {
                 handle: TypedHandle::new(data),
             },
@@ -425,10 +459,6 @@ where
 
     pub(crate) fn handle(&self) -> &crate::Handle {
         &self.reactor
-    }
-
-    pub(crate) fn is_submitted(&self) -> bool {
-        matches!(self.state, State::Submitted { .. })
     }
 
     pub(crate) fn prepare_batch(
@@ -462,27 +492,15 @@ where
         this.state.fail_submit(err);
     }
 
-    fn poll_submit(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        let mut this = self.as_mut().project();
-        if this.submit.is_none() {
-            if let Some(entry) = this.state.configure() {
-                match this.reactor.try_push(entry) {
-                    TryPush::Submitted => this.state.finish_submit(),
-                    TryPush::Full(entry) => this.submit.set(Some(this.reactor.push(entry))),
-                    TryPush::Failed(err) => this.state.fail_submit(&err),
-                }
+    /// Configure and submit a prepared operation; otherwise do nothing.
+    fn submit_if_prepared(self: Pin<&mut Self>) {
+        let this = self.project();
+        if let Some(entry) = this.state.configure() {
+            match this.reactor.submit_entry(entry) {
+                Ok(()) => this.state.finish_submit(),
+                Err(err) => this.state.fail_submit(&err),
             }
         }
-
-        let Some(fut) = this.submit.as_mut().as_pin_mut() else {
-            return Poll::Ready(());
-        };
-        match ready!(fut.poll(cx)) {
-            Ok(()) => this.state.finish_submit(),
-            Err(err) => this.state.fail_submit(&err),
-        }
-        this.submit.set(None);
-        Poll::Ready(())
     }
 }
 
@@ -493,7 +511,7 @@ where
     type Output = T::Output;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        ready!(self.as_mut().poll_submit(cx));
+        self.as_mut().submit_if_prepared();
         let this = self.project();
         let State::Submitted { inner } = this.state else {
             unreachable!("operation not submitted");
@@ -513,7 +531,7 @@ where
     type Item = T::Item;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        ready!(self.as_mut().poll_submit(cx));
+        self.as_mut().submit_if_prepared();
         let this = self.project();
         let State::Submitted { inner } = this.state else {
             unreachable!("operation not submitted");
@@ -1372,7 +1390,7 @@ mod tests {
     }
 
     #[test]
-    fn first_poll_submits_without_allocating_backpressure_future() {
+    fn first_poll_hands_the_entry_to_the_driver() {
         #[derive(Debug)]
         struct NopOp;
 
@@ -1403,9 +1421,10 @@ mod tests {
         let mut cx = std::task::Context::from_waker(&waker);
 
         assert!(Future::poll(op.as_mut(), &mut cx).is_pending());
-        let op = op.as_ref().get_ref();
-        assert!(op.submit.is_none());
-        assert!(matches!(op.state, State::Submitted { .. }));
+        assert!(matches!(
+            op.as_ref().get_ref().state,
+            State::Submitted { .. }
+        ));
     }
 
     #[derive(Debug)]
@@ -1471,16 +1490,13 @@ mod tests {
                 ops.push(Box::pin(handle.submit(CountedNop(Rc::clone(&configured)))));
             }
             // Poll every operation once against a one-entry SQ so that later
-            // ones wait for capacity with their entries already configured.
+            // ones wait in the driver's queue with their entries configured.
             let waker = futures_test::task::noop_waker();
             let mut cx = std::task::Context::from_waker(&waker);
             for op in &mut ops {
                 assert!(Future::poll(op.as_mut(), &mut cx).is_pending());
             }
-            assert!(
-                ops[1].submit.is_some(),
-                "the full SQ should apply backpressure"
-            );
+            assert_eq!(handle.queued_entries(), 3, "the full SQ queues the rest");
             let mut results = Vec::new();
             for op in ops {
                 results.push(op.await);
@@ -1493,11 +1509,11 @@ mod tests {
     }
 
     #[test]
-    fn operation_future_does_not_carry_its_sqe() {
+    fn operation_future_holds_neither_its_sqe_nor_a_push_future() {
         assert!(
+            mem::size_of::<Op<CountedNop>>() <= 4 * mem::size_of::<usize>(),
+            "an Op holds its handle, driver handle and predecessor: {} bytes",
             mem::size_of::<Op<CountedNop>>()
-                < mem::size_of::<Option<PushFuture>>() + mem::size_of::<io_uring::squeue::Entry>(),
-            "an Op should hold only its handle until it is configured"
         );
     }
 
