@@ -514,8 +514,8 @@ impl Handle {
 
     /// Prepare an operation for submission.
     ///
-    /// The returned [`Op`] is lazy: it does not touch the submission queue until
-    /// it is first polled.
+    /// The returned [`Op`] is lazy: it is not configured and does not touch the
+    /// submission queue until it is first polled.
     pub fn submit<T>(&self, op: T) -> Op<T>
     where
         T: Operation + 'static,
