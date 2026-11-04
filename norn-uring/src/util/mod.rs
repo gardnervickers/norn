@@ -7,9 +7,15 @@ pub(crate) mod notify;
 /// and wait for it to complete. This checks the round-trip
 /// functionality of the driver.
 ///
-/// ### Panics
-/// Panics if called outside a running driver context, or if submission fails.
-pub async fn noop() {
+/// # Errors
+///
+/// Returns an error if the driver cannot submit the operation or the kernel
+/// completes it with an error, for example because the driver has shut down.
+///
+/// # Panics
+///
+/// Panics if called outside a running driver context.
+pub async fn noop() -> io::Result<()> {
     let handle = crate::Handle::current();
 
     struct Nop;
@@ -34,5 +40,5 @@ pub async fn noop() {
             Ok(())
         }
     }
-    handle.submit(Nop).await.unwrap();
+    handle.submit(Nop).await
 }

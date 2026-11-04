@@ -281,7 +281,7 @@ fn close_rejects_submitted_operation_without_invalidating_it(
 
         // Completing a separate ring round trip ensures the receive was submitted
         // to the kernel before explicit close checks descriptor ownership.
-        norn_uring::noop().await;
+        norn_uring::noop().await.unwrap();
         let err = server.close().await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
 

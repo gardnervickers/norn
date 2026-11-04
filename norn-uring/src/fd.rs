@@ -86,6 +86,14 @@ impl UringFd {
     /// Returns [`io::ErrorKind::WouldBlock`] if an operation or another
     /// internal socket view still retains the descriptor. Other errors are
     /// reported by the kernel close operation.
+    ///
+    /// Dropping an in-flight operation (an unfinished write, or an `incoming()`
+    /// stream) only requests its cancellation. The operation keeps its reference
+    /// to the descriptor until the kernel reports its terminal completion, which
+    /// the driver reaps on a later turn, so a `close` called right after such a
+    /// drop can still return `WouldBlock`. Yield to the driver (for example with
+    /// [`noop`](crate::noop)) and retry, or let the last owner's drop close the
+    /// descriptor.
     pub async fn close(self) -> io::Result<()> {
         self.inner.close().await
     }

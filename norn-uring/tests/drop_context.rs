@@ -26,7 +26,8 @@ fn uring_executor_in_thread_local_can_be_dropped_at_thread_exit() {
                 .borrow_mut()
                 .as_mut()
                 .unwrap()
-                .block_on(norn_uring::noop());
+                .block_on(norn_uring::noop())
+                .unwrap();
         });
     });
     worker
@@ -40,6 +41,6 @@ fn dropping_idle_uring_executor_inside_another_restores_context() {
     outer.block_on(async {
         drop(runtime());
         // The outer driver context is restored after the inner teardown.
-        norn_uring::noop().await;
+        norn_uring::noop().await.unwrap();
     });
 }

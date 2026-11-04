@@ -440,6 +440,14 @@ impl File {
     /// continue retaining the descriptor until they are dropped or consumed. If
     /// close is rejected, dropping the last owner still closes the descriptor.
     ///
+    /// Dropping an in-flight operation (an unfinished write, or an `incoming()`
+    /// stream) only requests its cancellation. The operation keeps its reference
+    /// to the descriptor until the kernel reports its terminal completion, which
+    /// the driver reaps on a later turn, so a `close` called right after such a
+    /// drop can still return `WouldBlock`. Yield to the driver (for example with
+    /// [`noop`](crate::noop)) and retry, or let the last owner's drop close the
+    /// descriptor.
+    ///
     /// # Errors
     ///
     /// Returns [`io::ErrorKind::WouldBlock`] while another owner or operation
@@ -509,6 +517,14 @@ impl PipeReader {
     /// continue retaining the descriptor until they are dropped or consumed. If
     /// close is rejected, dropping the last owner still closes the descriptor.
     ///
+    /// Dropping an in-flight operation (an unfinished write, or an `incoming()`
+    /// stream) only requests its cancellation. The operation keeps its reference
+    /// to the descriptor until the kernel reports its terminal completion, which
+    /// the driver reaps on a later turn, so a `close` called right after such a
+    /// drop can still return `WouldBlock`. Yield to the driver (for example with
+    /// [`noop`](crate::noop)) and retry, or let the last owner's drop close the
+    /// descriptor.
+    ///
     /// # Errors
     ///
     /// Returns [`io::ErrorKind::WouldBlock`] while another owner or operation
@@ -567,6 +583,14 @@ impl PipeWriter {
     /// by this call; queued, submitted, and completed-but-unconsumed operations
     /// continue retaining the descriptor until they are dropped or consumed. If
     /// close is rejected, dropping the last owner still closes the descriptor.
+    ///
+    /// Dropping an in-flight operation (an unfinished write, or an `incoming()`
+    /// stream) only requests its cancellation. The operation keeps its reference
+    /// to the descriptor until the kernel reports its terminal completion, which
+    /// the driver reaps on a later turn, so a `close` called right after such a
+    /// drop can still return `WouldBlock`. Yield to the driver (for example with
+    /// [`noop`](crate::noop)) and retry, or let the last owner's drop close the
+    /// descriptor.
     ///
     /// # Errors
     ///
