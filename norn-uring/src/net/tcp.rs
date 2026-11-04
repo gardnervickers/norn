@@ -538,8 +538,10 @@ impl TcpSocket {
     /// # Errors
     ///
     /// The request resolves with [`io::ErrorKind::InvalidInput`] when `flags`
-    /// contains `MSG_TRUNC`, because its result does not identify the number of
-    /// buffers selected by a bundle receive.
+    /// contains `MSG_TRUNC` or `MSG_WAITALL`. `MSG_TRUNC` does not identify the
+    /// number of buffers selected by a bundle receive, and a partial
+    /// `MSG_WAITALL` retry can commit buffers that the completion does not
+    /// report.
     pub fn recv_bundle_with_flags(
         &self,
         ring: &RecvBufRing,
