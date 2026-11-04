@@ -191,19 +191,17 @@ impl<T> RegisteredReceiver for Local<T>
 where
     T: Send + 'static,
 {
-    fn wake_if_ready(&self) {
+    fn take_ready_waker(&self) -> Option<Waker> {
         if !self.shared.queue.is_empty() || self.shared.is_disconnected() {
-            if let Some(waker) = self.waker.borrow_mut().take() {
-                waker.wake();
-            }
+            self.waker.borrow_mut().take()
+        } else {
+            None
         }
     }
 
-    fn close(&self) {
+    fn close(&self) -> Option<Waker> {
         self.shared.receiver_closed.store(true, Ordering::Release);
-        if let Some(waker) = self.waker.borrow_mut().take() {
-            waker.wake();
-        }
+        self.waker.borrow_mut().take()
     }
 }
 
@@ -686,7 +684,7 @@ impl<T> RegisteredReceiver for ShardedLocal<T>
 where
     T: Send + 'static,
 {
-    fn wake_if_ready(&self) {
+    fn take_ready_waker(&self) -> Option<Waker> {
         let mut ready = false;
         for lane in &self.queues {
             if !lane.queue.is_empty() {
@@ -706,17 +704,15 @@ where
         }
 
         if ready || self.shared.is_disconnected() {
-            if let Some(waker) = self.waker.borrow_mut().take() {
-                waker.wake();
-            }
+            self.waker.borrow_mut().take()
+        } else {
+            None
         }
     }
 
-    fn close(&self) {
+    fn close(&self) -> Option<Waker> {
         self.shared.receiver_closed.store(true, Ordering::Release);
-        if let Some(waker) = self.waker.borrow_mut().take() {
-            waker.wake();
-        }
+        self.waker.borrow_mut().take()
     }
 }
 

@@ -4,18 +4,42 @@ use std::fmt;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::task::Waker;
 
 use norn_executor::park::{Park, ParkMode, Unpark};
 
+/// A receiver registered with a channel driver.
+///
+/// Both methods return the receiver's waker instead of invoking it, so the
+/// registry can release its borrows before any callback runs.
 pub(crate) trait RegisteredReceiver {
-    fn wake_if_ready(&self);
-    fn close(&self);
+    fn take_ready_waker(&self) -> Option<Waker>;
+    fn close(&self) -> Option<Waker>;
 }
 
 struct Registry {
     next_id: Cell<u64>,
     closed: Cell<bool>,
     receivers: RefCell<HashMap<u64, Rc<dyn RegisteredReceiver>>>,
+    // Reuse wake storage without retaining a borrow across user callbacks.
+    wake_storage: RefCell<Vec<Waker>>,
+}
+
+struct WakeBatch(Vec<Waker>);
+
+impl WakeBatch {
+    fn wake_all(&mut self) {
+        while let Some(waker) = self.0.pop() {
+            waker.wake();
+        }
+    }
+}
+
+impl Drop for WakeBatch {
+    fn drop(&mut self) {
+        // If one callback unwinds, still notify the remaining receivers.
+        self.wake_all();
+    }
 }
 
 impl Registry {
@@ -24,12 +48,15 @@ impl Registry {
             next_id: Cell::new(0),
             closed: Cell::new(false),
             receivers: RefCell::new(HashMap::new()),
+            wake_storage: RefCell::new(Vec::new()),
         }
     }
 
     fn register(&self, receiver: Rc<dyn RegisteredReceiver>) -> Option<u64> {
         if self.closed.get() {
-            receiver.close();
+            if let Some(waker) = receiver.close() {
+                waker.wake();
+            }
             return None;
         }
 
@@ -45,9 +72,14 @@ impl Registry {
     }
 
     fn wake_ready(&self) {
-        for receiver in self.receivers.borrow().values() {
-            receiver.wake_if_ready();
-        }
+        let mut wakers = self.wake_storage.take();
+        wakers.extend(
+            self.receivers
+                .borrow()
+                .values()
+                .filter_map(|receiver| receiver.take_ready_waker()),
+        );
+        self.wake_all(wakers);
     }
 
     fn shutdown(&self) {
@@ -55,11 +87,21 @@ impl Registry {
             return;
         }
 
-        let mut receivers = self.receivers.borrow_mut();
-        for receiver in receivers.values() {
-            receiver.close();
-        }
-        receivers.clear();
+        // Close every channel and empty the registry before any callback runs,
+        // so a waker that unwinds or re-enters cannot leave a channel open.
+        let receivers = self.receivers.take();
+        let mut wakers = self.wake_storage.take();
+        wakers.extend(receivers.values().filter_map(|receiver| receiver.close()));
+        drop(receivers);
+        self.wake_all(wakers);
+    }
+
+    fn wake_all(&self, wakers: Vec<Waker>) {
+        let mut batch = WakeBatch(wakers);
+        batch.wake_all();
+        // Reentrant wakeups may have populated their own empty storage. No
+        // wakers are dropped while this cache is borrowed.
+        self.wake_storage.replace(std::mem::take(&mut batch.0));
     }
 }
 
