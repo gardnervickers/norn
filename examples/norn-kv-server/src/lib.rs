@@ -25,3 +25,5 @@ pub mod sharded;
 
 #[cfg(test)]
 mod alloc_count;
+#[cfg(all(test, target_os = "linux"))]
+mod slow_peer;
