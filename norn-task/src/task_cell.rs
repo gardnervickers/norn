@@ -247,17 +247,16 @@ where
         let this = Self::from_raw_header(ptr);
         let state = this.as_ref().state();
         let header = this.as_ref().header();
-        match state.update(state::State::complete_task) {
-            state::CompleteTaskResult::NotifyJoinHandle => {
-                header.notify_join_handle();
-            }
+        let join_waker = match state.update(state::State::complete_task) {
+            state::CompleteTaskResult::NotifyJoinHandle => header.take_waker(),
             state::CompleteTaskResult::DropOutput => {
                 let future_cell = this.as_ref().future_cell();
                 future_cell.destroy();
+                None
             }
-        }
+        };
 
-        // Finally we need to unbind the task from the scheduler. The
+        // Unbind the task from the scheduler before waking. The
         // registered task borrows the intrusive-list reference rather than
         // owning a new reference count. Put it in `ManuallyDrop` before
         // invoking user scheduler code so unwinding cannot drop that
@@ -265,6 +264,12 @@ where
         let taskref = ManuallyDrop::new(crate::RegisteredTask::from(TaskRef::from_ptr(ptr)));
         let scheduler = this.as_ref().scheduler();
         scheduler.unbind(&taskref);
+
+        // Wake the join handle last. The waker is user code and may panic,
+        // which must not skip unbinding a task that has already completed.
+        if let Some(waker) = join_waker {
+            waker.wake();
+        }
     }
 
     unsafe fn dealloc(ptr: NonNull<header::Header>) {
