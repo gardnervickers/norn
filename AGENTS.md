@@ -9,6 +9,11 @@ Norn is an experimental set of Rust crates for building **single-threaded async 
 3. `norn-timer`: `Park` wrapper that adds timer-wheel scheduling.
 4. `norn-uring`: `Park` implementation backed by `io_uring` plus fs/net APIs.
 
+Supporting crates build on that stack: `norn-channel` (local and cross-thread
+channels that wake a parked driver), `norn-nursery` (scoped child tasks that
+may borrow from the caller), and `norn-multicore` (fixed groups of
+single-threaded runtimes, one per thread, connected by channels).
+
 The project is intentionally not general-purpose today; APIs are still in flux in executor/uring layers.
 
 ## Workspace Layout
@@ -40,7 +45,7 @@ The project is intentionally not general-purpose today; APIs are still in flux i
   2. runnable task drain loop,
   3. `park(mode)`.
 - `Handle::current()` comes from TLS context and panics outside executor context.
-- `block_on` currently does `self.park.park(mode).unwrap()`: park errors panic.
+- `try_block_on` propagates park errors; `block_on` panics on them.
 - `Drop` enters context, shuts down `TaskQueue`, then calls `Park::shutdown`.
 
 ### `norn-timer` model
@@ -49,13 +54,17 @@ The project is intentionally not general-purpose today; APIs are still in flux i
 - Hierarchical wheel: 6 levels, 64 slots per level, millisecond ticks.
 - `Sleep` futures resolve to `Result<(), norn_timer::Error>`; shutdown path returns shutdown errors.
 - Simulated clock is heavily used in tests/benchmarks.
-- Known gap: dropping timer driver does not currently fire all outstanding sleepers (tracked TODO in tests/comments).
+- Dropping the timer driver or calling `Park::shutdown` completes every outstanding sleeper with `Error::Shutdown`.
 
 ### `norn-uring` model
 
-- `Driver` owns ring + backpressure notifier + status (`Running`, `Draining`, `Shutdown`).
+- `Driver` owns ring + backpressure notifier + status (`Running`, `Closing`,
+  `DrainingOperations`, `ClosingResources`, `DrainingResources`, `Shutdown`).
 - Submission queue pressure is handled by `PushFuture` waiting on `Notify`.
-- Driver park loop retries `EBUSY`, loops on `EINTR`, drains CQ before parking.
+- Driver park loop drains the CQ before parking, loops on `EINTR`, and treats
+  `EBUSY`, `EAGAIN` and `ENOMEM` from `io_uring_enter` as transient: drain and
+  retry, or yield. Other enter errors are recorded as a health error and close
+  the driver.
 - Remote unpark is eventfd-based (`driver/unpark.rs`).
 - `Driver::drop` calls `Park::shutdown`; shutdown path uses cancellation + IO_DRAIN token.
 - Special CQE user_data tokens are reserved (`<= 1024`).
@@ -68,12 +77,16 @@ The project is intentionally not general-purpose today; APIs are still in flux i
 - Dropping submitted `Op` attempts cancellation (`cancel(user_data)`).
 - `Operation::reap` converts each kernel or synthetic completion into an owned
   value; dropping an unconsumed value releases any resources represented by it.
-- `UnsubmittedOp` currently expects push success and can panic if polled during shutdown.
+- Submission failures (including a driver that stopped accepting work) are
+  delivered to the operation as synthetic error completions; see
+  `CQEResult::is_synthetic`.
 
 ### FD and buffer lifetime constraints
 
 - `NornFd` is refcounted and waits for `strong_count == 1` before close submission.
-- `NornFd::Inner::drop` and `RecvBufRing::drop` call `Handle::current()`; dropping outside driver context is unsafe/panic-prone.
+- `NornFd` and `RecvBufRing` keep the driver handle they were created with, so
+  dropping them does not need a driver context. Constructing a `RecvBufRing`
+  still calls `Handle::current()`.
 - I/O buffers must implement `StableBuf`/`StableBufMut` (stable pointer guarantees).
 - Bufring uses registered kernel buffer rings and returns buffers to ring on `BufRingBuf::drop`.
 
