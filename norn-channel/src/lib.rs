@@ -24,7 +24,7 @@
 //! [`Receiver::close`](mpsc::Receiver::close),
 //! [`ShardedReceiver::close`](mpsc::ShardedReceiver::close), and driver
 //! shutdown (dropping a [`Driver`] or `Park::shutdown`) only refuse sends that
-//! begin afterwards. They do not wait for sends already past their closed
+//! observe the close. They do not wait for sends already past their closed
 //! check, so a racing send may return `Ok` after the receiver has reported
 //! `Closed`. Such a value is returned by a later receive call or dropped
 //! exactly once when the receiver is dropped; it is never leaked, and `Closed`
