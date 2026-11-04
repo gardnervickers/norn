@@ -86,8 +86,8 @@ impl TaskSet {
     /// This will prevent any new tasks from being added to the [`TaskSet`].
     ///
     /// # Panics
-    /// If a join waker panics, every remaining task is still shut down before
-    /// the first panic is propagated.
+    /// If a join waker or a scheduler destructor panics, every remaining task
+    /// is still shut down before the first panic is propagated.
     pub fn shutdown(&self) {
         // Safety: `TaskSet` is `!Send` and only accessed from one thread. Each
         // mutable borrow ends before a task is cancelled or dropped, since both
@@ -103,7 +103,12 @@ impl TaskSet {
             let Some(task) = task else {
                 break;
             };
-            if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(move || task.shutdown())) {
+            // Dropping the popped task may run the scheduler's destructor, which
+            // can panic too. Catch it separately from `shutdown`, so a panic in
+            // each does not unwind through the other and abort.
+            let shut_down = panic::catch_unwind(AssertUnwindSafe(|| task.shutdown()));
+            let dropped = panic::catch_unwind(AssertUnwindSafe(move || drop(task)));
+            for payload in [shut_down.err(), dropped.err()].into_iter().flatten() {
                 first_panic.get_or_insert(payload);
             }
         }
