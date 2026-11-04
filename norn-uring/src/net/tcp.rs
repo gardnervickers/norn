@@ -270,20 +270,28 @@ impl TcpListener {
 
     /// Accepts a new incoming connection to this listener.
     ///
+    /// The returned socket is bound to the [`Driver`](crate::Driver) that owns
+    /// the listener, whichever context finishes this future.
+    ///
     /// # Errors
     ///
     /// Returns an error if the accept operation fails.
-    ///
-    /// # Panics
-    ///
-    /// Panics if polled outside the [`Driver`](crate::Driver) context that owns
-    /// the listener.
     pub async fn accept(&self) -> io::Result<(TcpSocket, SocketAddr)> {
         let (socket, addr) = self.socket.accept().await?;
         Ok((TcpSocket { socket }, addr))
     }
 
     /// Returns a stream of incoming connections.
+    ///
+    /// The stream is backed by a multishot accept, so connections are accepted
+    /// without submitting a request per connection. Each socket is bound to the
+    /// [`Driver`](crate::Driver) that owns the listener.
+    ///
+    /// An error is yielded as an item and does not end the stream; the next
+    /// poll accepts again. The kernel can end a multishot accept without an
+    /// error, for example when it cannot post a completion to a full completion
+    /// queue. The stream re-arms after an accept that produced connections, and
+    /// ends (`None`) when one ends without producing any.
     pub fn incoming(&self) -> impl Stream<Item = io::Result<TcpSocket>> + '_ {
         Incoming {
             listener: &self.socket,
@@ -311,11 +319,6 @@ impl TcpListener {
 
 pin_project_lite::pin_project! {
     /// A stream of connections accepted by a [`TcpListener`].
-    ///
-    /// # Panics
-    ///
-    /// Polling may panic outside the [`Driver`](crate::Driver) context that
-    /// owns the listener.
     struct Incoming<'a> {
         listener: &'a socket::Socket,
         #[pin]
