@@ -62,7 +62,8 @@ pub unsafe trait Operation {
     ///
     /// The runtime calls this once, when the operation is first polled or when a linked
     /// request containing it is first polled. An operation dropped before then is never
-    /// configured.
+    /// configured. A panic in `configure` propagates out of that poll and leaves the operation
+    /// unusable: polling it again panics.
     ///
     /// Configuration failures are delivered through the operation's normal completion path;
     /// the operation is not submitted to the kernel.
