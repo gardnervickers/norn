@@ -70,18 +70,24 @@ where
 
     /// Take the output of the future, if it has been polled to completion.
     ///
+    /// Returns `None` while cancellation is still destroying the future. Its
+    /// destructor may run user code that polls the task's join handle before
+    /// the cancellation result has been stored.
+    ///
     /// # Panic
     /// If the future has not been polled to completion, or if it has been destroyed,
     /// this method will panic.
-    pub(crate) fn take_output(&self) -> Result<F::Output, TaskError> {
+    pub(crate) fn take_output(&self) -> Option<Result<F::Output, TaskError>> {
         // Safety: task state permits output access only after polling has
         // finished, and the single-thread task contract excludes concurrency.
         let this = unsafe { &mut *self.inner.get() };
-        if this.state != State::FutureResult {
-            panic!("future not polled to completion");
+        match this.state {
+            State::FutureResult => {}
+            State::Dropping => return None,
+            State::Future | State::Empty => panic!("future not polled to completion"),
         }
         this.state = State::Empty;
-        unsafe { ManuallyDrop::take(&mut this.storage.output) }
+        Some(unsafe { ManuallyDrop::take(&mut this.storage.output) })
     }
 
     /// Perform the poll operation on the future.
