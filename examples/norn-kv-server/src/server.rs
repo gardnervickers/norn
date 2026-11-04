@@ -270,9 +270,14 @@ async fn serve_connection_multishot(
             response = send_all(&socket, response).await?;
         }
         match outcome {
-            Ok(false) => {}
-            Ok(true) => {
+            Ok(BatchEnd::Open) => {}
+            Ok(BatchEnd::PeerClosed) => {
                 drop(incoming);
+                return Ok(());
+            }
+            Ok(BatchEnd::Quit) => {
+                // Requests pipelined after QUIT are left unread.
+                lingering_close(&socket, discard_multishot(&mut incoming)).await;
                 return Ok(());
             }
             Err(error) => {
@@ -283,10 +288,21 @@ async fn serve_connection_multishot(
     }
 }
 
+/// How a batch left the connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BatchEnd {
+    /// Keep serving.
+    Open,
+    /// The peer closed its write half after complete frames.
+    PeerClosed,
+    /// A QUIT was executed; the peer may still be sending.
+    Quit,
+}
+
 /// Execute one batch of buffered and newly received frames.
 ///
-/// Replies are appended to `response`. Returns whether the connection should
-/// close after the batch. On error, `response` still holds the replies of the
+/// Replies are appended to `response`. Returns whether and why the connection
+/// should close after the batch. On error, `response` still holds the replies of the
 /// frames executed before the failure, and the caller sends them before
 /// failing the connection.
 async fn fill_batch<S>(
@@ -295,19 +311,18 @@ async fn fill_batch<S>(
     config: ServerConfig,
     pending: &mut Vec<u8>,
     response: &mut Vec<u8>,
-) -> io::Result<bool>
+) -> io::Result<BatchEnd>
 where
     S: Stream<Item = io::Result<BufRingBuf>> + Unpin,
 {
     let mut commands = 0;
-    let mut close = false;
 
-    if !pending.is_empty() {
-        close = process_pending(handler, config, pending, response, &mut commands)?;
+    if !pending.is_empty() && process_pending(handler, config, pending, response, &mut commands)? {
+        return Ok(BatchEnd::Quit);
     }
 
     for selected_count in 0..MAX_READY_RECEIVES_PER_BATCH {
-        if close || batch_full(config, commands, response.len()) {
+        if batch_full(config, commands, response.len()) {
             break;
         }
 
@@ -319,17 +334,21 @@ where
             };
             next
         };
-        let Some(next) = next else {
-            if pending.is_empty() {
-                close = true;
-            } else {
+        let selected = match next {
+            Some(Ok(selected)) if !selected.is_empty() => selected,
+            Some(Err(error)) => return Err(error),
+            Some(Ok(_)) | None => {
+                if pending.is_empty() {
+                    return Ok(BatchEnd::PeerClosed);
+                }
                 return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
             }
-            break;
         };
-        close = process_selected_buffer(next?, handler, config, pending, response, &mut commands)?;
+        if process_selected_buffer(selected, handler, config, pending, response, &mut commands)? {
+            return Ok(BatchEnd::Quit);
+        }
     }
-    Ok(close)
+    Ok(BatchEnd::Open)
 }
 
 fn process_selected_buffer(
@@ -340,13 +359,7 @@ fn process_selected_buffer(
     response: &mut Vec<u8>,
     commands: &mut usize,
 ) -> io::Result<bool> {
-    if selected.is_empty() {
-        if pending.is_empty() {
-            return Ok(true);
-        }
-        return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
-    }
-
+    debug_assert!(!selected.is_empty(), "the caller handles EOF");
     let close = if pending.is_empty() {
         let outcome =
             process_available_frames(handler, config, selected.as_slice(), response, commands)?;
@@ -444,7 +457,12 @@ async fn serve_connection(
     socket.set_nodelay(true).await?;
 
     match serve_exact_frames(&socket, handler, config).await {
-        Ok(()) => socket.close().await,
+        Ok(BatchEnd::Quit) => {
+            // Requests pipelined after QUIT are left unread.
+            lingering_close(&socket, discard_exact(&socket)).await;
+            Ok(())
+        }
+        Ok(BatchEnd::PeerClosed | BatchEnd::Open) => socket.close().await,
         Err(error) => {
             lingering_close(&socket, discard_exact(&socket)).await;
             Err(error)
@@ -457,7 +475,7 @@ async fn serve_exact_frames(
     socket: &TcpSocket,
     handler: MemoryHandler,
     config: ServerConfig,
-) -> io::Result<()> {
+) -> io::Result<BatchEnd> {
     let mut header_buf = RecvBuffer::new(HEADER_LEN);
     let mut body_buf = RecvBuffer::new(config.max_body_len);
     let mut response = Vec::with_capacity(config.max_body_len + HEADER_LEN);
@@ -465,7 +483,7 @@ async fn serve_exact_frames(
     loop {
         header_buf.reset(HEADER_LEN);
         let Some(returned) = recv_exact(socket, header_buf).await? else {
-            return Ok(());
+            return Ok(BatchEnd::PeerClosed);
         };
         header_buf = returned;
 
@@ -500,7 +518,7 @@ async fn serve_exact_frames(
             response = send_all(socket, response).await?;
         }
         if action == ConnectionAction::Close {
-            return Ok(());
+            return Ok(BatchEnd::Quit);
         }
     }
 }
