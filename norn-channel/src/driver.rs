@@ -1,6 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fmt;
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -23,23 +24,6 @@ struct Registry {
     receivers: RefCell<HashMap<u64, Rc<dyn RegisteredReceiver>>>,
     // Reuse wake storage without retaining a borrow across user callbacks.
     wake_storage: RefCell<Vec<Waker>>,
-}
-
-struct WakeBatch(Vec<Waker>);
-
-impl WakeBatch {
-    fn wake_all(&mut self) {
-        while let Some(waker) = self.0.pop() {
-            waker.wake();
-        }
-    }
-}
-
-impl Drop for WakeBatch {
-    fn drop(&mut self) {
-        // If one callback unwinds, still notify the remaining receivers.
-        self.wake_all();
-    }
 }
 
 impl Registry {
@@ -96,12 +80,24 @@ impl Registry {
         self.wake_all(wakers);
     }
 
-    fn wake_all(&self, wakers: Vec<Waker>) {
-        let mut batch = WakeBatch(wakers);
-        batch.wake_all();
+    /// Wake every waker in `wakers`, then resume the first panic, if any.
+    ///
+    /// Each waker runs under `catch_unwind`, so a panicking callback cannot
+    /// lose the remaining receivers' wakeups, and a second panic does not
+    /// unwind during another and abort the process.
+    fn wake_all(&self, mut wakers: Vec<Waker>) {
+        let mut panic = None;
+        while let Some(waker) = wakers.pop() {
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| waker.wake())) {
+                panic.get_or_insert(payload);
+            }
+        }
         // Reentrant wakeups may have populated their own empty storage. No
         // wakers are dropped while this cache is borrowed.
-        self.wake_storage.replace(std::mem::take(&mut batch.0));
+        self.wake_storage.replace(wakers);
+        if let Some(payload) = panic {
+            resume_unwind(payload);
+        }
     }
 }
 
