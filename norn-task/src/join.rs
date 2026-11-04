@@ -19,8 +19,11 @@ use crate::task_cell::JoinHandleRef;
 /// The task belongs to the thread that runs it. Cloning, waking or dropping
 /// its waker from any other thread aborts the process (after printing a
 /// message), so a future must not hand its waker to another thread or to
-/// something completed there, such as a `std::thread` or a cross-thread
-/// channel. The process also aborts, instead of unwinding, if dropping the
+/// something completed there, such as a `std::thread`, or a channel or oneshot
+/// from another runtime (for example `futures::channel` or `tokio::sync`) whose
+/// sender completes on another thread. `norn-channel` is safe: it wakes receivers
+/// only on their own runtime thread. The process also aborts, instead of
+/// unwinding, if dropping the
 /// future or its output panics, or if the task's reference count overflows.
 #[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct JoinHandle<T> {

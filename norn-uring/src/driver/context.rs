@@ -24,7 +24,7 @@ impl DriverContext {
             let mut old = current.handle.borrow_mut();
             assert!(
                 old.is_none(),
-                "an io_uring driver is already entered on this thread; drivers cannot be nested"
+                "an io_uring driver is already entered on this thread; drivers cannot be nested, which includes a nested `block_on` over an io_uring driver"
             );
             *old = Some(handle);
         });

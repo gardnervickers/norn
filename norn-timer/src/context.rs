@@ -24,7 +24,7 @@ impl Context {
             let old = unsafe { &mut *current.handle.get() };
             assert!(
                 old.is_none(),
-                "a timer driver is already entered on this thread; drivers cannot be nested"
+                "a timer driver is already entered on this thread; drivers cannot be nested, which includes a nested `block_on` over a timer driver"
             );
             *old = Some(handle);
         });
