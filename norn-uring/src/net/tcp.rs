@@ -63,11 +63,11 @@ pin_project_lite::pin_project! {
     /// The kernel keeps the receive armed while the stream is not polled.
     /// Each receive completion takes at least one whole ring buffer, however
     /// few bytes arrived, and the stream holds it until a later `poll_next`
-    /// yields it. A
-    /// stream whose task stops polling, for example while one of its sends
-    /// is blocked, can therefore take every buffer of a ring it shares with
-    /// other streams, which then wait for a buffer return. Dropping the
-    /// stream returns those buffers but discards the data they hold.
+    /// yields it. A stream whose task stops polling, for example while one
+    /// of its sends is blocked, can therefore take every buffer of a ring it
+    /// shares with other streams, which then wait for a buffer return.
+    /// Dropping the stream returns those buffers but discards the data they
+    /// hold.
     pub struct TcpRecvRingMulti {
         #[pin]
         inner: Option<socket::RecvRingStream>,
@@ -118,11 +118,11 @@ pin_project_lite::pin_project! {
     /// The kernel keeps the receive armed while the stream is not polled.
     /// Each receive completion takes at least one whole ring buffer, however
     /// few bytes arrived, and the stream holds it until a later `poll_next`
-    /// yields it. A
-    /// stream whose task stops polling, for example while one of its sends
-    /// is blocked, can therefore take every buffer of a ring it shares with
-    /// other streams, which then wait for a buffer return. Dropping the
-    /// stream returns those buffers but discards the data they hold.
+    /// yields it. A stream whose task stops polling, for example while one
+    /// of its sends is blocked, can therefore take every buffer of a ring it
+    /// shares with other streams, which then wait for a buffer return.
+    /// Dropping the stream returns those buffers but discards the data they
+    /// hold.
     pub struct TcpRecvBundleMulti {
         #[pin]
         inner: Option<socket::RecvRingBundleStream>,
