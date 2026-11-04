@@ -207,6 +207,15 @@ impl PublicationTracker {
         self.poisoned
     }
 
+    /// Count the buffers that are claimed and not yet returned.
+    #[cfg(test)]
+    pub(super) fn owned(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|slot| slot.state == SlotState::Owned)
+            .count()
+    }
+
     /// Enter the fail-closed state because accounting outside the tracker
     /// observed a contradiction, such as an impossible CQE length.
     pub(super) fn poison(&mut self) {
