@@ -2240,6 +2240,61 @@ unsafe impl<const MULTI: bool> Operation for Poll<MULTI> {
     }
 }
 
+pin_project_lite::pin_project! {
+    /// Readiness events from a multishot poll that is re-armed whenever the
+    /// kernel ends it without an error.
+    ///
+    /// The kernel ends a multishot request when it cannot post a completion,
+    /// for example to a full CQ; that says nothing about the socket. An error
+    /// ends the stream: re-arming would fail the same way.
+    pub(crate) struct ReadinessStream {
+        socket: Socket,
+        events: u32,
+        #[pin]
+        current: Option<Op<Poll<true>>>,
+        done: bool,
+    }
+}
+
+impl ReadinessStream {
+    pub(crate) fn new(socket: &Socket, events: u32) -> Self {
+        Self {
+            socket: socket.clone(),
+            events,
+            current: Some(socket.poll_readiness::<true>(events)),
+            done: false,
+        }
+    }
+}
+
+impl futures_core::Stream for ReadinessStream {
+    type Item = io::Result<Event>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> TaskPoll<Option<Self::Item>> {
+        let mut this = self.project();
+        if *this.done {
+            return TaskPoll::Ready(None);
+        }
+        loop {
+            if let Some(current) = this.current.as_mut().as_pin_mut() {
+                match ready!(current.poll_next(cx)) {
+                    Some(Ok(event)) => return TaskPoll::Ready(Some(Ok(event))),
+                    Some(Err(err)) => {
+                        this.current.set(None);
+                        *this.done = true;
+                        return TaskPoll::Ready(Some(Err(err)));
+                    }
+                    // The poll has delivered its terminal completion, so it
+                    // may be replaced.
+                    None => this.current.set(None),
+                }
+            }
+            this.current
+                .set(Some(this.socket.poll_readiness::<true>(*this.events)));
+        }
+    }
+}
+
 impl Multishot for Poll<true> {
     type Item = io::Result<Event>;
 
