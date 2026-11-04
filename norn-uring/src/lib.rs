@@ -29,6 +29,24 @@
 //! # Ok::<(), std::io::Error>(())
 //! ```
 //!
+//! # Dropping an operation
+//!
+//! Dropping an operation future cancels it, and what that means depends on
+//! how far the operation got:
+//!
+//! - Never polled: nothing happened, and nothing is submitted.
+//! - Waiting for SQ space in the driver's queue: the operation is cancelled
+//!   there with `ECANCELED` and never reaches the kernel.
+//! - Held by the kernel: the driver queues an `IORING_OP_ASYNC_CANCEL`. The
+//!   kernel may complete the operation first, and its result is then
+//!   discarded: a receive's data is lost, and a send or write may have
+//!   happened. To keep a result, keep polling the operation instead.
+//!
+//! The kernel cannot cancel some operations once it holds them: a zero-copy
+//! send waiting for its notification, an in-flight `uring_cmd`, and a linked
+//! timeout, which ends with the request it bounds. They keep their buffers
+//! until the kernel finishes them, and driver shutdown waits for them.
+//!
 //! # Modules
 //!
 //! - [`buf`]: stable buffer traits and adapters used by I/O operations.
