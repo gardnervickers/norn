@@ -166,6 +166,30 @@ impl<T> Shared<T> {
     }
 }
 
+/// Stores `waker` in `slot` unless the stored waker already wakes the same task.
+///
+/// Dropping a waker runs arbitrary code that may re-enter the channel and
+/// touch this slot, so the clone happens before the borrow and the replaced
+/// waker is dropped after it is released.
+fn register_waker_in(slot: &RefCell<Option<Waker>>, waker: &Waker) {
+    if slot
+        .borrow()
+        .as_ref()
+        .is_some_and(|current| current.will_wake(waker))
+    {
+        return;
+    }
+    let new = waker.clone();
+    let old = slot.borrow_mut().replace(new);
+    drop(old);
+}
+
+/// Empties `slot`, dropping the stored waker after the borrow is released.
+fn clear_waker_in(slot: &RefCell<Option<Waker>>) {
+    let old = slot.borrow_mut().take();
+    drop(old);
+}
+
 struct Local<T> {
     shared: Arc<Shared<T>>,
     waker: RefCell<Option<Waker>>,
@@ -173,17 +197,11 @@ struct Local<T> {
 
 impl<T> Local<T> {
     fn register_waker(&self, waker: &Waker) {
-        let mut current = self.waker.borrow_mut();
-        if current
-            .as_ref()
-            .is_none_or(|current| !current.will_wake(waker))
-        {
-            *current = Some(waker.clone());
-        }
+        register_waker_in(&self.waker, waker);
     }
 
     fn clear_waker(&self) {
-        self.waker.borrow_mut().take();
+        clear_waker_in(&self.waker);
     }
 }
 
@@ -666,17 +684,11 @@ impl<T> ShardedLocal<T> {
     }
 
     fn register_waker(&self, waker: &Waker) {
-        let mut current = self.waker.borrow_mut();
-        if current
-            .as_ref()
-            .is_none_or(|current| !current.will_wake(waker))
-        {
-            *current = Some(waker.clone());
-        }
+        register_waker_in(&self.waker, waker);
     }
 
     fn clear_waker(&self) {
-        self.waker.borrow_mut().take();
+        clear_waker_in(&self.waker);
     }
 }
 
@@ -1233,6 +1245,48 @@ mod tests {
 
     use super::*;
     use crate::{Driver, DriverBuilder, Endpoint};
+
+    struct SlotTouchOnDrop {
+        slot: *const RefCell<Option<Waker>>,
+    }
+
+    // Safety: the test waker is only dropped synchronously on the thread that
+    // owns `slot`, which outlives it.
+    unsafe impl Send for SlotTouchOnDrop {}
+    unsafe impl Sync for SlotTouchOnDrop {}
+
+    // The drop-time re-entry is the point of this waker.
+    #[allow(clippy::manual_noop_waker)]
+    impl Wake for SlotTouchOnDrop {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    impl Drop for SlotTouchOnDrop {
+        fn drop(&mut self) {
+            // Re-enter the slot while the old waker is being dropped.
+            drop(unsafe { (*self.slot).borrow_mut().take() });
+        }
+    }
+
+    #[test]
+    fn replaced_and_cleared_wakers_drop_outside_the_slot_borrow() {
+        let slot = RefCell::new(None);
+        let reentrant = || Waker::from(Arc::new(SlotTouchOnDrop { slot: &slot }));
+
+        register_waker_in(&slot, &reentrant());
+        // Replacing drops the old waker, which re-enters the slot and takes the
+        // new waker that was already stored.
+        register_waker_in(&slot, Waker::noop());
+        assert!(
+            slot.borrow().is_none(),
+            "the old waker was not dropped after the new one was stored"
+        );
+
+        *slot.borrow_mut() = None;
+        register_waker_in(&slot, &reentrant());
+        clear_waker_in(&slot);
+        assert!(slot.borrow().is_none());
+    }
 
     fn endpoint() -> (DriverBuilder, Endpoint) {
         let builder = DriverBuilder::new();
