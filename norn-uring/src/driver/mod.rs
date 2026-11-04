@@ -1484,7 +1484,22 @@ impl Shared {
         }
     }
 
+    /// Queue a close of `fd` without waiting for its completion.
+    ///
+    /// Once the driver has shut down this refuses with
+    /// [`CloseFdError::NeverQueued`], so the caller closes the descriptor
+    /// directly. Shutdown has already submitted its `IO_DRAIN` sentinels, which
+    /// can make the kernel defer a new close until ring teardown, and teardown
+    /// cancels it: the descriptor would stay open forever. Nothing is left to
+    /// retain the descriptor, and nothing reaps this close. Any other code that
+    /// submits to a shut-down ring and does not wait for the result has the same
+    /// hazard.
     fn close_fd(&self, fd: types::Fd) -> Result<(), CloseFdError> {
+        if self.shutdown_outcome().is_some() {
+            return Err(CloseFdError::NeverQueued(io::Error::other(
+                "driver has shut down",
+            )));
+        }
         let entry = opcode::Close::new(fd)
             .build()
             .user_data(Driver::CLOSE_FD_TOKEN as u64);
