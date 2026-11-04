@@ -932,7 +932,7 @@ fn shutdown_after_abandoned_write_does_not_wait_for_writability(
                 drop(peer);
                 return Ok(());
             }
-            norn_uring::noop().await;
+            turn().await;
         }
         panic!("shutdown(SHUT_WR) is still waiting for POLLOUT from a peer that does not read");
     })
@@ -952,7 +952,7 @@ fn flush_after_abandoned_write_does_not_wait_for_writability(
                 drop(peer);
                 return Ok(());
             }
-            norn_uring::noop().await;
+            turn().await;
         }
         panic!("flush is still waiting for POLLOUT from a peer that does not read");
     })
@@ -981,4 +981,10 @@ fn write_vectored_skips_leading_empty_slices_before_capping(
         drop(peer);
         Ok(())
     })
+}
+
+/// Let the driver run one turn. Only the turn matters, not `noop()`'s result.
+#[allow(clippy::let_unit_value)]
+async fn turn() {
+    let _turn = norn_uring::noop().await;
 }
