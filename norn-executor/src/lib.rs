@@ -127,7 +127,9 @@ impl<P: park::Park> LocalExecutor<P> {
     /// ### Panics
     /// Panics if [`park::Park::park`] returns an error, or if an executor is
     /// already running on this thread: `block_on` and [`try_block_on`] cannot
-    /// be nested, including from inside a spawned task.
+    /// be nested, including from inside a spawned task. Over a timer or io_uring
+    /// park the panic comes from that driver, which is entered first, and says
+    /// "driver" rather than "executor".
     ///
     /// [`try_block_on`]: LocalExecutor::try_block_on
     pub fn block_on<F>(&mut self, fut: F) -> F::Output
@@ -225,8 +227,11 @@ impl Handle {
     /// The task belongs to the thread that runs it. Cloning, waking or dropping
     /// its waker from any other thread aborts the process (after printing a
     /// message), so a future must not hand its waker to another thread or to
-    /// something completed there, such as a `std::thread` or a cross-thread
-    /// channel. The process also aborts, instead of unwinding, if dropping the
+    /// something completed there, such as a `std::thread`, or a channel or oneshot
+    /// from another runtime (for example `futures::channel` or `tokio::sync`) whose
+    /// sender completes on another thread. `norn-channel` is safe: it wakes receivers
+    /// only on their own runtime thread. The process also aborts, instead of
+    /// unwinding, if dropping the
     /// future or its output panics, or if the task's reference count overflows.
     pub fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
     where
@@ -252,8 +257,11 @@ impl Handle {
 /// The task belongs to the thread that runs it. Cloning, waking or dropping
 /// its waker from any other thread aborts the process (after printing a
 /// message), so a future must not hand its waker to another thread or to
-/// something completed there, such as a `std::thread` or a cross-thread
-/// channel. The process also aborts, instead of unwinding, if dropping the
+/// something completed there, such as a `std::thread`, or a channel or oneshot
+/// from another runtime (for example `futures::channel` or `tokio::sync`) whose
+/// sender completes on another thread. `norn-channel` is safe: it wakes receivers
+/// only on their own runtime thread. The process also aborts, instead of
+/// unwinding, if dropping the
 /// future or its output panics, or if the task's reference count overflows.
 pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
 where
