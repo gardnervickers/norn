@@ -671,9 +671,13 @@ impl TcpSocket {
 
     /// Return a stream of readiness events for this socket.
     ///
-    /// `events` uses `libc::POLL*` flags such as `POLLIN` and `POLLOUT`.
+    /// `events` uses `libc::POLL*` flags such as `POLLIN` and `POLLOUT`. The
+    /// stream is backed by a multishot poll, which the kernel can end without
+    /// an error, for example when it cannot post a completion to a full
+    /// completion queue. The stream then polls again, so it ends only after
+    /// yielding an error, such as `ECANCELED` once the driver shuts down.
     pub fn poll_readiness_multi(&self, events: u32) -> impl Stream<Item = io::Result<Event>> {
-        self.socket.poll_readiness::<true>(events)
+        socket::ReadinessStream::new(&self.socket, events)
     }
 
     /// Set value for the `SO_RCVBUF` option on this socket.
