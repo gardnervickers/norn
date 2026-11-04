@@ -2734,8 +2734,14 @@ mod tests {
 
             // A close queued during CQE dispatch must survive a transient
             // submit failure and reach the kernel on the next park.
-            let raw_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
-            assert!(raw_fd >= 0);
+            // Closure is observed through the pipe's write end rather than by
+            // probing `raw_fd`, which a concurrent test could have reused.
+            let mut pipe_fds = [0; 2];
+            assert_eq!(
+                unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) },
+                0
+            );
+            let [raw_fd, write_end] = pipe_fds;
             driver.shared.fail_next_submit(errno);
             let result = driver.shared.close_fd(types::Fd(raw_fd));
             assert!(matches!(result, Err(CloseFdError::Queued(_))));
@@ -2743,7 +2749,8 @@ mod tests {
             assert!(driver.handle().health_error().is_none());
 
             driver.park(ParkMode::NoPark).unwrap();
-            assert_eq!(unsafe { libc::fcntl(raw_fd, libc::F_GETFD) }, -1);
+            crate::test_util::assert_pipe_reader_closed(write_end);
+            unsafe { libc::close(write_end) };
 
             // Remote wakeups still re-arm once the transient failure passes.
             let unparker = Arc::clone(&driver.unparker);

@@ -273,6 +273,7 @@ impl Singleshot for CloseFd {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::assert_pipe_reader_closed;
 
     fn pipe() -> [RawFd; 2] {
         let mut fds = [0; 2];
@@ -283,16 +284,6 @@ mod tests {
 
     fn assert_open(fd: RawFd) {
         assert_ne!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
-    }
-
-    fn assert_pipe_reader_closed(write_end: RawFd) {
-        let mut pollfd = libc::pollfd {
-            fd: write_end,
-            events: libc::POLLOUT,
-            revents: 0,
-        };
-        assert_eq!(unsafe { libc::poll(&mut pollfd, 1, 0) }, 1);
-        assert_ne!(pollfd.revents & libc::POLLERR, 0);
     }
 
     #[test]
