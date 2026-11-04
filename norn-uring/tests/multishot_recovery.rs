@@ -285,7 +285,7 @@ fn stalled_consumer_pauses_without_starving_its_ring() -> Result<(), Box<dyn std
             expected.extend_from_slice(&segment);
             stalled_client.send(segment).await.0?;
             for _ in 0..4 {
-                norn_uring::noop().await;
+                norn_uring::noop().await?;
             }
         }
 
