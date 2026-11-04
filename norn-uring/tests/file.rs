@@ -828,3 +828,307 @@ fn splice_and_tee() -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     })
 }
+
+/// `SPLICE_F_FD_IN_FIXED`, which `libc` does not export.
+const SPLICE_F_FD_IN_FIXED: u32 = 1 << 31;
+
+/// Run a pipe test on its own named thread and fail instead of hanging if a
+/// splice or tee never completes.
+fn pipe_watchdog(
+    name: &str,
+    f: impl FnOnce() -> Result<(), Box<dyn std::error::Error>> + Send + 'static,
+) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let thread = std::thread::Builder::new()
+        .name(name.to_owned())
+        .spawn(move || {
+            let res = f().map_err(|err| err.to_string());
+            let _ = tx.send(res);
+        })
+        .unwrap();
+    match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+        Ok(res) => {
+            thread.join().unwrap();
+            res.unwrap();
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            if let Err(panic) = thread.join() {
+                std::panic::resume_unwind(panic);
+            }
+            unreachable!("pipe test thread exited without a result");
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            panic!("{name}: a pipe operation did not complete within 10s")
+        }
+    }
+}
+
+fn pipe_test_opts() -> fs::OpenOptions {
+    let mut opts = fs::OpenOptions::new();
+    opts.create(true).truncate(true).read(true).write(true);
+    opts
+}
+
+/// Let spawned pipe operations reach the kernel, fail with `EAGAIN`, and arm
+/// their readiness wait.
+async fn settle_pipe_ops(probe: &fs::File) -> std::io::Result<()> {
+    for _ in 0..3 {
+        probe.read_at(vec![0u8; 1], 0).await.0?;
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    Ok(())
+}
+
+#[test]
+fn pipe_splice_consumer_waits_for_producer() {
+    pipe_watchdog("pipe_splice_consumer_waits_for_producer", || {
+        util::with_test_env(|| async {
+            let dir = util::ThreadNameTestDir::new();
+            let src = pipe_test_opts().open(dir.join("src")).await?;
+            src.write_at(vec![7u8; 4096], 0).await.0?;
+            let dst = std::rc::Rc::new(pipe_test_opts().open(dir.join("dst")).await?);
+            let (reader, writer) = fs::pipe()?;
+            let reader = std::rc::Rc::new(reader);
+
+            let consumer = {
+                let (reader, dst) = (reader.clone(), dst.clone());
+                norn_executor::spawn(async move {
+                    dst.splice_from_pipe(&reader, Some(0), 4096, 0).await
+                })
+            };
+            settle_pipe_ops(&src).await?;
+            assert_eq!(writer.splice_from(&src, Some(0), 4096, 0).await?, 4096);
+            assert_eq!(consumer.await.unwrap()?, 4096);
+
+            let (res, buf) = dst.read_at(vec![0u8; 4096], 0).await;
+            assert_eq!(res?, 4096);
+            assert!(buf.iter().all(|&b| b == 7));
+            Ok(())
+        })
+    });
+}
+
+#[test]
+fn pipe_splice_producer_waits_for_drain() {
+    pipe_watchdog("pipe_splice_producer_waits_for_drain", || {
+        util::with_test_env(|| async {
+            let dir = util::ThreadNameTestDir::new();
+            let src = std::rc::Rc::new(pipe_test_opts().open(dir.join("src")).await?);
+            src.write_at(vec![3u8; 4096], 0).await.0?;
+            let sink = pipe_test_opts().open(dir.join("sink")).await?;
+            let (reader, writer) = fs::pipe()?;
+            let writer = std::rc::Rc::new(writer);
+
+            // Fill the pipe; the nonblocking attempt that finds it full reports it.
+            let mut filled = 0;
+            loop {
+                match writer
+                    .splice_from(&src, Some(0), 4096, libc::SPLICE_F_NONBLOCK)
+                    .await
+                {
+                    Ok(n) => filled += n,
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(err) => return Err(err.into()),
+                }
+            }
+            assert!(filled > 0);
+
+            let producer = {
+                let (writer, src) = (writer.clone(), src.clone());
+                norn_executor::spawn(
+                    async move { writer.splice_from(&src, Some(0), 4096, 0).await },
+                )
+            };
+            settle_pipe_ops(&sink).await?;
+            let mut drained = 0;
+            while drained < filled {
+                drained += reader.splice_to(&sink, None, 65536, 0).await?;
+            }
+            assert_eq!(producer.await.unwrap()?, 4096);
+            assert_eq!(reader.splice_to(&sink, None, 65536, 0).await?, 4096);
+            Ok(())
+        })
+    });
+}
+
+#[test]
+fn pipe_tee_waits_for_data() {
+    pipe_watchdog("pipe_tee_waits_for_data", || {
+        util::with_test_env(|| async {
+            let dir = util::ThreadNameTestDir::new();
+            let src = pipe_test_opts().open(dir.join("src")).await?;
+            src.write_at(vec![5u8; 512], 0).await.0?;
+            let sink = pipe_test_opts().open(dir.join("sink")).await?;
+            let (reader, writer) = fs::pipe()?;
+            let (dup_reader, dup_writer) = fs::pipe()?;
+            let reader = std::rc::Rc::new(reader);
+
+            let tee = {
+                let reader = reader.clone();
+                norn_executor::spawn(async move { reader.tee_to(&dup_writer, 512, 0).await })
+            };
+            settle_pipe_ops(&src).await?;
+            assert_eq!(writer.splice_from(&src, Some(0), 512, 0).await?, 512);
+            assert_eq!(tee.await.unwrap()?, 512);
+
+            // tee leaves the source pipe's data in place.
+            assert_eq!(reader.splice_to(&sink, Some(0), 512, 0).await?, 512);
+            assert_eq!(dup_reader.splice_to(&sink, Some(512), 512, 0).await?, 512);
+            Ok(())
+        })
+    });
+}
+
+#[test]
+fn pipe_splice_nonblock_flag_returns_would_block() {
+    pipe_watchdog("pipe_splice_nonblock_flag_returns_would_block", || {
+        util::with_test_env(|| async {
+            let dir = util::ThreadNameTestDir::new();
+            let dst = pipe_test_opts().open(dir.join("dst")).await?;
+            let (reader, _writer) = fs::pipe()?;
+            let (_dup_reader, dup_writer) = fs::pipe()?;
+
+            let err = dst
+                .splice_from_pipe(&reader, Some(0), 4096, libc::SPLICE_F_NONBLOCK)
+                .await
+                .unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+            let err = reader
+                .splice_to(&dst, Some(0), 4096, libc::SPLICE_F_NONBLOCK)
+                .await
+                .unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+            let err = reader
+                .tee_to(&dup_writer, 4096, libc::SPLICE_F_NONBLOCK)
+                .await
+                .unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+            Ok(())
+        })
+    });
+}
+
+#[test]
+fn pipe_splice_writer_drop_yields_eof() {
+    pipe_watchdog("pipe_splice_writer_drop_yields_eof", || {
+        util::with_test_env(|| async {
+            let dir = util::ThreadNameTestDir::new();
+            let dst = std::rc::Rc::new(pipe_test_opts().open(dir.join("dst")).await?);
+            let (reader, writer) = fs::pipe()?;
+            let (_dup_reader, dup_writer) = fs::pipe()?;
+            let reader = std::rc::Rc::new(reader);
+
+            let splice = {
+                let (reader, dst) = (reader.clone(), dst.clone());
+                norn_executor::spawn(async move {
+                    dst.splice_from_pipe(&reader, Some(0), 4096, 0).await
+                })
+            };
+            let tee = {
+                let reader = reader.clone();
+                norn_executor::spawn(async move { reader.tee_to(&dup_writer, 4096, 0).await })
+            };
+            settle_pipe_ops(&dst).await?;
+            drop(writer);
+            assert_eq!(splice.await.unwrap()?, 0);
+            assert_eq!(tee.await.unwrap()?, 0);
+            assert_eq!(reader.splice_to(&dst, Some(0), 4096, 0).await?, 0);
+            Ok(())
+        })
+    });
+}
+
+#[test]
+fn pipe_dropped_waiting_splice_releases_descriptor() {
+    pipe_watchdog("pipe_dropped_waiting_splice_releases_descriptor", || {
+        util::with_test_env(|| async {
+            let dir = util::ThreadNameTestDir::new();
+            let dst = pipe_test_opts().open(dir.join("dst")).await?;
+            let (reader, _writer) = fs::pipe()?;
+            {
+                let mut splice = std::pin::pin!(dst.splice_from_pipe(&reader, Some(0), 4096, 0));
+                for _ in 0..3 {
+                    poll_fn(|cx| {
+                        assert!(splice.as_mut().poll(cx).is_pending());
+                        Poll::Ready(())
+                    })
+                    .await;
+                    settle_pipe_ops(&dst).await?;
+                }
+            }
+            settle_pipe_ops(&dst).await?;
+            reader.close().await?;
+            Ok(())
+        })
+    });
+}
+
+#[test]
+fn pipe_shutdown_with_waiting_splice_completes() {
+    pipe_watchdog("pipe_shutdown_with_waiting_splice_completes", || {
+        let writer = util::with_test_env(|| async {
+            let dir = util::ThreadNameTestDir::new();
+            let dst = pipe_test_opts().open(dir.join("dst")).await?;
+            let probe = pipe_test_opts().open(dir.join("probe")).await?;
+            let (reader, writer) = fs::pipe()?;
+            let _waiting = norn_executor::spawn(async move {
+                let _ = dst.splice_from_pipe(&reader, Some(0), 4096, 0).await;
+            });
+            settle_pipe_ops(&probe).await?;
+            // Keep the write end open past shutdown so the splice never sees EOF.
+            Ok(writer)
+        })?;
+        drop(writer);
+        Ok(())
+    });
+}
+
+#[test]
+fn pipe_splice_rejects_unsupported_flags() {
+    pipe_watchdog("pipe_splice_rejects_unsupported_flags", || {
+        util::with_test_env(|| async {
+            let dir = util::ThreadNameTestDir::new();
+            let src = pipe_test_opts().open(dir.join("src")).await?;
+            src.write_at(vec![1u8; 64], 0).await.0?;
+            let dst = pipe_test_opts().open(dir.join("dst")).await?;
+            let (reader, writer) = fs::pipe()?;
+            let (_dup_reader, dup_writer) = fs::pipe()?;
+            assert_eq!(writer.splice_from(&src, Some(0), 64, 0).await?, 64);
+
+            for flags in [SPLICE_F_FD_IN_FIXED, 0x10] {
+                let errs = [
+                    dst.splice_from_pipe(&reader, Some(0), 64, flags).await,
+                    reader.splice_to(&dst, Some(0), 64, flags).await,
+                    reader.tee_to(&dup_writer, 64, flags).await,
+                    src.splice_to_pipe(&writer, Some(0), 64, flags).await,
+                    writer.splice_from(&src, Some(0), 64, flags).await,
+                ];
+                for err in errs {
+                    assert_eq!(err.unwrap_err().raw_os_error(), Some(libc::EINVAL));
+                }
+            }
+            // Nothing was submitted, so the pipe still holds its data.
+            assert_eq!(reader.splice_to(&dst, Some(0), 64, 0).await?, 64);
+            Ok(())
+        })
+    });
+}
+
+#[test]
+fn pipe_splice_stops_on_eagain_from_the_file_side() {
+    pipe_watchdog("pipe_splice_stops_on_eagain_from_the_file_side", || {
+        util::with_test_env(|| async {
+            // A `File` wrapping an empty nonblocking pipe returns EAGAIN while
+            // the destination pipe is writable, which waiting cannot fix.
+            let (empty_reader, _empty_writer) = fs::pipe()?;
+            let not_ready = fs::File::from_uring_fd(empty_reader.into_uring_fd());
+            let (_reader, writer) = fs::pipe()?;
+            let err = writer
+                .splice_from(&not_ready, None, 4096, 0)
+                .await
+                .unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+            Ok(())
+        })
+    });
+}

@@ -319,10 +319,7 @@ mod tests {
     use crate::test_util::assert_pipe_reader_closed;
 
     fn pipe() -> [RawFd; 2] {
-        let mut fds = [0; 2];
-        let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
-        assert_eq!(rc, 0);
-        fds
+        crate::test_util::pipe_cloexec()
     }
 
     fn assert_open(fd: RawFd) {

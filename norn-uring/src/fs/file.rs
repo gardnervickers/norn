@@ -1,5 +1,6 @@
 use io_uring::types::FsyncFlags;
 use io_uring::{opcode, types};
+use std::future::Future;
 use std::io;
 use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
@@ -9,6 +10,7 @@ use crate::buf::{set_init_checked, StableBuf, StableBufMut};
 use crate::fd::{NornFd, UringFd};
 use crate::fixedbuf::FixedBuf;
 use crate::fs::opts;
+use crate::net::socket::Poll;
 use crate::operation::{CQEResult, Operation, Singleshot};
 
 /// A reference to an open file on the filesystem.
@@ -44,7 +46,21 @@ impl std::fmt::Debug for PipeWriter {
     }
 }
 
-/// Create a nonblocking pipe.
+/// Create a pipe.
+///
+/// Both ends are opened with `O_NONBLOCK`. The splice and tee methods on
+/// [`File`], [`PipeReader`] and [`PipeWriter`] still wait when the pipe is
+/// empty or full: if the kernel reports `EAGAIN`, the operation waits for the
+/// pipe end to become ready and retries, without holding a kernel worker
+/// thread while it waits. Pass `libc::SPLICE_F_NONBLOCK` to an individual
+/// operation to make a single attempt that returns
+/// [`io::ErrorKind::WouldBlock`] instead.
+///
+/// Without `SPLICE_F_NONBLOCK`, [`io::ErrorKind::WouldBlock`] means the
+/// awaited pipe ends were ready but the operation still could not proceed
+/// several times in a row: the other descriptor is not ready (for example a
+/// nonblocking socket wrapped as a [`File`]), or other operations on the same
+/// pipe keep taking the data or space first.
 ///
 /// # Errors
 ///
@@ -394,9 +410,16 @@ impl File {
 
     /// Splice bytes from this file into the provided pipe.
     ///
+    /// Waits while `dst` is full; see [`pipe`] for the waiting contract.
+    /// `flags` accepts `SPLICE_F_MOVE`, `SPLICE_F_NONBLOCK`, `SPLICE_F_MORE`
+    /// and `SPLICE_F_GIFT`.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the splice operation fails.
+    /// Returns [`io::ErrorKind::InvalidInput`] (`EINVAL`) for any other flag,
+    /// [`io::ErrorKind::WouldBlock`] if `SPLICE_F_NONBLOCK` is set and the
+    /// pipe is full or this file is not ready, or another error if the splice
+    /// operation fails.
     pub async fn splice_to_pipe(
         &self,
         dst: &PipeWriter,
@@ -404,22 +427,29 @@ impl File {
         len: u32,
         flags: u32,
     ) -> io::Result<usize> {
-        let splice = SpliceOp::new(
-            self.fd.lease(),
-            option_offset_to_i64(src_offset)?,
-            dst.fd.lease(),
-            -1,
-            len,
-            flags,
-        );
-        self.fd.submit(splice).await
+        check_splice_flags(flags)?;
+        let src_offset = option_offset_to_i64(src_offset)?;
+        let wait = PipeWait::writable(&dst.fd);
+        retry_pipe_op(flags, wait, || {
+            let splice = SpliceOp::new(self.fd.lease(), src_offset, dst.fd.lease(), -1, len, flags);
+            self.fd.submit(splice)
+        })
+        .await
     }
 
     /// Splice bytes from the provided pipe into this file.
     ///
+    /// Waits while `src` is empty and still has a writer; see [`pipe`] for
+    /// the waiting contract. Returns `Ok(0)` once `src` is empty and every
+    /// write end is closed. `flags` accepts `SPLICE_F_MOVE`,
+    /// `SPLICE_F_NONBLOCK`, `SPLICE_F_MORE` and `SPLICE_F_GIFT`.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the splice operation fails.
+    /// Returns [`io::ErrorKind::InvalidInput`] (`EINVAL`) for any other flag,
+    /// [`io::ErrorKind::WouldBlock`] if `SPLICE_F_NONBLOCK` is set and the
+    /// pipe is empty or this file is not ready, or another error if the
+    /// splice operation fails.
     pub async fn splice_from_pipe(
         &self,
         src: &PipeReader,
@@ -427,15 +457,14 @@ impl File {
         len: u32,
         flags: u32,
     ) -> io::Result<usize> {
-        let splice = SpliceOp::new(
-            src.fd.lease(),
-            -1,
-            self.fd.lease(),
-            option_offset_to_i64(dst_offset)?,
-            len,
-            flags,
-        );
-        self.fd.submit(splice).await
+        check_splice_flags(flags)?;
+        let dst_offset = option_offset_to_i64(dst_offset)?;
+        let wait = PipeWait::readable(&src.fd);
+        retry_pipe_op(flags, wait, || {
+            let splice = SpliceOp::new(src.fd.lease(), -1, self.fd.lease(), dst_offset, len, flags);
+            self.fd.submit(splice)
+        })
+        .await
     }
 
     /// Close the file.
@@ -476,9 +505,17 @@ impl PipeReader {
 
     /// Splice bytes from this pipe into the provided file.
     ///
+    /// Waits while this pipe is empty and still has a writer; see [`pipe`]
+    /// for the waiting contract. Returns `Ok(0)` once the pipe is empty and
+    /// every write end is closed. `flags` accepts `SPLICE_F_MOVE`,
+    /// `SPLICE_F_NONBLOCK`, `SPLICE_F_MORE` and `SPLICE_F_GIFT`.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the splice operation fails.
+    /// Returns [`io::ErrorKind::InvalidInput`] (`EINVAL`) for any other flag,
+    /// [`io::ErrorKind::WouldBlock`] if `SPLICE_F_NONBLOCK` is set and the
+    /// pipe is empty or `dst` is not ready, or another error if the splice
+    /// operation fails.
     pub async fn splice_to(
         &self,
         dst: &File,
@@ -486,25 +523,41 @@ impl PipeReader {
         len: u32,
         flags: u32,
     ) -> io::Result<usize> {
-        let splice = SpliceOp::new(
-            self.fd.lease(),
-            -1,
-            dst.fd.lease(),
-            option_offset_to_i64(dst_offset)?,
-            len,
-            flags,
-        );
-        self.fd.submit(splice).await
+        check_splice_flags(flags)?;
+        let dst_offset = option_offset_to_i64(dst_offset)?;
+        let wait = PipeWait::readable(&self.fd);
+        retry_pipe_op(flags, wait, || {
+            let splice = SpliceOp::new(self.fd.lease(), -1, dst.fd.lease(), dst_offset, len, flags);
+            self.fd.submit(splice)
+        })
+        .await
     }
 
     /// Duplicate bytes from this pipe into another pipe without consuming them.
     ///
+    /// Waits while this pipe is empty and still has a writer, or while `dst`
+    /// is full; see [`pipe`] for the waiting contract. Returns `Ok(0)` once
+    /// this pipe is empty and every write end is closed. `flags` accepts
+    /// `SPLICE_F_MOVE`, `SPLICE_F_NONBLOCK`, `SPLICE_F_MORE` and
+    /// `SPLICE_F_GIFT`.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the tee operation fails.
+    /// Returns [`io::ErrorKind::InvalidInput`] (`EINVAL`) for any other flag,
+    /// [`io::ErrorKind::WouldBlock`] if `SPLICE_F_NONBLOCK` is set and this
+    /// pipe is empty or `dst` is full, or another error if the tee operation
+    /// fails.
     pub async fn tee_to(&self, dst: &PipeWriter, len: u32, flags: u32) -> io::Result<usize> {
-        let tee = TeeOp::new(self.fd.lease(), dst.fd.lease(), len, flags);
-        self.fd.submit(tee).await
+        check_splice_flags(flags)?;
+        let wait = PipeWait {
+            readable: Some(&self.fd),
+            writable: Some(&dst.fd),
+        };
+        retry_pipe_op(flags, wait, || {
+            let tee = TeeOp::new(self.fd.lease(), dst.fd.lease(), len, flags);
+            self.fd.submit(tee)
+        })
+        .await
     }
 
     /// Close the pipe read end.
@@ -545,9 +598,16 @@ impl PipeWriter {
 
     /// Splice bytes from the provided file into this pipe.
     ///
+    /// Waits while this pipe is full; see [`pipe`] for the waiting contract.
+    /// `flags` accepts `SPLICE_F_MOVE`, `SPLICE_F_NONBLOCK`, `SPLICE_F_MORE`
+    /// and `SPLICE_F_GIFT`.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the splice operation fails.
+    /// Returns [`io::ErrorKind::InvalidInput`] (`EINVAL`) for any other flag,
+    /// [`io::ErrorKind::WouldBlock`] if `SPLICE_F_NONBLOCK` is set and the
+    /// pipe is full or `src` is not ready, or another error if the splice
+    /// operation fails.
     pub async fn splice_from(
         &self,
         src: &File,
@@ -555,15 +615,14 @@ impl PipeWriter {
         len: u32,
         flags: u32,
     ) -> io::Result<usize> {
-        let splice = SpliceOp::new(
-            src.fd.lease(),
-            option_offset_to_i64(src_offset)?,
-            self.fd.lease(),
-            -1,
-            len,
-            flags,
-        );
-        self.fd.submit(splice).await
+        check_splice_flags(flags)?;
+        let src_offset = option_offset_to_i64(src_offset)?;
+        let wait = PipeWait::writable(&self.fd);
+        retry_pipe_op(flags, wait, || {
+            let splice = SpliceOp::new(src.fd.lease(), src_offset, self.fd.lease(), -1, len, flags);
+            self.fd.submit(splice)
+        })
+        .await
     }
 
     /// Close the pipe write end.
@@ -1335,6 +1394,113 @@ impl Singleshot for Truncate {
 
     fn complete(self, result: CQEResult) -> Self::Output {
         result.result.map(|_| ())
+    }
+}
+
+/// Splice and tee flags that preserve descriptor ownership. In particular,
+/// `SPLICE_F_FD_IN_FIXED` would make the kernel read a registered file slot
+/// instead of the descriptor this operation retains.
+const SPLICE_FLAGS: u32 =
+    libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK | libc::SPLICE_F_MORE | libc::SPLICE_F_GIFT;
+
+/// Consecutive `EAGAIN` results tolerated while the awaited pipe ends already
+/// report readiness. Such results come from the other descriptor (for
+/// example a nonblocking socket wrapped as a [`File`]), which this module
+/// cannot wait on.
+const MAX_READY_EAGAIN: u32 = 4;
+
+fn check_splice_flags(flags: u32) -> io::Result<()> {
+    if flags & !SPLICE_FLAGS != 0 {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    Ok(())
+}
+
+/// The pipe ends a splice or tee waits on after `EAGAIN`.
+struct PipeWait<'a> {
+    readable: Option<&'a UringFd>,
+    writable: Option<&'a UringFd>,
+}
+
+impl<'a> PipeWait<'a> {
+    fn readable(fd: &'a UringFd) -> Self {
+        Self {
+            readable: Some(fd),
+            writable: None,
+        }
+    }
+
+    fn writable(fd: &'a UringFd) -> Self {
+        Self {
+            readable: None,
+            writable: Some(fd),
+        }
+    }
+
+    fn ends(&self) -> impl Iterator<Item = (&'a UringFd, u32)> {
+        let readable = self.readable.map(|fd| (fd, libc::POLLIN as u32));
+        let writable = self.writable.map(|fd| (fd, libc::POLLOUT as u32));
+        readable.into_iter().chain(writable)
+    }
+
+    /// Returns whether every awaited end is ready now. Hangup and error
+    /// count as ready, because the retried operation reports them.
+    fn is_ready(&self) -> io::Result<bool> {
+        for (fd, events) in self.ends() {
+            let mut pollfd = libc::pollfd {
+                fd: fd.fd().0,
+                events: events as i16,
+                revents: 0,
+            };
+            let res = unsafe { libc::poll(&mut pollfd, 1, 0) };
+            if res < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if pollfd.revents == 0 {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Wait until each awaited end has reported readiness once. Pipe
+    /// readiness is level-triggered and checked when the poll is armed, so a
+    /// wakeup that races with arming is not lost.
+    async fn wait(&self) -> io::Result<()> {
+        for (fd, events) in self.ends() {
+            // The retried operation reports any error or hangup, so only the
+            // poll's own failure matters here.
+            let _ = fd.submit(Poll::<false>::new(fd.lease(), events)).await?;
+        }
+        Ok(())
+    }
+}
+
+/// Run a splice or tee until it completes with something other than `EAGAIN`,
+/// waiting for the pipe ends in `wait` between attempts. With
+/// `SPLICE_F_NONBLOCK` the first result is returned as is.
+async fn retry_pipe_op<F, R>(flags: u32, wait: PipeWait<'_>, mut attempt: F) -> io::Result<usize>
+where
+    F: FnMut() -> R,
+    R: Future<Output = io::Result<usize>>,
+{
+    let mut ready_eagain = 0;
+    loop {
+        match attempt().await {
+            Err(err)
+                if err.raw_os_error() == Some(libc::EAGAIN)
+                    && flags & libc::SPLICE_F_NONBLOCK == 0 => {}
+            res => return res,
+        }
+        if wait.is_ready()? {
+            ready_eagain += 1;
+            if ready_eagain >= MAX_READY_EAGAIN {
+                return Err(io::Error::from_raw_os_error(libc::EAGAIN));
+            }
+        } else {
+            ready_eagain = 0;
+        }
+        wait.wait().await?;
     }
 }
 

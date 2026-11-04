@@ -2455,17 +2455,15 @@ mod tests {
             assert_ne!(unsafe { libc::fcntl(raw_fd, libc::F_GETFD) }, -1);
         }
 
-        fn assert_closed(raw_fd: libc::c_int) {
-            assert_eq!(unsafe { libc::fcntl(raw_fd, libc::F_GETFD) }, -1);
-            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
-        }
-
-        let mut pipe_fds = [0; 2];
-        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
+        // Observing the writer checks the pipe the driver closed, not the
+        // descriptor number. The number is safe to probe only because this test
+        // runs isolated, which the dup2 below also relies on.
+        let pipe_fds = crate::test_util::pipe_cloexec();
         let owned_fd = pipe_fds[0];
         let write_fd = pipe_fds[1];
-        let duplicate_fd = unsafe { libc::dup(owned_fd) };
-        assert!(duplicate_fd >= 0);
+        // An unrelated descriptor to place on `owned_fd`'s number below.
+        let spare_fds = crate::test_util::pipe_cloexec();
+        let duplicate_fd = spare_fds[0];
 
         let mut driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
         let weak_shared = Rc::downgrade(&driver.shared);
@@ -2503,7 +2501,7 @@ mod tests {
             1,
             "the cleanup-generated close must be compatible with IO_DRAIN"
         );
-        assert_closed(owned_fd);
+        crate::test_util::assert_pipe_reader_closed(write_fd);
         assert_open(duplicate_fd);
 
         // Reuse the exact integer descriptor before destroying the ring. A close SQE
@@ -2517,6 +2515,7 @@ mod tests {
             libc::close(owned_fd);
             libc::close(duplicate_fd);
             libc::close(write_fd);
+            libc::close(spare_fds[1]);
         }
     }
 
@@ -2781,12 +2780,7 @@ mod tests {
             // submit failure and reach the kernel on the next park.
             // Closure is observed through the pipe's write end rather than by
             // probing `raw_fd`, which a concurrent test could have reused.
-            let mut pipe_fds = [0; 2];
-            assert_eq!(
-                unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) },
-                0
-            );
-            let [raw_fd, write_end] = pipe_fds;
+            let [raw_fd, write_end] = crate::test_util::pipe_cloexec();
             driver.shared.fail_next_submit(errno);
             let result = driver.shared.close_fd(types::Fd(raw_fd));
             assert!(matches!(result, Err(CloseFdError::Queued(_))));
