@@ -904,13 +904,15 @@ impl Driver {
         loop {
             match self.submit(mode) {
                 Ok(_) => return Ok(()),
-                Err(err) if err.raw_os_error() == Some(libc::EBUSY) => {
-                    trace!(target: LOG, "park.ebusy");
+                Err(err) if Shared::is_transient_submit_error(&err) => {
+                    trace!(target: LOG, "park.transient {err}");
                     let drained = self.drain_normal(&mut remaining);
                     trace!(target: LOG, "park.drained {}", drained);
-                    if remaining.is_some() && (drained == 0 || remaining == Some(0)) {
+                    let ebusy = err.raw_os_error() == Some(libc::EBUSY);
+                    if (remaining.is_some() || !ebusy) && (drained == 0 || remaining == Some(0)) {
                         // Yield to runnable work. The next park call will retry
-                        // any submission that remains queued.
+                        // any submission that remains queued. Allocation
+                        // failures yield here too rather than spin on enter.
                         return Ok(());
                     }
                     mode = ParkMode::NoPark;
@@ -1082,7 +1084,19 @@ impl Shared {
     }
 
     fn should_record_submit_error(err: &io::Error) -> bool {
-        !matches!(err.raw_os_error(), Some(libc::EBUSY | libc::EINTR))
+        !matches!(err.raw_os_error(), Some(libc::EINTR)) && !Self::is_transient_submit_error(err)
+    }
+
+    /// Returns true for `io_uring_enter` failures that leave the ring usable.
+    ///
+    /// EBUSY reports a full CQ; EAGAIN and ENOMEM report that the kernel could
+    /// not allocate request memory. In each case the caller should reap
+    /// completions and retry rather than retire the driver.
+    fn is_transient_submit_error(err: &io::Error) -> bool {
+        matches!(
+            err.raw_os_error(),
+            Some(libc::EBUSY | libc::EAGAIN | libc::ENOMEM)
+        )
     }
 
     /// Get the current status of the driver.
@@ -2692,11 +2706,57 @@ mod tests {
             "EINTR should remain retryable"
         );
 
+        for errno in [libc::EAGAIN, libc::ENOMEM] {
+            assert!(
+                !Shared::should_record_submit_error(&io::Error::from_raw_os_error(errno)),
+                "allocation failure {errno} should remain a transient submit condition"
+            );
+        }
+
         let eio = io::Error::from_raw_os_error(libc::EIO);
         assert!(
             Shared::should_record_submit_error(&eio),
             "hard submit failures should still transition driver health"
         );
+    }
+
+    #[test]
+    fn transient_enter_failures_keep_the_driver_running() {
+        for errno in [libc::EAGAIN, libc::ENOMEM] {
+            let mut driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+
+            driver.shared.fail_next_submit(errno);
+            driver
+                .park(ParkMode::NextCompletion)
+                .expect("a transient park failure should yield, not fail");
+            assert_eq!(driver.shared.status(), Status::Running);
+            assert!(driver.handle().health_error().is_none());
+
+            // A close queued during CQE dispatch must survive a transient
+            // submit failure and reach the kernel on the next park.
+            let raw_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
+            assert!(raw_fd >= 0);
+            driver.shared.fail_next_submit(errno);
+            let result = driver.shared.close_fd(types::Fd(raw_fd));
+            assert!(matches!(result, Err(CloseFdError::Queued(_))));
+            assert_eq!(driver.shared.status(), Status::Running);
+            assert!(driver.handle().health_error().is_none());
+
+            driver.park(ParkMode::NoPark).unwrap();
+            assert_eq!(unsafe { libc::fcntl(raw_fd, libc::F_GETFD) }, -1);
+
+            // Remote wakeups still re-arm once the transient failure passes.
+            let unparker = Arc::clone(&driver.unparker);
+            let remote = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                unparker.wake();
+            });
+            driver
+                .park(ParkMode::NextCompletion)
+                .expect("remote unpark should end the park");
+            remote.join().unwrap();
+            assert_eq!(driver.shared.status(), Status::Running);
+        }
     }
 
     #[test]
