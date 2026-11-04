@@ -127,6 +127,9 @@ pub struct Store {
     config: StoreConfig,
     free: FreeList,
     generations: Vec<u64>,
+    /// Slots with a `put` or `delete` write that may still reach the file.
+    /// `get` and `delete` reject them.
+    reserved: Vec<bool>,
     index_bits: u32,
     index_mask: u64,
     scratch: Option<BlockBuf>,
@@ -154,6 +157,7 @@ impl Store {
             config,
             free: FreeList::new(config.slot_count),
             generations: vec![0; config.slot_count],
+            reserved: vec![false; config.slot_count],
             index_bits,
             index_mask,
             scratch: None,
@@ -186,7 +190,7 @@ impl Store {
             });
         }
 
-        self.file.release_abandoned(|slot| self.free.set_free(slot));
+        self.release_abandoned();
         let Some(slot) = self.free.allocate() else {
             return Err(Error::io(
                 "allocate slot",
@@ -196,12 +200,15 @@ impl Store {
 
         let generation = self.next_generation(slot);
         let key = self.make_key(slot, generation);
-        // Reserve the generation now so stale keys for this slot are rejected
-        // even while a cancelled write to it is still in flight.
+        // Reserve the slot and its generation now so neither stale keys nor
+        // the predictable new key can reach it while a cancelled write to it
+        // is still in flight.
         self.generations[slot] = generation;
+        self.reserved[slot] = true;
         let mut buf = match self.take_block() {
             Ok(buf) => buf,
             Err(err) => {
+                self.reserved[slot] = false;
                 self.free.set_free(slot);
                 return Err(err);
             }
@@ -219,7 +226,9 @@ impl Store {
             },
         );
 
-        match self.write_reserved_slot(slot, buf).await {
+        let res = self.write_reserved_slot(slot, buf).await;
+        self.reserved[slot] = false;
+        match res {
             Ok(()) => Ok(Key(key)),
             Err(err) => {
                 self.free.set_free(slot);
@@ -238,7 +247,7 @@ impl Store {
         let Some((slot, generation)) = self.decode_key(key) else {
             return Ok(None);
         };
-        if self.free.is_free(slot) || self.generations[slot] != generation {
+        if !self.is_live(slot, generation) {
             return Ok(None);
         }
 
@@ -256,14 +265,26 @@ impl Store {
 
     /// Delete a key, returning whether a live slot was actually marked deleted.
     ///
+    /// # Cancellation
+    ///
+    /// Dropping the returned future after the tombstone write was submitted
+    /// deletes the key: `get` returns `None` and a retried `delete` returns
+    /// `false`. The slot stays reserved until the write's final completion,
+    /// then returns to the free list for a later `put`. The tombstone may or
+    /// may not have reached the file; if it did not and no later `put` reused
+    /// the slot, the old value is live again after a reopen, as it would be
+    /// after a crash during `delete`.
+    ///
     /// # Errors
     ///
-    /// Returns [`Error::Io`] if reading or rewriting the referenced slot fails.
+    /// Returns [`Error::Io`] if buffer allocation or writing the tombstone
+    /// fails. The key stays live in that case.
     pub async fn delete(&mut self, key: Key) -> Result<bool> {
+        self.release_abandoned();
         let Some((slot, generation)) = self.decode_key(key) else {
             return Ok(false);
         };
-        if self.free.is_free(slot) || self.generations[slot] != generation {
+        if !self.is_live(slot, generation) {
             return Ok(false);
         }
 
@@ -279,8 +300,13 @@ impl Store {
                 crc: 0,
             },
         );
-        self.write_slot(slot, delete_buf).await?;
-        self.generations[slot] = generation;
+        // Reserve the slot until the tombstone write's final completion, so a
+        // retried `delete` cannot free it and let a later `put` reuse it while
+        // this tombstone can still land over the new value.
+        self.reserved[slot] = true;
+        let res = self.write_reserved_slot(slot, delete_buf).await;
+        self.reserved[slot] = false;
+        res?;
         self.free.set_free(slot);
         Ok(true)
     }
@@ -332,16 +358,6 @@ impl Store {
             .map_err(|err| Error::io("read slot", err))
     }
 
-    async fn write_slot(&mut self, slot: usize, buf: BlockBuf) -> Result<()> {
-        let buf = self
-            .file
-            .write_block(slot, buf)
-            .await
-            .map_err(|err| Error::io("write slot", err))?;
-        self.scratch = Some(buf);
-        Ok(())
-    }
-
     async fn write_reserved_slot(&mut self, slot: usize, buf: BlockBuf) -> Result<()> {
         let buf = self
             .file
@@ -350,6 +366,25 @@ impl Store {
             .map_err(|err| Error::io("write slot", err))?;
         self.scratch = Some(buf);
         Ok(())
+    }
+
+    /// Free each slot whose cancelled `put` or `delete` write has reached its
+    /// final completion.
+    fn release_abandoned(&mut self) {
+        let Self {
+            file,
+            free,
+            reserved,
+            ..
+        } = self;
+        file.release_abandoned(|slot| {
+            reserved[slot] = false;
+            free.set_free(slot);
+        });
+    }
+
+    fn is_live(&self, slot: usize, generation: u64) -> bool {
+        !self.free.is_free(slot) && !self.reserved[slot] && self.generations[slot] == generation
     }
 
     fn take_block(&mut self) -> Result<BlockBuf> {
@@ -690,15 +725,6 @@ mod block {
                     ));
                 }
                 Ok(buf)
-            }
-
-            pub(crate) async fn write_block(
-                &self,
-                block: usize,
-                buf: BlockBuf,
-            ) -> io::Result<BlockBuf> {
-                let (res, buf) = self.write_buf(block, buf).await;
-                res.map(|()| buf)
             }
 
             /// Write a block whose caller holds a reservation on it.
