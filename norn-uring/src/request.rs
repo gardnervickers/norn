@@ -7,7 +7,6 @@ use std::time::Duration;
 
 use smallvec::SmallVec;
 
-use crate::driver::PushBatchFuture;
 use crate::error::SubmitError;
 use crate::operation::{ConfiguredEntry, Op, Singleshot};
 
@@ -91,6 +90,38 @@ pub trait Request: Future + Sized + private::Chainable {
 
 impl<T> Request for T where T: Future + Sized + private::Chainable {}
 
+/// Configure two linked requests and hand them to the driver as one batch.
+///
+/// The driver pushes the batch whole, or queues it until the SQ has room, so
+/// both requests count as submitted once this returns.
+fn submit_pair<A, B>(mut left: Pin<&mut A>, mut right: Pin<&mut B>)
+where
+    A: Request,
+    B: Request,
+{
+    let mut batch = SmallVec::new();
+    if !left.as_mut().prepare_batch(&mut batch) {
+        right.as_mut().cancel_unsubmitted();
+    } else {
+        right.as_mut().prepare_batch(&mut batch);
+    }
+    let submitted = if batch.is_empty() {
+        Ok(())
+    } else {
+        left.as_ref().get_ref().reactor().submit_batch(batch)
+    };
+    match submitted {
+        Ok(()) => {
+            left.as_mut().finish_submit();
+            right.as_mut().finish_submit();
+        }
+        Err(err) => {
+            left.as_mut().fail_submit(&err);
+            right.as_mut().fail_submit(&err);
+        }
+    }
+}
+
 pin_project_lite::pin_project! {
     /// A linked request that yields both inner results.
     #[must_use = "futures do nothing unless you `.await` or poll them"]
@@ -126,8 +157,6 @@ pin_project_lite::pin_project! {
             left: A,
             #[pin]
             right: B,
-            #[pin]
-            submit: Option<PushBatchFuture>,
             left_output: Option<A::Output>,
             right_output: Option<B::Output>,
             submitted: bool,
@@ -150,7 +179,6 @@ where
             state: ThenState::Pending {
                 left,
                 right,
-                submit: None,
                 left_output: None,
                 right_output: None,
                 submitted: false,
@@ -172,7 +200,6 @@ where
             let ThenStateProj::Pending {
                 mut left,
                 mut right,
-                mut submit,
                 submitted,
                 ..
             } = this.state.as_mut().project()
@@ -181,43 +208,10 @@ where
             };
 
             if !*submitted {
-                if submit.is_none() {
-                    ready!(left.as_mut().poll_ready_to_prepare(cx));
-                    ready!(right.as_mut().poll_ready_to_prepare(cx));
-                    let mut batch = SmallVec::new();
-                    if !left.as_mut().prepare_batch(&mut batch) {
-                        right.as_mut().cancel_unsubmitted();
-                    } else {
-                        right.as_mut().prepare_batch(&mut batch);
-                    }
-                    if batch.is_empty() {
-                        left.as_mut().finish_submit();
-                        right.as_mut().finish_submit();
-                        *submitted = true;
-                    } else {
-                        let reactor = left.as_ref().get_ref().reactor().clone();
-                        submit.set(Some(reactor.push_batch(batch)));
-                    }
-                }
-
-                if !*submitted {
-                    let fut = submit
-                        .as_mut()
-                        .as_pin_mut()
-                        .expect("submit future must exist");
-                    match ready!(fut.poll(cx)) {
-                        Ok(()) => {
-                            left.as_mut().finish_submit();
-                            right.as_mut().finish_submit();
-                        }
-                        Err(err) => {
-                            left.as_mut().fail_submit(&err);
-                            right.as_mut().fail_submit(&err);
-                        }
-                    }
-                    submit.set(None);
-                    *submitted = true;
-                }
+                ready!(left.as_mut().poll_ready_to_prepare(cx));
+                ready!(right.as_mut().poll_ready_to_prepare(cx));
+                submit_pair(left.as_mut(), right.as_mut());
+                *submitted = true;
             }
         }
 
@@ -289,8 +283,6 @@ pin_project_lite::pin_project! {
             left: A,
             #[pin]
             right: B,
-            #[pin]
-            submit: Option<PushBatchFuture>,
             left_output: Option<A::Output>,
             right_done: bool,
             submitted: bool,
@@ -313,7 +305,6 @@ where
             state: ThenAuxState::Pending {
                 left,
                 right,
-                submit: None,
                 left_output: None,
                 right_done: false,
                 submitted: false,
@@ -335,7 +326,6 @@ where
             let ThenAuxStateProj::Pending {
                 mut left,
                 mut right,
-                mut submit,
                 submitted,
                 ..
             } = this.state.as_mut().project()
@@ -344,43 +334,10 @@ where
             };
 
             if !*submitted {
-                if submit.is_none() {
-                    ready!(left.as_mut().poll_ready_to_prepare(cx));
-                    ready!(right.as_mut().poll_ready_to_prepare(cx));
-                    let mut batch = SmallVec::new();
-                    if !left.as_mut().prepare_batch(&mut batch) {
-                        right.as_mut().cancel_unsubmitted();
-                    } else {
-                        right.as_mut().prepare_batch(&mut batch);
-                    }
-                    if batch.is_empty() {
-                        left.as_mut().finish_submit();
-                        right.as_mut().finish_submit();
-                        *submitted = true;
-                    } else {
-                        let reactor = left.as_ref().get_ref().reactor().clone();
-                        submit.set(Some(reactor.push_batch(batch)));
-                    }
-                }
-
-                if !*submitted {
-                    let fut = submit
-                        .as_mut()
-                        .as_pin_mut()
-                        .expect("submit future must exist");
-                    match ready!(fut.poll(cx)) {
-                        Ok(()) => {
-                            left.as_mut().finish_submit();
-                            right.as_mut().finish_submit();
-                        }
-                        Err(err) => {
-                            left.as_mut().fail_submit(&err);
-                            right.as_mut().fail_submit(&err);
-                        }
-                    }
-                    submit.set(None);
-                    *submitted = true;
-                }
+                ready!(left.as_mut().poll_ready_to_prepare(cx));
+                ready!(right.as_mut().poll_ready_to_prepare(cx));
+                submit_pair(left.as_mut(), right.as_mut());
+                *submitted = true;
             }
         }
 

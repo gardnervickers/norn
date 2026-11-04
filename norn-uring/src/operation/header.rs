@@ -13,7 +13,21 @@ pub(crate) struct Header {
     refcount: Cell<usize>,
     waker: RefCell<Option<Waker>>,
     complete: Cell<bool>,
+    queue: Cell<QueueState>,
     pub(crate) vtable: &'static VTable,
+}
+
+/// Whether an operation's entry waits in the driver's overflow queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QueueState {
+    /// The entry is not in the overflow queue: it is unconfigured, in the SQ
+    /// or the kernel, or done.
+    Idle,
+    /// The entry waits in the overflow queue for SQ space.
+    Queued,
+    /// The operation was cancelled while its entry waited there, so the entry
+    /// completes with `ECANCELED` instead of reaching the kernel.
+    Cancelled,
 }
 
 pub(crate) struct VTable {
@@ -60,6 +74,7 @@ impl Header {
             refcount: Cell::new(1),
             waker: Default::default(),
             complete: Cell::new(false),
+            queue: Cell::new(QueueState::Idle),
             vtable,
         }
     }
@@ -97,6 +112,14 @@ impl Header {
     /// must have returned false for it.
     pub(crate) unsafe fn set_complete(&self) {
         self.complete.set(true);
+    }
+
+    pub(crate) fn queue_state(&self) -> QueueState {
+        self.queue.get()
+    }
+
+    pub(crate) fn set_queue_state(&self, state: QueueState) {
+        self.queue.set(state);
     }
 
     /// Take the waker from the header.

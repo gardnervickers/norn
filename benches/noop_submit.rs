@@ -59,7 +59,7 @@ impl bencher::TDynBenchFn for NoopBench {
 ///
 /// We submit a burst of `n` noop futures with `join_all` while using a very
 /// small ring. Since `n` is orders of magnitude larger than ring entries, this
-/// necessarily exercises the SQ-full wait path in `PushFuture`.
+/// necessarily exercises the driver's SQ overflow queue.
 struct NoopBackpressureBench {
     ring_entries: u32,
     n: usize,
