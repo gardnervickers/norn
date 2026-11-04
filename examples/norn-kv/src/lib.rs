@@ -164,6 +164,14 @@ impl Store {
 
     /// Store bytes in a free slot and return an opaque key.
     ///
+    /// # Cancellation
+    ///
+    /// Dropping the returned future after the slot write was submitted keeps
+    /// the slot reserved until the write's final completion, then returns it
+    /// to the free list for a later `put`. The cancelled value may or may not
+    /// have reached the file; if it did, it occupies the slot again after a
+    /// reopen, as it would after a crash during `put`.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::ValueTooLarge`] if the value does not fit in a slot.
@@ -178,6 +186,7 @@ impl Store {
             });
         }
 
+        self.file.release_abandoned(|slot| self.free.set_free(slot));
         let Some(slot) = self.free.allocate() else {
             return Err(Error::io(
                 "allocate slot",
@@ -187,7 +196,16 @@ impl Store {
 
         let generation = self.next_generation(slot);
         let key = self.make_key(slot, generation);
-        let mut buf = self.take_block()?;
+        // Reserve the generation now so stale keys for this slot are rejected
+        // even while a cancelled write to it is still in flight.
+        self.generations[slot] = generation;
+        let mut buf = match self.take_block() {
+            Ok(buf) => buf,
+            Err(err) => {
+                self.free.set_free(slot);
+                return Err(err);
+            }
+        };
         buf[HEADER_SIZE..HEADER_SIZE + value.len()].copy_from_slice(&value);
         write_header(
             &mut buf,
@@ -201,11 +219,8 @@ impl Store {
             },
         );
 
-        match self.write_slot(slot, buf).await {
-            Ok(()) => {
-                self.generations[slot] = generation;
-                Ok(Key(key))
-            }
+        match self.write_reserved_slot(slot, buf).await {
+            Ok(()) => Ok(Key(key)),
             Err(err) => {
                 self.free.set_free(slot);
                 Err(err)
@@ -321,6 +336,16 @@ impl Store {
         let buf = self
             .file
             .write_block(slot, buf)
+            .await
+            .map_err(|err| Error::io("write slot", err))?;
+        self.scratch = Some(buf);
+        Ok(())
+    }
+
+    async fn write_reserved_slot(&mut self, slot: usize, buf: BlockBuf) -> Result<()> {
+        let buf = self
+            .file
+            .write_reserved_block(slot, buf)
             .await
             .map_err(|err| Error::io("write slot", err))?;
         self.scratch = Some(buf);
@@ -601,9 +626,11 @@ mod block {
 
     #[cfg(target_os = "linux")]
     mod linux {
+        use std::cell::RefCell;
         use std::io;
         use std::path::Path;
         use std::ptr::NonNull;
+        use std::rc::Rc;
 
         use norn_uring::buf::{StableBuf, StableBufMut};
         use norn_uring::fs;
@@ -614,6 +641,9 @@ mod block {
         pub(crate) struct BlockFile {
             file: fs::File,
             block_size: usize,
+            /// Blocks whose reserved write was abandoned and has since reached
+            /// its final completion.
+            abandoned: Rc<RefCell<Vec<usize>>>,
         }
 
         impl BlockFile {
@@ -639,7 +669,11 @@ mod block {
                     file.fallocate(0, total_len, 0).await?;
                 }
 
-                Ok(Self { file, block_size })
+                Ok(Self {
+                    file,
+                    block_size,
+                    abandoned: Rc::default(),
+                })
             }
 
             pub(crate) async fn read_block(&self, block: usize) -> io::Result<BlockBuf> {
@@ -663,32 +697,111 @@ mod block {
                 block: usize,
                 buf: BlockBuf,
             ) -> io::Result<BlockBuf> {
-                if buf.len != self.block_size {
-                    return Err(io::Error::new(
+                let (res, buf) = self.write_buf(block, buf).await;
+                res.map(|()| buf)
+            }
+
+            /// Write a block whose caller holds a reservation on it.
+            ///
+            /// If this future is dropped before it completes, `block` is
+            /// reported by [`BlockFile::release_abandoned`] once the write can
+            /// no longer reach the file. `norn-uring` keeps a dropped
+            /// operation's buffer alive until its final completion, so dropping
+            /// the buffer marks that point.
+            pub(crate) async fn write_reserved_block(
+                &self,
+                block: usize,
+                buf: BlockBuf,
+            ) -> io::Result<BlockBuf> {
+                let buf = ReservedBuf {
+                    buf,
+                    release: AbandonedBlock {
+                        block,
+                        abandoned: Rc::clone(&self.abandoned),
+                        completed: false,
+                    },
+                };
+                let (res, mut buf) = self.write_buf(block, buf).await;
+                // The write completed here, so the caller handles the outcome.
+                buf.release.completed = true;
+                res.map(|()| buf.buf)
+            }
+
+            /// Pass each block released by an abandoned reserved write to
+            /// `release`.
+            pub(crate) fn release_abandoned(&self, mut release: impl FnMut(usize)) {
+                for block in self.abandoned.borrow_mut().drain(..) {
+                    release(block);
+                }
+            }
+
+            async fn write_buf<B>(&self, block: usize, buf: B) -> (io::Result<()>, B)
+            where
+                B: StableBuf + 'static,
+            {
+                if buf.bytes_init() != self.block_size {
+                    let err = io::Error::new(
                         io::ErrorKind::InvalidInput,
                         format!(
                             "block write length mismatch: expected {}, got {}",
-                            self.block_size, buf.len
+                            self.block_size,
+                            buf.bytes_init()
                         ),
-                    ));
+                    );
+                    return (Err(err), buf);
                 }
 
                 let (res, buf) = self.file.write_at(buf, self.offset(block)).await;
-                let n = res?;
-                if n != self.block_size {
-                    return Err(io::Error::new(
+                let res = match res {
+                    Ok(n) if n == self.block_size => Ok(()),
+                    Ok(n) => Err(io::Error::new(
                         io::ErrorKind::WriteZero,
                         format!(
                             "short block write at block {block}: expected {}, got {n}",
                             self.block_size
                         ),
-                    ));
-                }
-                Ok(buf)
+                    )),
+                    Err(err) => Err(err),
+                };
+                (res, buf)
             }
 
             fn offset(&self, block: usize) -> u64 {
                 (block * self.block_size) as u64
+            }
+        }
+
+        /// A block buffer that reports its block as abandoned when dropped.
+        #[derive(Debug)]
+        struct ReservedBuf {
+            buf: AlignedBuf,
+            release: AbandonedBlock,
+        }
+
+        // Safety: delegates to the owned `AlignedBuf`, whose allocation does
+        // not move with this wrapper.
+        unsafe impl StableBuf for ReservedBuf {
+            fn stable_ptr(&self) -> *const u8 {
+                self.buf.stable_ptr()
+            }
+
+            fn bytes_init(&self) -> usize {
+                self.buf.bytes_init()
+            }
+        }
+
+        #[derive(Debug)]
+        struct AbandonedBlock {
+            block: usize,
+            abandoned: Rc<RefCell<Vec<usize>>>,
+            completed: bool,
+        }
+
+        impl Drop for AbandonedBlock {
+            fn drop(&mut self) {
+                if !self.completed {
+                    self.abandoned.borrow_mut().push(self.block);
+                }
             }
         }
 
@@ -847,6 +960,21 @@ mod block {
                 file.sync_data()?;
                 Ok(bytes)
             }
+
+            /// Write a block whose caller holds a reservation on it.
+            ///
+            /// The blocking write finishes in the poll that starts it, so it
+            /// is never abandoned while it can still reach the file.
+            pub(crate) async fn write_reserved_block(
+                &self,
+                block: usize,
+                bytes: BlockBuf,
+            ) -> io::Result<BlockBuf> {
+                self.write_block(block, bytes).await
+            }
+
+            /// Blocking writes are never abandoned in flight.
+            pub(crate) fn release_abandoned(&self, _release: impl FnMut(usize)) {}
 
             fn offset(&self, block: usize) -> u64 {
                 (block * self.block_size) as u64
