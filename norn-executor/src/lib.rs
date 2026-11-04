@@ -213,7 +213,10 @@ impl Handle {
     ///
     /// ### Panics
     /// This function will panic if called from outside of a [`LocalExecutor`]
-    /// context.
+    /// context. That includes a destructor that runs at thread exit, after the
+    /// thread's executor context has been destroyed; a panic there aborts the
+    /// process, so a task destructor must not call this when its executor is
+    /// stored in a `thread_local!`.
     pub fn current() -> Self {
         context::Context::handle().expect("executor not set")
     }

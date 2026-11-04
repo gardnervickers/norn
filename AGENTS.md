@@ -63,10 +63,12 @@ The project is intentionally not general-purpose today; APIs are still in flux i
 - `Driver` owns ring + backpressure notifier + status (`Running`, `Closing`,
   `DrainingOperations`, `ClosingResources`, `DrainingResources`, `Shutdown`).
 - Submission queue pressure is handled by `PushFuture` waiting on `Notify`.
-- Driver park loop drains the CQ before parking, loops on `EINTR`, and treats
-  `EBUSY`, `EAGAIN` and `ENOMEM` from `io_uring_enter` as transient: drain and
-  retry, or yield. Other enter errors are recorded as a health error and close
-  the driver.
+- Driver park loop drains the CQ before parking and treats `EBUSY`, `EAGAIN`
+  and `ENOMEM` from `io_uring_enter` as transient: drain and retry, or yield.
+  `EINTR` retries the enter, except in a timed park, which returns early so a
+  steady signal stream cannot restart the full timeout (callers re-check their
+  deadlines). Other enter errors are recorded as a health error and close the
+  driver.
 - Remote unpark is eventfd-based (`driver/unpark.rs`).
 - `Driver::drop` calls `Park::shutdown`; shutdown path uses cancellation + IO_DRAIN token.
 - Special CQE user_data tokens are reserved (`<= 1024`).

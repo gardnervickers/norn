@@ -522,6 +522,13 @@ impl Handle {
     }
 
     /// Whether shutdown may have cancelled any submitted request.
+    ///
+    /// `cancel_all` cancels with `IORING_ASYNC_CANCEL_ANY`, which matches every
+    /// submitted request and does not report which ones it hit, so this cannot
+    /// say whether a particular request was cancelled. It is set before the
+    /// cancel is issued and never cleared. After it is set, an `-ECANCELED`
+    /// completion therefore cannot be told apart from one the operation
+    /// produced on its own, and callers must treat it as "possibly cancelled".
     pub(crate) fn cancel_all_requested(&self) -> bool {
         self.shared.cancel_all_requested.get()
     }
@@ -1508,6 +1515,11 @@ impl Shared {
     }
 
     /// Cancel all outstanding requests synchronously.
+    ///
+    /// This matches with `CancelBuilder::any()`, not by descriptor or
+    /// `user_data`: every submitted request is a candidate. It sets
+    /// `cancel_all_requested`; see `Handle::cancel_all_requested` for what that
+    /// does and does not establish.
     pub(crate) fn cancel_all(&self) -> io::Result<()> {
         self.cancel_all_requested.set(true);
         #[cfg(test)]

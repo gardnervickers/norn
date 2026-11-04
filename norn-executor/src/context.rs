@@ -60,12 +60,18 @@ impl Context {
     }
 
     /// Returns a reference to the current executor.
+    ///
+    /// Returns `None` when no executor is set, including when thread-local
+    /// storage has already been destroyed (a destructor running at thread exit).
     pub(crate) fn handle() -> Option<Handle> {
-        CURRENT.with(|current| {
-            // Safety: the slot is thread-local and this borrow ends before
-            // any user code runs.
-            unsafe { (*current.handle.get()).clone() }
-        })
+        CURRENT
+            .try_with(|current| {
+                // Safety: the slot is thread-local and this borrow ends before
+                // any user code runs.
+                unsafe { (*current.handle.get()).clone() }
+            })
+            .ok()
+            .flatten()
     }
 
     /// Invoke `f` with the current executor handle.
