@@ -329,6 +329,15 @@ impl UdpSocket {
     /// Each yielded item includes payload bytes and the sender address.
     /// See [`UdpRecvFromRingMulti`] for recovery and backpressure behavior.
     ///
+    /// # Buffer sizing
+    ///
+    /// The kernel stores a 16-byte `io_uring_recvmsg_out` header and a 28-byte
+    /// sender address field ahead of the payload in each ring buffer, so each
+    /// buffer carries at most `ring.buf_capacity() - 44` payload bytes. A
+    /// larger datagram is truncated to fit, and the yielded
+    /// [`RecvMsgRingBuf::is_truncated`] returns `true`. Rings with buffers
+    /// shorter than 44 bytes cannot receive with this operation.
+    ///
     /// # Panics
     ///
     /// Panics when the buffer ring was registered with another driver.
