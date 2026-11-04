@@ -926,8 +926,13 @@ impl RuntimeGroup {
     }
 
     /// Wait for every worker to finish naturally.
+    ///
+    /// When called on one of the group's own workers, this waits for every
+    /// other worker and leaves the calling worker running. The calling
+    /// worker's outcome cannot be observed here, so it is never reported in
+    /// the returned [`JoinError`].
     pub fn join(mut self) -> Result<(), JoinError> {
-        let failures = collect_worker_failures(std::mem::take(&mut self.workers));
+        let failures = collect_worker_failures(self.take_other_workers());
         if failures.is_empty() {
             Ok(())
         } else {
@@ -936,9 +941,25 @@ impl RuntimeGroup {
     }
 
     /// Request cooperative shutdown, then wait for every worker to finish.
+    ///
+    /// Like [`join`](Self::join), this does not wait for or report the
+    /// calling worker when called on one of the group's own workers.
     pub fn shutdown(self) -> Result<(), JoinError> {
         self.request_shutdown();
         self.join()
+    }
+
+    /// Take every worker except the current thread, detaching the current
+    /// thread's own worker if this group is owned by one of its workers.
+    ///
+    /// A thread cannot join itself, so that worker is left running.
+    fn take_other_workers(&mut self) -> Vec<WorkerThread> {
+        let current = thread::current().id();
+        let (own, others): (Vec<_>, Vec<_>) = std::mem::take(&mut self.workers)
+            .into_iter()
+            .partition(|worker| worker.join.thread().id() == current);
+        drop(own);
+        others
     }
 }
 
@@ -948,11 +969,7 @@ impl Drop for RuntimeGroup {
         // Detached workers could outlive the owner and be killed mid-I/O at
         // process exit. A group dropped on one of its own workers cannot join
         // that thread, so it leaves only that worker running.
-        let current = thread::current().id();
-        let (own, others): (Vec<_>, Vec<_>) = std::mem::take(&mut self.workers)
-            .into_iter()
-            .partition(|worker| worker.join.thread().id() == current);
-        drop(own);
+        let others = self.take_other_workers();
         join_worker_threads(others);
     }
 }
@@ -1097,6 +1114,63 @@ mod tests {
 
         drop(builder.start().unwrap());
         assert!(finished.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn shutdown_on_a_worker_joins_the_other_workers() {
+        let mut builder = Builder::new(2);
+        let (group_tx, group_rx) = std_mpsc::channel::<RuntimeGroup>();
+        let (result_tx, result_rx) = std_mpsc::channel();
+        let peer_finished = Arc::new(AtomicBool::new(false));
+        let worker_finished = Arc::clone(&peer_finished);
+
+        builder
+            .worker(WorkerId::new(0), move |_| async move {
+                let result = group_rx.recv().unwrap().shutdown();
+                result_tx
+                    .send((result.is_ok(), worker_finished.load(Ordering::Acquire)))
+                    .unwrap();
+            })
+            .unwrap();
+        builder
+            .worker(WorkerId::new(1), move |context| async move {
+                context.shutdown_requested().await;
+                peer_finished.store(true, Ordering::Release);
+            })
+            .unwrap();
+
+        group_tx.send(builder.start().unwrap()).unwrap();
+        let (ok, peer_finished) = result_rx
+            .recv()
+            .expect("shutdown panicked on the group's own worker");
+        assert!(ok);
+        assert!(peer_finished);
+    }
+
+    #[test]
+    fn join_on_a_worker_reports_only_the_other_workers() {
+        let mut builder = Builder::new(2);
+        let (group_tx, group_rx) = std_mpsc::channel::<RuntimeGroup>();
+        let (result_tx, result_rx) = std_mpsc::channel();
+
+        builder
+            .worker(WorkerId::new(0), move |_| async move {
+                let error = group_rx.recv().unwrap().join().unwrap_err();
+                let failed: Vec<_> = error.failures().iter().map(WorkerFailure::worker).collect();
+                result_tx.send(failed).unwrap();
+            })
+            .unwrap();
+        builder
+            .worker(WorkerId::new(1), |_| async {
+                Err::<(), BoxError>("peer failed".into())
+            })
+            .unwrap();
+
+        group_tx.send(builder.start().unwrap()).unwrap();
+        let failed = result_rx
+            .recv()
+            .expect("join panicked on the group's own worker");
+        assert_eq!(failed, [WorkerId::new(1)]);
     }
 
     #[test]
