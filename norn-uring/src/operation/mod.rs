@@ -10,7 +10,7 @@ mod raw;
 
 use io_uring::types::CancelBuilder;
 pub use raw::CQEResult;
-pub(crate) use raw::RawOpRef;
+pub(crate) use raw::{OperationId, RawOpRef};
 
 use io_uring::squeue::Flags;
 use smallvec::SmallVec;
@@ -635,7 +635,7 @@ pub(crate) unsafe fn reap_operation(entry: &io_uring::cqueue::Entry) {
     assert!(entry.user_data() > 1024);
     let handle = RawOpRef::from_raw_usize(entry.user_data() as usize);
     let result = decode_cqe_result(entry.result(), entry.flags());
-    let result = CQEResult::new(result, entry.flags());
+    let result = CQEResult::from_cqe(result, entry.flags(), entry.user_data() as usize);
     // Safety: `handle` was reconstructed from this CQE's runtime-owned
     // `user_data`; draining the CQ invokes this path exactly once per entry.
     unsafe { handle.reap(result) };

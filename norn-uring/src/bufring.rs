@@ -4,12 +4,14 @@
 //! [registered buffer ring test](https://github.com/tokio-rs/io-uring/blob/master/io-uring-test/src/tests/register_buf_ring.rs).
 
 use std::cell::{Cell, RefCell, UnsafeCell};
+use std::num::NonZeroUsize;
 use std::rc::Rc;
 use std::sync::atomic::{self, AtomicU16};
 use std::{fmt, io, ops, ptr};
 
 use crate::buf::StableBuf;
 use crate::driver::BufRingRegistration;
+use crate::operation::OpTarget;
 use crate::util::notify::Notify;
 use crate::Handle;
 use io_uring::types::{self, BufRingEntry};
@@ -28,7 +30,8 @@ use tracker::{BufferToken, BundleClaim, PublicationTracker, TrackerError};
 /// order from kernel buffer selection.
 ///
 /// A multishot receive stream keeps selecting buffers while its task is not
-/// polling it, so one stalled consumer can hold every buffer of a shared ring.
+/// polling it, so one stalled consumer can hold every buffer of a shared ring
+/// unless [`Builder::max_unconsumed_per_receive`] bounds it.
 ///
 /// # Example
 ///
@@ -62,16 +65,27 @@ impl fmt::Debug for RecvBufRing {
             .field("ring_entries", &self.rc.ring_entries())
             .field("buf_cnt", &self.rc.buf_cnt)
             .field("buf_len", &self.rc.buf_len)
+            .field(
+                "max_unconsumed_per_receive",
+                &self.rc.max_unconsumed_per_receive,
+            )
             .finish()
     }
 }
 
 impl RecvBufRing {
-    fn new(registration: BufRingRegistration, storage: Rc<BufRingStorage>) -> Self {
+    fn new(
+        registration: BufRingRegistration,
+        storage: Rc<BufRingStorage>,
+        max_unconsumed_per_receive: Option<NonZeroUsize>,
+    ) -> Self {
         RecvBufRing {
             rc: Rc::new(InnerBufRing {
                 registration,
                 storage,
+                max_unconsumed_per_receive,
+                #[cfg(test)]
+                pauses: Cell::new(0),
             }),
         }
     }
@@ -89,6 +103,20 @@ impl RecvBufRing {
     /// Returns the number of buffers in the buffer ring.
     pub fn buf_count(&self) -> u16 {
         self.rc.buf_cnt
+    }
+
+    /// Returns the limit on buffers one multishot receive may hold before it
+    /// pauses, if one was set with [`Builder::max_unconsumed_per_receive`].
+    pub fn max_unconsumed_per_receive(&self) -> Option<usize> {
+        self.rc.max_unconsumed_per_receive.map(NonZeroUsize::get)
+    }
+
+    /// Request cancellation of a multishot receive on this ring, so that it
+    /// stops selecting buffers. This never enters the kernel.
+    pub(crate) fn pause_receive(&self, target: OpTarget) {
+        #[cfg(test)]
+        self.rc.pauses.set(self.rc.pauses.get() + 1);
+        self.rc.registration.cancel_op(target)
     }
 
     pub(crate) fn return_epoch(&self) -> u64 {
@@ -167,6 +195,23 @@ impl RecvBufRing {
 
     pub(crate) fn bgid(&self) -> Bgid {
         self.rc.bgid
+    }
+
+    /// Count the buffers that completions or their consumers hold.
+    #[cfg(test)]
+    pub(crate) fn test_owned_buffers(&self) -> usize {
+        self.rc.tracker.borrow().owned()
+    }
+
+    /// Count the pauses requested by receives on this ring.
+    #[cfg(test)]
+    pub(crate) fn test_pauses(&self) -> usize {
+        self.rc.pauses.get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_quarantine(&self) {
+        let _ = self.rc.poison("test quarantine");
     }
 
     pub(crate) fn same_driver(&self, handle: &Handle) -> bool {
@@ -743,6 +788,7 @@ pub struct Builder {
     ring_entries: u16,
     buf_cnt: u16,
     buf_len: usize,
+    max_unconsumed_per_receive: Option<usize>,
 }
 
 impl Builder {
@@ -759,6 +805,7 @@ impl Builder {
             ring_entries: 128,
             buf_cnt: 0, // 0 indicates buf_cnt is taken from ring_entries
             buf_len: 4096,
+            max_unconsumed_per_receive: None,
         }
     }
 
@@ -783,12 +830,52 @@ impl Builder {
         self
     }
 
+    /// Bound the buffers that one multishot receive stream may hold before
+    /// its consumer takes them. By default there is no bound.
+    ///
+    /// The kernel keeps a multishot receive armed while its stream is not
+    /// polled, and the stream holds each received buffer until a later
+    /// `poll_next` yields it. Without a bound, a stream whose task stops
+    /// polling can take every buffer of the ring, and every other receive on
+    /// the ring then waits for a buffer return.
+    ///
+    /// When a stream's received but not yet yielded buffers reach `limit`,
+    /// the stream pauses: it cancels its kernel receive, and the socket keeps
+    /// further data. Once the consumer has taken every buffer received before
+    /// the pause, its next `poll_next` re-arms the receive. A pause neither
+    /// loses nor reorders data, and it is not reported to the consumer. A
+    /// bundle counts each of its buffers.
+    ///
+    /// The bound is approximate. Completions the kernel posts before it
+    /// processes the cancellation are still delivered, so a paused stream can
+    /// briefly hold more than `limit` buffers. Choose a limit above the
+    /// backlog that a consumer which keeps polling builds up between polls,
+    /// or healthy streams pause and re-arm needlessly.
+    ///
+    /// While a TCP stream is paused its socket's receive buffer fills and the
+    /// peer's sends block. While a UDP stream is paused datagrams queue in
+    /// the socket's receive buffer, and the kernel drops them once it is
+    /// full, as it would for any slow receiver.
+    ///
+    /// A bound per stream does not by itself guarantee progress to other
+    /// streams: `buf_cnt` must exceed `limit` times the number of streams
+    /// that may stop polling at the same time.
+    ///
+    /// Buffers the application holds after a stream yields them are not
+    /// counted.
+    pub fn max_unconsumed_per_receive(mut self, limit: usize) -> Builder {
+        self.max_unconsumed_per_receive = Some(limit);
+        self
+    }
+
     /// Return a [`RecvBufRing`].
     ///
     /// # Errors
     ///
-    /// Returns an error for an invalid ring configuration, allocation failure,
-    /// duplicate buffer-group ID, or kernel registration failure.
+    /// Returns an error for an invalid ring configuration (including a zero
+    /// [`max_unconsumed_per_receive`](Self::max_unconsumed_per_receive)
+    /// limit), allocation failure, duplicate buffer-group ID, or kernel
+    /// registration failure.
     ///
     /// # Panics
     ///
@@ -815,6 +902,14 @@ impl Builder {
         // wrap calculation trivial.
         b.ring_entries = b.ring_entries.next_power_of_two();
 
+        let max_unconsumed_per_receive = match b.max_unconsumed_per_receive {
+            None => None,
+            Some(limit) => Some(
+                NonZeroUsize::new(limit)
+                    .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?,
+            ),
+        };
+
         let handle = crate::Handle::current();
         let storage = Rc::new(BufRingStorage::new(
             b.bgid,
@@ -825,13 +920,20 @@ impl Builder {
         let reservation = handle.reserve_buf_ring(Rc::clone(&storage))?;
         reservation.register(|submitter| storage.register(submitter))?;
         let registration = reservation.commit();
-        Ok(RecvBufRing::new(registration, storage))
+        Ok(RecvBufRing::new(
+            registration,
+            storage,
+            max_unconsumed_per_receive,
+        ))
     }
 }
 
 struct InnerBufRing {
     registration: BufRingRegistration,
     storage: Rc<BufRingStorage>,
+    max_unconsumed_per_receive: Option<NonZeroUsize>,
+    #[cfg(test)]
+    pauses: Cell<usize>,
 }
 
 impl ops::Deref for InnerBufRing {
