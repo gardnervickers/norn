@@ -44,7 +44,7 @@ fn shutdown_with_detached_noops() -> Result<(), Box<dyn std::error::Error>> {
             })
             .detach();
         }
-        norn_uring::noop().await;
+        norn_uring::noop().await.unwrap();
         Ok(())
     })
 }

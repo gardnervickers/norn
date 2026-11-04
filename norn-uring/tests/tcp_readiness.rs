@@ -66,14 +66,14 @@ fn readiness_does_not_accumulate_while_reader_keeps_up() -> Result<(), Box<dyn s
         // Keep exactly one byte of backlog so every read succeeds without
         // EAGAIN while each new arrival wakes the socket's wait queue.
         peer.write_all(b"ab")?;
-        norn_uring::noop().await;
+        norn_uring::noop().await.unwrap();
         assert!(matches!(
             read_once(reader.as_mut()).await,
             Poll::Ready(Ok(()))
         ));
         for _ in 0..ARRIVALS {
             peer.write_all(b"c")?;
-            norn_uring::noop().await;
+            norn_uring::noop().await.unwrap();
             assert!(matches!(
                 read_once(reader.as_mut()).await,
                 Poll::Ready(Ok(()))

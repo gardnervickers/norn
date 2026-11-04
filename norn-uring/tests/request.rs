@@ -177,7 +177,7 @@ fn standalone_timeout_can_be_canceled_after_submission() -> Result<(), Box<dyn s
         let control = timeout.control();
         let waiter = norn_executor::spawn(timeout);
 
-        norn_uring::noop().await;
+        norn_uring::noop().await.unwrap();
         assert!(control.cancel().await?);
         assert_eq!(waiter.await??, TimeoutOutcome::Canceled);
         assert!(!control.cancel().await?);
@@ -192,7 +192,7 @@ fn standalone_timeout_can_be_reset_after_submission() -> Result<(), Box<dyn std:
         let control = timeout.control();
         let waiter = norn_executor::spawn(timeout);
 
-        norn_uring::noop().await;
+        norn_uring::noop().await.unwrap();
         assert!(control.reset(Duration::from_millis(5)).await?);
         assert_eq!(waiter.await??, TimeoutOutcome::Expired);
         assert!(!control.reset(Duration::from_secs(1)).await?);
@@ -216,7 +216,7 @@ fn linked_timeout_can_be_reset_after_submission() -> Result<(), Box<dyn std::err
         let control = request.control();
         let waiter = norn_executor::spawn(request);
 
-        norn_uring::noop().await;
+        norn_uring::noop().await.unwrap();
         assert!(control.reset(Duration::from_millis(5)).await?);
         let (recv_res, buf) = waiter.await?;
         assert_eq!(recv_res.unwrap_err().raw_os_error(), Some(libc::ECANCELED));
