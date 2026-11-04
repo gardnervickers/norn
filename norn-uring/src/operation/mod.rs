@@ -695,9 +695,9 @@ pub(crate) unsafe fn reap_operation(entry: &io_uring::cqueue::Entry) {
 ///
 /// A link joins an entry to the next SQE in the shared queue, which may belong
 /// to another task; the driver sets `IO_LINK` itself for requests submitted
-/// together. A request that skips its success CQE never releases its operation,
-/// and once one is submitted the kernel rejects every later `IO_DRAIN` entry,
-/// including the barriers that driver shutdown waits on.
+/// together. A request that skips its success CQE never releases its operation
+/// or leaves the in-flight count that driver shutdown drains to zero, and once
+/// one is submitted the kernel rejects every later `IO_DRAIN` entry.
 const RESERVED_SQE_FLAGS: Flags = Flags::IO_LINK
     .union(Flags::IO_HARDLINK)
     .union(Flags::SKIP_SUCCESS);
