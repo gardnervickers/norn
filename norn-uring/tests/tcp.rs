@@ -618,6 +618,53 @@ fn recv_bundle_rejects_waitall_without_consuming_input() -> Result<(), Box<dyn s
     })
 }
 
+/// A peeking bundle that fills its buffers while more data is queued retries
+/// in the kernel and copies the start of the queue again. Bundles reject
+/// `MSG_PEEK` before consuming input.
+#[test]
+fn recv_bundle_rejects_peek_without_consuming_input() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let (server, client) = connected_pair().await?;
+        let ring = RecvBufRing::builder(16).buf_cnt(8).buf_len(256).build()?;
+
+        let payload: Vec<u8> = (0..1024u32).map(|i| (i % 251) as u8).collect();
+        let (send_result, payload) = client.send(payload).await;
+        assert_eq!(send_result?, payload.len());
+
+        let err = server
+            .recv_bundle_with_flags(&ring, libc::MSG_PEEK)
+            .await
+            .expect_err("MSG_PEEK bundle receive must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        let mut multi = pin!(server.recv_bundle_multi_with_flags(&ring, libc::MSG_PEEK));
+        let err = multi
+            .next()
+            .await
+            .expect("configuration failure must produce one stream item")
+            .expect_err("MSG_PEEK multishot bundle receive must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(multi.next().await.is_none());
+
+        let mut received: Vec<u8> = Vec::with_capacity(payload.len());
+        while received.len() < payload.len() {
+            let bundle = match server.recv_bundle(&ring).await {
+                Ok(bundle) => bundle,
+                Err(err) if util::recv_bundle_unsupported(&err) => break,
+                Err(err) => return Err(err.into()),
+            };
+            received.extend(bundle.iter().flatten().copied());
+        }
+        if !received.is_empty() {
+            assert_eq!(received, payload);
+        }
+
+        server.close().await?;
+        client.close().await?;
+        Ok(())
+    })
+}
+
 #[test]
 fn recv_bundle_shared_ring_handles_reverse_poll_order() -> Result<(), Box<dyn std::error::Error>> {
     util::with_test_env(|| async {

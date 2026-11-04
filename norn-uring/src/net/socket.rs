@@ -215,6 +215,15 @@ fn validate_recv_bundle_flags(flags: i32) -> io::Result<()> {
             "MSG_TRUNC is unsupported for receive bundles because the completion byte count does not identify how many buffers were selected",
         ));
     }
+    // After a full bundle with more data queued, the kernel retries into
+    // further buffers. A peek leaves the queue intact, so the retry copies its
+    // start again and the bundle reports more bytes than were queued.
+    if flags & libc::MSG_PEEK != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "MSG_PEEK is unsupported for receive bundles because a kernel bundle retry peeks the start of the queue again",
+        ));
+    }
     // A partial `MSG_WAITALL` bundle retries inside the kernel. Before Linux's
     // `io_net_kbuf_can_retry` fix (absent from 6.18.58), that retry can commit a
     // different number of buffers than the final completion reports, so the
@@ -2393,18 +2402,24 @@ mod tests {
     }
 
     #[test]
-    fn recv_bundle_flag_validation_rejects_trunc_and_waitall() {
-        for flags in [0, libc::MSG_PEEK] {
-            validate_recv_bundle_flags(flags).unwrap();
+    fn recv_bundle_flag_validation_rejects_trunc_peek_and_waitall() {
+        validate_recv_bundle_flags(0).unwrap();
 
-            let err = validate_recv_bundle_flags(flags | libc::MSG_TRUNC).unwrap_err();
+        for (flag, name) in [
+            (libc::MSG_TRUNC, "MSG_TRUNC"),
+            (libc::MSG_PEEK, "MSG_PEEK"),
+            (libc::MSG_WAITALL, "MSG_WAITALL"),
+        ] {
+            let err = validate_recv_bundle_flags(flag).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-            assert!(err.to_string().contains("MSG_TRUNC"));
-
-            let err = validate_recv_bundle_flags(flags | libc::MSG_WAITALL).unwrap_err();
-            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-            assert!(err.to_string().contains("MSG_WAITALL"));
+            assert!(err.to_string().contains(name), "{err} should name {name}");
         }
+
+        // The checks run in a fixed order: TRUNC, then PEEK, then WAITALL.
+        let err = validate_recv_bundle_flags(libc::MSG_PEEK | libc::MSG_WAITALL).unwrap_err();
+        assert!(err.to_string().contains("MSG_PEEK"));
+        let err = validate_recv_bundle_flags(libc::MSG_TRUNC | libc::MSG_PEEK).unwrap_err();
+        assert!(err.to_string().contains("MSG_TRUNC"));
     }
 
     fn build_test_ring(driver: &crate::Driver, bgid: u16) -> io::Result<RecvBufRing> {

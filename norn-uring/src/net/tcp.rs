@@ -545,10 +545,11 @@ impl TcpSocket {
     /// # Errors
     ///
     /// The request resolves with [`io::ErrorKind::InvalidInput`] when `flags`
-    /// contains `MSG_TRUNC` or `MSG_WAITALL`. `MSG_TRUNC` does not identify the
-    /// number of buffers selected by a bundle receive, and a partial
-    /// `MSG_WAITALL` retry can commit buffers that the completion does not
-    /// report.
+    /// contains `MSG_TRUNC`, `MSG_PEEK` or `MSG_WAITALL`. `MSG_TRUNC` does not
+    /// identify the number of buffers selected by a bundle receive, a kernel
+    /// bundle retry peeks the start of the queue again under `MSG_PEEK`, and a
+    /// partial `MSG_WAITALL` retry can commit buffers that the completion does
+    /// not report.
     pub fn recv_bundle_with_flags(
         &self,
         ring: &RecvBufRing,
@@ -575,8 +576,9 @@ impl TcpSocket {
     /// # Errors
     ///
     /// The stream yields [`io::ErrorKind::InvalidInput`] and terminates when
-    /// `flags` contains `MSG_TRUNC` or `MSG_WAITALL`. `MSG_TRUNC` does not
-    /// identify the number of selected buffers, and multishot receives do not
+    /// `flags` contains `MSG_TRUNC`, `MSG_PEEK`, or `MSG_WAITALL`. `MSG_TRUNC`
+    /// does not identify the number of selected buffers, a kernel bundle retry
+    /// peeks the start of the queue again, and multishot receives do not
     /// support `MSG_WAITALL`.
     pub fn recv_bundle_multi_with_flags(
         &self,
