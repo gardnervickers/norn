@@ -222,6 +222,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let config = parse()?;
+    // Report an invalid limit before binding or announcing the listener.
+    config.server.validate()?;
     if config.workers > 1 {
         let server = ShardedServer::start(ShardedServerConfig {
             listen: config.listen,

@@ -883,7 +883,7 @@ async fn serve_sharded_connection(
     let mut incoming = Box::pin(socket.recv_ring_multi(&recv_ring));
     let decoder = FrameDecoder::new(config.max_body_len);
     let mut pending = Vec::with_capacity(RECV_BUFFER_LEN);
-    let mut output = Vec::with_capacity(config.max_body_len + HEADER_LEN);
+    let mut output = Vec::with_capacity(RECV_BUFFER_LEN);
     let mut stop_dispatch = false;
     let mut close_ready = false;
     let mut peer_eof = false;
