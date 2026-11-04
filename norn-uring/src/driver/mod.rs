@@ -10,7 +10,7 @@ use std::{io, mem};
 use io_uring::squeue::{Flags, PushError};
 use io_uring::types::{self, CancelBuilder, SubmitArgs, Timespec};
 use io_uring::{cqueue, opcode, IoUring, Submitter};
-use log::{debug, error, trace, warn};
+use log::{debug, trace, warn};
 use norn_executor::park::{Park, ParkMode};
 use smallvec::SmallVec;
 
@@ -917,10 +917,6 @@ impl Driver {
                     }
                     mode = ParkMode::NoPark;
                 }
-                Err(err) if err.raw_os_error() == Some(libc::EINTR) => {
-                    error!(target: LOG, "park.eintr");
-                    continue;
-                }
                 Err(err) => return Err(err),
             }
         }
@@ -1294,6 +1290,18 @@ impl Shared {
                 {
                     // A timed CQ wait expired normally. ETIME in other submit
                     // modes remains an unexpected driver failure.
+                    return Ok(0);
+                }
+                Err(err)
+                    if matches!(mode, ParkMode::Timeout(_))
+                        && err.raw_os_error() == Some(libc::EINTR) =>
+                {
+                    // A signal interrupted the timed wait. Retrying would
+                    // restart the full timeout on every signal, so a steady
+                    // signal stream could postpone the park indefinitely. A
+                    // timed park may return early; the caller re-checks its
+                    // deadlines and parks again with the remaining time.
+                    trace!(target: LOG, "submit.eintr timed park returns early");
                     return Ok(0);
                 }
                 Err(err) if err.raw_os_error() == Some(libc::EINTR) => {
