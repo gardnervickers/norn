@@ -1,5 +1,6 @@
-//! A connection that fails while the peer is still sending must not reset
-//! the connection and discard replies the server already flushed.
+//! A connection that fails or executes QUIT while the peer is still sending
+//! must not reset the connection and discard replies the server already
+//! flushed.
 #![cfg(target_os = "linux")]
 
 use std::io::{Read, Write};
@@ -14,6 +15,7 @@ use norn_kv_server::sharded::{ShardedServer, ShardedServerConfig};
 const HEADER_LEN: usize = 24;
 const OP_GET: u8 = 0x00;
 const OP_SET: u8 = 0x01;
+const OP_QUIT: u8 = 0x07;
 const GETS: u32 = 4;
 
 fn request(opcode: u8, key: &[u8], extras: &[u8], value: &[u8], opaque: u32) -> Vec<u8> {
@@ -71,19 +73,32 @@ fn connect_small_rcvbuf(address: SocketAddr) -> TcpStream {
     }
 }
 
-/// Pipeline a large SET, GETs of it, and an oversized SET header followed by
-/// megabytes of body, reading nothing until the server has failed the
-/// connection. Returns the opaque of every complete reply.
-fn replies_after_failure(address: SocketAddr) -> Vec<u32> {
+/// What ends the connection after the pipelined GETs.
+#[derive(Clone, Copy)]
+enum Ending {
+    /// A SET header declaring a body far above `max_body_len`.
+    Oversized,
+    /// A QUIT, answered with opaque 2.
+    Quit,
+}
+
+/// Pipeline a large SET, GETs of it, and `ending` followed by megabytes of
+/// unread input, reading nothing until the server has ended the connection.
+/// Returns the opaque of every complete reply.
+fn replies_after(address: SocketAddr, ending: Ending) -> Vec<u32> {
     let mut stream = connect_small_rcvbuf(address);
     let mut wire = request(OP_SET, b"big", &[0; 8], &vec![b'v'; 60_000], 1);
     for opaque in 0..GETS {
         wire.extend(request(OP_GET, b"big", &[], &[], 100 + opaque));
     }
-    // A SET header declaring a body far above `max_body_len`.
-    let mut oversized = request(OP_SET, b"big", &[0; 8], &[], 2);
-    oversized[8..12].copy_from_slice(&50_000_000_u32.to_be_bytes());
-    wire.extend(&oversized[..HEADER_LEN]);
+    match ending {
+        Ending::Oversized => {
+            let mut oversized = request(OP_SET, b"big", &[0; 8], &[], 2);
+            oversized[8..12].copy_from_slice(&50_000_000_u32.to_be_bytes());
+            wire.extend(&oversized[..HEADER_LEN]);
+        }
+        Ending::Quit => wire.extend(request(OP_QUIT, &[], &[], &[], 2)),
+    }
 
     let mut writer = stream.try_clone().unwrap();
     std::thread::spawn(move || {
@@ -119,8 +134,33 @@ fn replies_after_failure(address: SocketAddr) -> Vec<u32> {
     opaques
 }
 
-fn expected() -> Vec<u32> {
-    std::iter::once(1).chain(100..100 + GETS).collect()
+fn expected(ending: Ending) -> Vec<u32> {
+    let mut opaques: Vec<_> = std::iter::once(1).chain(100..100 + GETS).collect();
+    if let Ending::Quit = ending {
+        opaques.push(2);
+    }
+    opaques
+}
+
+fn check_multishot(ending: Ending) {
+    let replies = replies_after(single_worker(RecvMode::Multishot), ending);
+    assert_eq!(replies, expected(ending));
+}
+
+fn check_exact(ending: Ending) {
+    let replies = replies_after(single_worker(RecvMode::Exact), ending);
+    assert_eq!(replies, expected(ending));
+}
+
+fn check_sharded(ending: Ending) {
+    let server = ShardedServer::start(ShardedServerConfig {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        ..ShardedServerConfig::default()
+    })
+    .unwrap();
+    let replies = replies_after(server.local_addr(), ending);
+    server.shutdown().unwrap();
+    assert_eq!(replies, expected(ending));
 }
 
 fn single_worker(recv_mode: RecvMode) -> SocketAddr {
@@ -150,24 +190,30 @@ fn single_worker(recv_mode: RecvMode) -> SocketAddr {
 
 #[test]
 fn failure_keeps_flushed_replies_multishot() {
-    let replies = replies_after_failure(single_worker(RecvMode::Multishot));
-    assert_eq!(replies, expected());
+    check_multishot(Ending::Oversized);
 }
 
 #[test]
 fn failure_keeps_flushed_replies_exact() {
-    let replies = replies_after_failure(single_worker(RecvMode::Exact));
-    assert_eq!(replies, expected());
+    check_exact(Ending::Oversized);
 }
 
 #[test]
 fn failure_keeps_flushed_replies_sharded() {
-    let server = ShardedServer::start(ShardedServerConfig {
-        listen: "127.0.0.1:0".parse().unwrap(),
-        ..ShardedServerConfig::default()
-    })
-    .unwrap();
-    let replies = replies_after_failure(server.local_addr());
-    server.shutdown().unwrap();
-    assert_eq!(replies, expected());
+    check_sharded(Ending::Oversized);
+}
+
+#[test]
+fn quit_keeps_flushed_replies_multishot() {
+    check_multishot(Ending::Quit);
+}
+
+#[test]
+fn quit_keeps_flushed_replies_exact() {
+    check_exact(Ending::Quit);
+}
+
+#[test]
+fn quit_keeps_flushed_replies_sharded() {
+    check_sharded(Ending::Quit);
 }

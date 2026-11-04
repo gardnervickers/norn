@@ -974,11 +974,12 @@ async fn serve_sharded_connection(
                 drop(incoming);
                 return socket.close().await;
             }
-            // QUIT leaves the peer open and the multishot receive armed.
-            // Dropping both lets the receive's terminal cancellation retain
-            // the descriptor until its ordinary deferred close boundary.
-            drop(incoming);
-            drop(socket);
+            // QUIT leaves the peer open and the multishot receive armed, and
+            // requests pipelined after it are unread. Linger so they do not
+            // reset the replies; if the budget runs out, dropping the stream
+            // lets the receive's terminal cancellation retain the descriptor
+            // until its ordinary deferred close boundary.
+            lingering_close(&socket, discard_multishot(&mut incoming)).await;
             return Ok(());
         }
         if !need_more
