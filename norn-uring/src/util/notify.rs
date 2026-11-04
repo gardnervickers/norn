@@ -303,6 +303,8 @@ mod tests {
     unsafe impl Send for NotifyOnDrop {}
     unsafe impl Sync for NotifyOnDrop {}
 
+    // The drop-time re-entry is the point of this waker.
+    #[allow(clippy::manual_noop_waker)]
     impl Wake for NotifyOnDrop {
         fn wake(self: Arc<Self>) {}
     }
@@ -323,7 +325,6 @@ mod tests {
         let mut notified = pin!(notify.wait());
 
         assert!(notified.as_mut().poll(&mut old_cx).is_pending());
-        drop(old_cx);
         drop(old_waker);
         // Replacing the waker drops the old one, which fires this same entry.
         assert!(notified.as_mut().poll(&mut new_cx).is_pending());

@@ -149,6 +149,8 @@ mod tests {
     unsafe impl Send for ReentrantDrop {}
     unsafe impl Sync for ReentrantDrop {}
 
+    // The drop-time re-entry is the point of this waker.
+    #[allow(clippy::manual_noop_waker)]
     impl Wake for ReentrantDrop {
         fn wake(self: Arc<Self>) {}
     }
