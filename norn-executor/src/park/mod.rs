@@ -93,6 +93,12 @@ pub trait Park {
     ///
     /// The default implementation calls [`Park::enter`].
     ///
+    /// A [`Park`] that wraps another one must override this and forward to
+    /// `inner.enter_for_shutdown()` (alongside any context of its own), as the
+    /// timer and channel drivers do. Relying on the default calls
+    /// `inner.enter()` through [`Park::enter`], which asserts that no context is
+    /// installed and so aborts or panics in the cases above.
+    ///
     /// [`LocalExecutor`]: crate::LocalExecutor
     fn enter_for_shutdown(&self) -> Self::Guard {
         self.enter()

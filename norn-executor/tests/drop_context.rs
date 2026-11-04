@@ -98,3 +98,53 @@ fn dropping_nested_executor_during_shutdown_does_not_abort() {
         "nested executor drop aborted the process: {status}"
     );
 }
+
+thread_local! {
+    static TASK_RUNTIME: RefCell<Option<LocalExecutor<SpinPark>>> =
+        RefCell::new(Some(LocalExecutor::new(SpinPark)));
+}
+
+static LOOKUP_PANIC: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Looks up the current executor from a destructor and records the panic.
+struct LookupOnDrop;
+
+impl Drop for LookupOnDrop {
+    fn drop(&mut self) {
+        let result = std::panic::catch_unwind(norn_executor::Handle::current);
+        let message = match result {
+            Ok(_) => "found an executor".to_owned(),
+            Err(payload) => payload
+                .downcast_ref::<&str>()
+                .map(ToString::to_string)
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_default(),
+        };
+        *LOOKUP_PANIC.lock().unwrap() = Some(message);
+    }
+}
+
+#[test]
+fn task_destructor_at_thread_exit_reports_no_executor() {
+    let worker = std::thread::spawn(|| {
+        TASK_RUNTIME.with(|runtime| {
+            let mut runtime = runtime.borrow_mut();
+            let runtime = runtime.as_mut().unwrap();
+            runtime.block_on(async {
+                let guard = LookupOnDrop;
+                spawn(async move {
+                    let _guard = guard;
+                    std::future::pending::<()>().await;
+                })
+                .detach();
+            });
+        });
+    });
+    worker
+        .join()
+        .expect("a task destructor at thread exit must not abort");
+    // The executor context is gone by then, and the lookup must say so rather
+    // than panic with a thread-local access error.
+    let message = LOOKUP_PANIC.lock().unwrap().take();
+    assert_eq!(message.as_deref(), Some("executor not set"));
+}

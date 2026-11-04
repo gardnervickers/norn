@@ -51,8 +51,14 @@ impl DriverContext {
     }
 
     /// Returns a reference to the current executor.
+    ///
+    /// Returns `None` when no driver is set, including when thread-local
+    /// storage has already been destroyed (a destructor running at thread exit).
     pub(crate) fn handle() -> Option<Handle> {
-        CURRENT.with(|c| c.handle.borrow().clone())
+        CURRENT
+            .try_with(|c| c.handle.borrow().clone())
+            .ok()
+            .flatten()
     }
 }
 

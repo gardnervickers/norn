@@ -102,7 +102,8 @@ struct Inner {
     fd: types::Fd,
     handle: Option<Handle>,
     closed: Cell<bool>,
-    /// Set when the runtime requests cancellation of an explicit close.
+    /// Set when the runtime requests cancellation of an explicit close, and
+    /// cleared when the next explicit close starts.
     close_canceled: Cell<bool>,
 }
 
@@ -146,6 +147,12 @@ impl NornFd {
             ));
         }
         if let Some(handle) = &self.inner.handle {
+            // The flag describes only the close submitted below. A close future
+            // dropped earlier already had its `CloseFd` released (that is what
+            // the sole-ownership check above establishes), so a stale flag would
+            // make a genuine -ECANCELED from this close look runtime-cancelled
+            // and trigger a close by fd number.
+            self.inner.close_canceled.set(false);
             // Dropping this future before completion cancels a submitted close.
             // Record that before its terminal CQE can be reaped.
             let mut cancel = RecordCloseCancel(Some(&self.inner.close_canceled));
@@ -551,6 +558,35 @@ mod tests {
         // cancellation can match it.
         driver.park(ParkMode::NoPark).unwrap();
         assert_pipe_reader_closed(write_end);
+        unsafe { libc::close(write_end) };
+    }
+
+    #[test]
+    fn starting_a_close_clears_a_stale_cancellation_flag() {
+        use std::future::Future;
+        use std::task::{Context, Waker};
+
+        let driver = crate::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let [read_end, write_end] = pipe();
+        let fd = NornFd::from_fd_on(read_end, driver.handle());
+        // Model an earlier close future that was dropped after being submitted.
+        fd.inner.close_canceled.set(true);
+        let inner = Rc::downgrade(&fd.inner);
+
+        let mut close = Box::pin(async move { fd.close().await });
+        assert!(close
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+
+        let submitted = inner.upgrade().expect("submitted close retains descriptor");
+        assert!(
+            !submitted.close_canceled.get(),
+            "a new close must not inherit the previous close's cancellation"
+        );
+        drop(submitted);
+        drop(close);
+        drop(driver);
         unsafe { libc::close(write_end) };
     }
 
