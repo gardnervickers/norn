@@ -44,7 +44,7 @@ impl TimeoutState {
         Self {
             lifecycle: Cell::new(TimeoutLifecycle::Prepared),
             duration: Cell::new(duration),
-            timespec: Cell::new(duration.into()),
+            timespec: Cell::new(crate::util::timespec(duration)),
             waiters: RefCell::new(Vec::new()),
         }
     }
@@ -58,7 +58,7 @@ impl TimeoutState {
             "cannot update inactive timeout storage"
         );
         self.duration.set(duration);
-        self.timespec.set(duration.into());
+        self.timespec.set(crate::util::timespec(duration));
     }
 
     fn mark_submitted(&self) {
@@ -931,7 +931,7 @@ impl TimeoutUpdate {
                         target: this.target.operation.clone(),
                         state: Rc::clone(&this.target.state),
                         duration: *this.duration,
-                        timespec: (*this.duration).into(),
+                        timespec: crate::util::timespec(*this.duration),
                         kind: this.target.kind,
                     },
                     this.target.reactor.clone(),
@@ -999,7 +999,7 @@ impl private::Chainable for TimeoutUpdate {
                     target: target.operation,
                     state: Rc::clone(&target.state),
                     duration,
-                    timespec: duration.into(),
+                    timespec: crate::util::timespec(duration),
                     kind: target.kind,
                 },
                 target.reactor,

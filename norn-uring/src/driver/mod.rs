@@ -1197,8 +1197,9 @@ impl Driver {
             // Like the first cancel, this matches every request. That includes a
             // drop-close (`CLOSE_FD_TOKEN`) still queued in io-wq, which only
             // happens for files whose close flushes (FUSE, NFS); cancelling one
-            // leaks its descriptor. This runs only after a full timeout with no
-            // completion.
+            // leaks its descriptor. This runs only after a wait that completed
+            // nothing, and a signal can cut that wait short: a timed park
+            // returns early on `EINTR`.
             debug!(
                 target: LOG,
                 "shutdown.recancel in_flight={}",
@@ -1612,9 +1613,7 @@ impl Shared {
         let mut ring = self.ring.borrow_mut();
         Ok(match mode {
             ParkMode::Timeout(duration) => {
-                let ts = Timespec::new()
-                    .sec(duration.as_secs())
-                    .nsec(duration.subsec_nanos());
+                let ts = crate::util::timespec(duration);
                 let args = SubmitArgs::new().timespec(&ts);
                 ring.submitter().submit_with_args(1, &args)?
             }
@@ -1851,9 +1850,14 @@ impl Shared {
     /// after the target was issued; a second ENOENT then means the target is
     /// issued but not cancellable, and there is no further retry.
     ///
+    /// Under SQPOLL, the kernel's SQ thread may run that task work instead of
+    /// the enter, so the retry can still arrive before the target is issued.
+    /// The target then runs until it completes on its own or shutdown cancels
+    /// it. This is suspected from the kernel source, not reproduced.
+    ///
     /// Retries run only while the driver accepts work. Shutdown reclaims the
-    /// remaining targets through synchronous cancellation and its drain
-    /// barriers instead.
+    /// remaining targets through synchronous cancellation and its re-cancels
+    /// instead.
     #[inline]
     fn retry_cancels(self: &Rc<Self>) {
         if self.cancel_retries.borrow().is_empty() {
