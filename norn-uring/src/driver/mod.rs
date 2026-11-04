@@ -166,9 +166,16 @@ struct Shared {
     ///
     /// Each target retains its operation's identity until the cancellation is
     /// queued. Parks retry these after draining completions.
-    deferred_cancels: RefCell<VecDeque<OpTarget>>,
+    deferred_cancels: RefCell<VecDeque<PendingCancel>>,
     /// Set once shutdown has requested cancellation of every outstanding request.
     cancel_all_requested: Cell<bool>,
+    /// Linked requests whose first cancellation found nothing (ENOENT).
+    ///
+    /// A request linked behind another is invisible to cancellation until the
+    /// kernel issues it, which happens in task work after its predecessor
+    /// completes. Each entry is cancelled once more, after that point. Unlike
+    /// `deferred_cancels`, these do not represent SQ demand.
+    cancel_retries: RefCell<Vec<CancelRetry>>,
     submit_error: RefCell<Option<(io::ErrorKind, String)>>,
     shutdown_outcome: Cell<Option<ShutdownOutcome>>,
     #[cfg(test)]
@@ -206,6 +213,31 @@ pub(crate) struct BufRingReservation {
 pub(crate) struct BufRingRegistration {
     shared: Rc<Shared>,
     registration: Rc<RegisteredBufRing>,
+}
+
+/// A cancellation waiting for SQ space.
+struct PendingCancel {
+    target: OpTarget,
+    /// The request linked immediately before `target`, if any. Only a
+    /// first cancellation of a linked request carries it; it allows one retry.
+    predecessor: Option<OpTarget>,
+}
+
+/// One allowed retry of a linked request's cancellation that found nothing.
+pub(crate) struct CancelRetry {
+    shared: Weak<Shared>,
+    target: Option<OpTarget>,
+    predecessor: OpTarget,
+}
+
+impl CancelRetry {
+    /// Queue the retry for `target` with a later park.
+    pub(crate) fn schedule(mut self, target: OpTarget) {
+        self.target = Some(target);
+        if let Some(shared) = self.shared.upgrade() {
+            shared.cancel_retries.borrow_mut().push(self);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -482,8 +514,11 @@ impl Handle {
     /// This never enters the kernel. The cancellation is queued in the SQ, or
     /// deferred in driver-owned state when the SQ is full, and is submitted
     /// by a later park.
-    pub(crate) fn cancel_op(&self, target: OpTarget) {
-        self.shared.cancel_op(target)
+    ///
+    /// `predecessor` is the request linked immediately before `target`, if
+    /// `target` was submitted as a later member of a linked batch.
+    pub(crate) fn cancel_op(&self, target: OpTarget, predecessor: Option<OpTarget>) {
+        self.shared.cancel_op(target, predecessor)
     }
 
     /// Attempt to push a new entry into the submission queue.
@@ -662,6 +697,7 @@ impl Driver {
                 status: Cell::new(Status::Running),
                 deferred_cancels: RefCell::new(VecDeque::new()),
                 cancel_all_requested: Cell::new(false),
+                cancel_retries: RefCell::new(Vec::new()),
                 submit_error: RefCell::new(None),
                 shutdown_outcome: Cell::new(None),
                 #[cfg(test)]
@@ -907,6 +943,7 @@ impl Driver {
             trace!(target: LOG, "park.drained {}", drained);
             mode = ParkMode::NoPark;
         }
+        self.shared.retry_cancels();
         self.shared.flush_deferred_cancels();
 
         loop {
@@ -1033,6 +1070,7 @@ impl Driver {
                     // the driver context, so that destroying the target can queue its
                     // resource-release work ahead of the final barrier.
                     drop(self.shared.take_deferred_cancels());
+                    drop(self.shared.cancel_retries.take());
                     // Reaping the first barrier can destroy RawOps. Their destructors may
                     // enqueue close SQEs or other resource-release work after that barrier,
                     // so flush the complete userspace SQ before ordering a final drain behind it.
@@ -1428,7 +1466,7 @@ impl Shared {
         !self.deferred_cancels.borrow().is_empty()
     }
 
-    fn take_deferred_cancels(&self) -> VecDeque<OpTarget> {
+    fn take_deferred_cancels(&self) -> VecDeque<PendingCancel> {
         mem::take(&mut *self.deferred_cancels.borrow_mut())
     }
 
@@ -1437,49 +1475,145 @@ impl Shared {
     /// The cancellation SQE follows the target's SQE in the queue, so it cannot
     /// reach the kernel first. If the SQ is full, the target is retained in
     /// driver-owned state and retried by later parks.
-    fn cancel_op(&self, target: OpTarget) {
+    ///
+    /// `predecessor` is the request linked immediately before `target`. If the
+    /// cancellation finds nothing because the kernel has not yet issued
+    /// `target`, it is retried once after the issue must have happened.
+    fn cancel_op(self: &Rc<Self>, target: OpTarget, predecessor: Option<OpTarget>) {
         if target.is_complete() {
             return;
         }
+        let cancel = PendingCancel {
+            target,
+            predecessor,
+        };
         if self.has_deferred_cancels() {
-            self.deferred_cancels.borrow_mut().push_back(target);
+            self.deferred_cancels.borrow_mut().push_back(cancel);
             return;
         }
-        if let Err(target) = self.try_push_cancel(target) {
+        if let Err(cancel) = self.try_push_cancel(cancel) {
             trace!(target: LOG, "cancel.deferred");
-            self.deferred_cancels.borrow_mut().push_back(target);
+            self.deferred_cancels.borrow_mut().push_back(cancel);
         }
     }
 
-    fn try_push_cancel(&self, target: OpTarget) -> Result<(), OpTarget> {
+    fn try_push_cancel(self: &Rc<Self>, cancel: PendingCancel) -> Result<(), PendingCancel> {
         if self.ring.borrow_mut().submission().is_full() {
-            return Err(target);
+            return Err(cancel);
         }
-        let entry = AsyncCancel::entry(target.clone());
+        let retry = cancel.predecessor.clone().map(|predecessor| CancelRetry {
+            shared: Rc::downgrade(self),
+            target: None,
+            predecessor,
+        });
+        let entry = AsyncCancel::entry(cancel.target.clone(), retry);
         match self.try_push(entry) {
             Ok(()) => Ok(()),
             Err(entry) => {
                 drop(entry);
-                Err(target)
+                Err(cancel)
             }
         }
     }
 
     /// Queue as many deferred cancellations as the SQ can hold.
-    fn flush_deferred_cancels(&self) {
+    fn flush_deferred_cancels(self: &Rc<Self>) {
         loop {
-            let Some(target) = self.deferred_cancels.borrow_mut().pop_front() else {
+            let Some(cancel) = self.deferred_cancels.borrow_mut().pop_front() else {
                 return;
             };
-            if target.is_complete() {
+            if cancel.target.is_complete() {
                 // Dropping a completed target may destroy its operation, so do it
                 // without holding the deferred queue.
-                drop(target);
+                drop(cancel);
                 continue;
             }
-            if let Err(target) = self.try_push_cancel(target) {
-                self.deferred_cancels.borrow_mut().push_front(target);
+            if let Err(cancel) = self.try_push_cancel(cancel) {
+                self.deferred_cancels.borrow_mut().push_front(cancel);
                 return;
+            }
+        }
+    }
+
+    /// Issue each due retry of a linked request's cancellation.
+    ///
+    /// A linked request is issued from task work queued when its predecessor
+    /// completes. A retry is therefore due once the predecessor's terminal CQE
+    /// has been reaped. Before sending it, the driver runs pending task work
+    /// with a non-blocking GETEVENTS enter, so the retry reaches the kernel
+    /// after the target was issued; a second ENOENT then means the target is
+    /// issued but not cancellable, and there is no further retry.
+    ///
+    /// Retries run only while the driver accepts work. Shutdown reclaims the
+    /// remaining targets through synchronous cancellation and its drain
+    /// barriers instead.
+    #[inline]
+    fn retry_cancels(self: &Rc<Self>) {
+        if self.cancel_retries.borrow().is_empty() {
+            return;
+        }
+        self.retry_cancels_slow();
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn retry_cancels_slow(self: &Rc<Self>) {
+        let retries = self.cancel_retries.take();
+        if self.status() != Status::Running {
+            // Dropping a target may destroy its operation, so do it without
+            // holding the retry queue.
+            drop(retries);
+            return;
+        }
+        let mut waiting = Vec::new();
+        let mut due = Vec::new();
+        for retry in retries {
+            let target = retry.target.as_ref().expect("scheduled retry has a target");
+            if target.is_complete() {
+                continue;
+            }
+            if retry.predecessor.is_complete() {
+                due.push(retry);
+            } else {
+                waiting.push(retry);
+            }
+        }
+        if !due.is_empty() {
+            if self.run_task_work() {
+                for mut retry in due {
+                    let target = retry.target.take().expect("scheduled retry has a target");
+                    self.cancel_op(target, None);
+                }
+            } else {
+                // Task work is still pending; the next park tries again.
+                waiting.extend(due);
+            }
+        }
+        if !waiting.is_empty() {
+            self.cancel_retries.borrow_mut().extend(waiting);
+        }
+    }
+
+    /// Run pending task work without waiting for completions.
+    ///
+    /// Returns true when the enter succeeded and the kernel reports no task
+    /// work still pending. The kernel reports pending work (`IORING_SQ_TASKRUN`)
+    /// only for rings set up with `IORING_SETUP_TASKRUN_FLAG`; on other rings a
+    /// successful enter is taken to have run it all.
+    fn run_task_work(&self) -> bool {
+        const IORING_ENTER_GETEVENTS: u32 = 1;
+        let mut ring = self.ring.borrow_mut();
+        // Safety: the enter submits nothing, waits for nothing and passes no
+        // argument; with GETEVENTS it only runs task work and flushes the CQ.
+        let entered = unsafe {
+            ring.submitter()
+                .enter::<libc::sigset_t>(0, 0, IORING_ENTER_GETEVENTS, None)
+        };
+        match entered {
+            Ok(_) => !ring.submission().taskrun(),
+            Err(err) => {
+                trace!(target: LOG, "cancel.retry.run_task_work {err}");
+                false
             }
         }
     }
@@ -3066,5 +3200,131 @@ mod tests {
         assert!(!driver.shared.has_deferred_cancels());
         assert!(dropped.load(Ordering::Acquire));
         assert_eq!(Rc::strong_count(&driver.shared), 1);
+    }
+
+    #[test]
+    fn dropped_linked_request_is_cancelled_after_its_head_completes() {
+        // Once a link head completes, the kernel issues its dependent from task
+        // work. Under DEFER_TASKRUN that work runs only in a GETEVENTS enter,
+        // after the SQEs of that enter are issued. A cancellation queued by Drop
+        // in that window finds nothing (ENOENT) and must be retried once that
+        // work has run, or the abandoned dependent stays in flight until shutdown.
+        let mut builder = io_uring::IoUring::builder();
+        builder
+            .setup_coop_taskrun()
+            .setup_defer_taskrun()
+            .setup_single_issuer();
+        let Ok(mut driver) = Driver::new(builder, 8) else {
+            eprintln!("skipping: the kernel does not support DEFER_TASKRUN");
+            return;
+        };
+        let handle = driver.handle();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let head_reaped = Arc::new(AtomicUsize::new(0));
+        let mut chain = Box::pin(
+            handle
+                .submit(TrackedNop {
+                    reaped: Arc::clone(&head_reaped),
+                    completions_dropped: Arc::new(AtomicUsize::new(0)),
+                    operations_dropped: Arc::new(AtomicUsize::new(0)),
+                })
+                .then(long_lived_read(&handle, &dropped)),
+        );
+        let waker = futures_test::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(chain.as_mut().poll(&mut cx).is_pending());
+
+        // Submit the linked pair. The head completes inline; the dependent read
+        // is queued for issue.
+        driver.park(ParkMode::NoPark).unwrap();
+        driver.park(ParkMode::NoPark).unwrap();
+        assert_eq!(head_reaped.load(Ordering::SeqCst), 1);
+
+        // The application abandons the request, which must cancel the read.
+        drop(chain);
+        for _ in 0..20 {
+            if dropped.load(Ordering::Acquire) {
+                break;
+            }
+            driver
+                .park(ParkMode::Timeout(Duration::from_millis(5)))
+                .unwrap();
+        }
+        let released = dropped.load(Ordering::Acquire);
+        // The retry found its target, so none remains queued.
+        let retrying = !driver.shared.cancel_retries.borrow().is_empty();
+        drop(handle);
+        assert_eq!(
+            driver.shutdown_with_outcome(),
+            ShutdownOutcome::CleanDrained
+        );
+        assert!(
+            released,
+            "the abandoned linked read was still in flight after 20 parks"
+        );
+        assert!(!retrying, "a completed target must not be retried");
+    }
+
+    #[test]
+    fn dropped_link_before_head_cqe_is_reaped_is_cancelled_without_an_unrelated_wake() {
+        // Drop the chain after its head completed in the kernel but before the
+        // driver reaped the head's CQE, then park with a long timeout as an
+        // idle executor would. The retry must not wait for some other wake.
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut builder = io_uring::IoUring::builder();
+            builder
+                .setup_coop_taskrun()
+                .setup_defer_taskrun()
+                .setup_single_issuer();
+            let Ok(mut driver) = Driver::new(builder, 8) else {
+                eprintln!("skipping: the kernel does not support DEFER_TASKRUN");
+                tx.send(None).unwrap();
+                return;
+            };
+            let handle = driver.handle();
+            let dropped = Arc::new(AtomicBool::new(false));
+            let mut chain = Box::pin(
+                handle
+                    .submit(TrackedNop {
+                        reaped: Arc::new(AtomicUsize::new(0)),
+                        completions_dropped: Arc::new(AtomicUsize::new(0)),
+                        operations_dropped: Arc::new(AtomicUsize::new(0)),
+                    })
+                    .then(long_lived_read(&handle, &dropped)),
+            );
+            let waker = futures_test::task::noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            assert!(chain.as_mut().poll(&mut cx).is_pending());
+            // Submit the pair. The NOP head completes inline; its CQE is not
+            // reaped yet.
+            driver.park(ParkMode::NoPark).unwrap();
+            drop(chain);
+            let start = std::time::Instant::now();
+            let mut parks = 0;
+            while !dropped.load(Ordering::Acquire) && parks < 10 {
+                driver
+                    .park(ParkMode::Timeout(Duration::from_secs(2)))
+                    .unwrap();
+                parks += 1;
+            }
+            tx.send(Some((
+                dropped.load(Ordering::Acquire),
+                start.elapsed(),
+                parks,
+            )))
+            .unwrap();
+            drop(handle);
+            let _ = driver.shutdown_with_outcome();
+        });
+        let Some((released, elapsed, parks)) = rx.recv_timeout(Duration::from_secs(30)).unwrap()
+        else {
+            return;
+        };
+        assert!(released, "the abandoned linked read was never released");
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "released only after {elapsed:?} ({parks} parks): the retry waited for an unrelated wake"
+        );
     }
 }
