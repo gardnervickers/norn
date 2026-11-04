@@ -107,8 +107,8 @@ impl RecvBufRing {
 
     /// Returns the limit on buffers one multishot receive may hold before it
     /// pauses, if one was set with [`Builder::max_unconsumed_per_receive`].
-    pub fn max_unconsumed_per_receive(&self) -> Option<usize> {
-        self.rc.max_unconsumed_per_receive.map(NonZeroUsize::get)
+    pub fn max_unconsumed_per_receive(&self) -> Option<NonZeroUsize> {
+        self.rc.max_unconsumed_per_receive
     }
 
     /// Request cancellation of a multishot receive on this ring, so that it
@@ -788,7 +788,7 @@ pub struct Builder {
     ring_entries: u16,
     buf_cnt: u16,
     buf_len: usize,
-    max_unconsumed_per_receive: Option<usize>,
+    max_unconsumed_per_receive: Option<NonZeroUsize>,
 }
 
 impl Builder {
@@ -842,13 +842,14 @@ impl Builder {
     /// When a stream's received but not yet yielded buffers reach `limit`,
     /// the stream pauses: it cancels its kernel receive, and the socket keeps
     /// further data. Once the consumer has taken every buffer received before
-    /// the pause, its next `poll_next` re-arms the receive. A pause neither
-    /// loses nor reorders data, and it is not reported to the consumer. A
-    /// bundle counts each of its buffers.
+    /// the pause, its next `poll_next` re-arms the receive. The pause is not
+    /// reported to the consumer. On TCP it neither loses nor reorders data.
+    /// A bundle counts each of its buffers.
     ///
     /// The bound is approximate. Completions the kernel posts before it
     /// processes the cancellation are still delivered, so a paused stream can
-    /// briefly hold more than `limit` buffers. Choose a limit above the
+    /// briefly hold more than `limit` buffers; if it reaches twice the limit,
+    /// the cancellation is requested once more. Choose a limit above the
     /// backlog that a consumer which keeps polling builds up between polls,
     /// or healthy streams pause and re-arm needlessly.
     ///
@@ -861,9 +862,14 @@ impl Builder {
     /// streams: `buf_cnt` must exceed `limit` times the number of streams
     /// that may stop polling at the same time.
     ///
+    /// If the driver shuts down while a stream is paused, the stream yields
+    /// the buffers it holds and then ends. A stream that is still armed at
+    /// shutdown instead yields the `ECANCELED` error of shutdown's
+    /// cancellation as its final item.
+    ///
     /// Buffers the application holds after a stream yields them are not
     /// counted.
-    pub fn max_unconsumed_per_receive(mut self, limit: usize) -> Builder {
+    pub fn max_unconsumed_per_receive(mut self, limit: NonZeroUsize) -> Builder {
         self.max_unconsumed_per_receive = Some(limit);
         self
     }
@@ -872,10 +878,8 @@ impl Builder {
     ///
     /// # Errors
     ///
-    /// Returns an error for an invalid ring configuration (including a zero
-    /// [`max_unconsumed_per_receive`](Self::max_unconsumed_per_receive)
-    /// limit), allocation failure, duplicate buffer-group ID, or kernel
-    /// registration failure.
+    /// Returns an error for an invalid ring configuration, allocation failure,
+    /// duplicate buffer-group ID, or kernel registration failure.
     ///
     /// # Panics
     ///
@@ -902,14 +906,6 @@ impl Builder {
         // wrap calculation trivial.
         b.ring_entries = b.ring_entries.next_power_of_two();
 
-        let max_unconsumed_per_receive = match b.max_unconsumed_per_receive {
-            None => None,
-            Some(limit) => Some(
-                NonZeroUsize::new(limit)
-                    .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?,
-            ),
-        };
-
         let handle = crate::Handle::current();
         let storage = Rc::new(BufRingStorage::new(
             b.bgid,
@@ -923,7 +919,7 @@ impl Builder {
         Ok(RecvBufRing::new(
             registration,
             storage,
-            max_unconsumed_per_receive,
+            b.max_unconsumed_per_receive,
         ))
     }
 }

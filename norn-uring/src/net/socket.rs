@@ -34,13 +34,16 @@ pub(crate) struct RingRecvCompletion<T> {
 #[derive(Debug, Default)]
 struct ReceiveBacklog {
     unconsumed: usize,
-    pause_requested: bool,
+    // Cancellations requested so far: one at the limit, and one more at
+    // twice the limit in case the first did not take effect.
+    pause_requests: u8,
 }
 
 impl ReceiveBacklog {
     /// Count the buffers of one reaped completion, and pause the receive
     /// once its backlog reaches the ring's limit while the kernel keeps it
-    /// armed.
+    /// armed. If the backlog still grows to twice the limit, request the
+    /// cancellation again.
     ///
     /// # Safety
     ///
@@ -50,14 +53,19 @@ impl ReceiveBacklog {
         let Some(limit) = ring.max_unconsumed_per_receive() else {
             return;
         };
-        if self.pause_requested || self.unconsumed < limit {
+        let threshold = match self.pause_requests {
+            0 => limit.get(),
+            1 => limit.get().saturating_mul(2),
+            _ => return,
+        };
+        if self.unconsumed < threshold {
             return;
         }
         // A terminal completion has no id: the receive is ending anyway.
         let Some(id) = id else {
             return;
         };
-        self.pause_requested = true;
+        self.pause_requests += 1;
         // Safety: the caller is reaping the non-terminal completion `id` came
         // from. The cancellation is queued, never submitted from here, so
         // this does not re-enter the kernel or the completion drain.
@@ -75,7 +83,7 @@ impl ReceiveBacklog {
     /// Shutdown also cancels with `ECANCELED`; the stream then sees the
     /// stopped driver before it re-arms.
     fn is_pause(&self, terminal: bool, result: &io::Result<impl Sized>) -> bool {
-        self.pause_requested
+        self.pause_requests != 0
             && terminal
             && matches!(result, Err(error) if error.raw_os_error() == Some(libc::ECANCELED))
     }
