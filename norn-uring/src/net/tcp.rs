@@ -17,6 +17,9 @@ use super::socket::Accept;
 
 const LOG: &str = "norn_uring::net::tcp";
 
+/// Linux `IOV_MAX`: the most `iovec`s one `sendmsg(2)` call accepts.
+const IOV_MAX: usize = 1024;
+
 /// A TCP listener.
 ///
 /// A `TcpListener` can be used to accept incoming TCP connections.
@@ -807,6 +810,9 @@ impl tokio::io::AsyncWrite for TcpStreamWriter {
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<Result<usize, io::Error>> {
         let this = self.project();
+        // The kernel rejects more than IOV_MAX iovecs with EMSGSIZE. Like
+        // `std`, pass only the first IOV_MAX slices; a short write is valid.
+        let bufs = &bufs[..bufs.len().min(IOV_MAX)];
         let n = ready!(this.inner.poll_op(
             cx,
             |sock| sock.send_vectored_with_flags(bufs, libc::MSG_NOSIGNAL),
