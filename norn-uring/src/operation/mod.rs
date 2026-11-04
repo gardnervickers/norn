@@ -63,6 +63,13 @@ pub unsafe trait Operation {
     /// kernel. Implementations may store pointers to fields of `self` in the entry, but must not
     /// invalidate the pointed-to storage during that period.
     ///
+    /// The runtime owns the `IOSQE_IO_LINK`, `IOSQE_IO_HARDLINK`, and
+    /// `IOSQE_CQE_SKIP_SUCCESS` flags. The submission queue is shared, so a link would join
+    /// the entry to whichever SQE is queued next, and a skipped success CQE would leave the
+    /// operation without its terminal completion. Use [`Request::then`](crate::Request::then)
+    /// to link requests. An entry that sets one of these flags fails configuration with
+    /// [`io::ErrorKind::InvalidInput`].
+    ///
     /// # Errors
     ///
     /// Returns an error when the operation cannot construct a valid submission
@@ -415,8 +422,9 @@ where
         let handle = TypedHandle::new(data);
         let mut data = handle.data_mut().expect("operation already completed");
 
-        let entry =
-            T::configure(&mut data).map(|entry| ConfiguredEntry::new(handle.untyped(), entry));
+        let entry = T::configure(&mut data)
+            .and_then(reject_reserved_flags)
+            .map(|entry| ConfiguredEntry::new(handle.untyped(), entry));
         drop(data);
         (handle, entry)
     }
@@ -641,6 +649,37 @@ pub(crate) unsafe fn reap_operation(entry: &io_uring::cqueue::Entry) {
     unsafe { handle.reap(result) };
 }
 
+/// SQE flags that only the runtime may set.
+///
+/// A link joins an entry to the next SQE in the shared queue, which may belong
+/// to another task; the driver sets `IO_LINK` itself for requests submitted
+/// together. A request that skips its success CQE never releases its operation,
+/// and once one is submitted the kernel rejects every later `IO_DRAIN` entry,
+/// including the barriers that driver shutdown waits on.
+const RESERVED_SQE_FLAGS: Flags = Flags::IO_LINK
+    .union(Flags::IO_HARDLINK)
+    .union(Flags::SKIP_SUCCESS);
+
+fn reject_reserved_flags(entry: io_uring::squeue::Entry) -> io::Result<io_uring::squeue::Entry> {
+    if sqe_flags(&entry).intersects(RESERVED_SQE_FLAGS) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "operations may not set IO_LINK, IO_HARDLINK, or CQE_SKIP_SUCCESS; \
+             link requests with Request::then",
+        ));
+    }
+    Ok(entry)
+}
+
+/// Return the flags byte of a configured SQE.
+fn sqe_flags(entry: &io_uring::squeue::Entry) -> Flags {
+    const _: () = assert!(mem::size_of::<io_uring::squeue::Entry>() == 64);
+    // Safety: `squeue::Entry` is a `repr(C)` wrapper of the kernel's
+    // `io_uring_sqe`, which stores its `u8` flags at byte offset 1.
+    let flags = unsafe { std::ptr::from_ref(entry).cast::<u8>().add(1).read() };
+    Flags::from_bits_retain(flags)
+}
+
 fn decode_cqe_result(result: i32, flags: u32) -> io::Result<u32> {
     if result >= 0 || io_uring::cqueue::notif(flags) {
         Ok(result as u32)
@@ -734,6 +773,48 @@ mod tests {
                 .raw_os_error(),
             Some(libc::EINVAL)
         );
+    }
+
+    #[test]
+    fn sqe_flags_reads_each_configured_flag() {
+        for flags in [
+            Flags::empty(),
+            Flags::FIXED_FILE,
+            Flags::IO_DRAIN,
+            Flags::IO_LINK,
+            Flags::IO_HARDLINK,
+            Flags::ASYNC,
+            Flags::BUFFER_SELECT,
+            Flags::SKIP_SUCCESS,
+            Flags::all(),
+        ] {
+            let entry = io_uring::opcode::Nop::new()
+                .build()
+                .flags(flags)
+                .user_data(u64::MAX);
+            assert_eq!(sqe_flags(&entry), flags);
+        }
+    }
+
+    #[test]
+    fn only_runtime_owned_flags_fail_configuration() {
+        for reserved in [Flags::IO_LINK, Flags::IO_HARDLINK, Flags::SKIP_SUCCESS] {
+            let entry = io_uring::opcode::Nop::new()
+                .build()
+                .flags(reserved | Flags::ASYNC);
+            let error = reject_reserved_flags(entry).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        }
+        for allowed in [
+            Flags::empty(),
+            Flags::FIXED_FILE,
+            Flags::IO_DRAIN,
+            Flags::ASYNC,
+            Flags::BUFFER_SELECT,
+        ] {
+            let entry = io_uring::opcode::Nop::new().build().flags(allowed);
+            assert!(reject_reserved_flags(entry).is_ok());
+        }
     }
 
     #[derive(Debug, Default)]
