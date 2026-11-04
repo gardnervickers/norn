@@ -79,8 +79,14 @@ impl File {
     ) -> io::Result<Self> {
         let access_mode = opts.get_access_mode()?;
         let creation_mode = opts.get_creation_mode()?;
-        let open = Open::new(path.as_ref(), access_mode, creation_mode, opts.mode)?;
         let handle = crate::Handle::current();
+        let open = Open::new(
+            path.as_ref(),
+            access_mode,
+            creation_mode,
+            opts.mode,
+            handle.clone(),
+        )?;
         let fd = handle.submit(open).await?;
         Ok(Self {
             fd: UringFd::from_inner(fd),
@@ -580,17 +586,26 @@ impl PipeWriter {
 struct Open {
     path: std::ffi::CString,
     how: types::OpenHow,
+    /// The driver that submits the open. The new descriptor is bound to it,
+    /// whichever context finishes the future.
+    handle: crate::Handle,
 }
 
 impl Open {
-    fn new(path: &Path, access_mode: i32, creation_mode: i32, mode: u32) -> io::Result<Self> {
+    fn new(
+        path: &Path,
+        access_mode: i32,
+        creation_mode: i32,
+        mode: u32,
+        handle: crate::Handle,
+    ) -> io::Result<Self> {
         let path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
         let flags = access_mode | creation_mode | libc::O_CLOEXEC;
         let mut how = types::OpenHow::new().flags(flags as u64);
         if creation_mode & libc::O_CREAT != 0 {
             how = how.mode(mode as u64);
         }
-        Ok(Self { path, how })
+        Ok(Self { path, how, handle })
     }
 }
 
@@ -616,7 +631,7 @@ impl Singleshot for Open {
     type Output = io::Result<NornFd>;
 
     fn complete(self, result: Self::Completion) -> Self::Output {
-        Ok(NornFd::from_fd(result?.into_raw_fd()))
+        Ok(NornFd::from_fd_on(result?.into_raw_fd(), self.handle))
     }
 }
 

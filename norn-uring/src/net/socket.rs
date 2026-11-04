@@ -183,8 +183,15 @@ fn reap_owned_fd(result: CQEResult) -> io::Result<OwnedFd> {
     })
 }
 
-fn bind_owned_fd(fd: OwnedFd) -> NornFd {
-    NornFd::from_fd(fd.into_raw_fd())
+/// Binds a descriptor returned by an operation to the driver that submitted it,
+/// not to whichever driver happens to be current when the future finishes.
+fn bind_owned_fd(fd: OwnedFd, handle: crate::Handle) -> NornFd {
+    NornFd::from_fd_on(fd.into_raw_fd(), handle)
+}
+
+/// Binds a descriptor accepted from `listener` to the listener's driver.
+fn bind_accepted_fd(fd: OwnedFd, listener: &NornFd) -> NornFd {
+    listener.sibling_from_fd(fd.into_raw_fd())
 }
 
 fn invalid_socket_addr_error() -> io::Error {
@@ -307,6 +314,7 @@ impl Socket {
             domain,
             socket_type,
             protocol,
+            handle: handle.clone(),
         };
         let fd = handle.submit(op).await?;
         let this = Self::from_fd(fd);
@@ -724,6 +732,7 @@ struct OpenSocket {
     domain: Domain,
     socket_type: Type,
     protocol: Option<Protocol>,
+    handle: crate::Handle,
 }
 
 // Safety: the socket SQE contains only copied scalar arguments. `reap` converts
@@ -751,7 +760,7 @@ impl Singleshot for OpenSocket {
     type Output = io::Result<NornFd>;
 
     fn complete(self, completion: Self::Completion) -> Self::Output {
-        completion.map(bind_owned_fd)
+        completion.map(|fd| bind_owned_fd(fd, self.handle))
     }
 }
 
@@ -1460,7 +1469,7 @@ impl Singleshot for Accept<false> {
         // Safety: the kernel wrote at most `addr_len` bytes into `addr`.
         unsafe { this.addr.set_length(this.addr_len) };
         let addr = as_socket_addr(&this.addr)?;
-        Ok((bind_owned_fd(fd), addr))
+        Ok((bind_accepted_fd(fd, &this.fd), addr))
     }
 }
 
@@ -1468,11 +1477,11 @@ impl Multishot for Accept<true> {
     type Item = io::Result<NornFd>;
 
     fn update(&mut self, completion: Self::Completion) -> Self::Item {
-        completion.map(bind_owned_fd)
+        completion.map(|fd| bind_accepted_fd(fd, &self.fd))
     }
 
     fn complete(self, completion: Self::Completion) -> Option<Self::Item> {
-        Some(completion.map(bind_owned_fd))
+        Some(completion.map(|fd| bind_accepted_fd(fd, &self.fd)))
     }
 }
 
