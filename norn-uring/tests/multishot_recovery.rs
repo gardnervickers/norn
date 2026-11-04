@@ -273,7 +273,7 @@ fn stalled_consumer_pauses_without_starving_its_ring() -> Result<(), Box<dyn std
         let ring = RecvBufRing::builder(1)
             .buf_cnt(32)
             .buf_len(64)
-            .max_unconsumed_per_receive(8)
+            .max_unconsumed_per_receive(std::num::NonZeroUsize::new(8).unwrap())
             .build()?;
         let (stalled_server, stalled_client) = tcp_pair().await?;
         stalled_client.set_nodelay(true).await?;

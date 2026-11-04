@@ -6,6 +6,7 @@
 
 use std::io::Write;
 use std::net::{SocketAddr, TcpListener as StdListener, TcpStream as StdStream};
+use std::num::NonZeroUsize;
 use std::os::fd::IntoRawFd;
 use std::pin::Pin;
 use std::task::{Context, Poll as TaskPoll};
@@ -66,7 +67,7 @@ fn driver() -> crate::Driver {
 fn ring(buf_cnt: u16, buf_len: usize, limit: Option<usize>) -> RecvBufRing {
     let builder = RecvBufRing::builder(3).buf_cnt(buf_cnt).buf_len(buf_len);
     match limit {
-        Some(limit) => builder.max_unconsumed_per_receive(limit),
+        Some(limit) => builder.max_unconsumed_per_receive(NonZeroUsize::new(limit).unwrap()),
         None => builder,
     }
     .build()
@@ -601,15 +602,10 @@ fn quarantine_while_paused_fails_the_re_arm() {
 }
 
 #[test]
-fn zero_limit_is_rejected() {
+fn ring_reports_its_limit() {
     let driver = driver();
     let _guard = driver.enter();
-    let error = RecvBufRing::builder(3)
-        .buf_cnt(4)
-        .max_unconsumed_per_receive(0)
-        .build()
-        .unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(ring(4, 64, None).max_unconsumed_per_receive(), None);
     let ring = ring(4, 64, Some(2));
-    assert_eq!(ring.max_unconsumed_per_receive(), Some(2));
+    assert_eq!(ring.max_unconsumed_per_receive(), NonZeroUsize::new(2));
 }
