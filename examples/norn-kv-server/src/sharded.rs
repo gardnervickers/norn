@@ -2872,7 +2872,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "a non-reading peer stalls every connection on its worker until norn-uring bounds the buffers one receive may hold"]
     fn non_reading_peer_does_not_stall_other_sharded_connections() {
         crate::slow_peer::hog_does_not_stall_other_connections(
             |connection, socket, ring| async move {
