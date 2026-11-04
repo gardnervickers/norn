@@ -439,6 +439,11 @@ impl Socket {
         Ok((socket, addr))
     }
 
+    /// Whether this socket's driver still accepts work.
+    pub(crate) fn driver_running(&self) -> bool {
+        self.fd.handle().is_running()
+    }
+
     pub(crate) fn accept_multi(&self) -> Op<Accept<true>> {
         let op = Accept::<true>::new(self.fd.lease());
         self.fd.submit(op)

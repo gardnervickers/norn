@@ -315,7 +315,8 @@ impl TcpListener {
     /// poll accepts again. The kernel can end a multishot accept without an
     /// error, for example when it cannot post a completion to a full completion
     /// queue. The stream re-arms after an accept that produced connections, and
-    /// ends (`None`) when one ends without producing any.
+    /// ends (`None`) when one ends without producing any, or once the driver
+    /// stops accepting work.
     pub fn incoming(&self) -> impl Stream<Item = io::Result<TcpSocket>> + '_ {
         Incoming {
             listener: &self.socket,
@@ -390,6 +391,11 @@ impl Stream for Incoming<'_> {
                         }
                     }
                 }
+            }
+            // Once the driver stops accepting work, every new accept would fail
+            // at once, and a consumer that continues past errors would spin.
+            if !this.listener.driver_running() {
+                return Poll::Ready(None);
             }
             this.current.set(Some(this.listener.accept_multi()));
         }

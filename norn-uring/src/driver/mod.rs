@@ -601,6 +601,11 @@ impl Handle {
         self.shared.cancel_all_requested.get()
     }
 
+    /// Whether the driver still accepts work.
+    pub(crate) fn is_running(&self) -> bool {
+        self.shared.status() == Status::Running
+    }
+
     pub(crate) fn reserve_fixed_buffers(
         &self,
     ) -> Result<FixedBufReservation, ReserveFixedBufError> {
@@ -2469,6 +2474,40 @@ mod tests {
         drop(read);
         assert!(park_until(&mut driver, 20, || dropped.load(Ordering::Acquire)));
         assert_eq!(wakes.get(), 0);
+    }
+
+    #[test]
+    fn incoming_ends_once_the_driver_stops_accepting_work() {
+        use futures_util::StreamExt;
+
+        let driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let handle = driver.handle();
+        let mut ex = norn_executor::LocalExecutor::new(driver);
+        let items = ex.block_on(async move {
+            let listener = crate::net::TcpListener::bind("127.0.0.1:0".parse().unwrap(), 8)
+                .await
+                .unwrap();
+            let mut incoming = pin!(listener.incoming());
+            assert!(futures_util::poll!(incoming.next()).is_pending());
+            crate::noop().await.unwrap();
+
+            // As after a health error: the driver stops accepting work, and the
+            // armed accept ends.
+            handle.shared.set_status(Status::Closing);
+            handle.shared.cancel_all().unwrap();
+            let mut items = Vec::new();
+            for _ in 0..8 {
+                match incoming.next().await {
+                    Some(item) => items.push(item.map(drop).map_err(|err| err.kind())),
+                    None => break,
+                }
+            }
+            items
+        });
+        assert!(
+            items.len() <= 1,
+            "incoming() kept re-arming into a stopped driver: {items:?}"
+        );
     }
 
     #[test]
