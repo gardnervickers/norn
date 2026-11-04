@@ -43,7 +43,8 @@ const COMPLETION_DRAIN_BATCH: usize = 32;
 
 const DEFAULT_COMPLETION_DRAIN_BUDGET: NonZeroUsize = NonZeroUsize::new(32).unwrap();
 
-/// Maximum time each shutdown cancellation attempt waits for the kernel.
+/// Maximum time each shutdown cancellation attempt, and each wait on the
+/// operations drain barrier, waits for the kernel.
 ///
 /// `IORING_REGISTER_SYNC_CANCEL` accepts a timeout, so teardown can retry without
 /// entering one unbounded syscall when a request cannot be cancelled.
@@ -80,6 +81,9 @@ impl Default for DriverOptions {
 /// Shutdown stops accepting new requests, cancels outstanding work, and waits
 /// for every kernel-owned operation to reach a terminal completion. Teardown
 /// retries unclassified cancellation errors and submission errors indefinitely.
+/// While it waits, it cancels again after every bounded wait that completes
+/// nothing, so a request that the kernel issues only after the first
+/// cancellation, such as a linked dependent, is reclaimed too.
 /// Kernels without synchronous cancellation proceed directly to the drain
 /// barriers, which can still block forever behind an operation that cannot
 /// complete without cancellation.
@@ -1049,6 +1053,10 @@ impl Driver {
                     if self.shared.has_deferred_cancels() {
                         continue;
                     }
+                    // Issue linked dependents whose heads have already completed, so
+                    // the synchronous cancel can find them. Under DEFER_TASKRUN only a
+                    // GETEVENTS enter runs that task work.
+                    self.shared.run_all_task_work();
 
                     if let Err(err) = self.shared.cancel_all() {
                         if Self::sync_cancel_unsupported(&err) {
@@ -1074,10 +1082,31 @@ impl Driver {
                     }
                 }
                 Status::DrainingOperations => {
-                    if let Err(err) =
-                        self.park_with_completion_budget(ParkMode::NextCompletion, None)
-                    {
+                    if self.drain_exhaustive() > 0 {
+                        continue;
+                    }
+                    // A head can still complete after the synchronous cancel, and its
+                    // linked dependent is issued only then. An unbounded wait would
+                    // leave the barrier stuck behind that request, so wait for a
+                    // bounded time and cancel again if nothing completed.
+                    if let Err(err) = self.park_with_completion_budget(
+                        ParkMode::Timeout(SHUTDOWN_CANCEL_TIMEOUT),
+                        None,
+                    ) {
                         self.retry_shutdown("park", &err);
+                        continue;
+                    }
+                    if self.drain_exhaustive() == 0
+                        && self.shared.status() == Status::DrainingOperations
+                    {
+                        // Like the first cancel, this matches every request. That
+                        // includes a drop-close (`CLOSE_FD_TOKEN`) still queued in
+                        // io-wq, which only happens for files whose close flushes
+                        // (FUSE, NFS); cancelling one leaks its descriptor. This
+                        // runs only after a full timeout with no completion.
+                        if let Err(err) = self.shared.cancel_all() {
+                            trace!(target: LOG, "shutdown.recancel {err:?}");
+                        }
                     }
                 }
                 Status::ClosingResources => {
@@ -1685,6 +1714,22 @@ impl Shared {
         self.submit(ParkMode::NoPark)
             .map_err(CloseFdError::Queued)?;
         Ok(())
+    }
+
+    /// Run deferred task work until the kernel reports none left.
+    ///
+    /// The kernel issues a linked dependent from task work once its head
+    /// completes, and an enter that waits for nothing runs a bounded batch of
+    /// that work (20 items in 6.18). Without `IORING_SETUP_TASKRUN_FLAG` one
+    /// enter is taken to have run it all, and the bounded re-cancel while
+    /// draining covers what is left.
+    fn run_all_task_work(&self) {
+        const MAX_ENTERS: usize = 64;
+        for _ in 0..MAX_ENTERS {
+            if self.run_task_work() {
+                return;
+            }
+        }
     }
 
     /// Cancel all outstanding requests synchronously.
@@ -3013,6 +3058,97 @@ mod tests {
             driver.shared.registered_buffers.test_state(),
             FixedBufState::Empty
         );
+    }
+
+    fn shutdown_reclaims_hard_linked_read(builder: io_uring::Builder) {
+        // A hard link issues its dependent even when the head fails. Shutdown's
+        // synchronous cancel stops the head, which issues the read only
+        // afterwards, so only a later cancellation can reclaim it.
+        #[derive(Debug)]
+        struct Head {
+            timeout: Timespec,
+        }
+
+        // Safety: the timespec lives in the operation through its terminal CQE.
+        unsafe impl Operation for Head {
+            type Completion = CQEResult;
+
+            fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+                Ok(opcode::Timeout::new(&self.timeout).build())
+            }
+
+            unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+                result
+            }
+        }
+
+        impl Singleshot for Head {
+            type Output = io::Result<u32>;
+
+            fn complete(self, completion: Self::Completion) -> Self::Output {
+                completion.into_result()
+            }
+        }
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut driver = Driver::new(builder, 8).unwrap();
+            let handle = driver.handle();
+            let dropped = Arc::new(AtomicBool::new(false));
+            let mut head = Box::pin(handle.submit(Head {
+                timeout: Timespec::new().sec(3_600),
+            }));
+            let mut read = Box::pin(long_lived_read(&handle, &dropped));
+            let mut batch = SmallVec::new();
+            assert!(head.as_mut().prepare_batch(&mut batch));
+            assert!(read.as_mut().prepare_batch(&mut batch));
+            let mut batch = batch.into_iter();
+            let head_entry = batch
+                .next()
+                .unwrap()
+                .into_entry_with_flags(Flags::IO_HARDLINK);
+            let read_entry = batch.next().unwrap().into_entry_with_flags(Flags::empty());
+            // Safety: both entries come from live operations whose kernel
+            // references they carry.
+            unsafe {
+                driver.shared.try_push_raw(&head_entry).unwrap();
+                driver.shared.try_push_raw(&read_entry).unwrap();
+            }
+            head.as_mut().finish_submit();
+            read.as_mut().finish_submit();
+            driver.park(ParkMode::NoPark).unwrap();
+
+            // The operations stay alive, so only shutdown cancels them.
+            let outcome = driver.shutdown_with_outcome();
+            let attempts = driver.shared.shutdown_test.cancel_all_attempts.get();
+            let reclaimed = dropped.load(Ordering::Acquire);
+            drop((head, read));
+            tx.send((outcome, attempts, reclaimed)).unwrap();
+        });
+        let (outcome, attempts, reclaimed) = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("shutdown never reclaimed the hard-linked read");
+        assert_eq!(outcome, ShutdownOutcome::CleanDrained);
+        assert!(
+            attempts >= 2,
+            "the read is issued after the first synchronous cancel and needs another ({attempts})"
+        );
+        assert!(!reclaimed, "the operation outlives shutdown in this test");
+    }
+
+    #[test]
+    fn shutdown_recancels_a_request_issued_after_the_sync_cancel() {
+        shutdown_reclaims_hard_linked_read(io_uring::IoUring::builder());
+    }
+
+    #[test]
+    fn shutdown_recancels_a_request_issued_after_the_sync_cancel_with_defer_taskrun() {
+        let mut builder = io_uring::IoUring::builder();
+        builder
+            .setup_coop_taskrun()
+            .setup_defer_taskrun()
+            .setup_single_issuer();
+        shutdown_reclaims_hard_linked_read(builder);
     }
 
     fn long_lived_read(handle: &Handle, dropped: &Arc<AtomicBool>) -> Op<LongLivedOp> {
