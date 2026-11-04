@@ -28,14 +28,27 @@ pub(crate) fn run_isolated(test_name: &str, test: impl FnOnce()) {
     }
 }
 
+/// Creates a pipe whose ends are close-on-exec.
+///
+/// Lib tests run in parallel and some of them spawn subprocesses. A pipe made
+/// with plain `pipe(2)` would be inherited by those children and kept open
+/// until they exit, which keeps a read end alive after the test closed it.
+pub(crate) fn pipe_cloexec() -> [RawFd; 2] {
+    let mut fds = [0; 2];
+    let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    assert_eq!(rc, 0, "pipe2 failed: {}", std::io::Error::last_os_error());
+    fds
+}
+
 /// Asserts that every read end of the pipe whose write end is `write_end` is
 /// closed.
 ///
 /// Unlike probing the closed descriptor number itself, this cannot be fooled
 /// by another test thread reusing that number, because the pipe is private to
 /// the caller. A concurrent `fork` in another test can briefly hold an inherited
-/// copy of the read end until its `exec`, so closure is awaited for a bounded
-/// time rather than sampled once.
+/// copy of the read end until its `exec` closes it (pipes from
+/// [`pipe_cloexec`] are not kept past that), so closure is awaited for a
+/// bounded time rather than sampled once.
 pub(crate) fn assert_pipe_reader_closed(write_end: RawFd) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {

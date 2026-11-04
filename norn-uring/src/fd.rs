@@ -107,7 +107,12 @@ struct Inner {
 }
 
 impl NornFd {
-    /// Create a new [`NornFd`] from a regular file descriptor.
+    /// Create a new [`NornFd`] from a regular file descriptor, bound to the
+    /// driver current at the call. Production code binds with
+    /// [`NornFd::from_fd_on`] or [`NornFd::sibling_from_fd`] instead, because
+    /// the current driver is not necessarily the one that produced the
+    /// descriptor.
+    #[cfg(test)]
     pub(crate) fn from_fd(fd: RawFd) -> Self {
         Self::new(types::Fd(fd))
     }
@@ -116,6 +121,13 @@ impl NornFd {
         Self::new_with_handle(types::Fd(fd), Some(handle))
     }
 
+    /// Create a [`NornFd`] bound to the same driver as `self`, or unbound if
+    /// `self` is unbound.
+    pub(crate) fn sibling_from_fd(&self, fd: RawFd) -> Self {
+        Self::new_with_handle(types::Fd(fd), self.inner.handle.clone())
+    }
+
+    #[cfg(test)]
     fn new(fd: types::Fd) -> Self {
         Self::new_with_handle(fd, Handle::try_current())
     }
@@ -307,10 +319,7 @@ mod tests {
     use crate::test_util::assert_pipe_reader_closed;
 
     fn pipe() -> [RawFd; 2] {
-        let mut fds = [0; 2];
-        let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
-        assert_eq!(rc, 0);
-        fds
+        crate::test_util::pipe_cloexec()
     }
 
     fn assert_open(fd: RawFd) {

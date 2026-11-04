@@ -263,12 +263,18 @@ where
         // borrowed reference.
         let taskref = ManuallyDrop::new(crate::RegisteredTask::from(TaskRef::from_ptr(ptr)));
         let scheduler = this.as_ref().scheduler();
-        scheduler.unbind(&taskref);
+        let unbound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            scheduler.unbind(&taskref);
+        }));
 
         // Wake the join handle last. The waker is user code and may panic,
-        // which must not skip unbinding a task that has already completed.
+        // which must not skip unbinding a task that has already completed. A
+        // panicking `unbind` must not leave the joiner waiting either.
         if let Some(waker) = join_waker {
             waker.wake();
+        }
+        if let Err(payload) = unbound {
+            std::panic::resume_unwind(payload);
         }
     }
 

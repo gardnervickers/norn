@@ -1,8 +1,10 @@
 #![cfg(target_os = "linux")]
 
+use std::future::poll_fn;
 use std::io;
 use std::net::SocketAddr;
-use std::pin::pin;
+use std::pin::{pin, Pin};
+use std::task::Poll;
 
 use bytes::BytesMut;
 use futures_core::Stream;
@@ -11,7 +13,7 @@ use norn_executor::spawn;
 use norn_uring::buf::StableBuf;
 use norn_uring::bufring::RecvBufRing;
 use norn_uring::net::{SendZcUsage, TcpListener, TcpListenerOptions, TcpSocket};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 mod util;
 
@@ -616,6 +618,53 @@ fn recv_bundle_rejects_waitall_without_consuming_input() -> Result<(), Box<dyn s
     })
 }
 
+/// A peeking bundle that fills its buffers while more data is queued retries
+/// in the kernel and copies the start of the queue again. Bundles reject
+/// `MSG_PEEK` before consuming input.
+#[test]
+fn recv_bundle_rejects_peek_without_consuming_input() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let (server, client) = connected_pair().await?;
+        let ring = RecvBufRing::builder(16).buf_cnt(8).buf_len(256).build()?;
+
+        let payload: Vec<u8> = (0..1024u32).map(|i| (i % 251) as u8).collect();
+        let (send_result, payload) = client.send(payload).await;
+        assert_eq!(send_result?, payload.len());
+
+        let err = server
+            .recv_bundle_with_flags(&ring, libc::MSG_PEEK)
+            .await
+            .expect_err("MSG_PEEK bundle receive must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        let mut multi = pin!(server.recv_bundle_multi_with_flags(&ring, libc::MSG_PEEK));
+        let err = multi
+            .next()
+            .await
+            .expect("configuration failure must produce one stream item")
+            .expect_err("MSG_PEEK multishot bundle receive must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(multi.next().await.is_none());
+
+        let mut received: Vec<u8> = Vec::with_capacity(payload.len());
+        while received.len() < payload.len() {
+            let bundle = match server.recv_bundle(&ring).await {
+                Ok(bundle) => bundle,
+                Err(err) if util::recv_bundle_unsupported(&err) => break,
+                Err(err) => return Err(err.into()),
+            };
+            received.extend(bundle.iter().flatten().copied());
+        }
+        if !received.is_empty() {
+            assert_eq!(received, payload);
+        }
+
+        server.close().await?;
+        client.close().await?;
+        Ok(())
+    })
+}
+
 #[test]
 fn recv_bundle_shared_ring_handles_reverse_poll_order() -> Result<(), Box<dyn std::error::Error>> {
     util::with_test_env(|| async {
@@ -844,4 +893,98 @@ fn write_vectored_accepts_more_than_iov_max_slices() -> Result<(), Box<dyn std::
         drop(peer);
         Ok(())
     })
+}
+
+/// Fill the send path of a connection whose peer never reads, abandon the
+/// pending write, and return the stream with its readiness gate closed.
+async fn stream_with_abandoned_write(
+) -> Result<(Pin<Box<norn_uring::net::TcpStream>>, std::net::TcpStream), Box<dyn std::error::Error>>
+{
+    let listener = TcpListener::bind("127.0.0.1:0".parse()?, 8).await?;
+    let peer = std::net::TcpStream::connect(listener.local_addr()?)?;
+    let (server, _) = listener.accept().await?;
+    let mut stream = Box::pin(server.into_stream());
+
+    let chunk = vec![0_u8; 64 * 1024];
+    for _ in 0..4096 {
+        match poll_fn(|cx| Poll::Ready(stream.as_mut().poll_write(cx, &chunk))).await {
+            Poll::Ready(Ok(_)) => {}
+            Poll::Ready(Err(err)) => return Err(err.into()),
+            // The application abandons the write here, for example after a
+            // write timeout.
+            Poll::Pending => return Ok((stream, peer)),
+        }
+    }
+    panic!("the send path never filled");
+}
+
+/// `poll_shutdown` must not wait for `POLLOUT`: `shutdown(SHUT_WR)` is valid
+/// even when the send buffer is full and the peer has stopped reading.
+#[test]
+fn shutdown_after_abandoned_write_does_not_wait_for_writability(
+) -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let (mut stream, peer) = stream_with_abandoned_write().await?;
+        let mut shutdown = pin!(poll_fn(|cx| stream.as_mut().poll_shutdown(cx)));
+        for _ in 0..200 {
+            if let Poll::Ready(result) = futures_util::poll!(shutdown.as_mut()) {
+                result?;
+                drop(peer);
+                return Ok(());
+            }
+            turn().await;
+        }
+        panic!("shutdown(SHUT_WR) is still waiting for POLLOUT from a peer that does not read");
+    })
+}
+
+/// A TCP stream has no userspace buffer, so `poll_flush` must complete without
+/// waiting for `POLLOUT`.
+#[test]
+fn flush_after_abandoned_write_does_not_wait_for_writability(
+) -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let (mut stream, peer) = stream_with_abandoned_write().await?;
+        let mut flush = pin!(poll_fn(|cx| stream.as_mut().poll_flush(cx)));
+        for _ in 0..200 {
+            if let Poll::Ready(result) = futures_util::poll!(flush.as_mut()) {
+                result?;
+                drop(peer);
+                return Ok(());
+            }
+            turn().await;
+        }
+        panic!("flush is still waiting for POLLOUT from a peer that does not read");
+    })
+}
+
+/// Leading empty slices must not eat the `IOV_MAX` cap: a vectored write with
+/// data after more than `IOV_MAX` empty slices writes that data instead of
+/// returning `Ok(0)`, which writers treat as a failure.
+#[test]
+fn write_vectored_skips_leading_empty_slices_before_capping(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::future::poll_fn;
+    use tokio::io::AsyncWrite;
+
+    util::with_test_env(|| async {
+        let listener = TcpListener::bind("127.0.0.1:0".parse()?, 8).await?;
+        let peer = std::net::TcpStream::connect(listener.local_addr()?)?;
+        let (server, _) = listener.accept().await?;
+        let mut stream = pin!(server.into_stream());
+
+        let empty: &[u8] = &[];
+        let mut slices: Vec<io::IoSlice<'_>> = vec![io::IoSlice::new(empty); 1500];
+        slices.push(io::IoSlice::new(b"data"));
+        let written = poll_fn(|cx| stream.as_mut().poll_write_vectored(cx, &slices)).await?;
+        assert_eq!(written, 4);
+        drop(peer);
+        Ok(())
+    })
+}
+
+/// Let the driver run one turn. Only the turn matters, not `noop()`'s result.
+#[allow(clippy::let_unit_value)]
+async fn turn() {
+    let _turn = norn_uring::noop().await;
 }

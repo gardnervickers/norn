@@ -183,8 +183,15 @@ fn reap_owned_fd(result: CQEResult) -> io::Result<OwnedFd> {
     })
 }
 
-fn bind_owned_fd(fd: OwnedFd) -> NornFd {
-    NornFd::from_fd(fd.into_raw_fd())
+/// Binds a descriptor returned by an operation to the driver that submitted it,
+/// not to whichever driver happens to be current when the future finishes.
+fn bind_owned_fd(fd: OwnedFd, handle: crate::Handle) -> NornFd {
+    NornFd::from_fd_on(fd.into_raw_fd(), handle)
+}
+
+/// Binds a descriptor accepted from `listener` to the listener's driver.
+fn bind_accepted_fd(fd: OwnedFd, listener: &NornFd) -> NornFd {
+    listener.sibling_from_fd(fd.into_raw_fd())
 }
 
 fn invalid_socket_addr_error() -> io::Error {
@@ -215,10 +222,19 @@ fn validate_recv_bundle_flags(flags: i32) -> io::Result<()> {
             "MSG_TRUNC is unsupported for receive bundles because the completion byte count does not identify how many buffers were selected",
         ));
     }
-    // A partial `MSG_WAITALL` bundle retries inside the kernel. Before Linux's
-    // `io_net_kbuf_can_retry` fix (absent from 6.18.58), that retry can commit a
-    // different number of buffers than the final completion reports, so the
-    // kernel later reselects a buffer the returned bundle still owns.
+    // After a full bundle with more data queued, the kernel retries into
+    // further buffers. A peek leaves the queue intact, so the retry copies its
+    // start again and the bundle reports more bytes than were queued.
+    if flags & libc::MSG_PEEK != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "MSG_PEEK is unsupported for receive bundles because a kernel bundle retry peeks the start of the queue again",
+        ));
+    }
+    // A partial `MSG_WAITALL` bundle retries inside the kernel. On the kernels
+    // this was tested against (Linux 6.18.58), that retry can commit a different
+    // number of buffers than the final completion reports, so the kernel later
+    // reselects a buffer the returned bundle still owns.
     if flags & libc::MSG_WAITALL != 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -307,6 +323,7 @@ impl Socket {
             domain,
             socket_type,
             protocol,
+            handle: handle.clone(),
         };
         let fd = handle.submit(op).await?;
         let this = Self::from_fd(fd);
@@ -724,6 +741,7 @@ struct OpenSocket {
     domain: Domain,
     socket_type: Type,
     protocol: Option<Protocol>,
+    handle: crate::Handle,
 }
 
 // Safety: the socket SQE contains only copied scalar arguments. `reap` converts
@@ -751,7 +769,7 @@ impl Singleshot for OpenSocket {
     type Output = io::Result<NornFd>;
 
     fn complete(self, completion: Self::Completion) -> Self::Output {
-        completion.map(bind_owned_fd)
+        completion.map(|fd| bind_owned_fd(fd, self.handle))
     }
 }
 
@@ -1062,6 +1080,7 @@ unsafe impl Operation for RecvRing {
 
     unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
         let (result, flags) = result.into_parts();
+        let result = result.map_err(|error| self.ring.release_failed(error, flags));
         result.and_then(|n| {
             // A stream EOF completes with no buffer id; see `RecvFromRing`.
             if n == 0 && io_uring::cqueue::buffer_select(flags).is_none() {
@@ -1081,12 +1100,27 @@ impl Singleshot for RecvRing {
     }
 }
 
+/// Bytes reserved for the sender address at the start of each buffer selected
+/// by a multishot recvmsg.
+///
+/// The kernel writes a fixed-size name field of exactly `msg_namelen` bytes
+/// into every selected buffer, so this is sized for the largest UDP address
+/// (`sockaddr_in6`) rather than a full `sockaddr_storage`.
+const RECVMSG_MULTI_NAME_LEN: usize = std::mem::size_of::<libc::sockaddr_in6>();
+
 /// A bufring-backed receive buffer that exposes only payload bytes for `RecvMsgMulti`.
+///
+/// Each selected ring buffer begins with a 16-byte `io_uring_recvmsg_out`
+/// header followed by a 28-byte sender address field, so a buffer of
+/// [`RecvBufRing::buf_capacity`] bytes holds at most `buf_capacity() - 44`
+/// payload bytes. Larger datagrams are truncated to fit and report
+/// [`is_truncated`](Self::is_truncated).
 #[derive(Debug)]
 pub struct RecvMsgRingBuf {
     buf: BufRingBuf,
     payload_offset: usize,
     payload_len: usize,
+    truncated: bool,
 }
 
 impl std::ops::Deref for RecvMsgRingBuf {
@@ -1098,20 +1132,41 @@ impl std::ops::Deref for RecvMsgRingBuf {
 }
 
 impl RecvMsgRingBuf {
-    fn new(buf: BufRingBuf, payload_offset: usize, payload_len: usize) -> Self {
+    fn new(buf: BufRingBuf, payload_offset: usize, payload_len: usize, truncated: bool) -> Self {
         Self {
             buf,
             payload_offset,
             payload_len,
+            truncated,
         }
     }
 
     /// Returns the payload bytes from the received message.
+    ///
+    /// When [`is_truncated`](Self::is_truncated) is `true`, these are only the
+    /// leading bytes of the datagram; the remainder was discarded.
     pub fn payload(&self) -> &[u8] {
         &self.buf[self.payload_offset..self.payload_offset + self.payload_len]
     }
 
+    /// Returns whether the datagram was larger than the space left in the ring
+    /// buffer and its payload was truncated.
+    ///
+    /// The kernel reports this with `MSG_TRUNC`. The discarded bytes cannot be
+    /// recovered; use a ring with larger buffers to receive such datagrams in
+    /// full.
+    #[must_use]
+    pub fn is_truncated(&self) -> bool {
+        self.truncated
+    }
+
     /// Returns the underlying full buffer including recvmsg metadata prefix.
+    ///
+    /// The prefix is the 16-byte `io_uring_recvmsg_out` header followed by a
+    /// name field. The name field is currently 28 bytes (`sockaddr_in6`), not a
+    /// full `sockaddr_storage`; that size is an implementation detail and can
+    /// change. Code that parses this buffer with `RecvMsgOut::parse` must pass a
+    /// `msghdr` whose `msg_namelen` matches it, so prefer [`payload`](Self::payload).
     pub fn as_raw(&self) -> &[u8] {
         &self.buf
     }
@@ -1159,6 +1214,14 @@ impl RecvFromRingMulti {
                 "invalid recvmsg multishot completion layout",
             )
         })?;
+        if recvmsg.is_name_data_truncated() {
+            // Unreachable for IPv4 and IPv6 sockets, whose addresses fit the
+            // reserved field. Refuse to parse a partial address.
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "recvmsg multishot sender address does not fit the reserved name field",
+            ));
+        }
         let addr = if recvmsg.name_data().is_empty() {
             as_socket_addr_or_peer(&self.fd, &self.addr, 0)?
         } else {
@@ -1168,7 +1231,11 @@ impl RecvFromRingMulti {
         let payload = recvmsg.payload_data();
         let payload_offset = payload.as_ptr() as usize - base_ptr;
         let payload_len = payload.len();
-        Ok((RecvMsgRingBuf::new(buf, payload_offset, payload_len), addr))
+        let truncated = recvmsg.is_payload_truncated();
+        Ok((
+            RecvMsgRingBuf::new(buf, payload_offset, payload_len, truncated),
+            addr,
+        ))
     }
 }
 
@@ -1182,9 +1249,13 @@ unsafe impl Operation for RecvFromRingMulti {
         self.ring.ensure_accepting_receives()?;
         let this = self;
         let msghdr = this.msghdr.as_mut_ptr();
+        // The kernel reserves exactly `msg_namelen` bytes for the sender
+        // address in every selected buffer; it does not write through
+        // `msg_name`. Reserve only what UDP needs.
+        debug_assert!(RECVMSG_MULTI_NAME_LEN <= this.addr.len() as usize);
         unsafe {
             (*msghdr).msg_name = this.addr.as_ptr() as *mut libc::c_void;
-            (*msghdr).msg_namelen = this.addr.len() as _;
+            (*msghdr).msg_namelen = RECVMSG_MULTI_NAME_LEN as _;
             (*msghdr).msg_control = std::ptr::null_mut();
             (*msghdr).msg_controllen = 0;
             (*msghdr).msg_iov = std::ptr::null_mut();
@@ -1460,7 +1531,7 @@ impl Singleshot for Accept<false> {
         // Safety: the kernel wrote at most `addr_len` bytes into `addr`.
         unsafe { this.addr.set_length(this.addr_len) };
         let addr = as_socket_addr(&this.addr)?;
-        Ok((bind_owned_fd(fd), addr))
+        Ok((bind_accepted_fd(fd, &this.fd), addr))
     }
 }
 
@@ -1468,11 +1539,11 @@ impl Multishot for Accept<true> {
     type Item = io::Result<NornFd>;
 
     fn update(&mut self, completion: Self::Completion) -> Self::Item {
-        completion.map(bind_owned_fd)
+        completion.map(|fd| bind_accepted_fd(fd, &self.fd))
     }
 
     fn complete(self, completion: Self::Completion) -> Option<Self::Item> {
-        Some(completion.map(bind_owned_fd))
+        Some(completion.map(|fd| bind_accepted_fd(fd, &self.fd)))
     }
 }
 
@@ -2250,19 +2321,12 @@ mod tests {
 
     #[test]
     fn unconsumed_reaped_descriptor_closes_directly() {
-        let mut fds = [0; 2];
-        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let fds = crate::test_util::pipe_cloexec();
 
         let completion = reap_owned_fd(CQEResult::new(Ok(fds[0] as u32), 0)).unwrap();
         drop(completion);
 
-        let mut pollfd = libc::pollfd {
-            fd: fds[1],
-            events: libc::POLLOUT,
-            revents: 0,
-        };
-        assert_eq!(unsafe { libc::poll(&mut pollfd, 1, 0) }, 1);
-        assert_ne!(pollfd.revents & libc::POLLERR, 0);
+        crate::test_util::assert_pipe_reader_closed(fds[1]);
         assert_eq!(unsafe { libc::close(fds[1]) }, 0);
     }
 
@@ -2341,18 +2405,24 @@ mod tests {
     }
 
     #[test]
-    fn recv_bundle_flag_validation_rejects_trunc_and_waitall() {
-        for flags in [0, libc::MSG_PEEK] {
-            validate_recv_bundle_flags(flags).unwrap();
+    fn recv_bundle_flag_validation_rejects_trunc_peek_and_waitall() {
+        validate_recv_bundle_flags(0).unwrap();
 
-            let err = validate_recv_bundle_flags(flags | libc::MSG_TRUNC).unwrap_err();
+        for (flag, name) in [
+            (libc::MSG_TRUNC, "MSG_TRUNC"),
+            (libc::MSG_PEEK, "MSG_PEEK"),
+            (libc::MSG_WAITALL, "MSG_WAITALL"),
+        ] {
+            let err = validate_recv_bundle_flags(flag).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-            assert!(err.to_string().contains("MSG_TRUNC"));
-
-            let err = validate_recv_bundle_flags(flags | libc::MSG_WAITALL).unwrap_err();
-            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-            assert!(err.to_string().contains("MSG_WAITALL"));
+            assert!(err.to_string().contains(name), "{err} should name {name}");
         }
+
+        // The checks run in a fixed order: TRUNC, then PEEK, then WAITALL.
+        let err = validate_recv_bundle_flags(libc::MSG_PEEK | libc::MSG_WAITALL).unwrap_err();
+        assert!(err.to_string().contains("MSG_PEEK"));
+        let err = validate_recv_bundle_flags(libc::MSG_TRUNC | libc::MSG_PEEK).unwrap_err();
+        assert!(err.to_string().contains("MSG_TRUNC"));
     }
 
     fn build_test_ring(driver: &crate::Driver, bgid: u16) -> io::Result<RecvBufRing> {
@@ -2387,9 +2457,9 @@ mod tests {
         drop(socket.recv_from_ring_multi(ring));
         drop(socket.recv_ring_multi(ring));
         drop(socket.recv_ring_bundle(ring));
-        drop(socket.recv_ring_bundle_with_flags(ring, libc::MSG_PEEK));
+        drop(socket.recv_ring_bundle_with_flags(ring, 0));
         drop(socket.recv_ring_bundle_multi_with_flags(ring, 0));
-        drop(socket.recv_ring_bundle_multi_with_flags(ring, libc::MSG_PEEK));
+        drop(socket.recv_ring_bundle_multi_with_flags(ring, 0));
     }
 
     #[test]
@@ -2416,13 +2486,13 @@ mod tests {
         assert_driver_mismatch(|| drop(socket.recv_ring_multi(&first_ring)));
         assert_driver_mismatch(|| drop(socket.recv_ring_bundle(&first_ring)));
         assert_driver_mismatch(|| {
-            drop(socket.recv_ring_bundle_with_flags(&first_ring, libc::MSG_PEEK));
+            drop(socket.recv_ring_bundle_with_flags(&first_ring, 0));
         });
         assert_driver_mismatch(|| {
             drop(socket.recv_ring_bundle_multi_with_flags(&first_ring, 0));
         });
         assert_driver_mismatch(|| {
-            drop(socket.recv_ring_bundle_multi_with_flags(&first_ring, libc::MSG_PEEK));
+            drop(socket.recv_ring_bundle_multi_with_flags(&first_ring, 0));
         });
         Ok(())
     }

@@ -270,20 +270,28 @@ impl TcpListener {
 
     /// Accepts a new incoming connection to this listener.
     ///
+    /// The returned socket is bound to the [`Driver`](crate::Driver) that owns
+    /// the listener, whichever context finishes this future.
+    ///
     /// # Errors
     ///
     /// Returns an error if the accept operation fails.
-    ///
-    /// # Panics
-    ///
-    /// Panics if polled outside the [`Driver`](crate::Driver) context that owns
-    /// the listener.
     pub async fn accept(&self) -> io::Result<(TcpSocket, SocketAddr)> {
         let (socket, addr) = self.socket.accept().await?;
         Ok((TcpSocket { socket }, addr))
     }
 
     /// Returns a stream of incoming connections.
+    ///
+    /// The stream is backed by a multishot accept, so connections are accepted
+    /// without submitting a request per connection. Each socket is bound to the
+    /// [`Driver`](crate::Driver) that owns the listener.
+    ///
+    /// An error is yielded as an item and does not end the stream; the next
+    /// poll accepts again. The kernel can end a multishot accept without an
+    /// error, for example when it cannot post a completion to a full completion
+    /// queue. The stream re-arms after an accept that produced connections, and
+    /// ends (`None`) when one ends without producing any.
     pub fn incoming(&self) -> impl Stream<Item = io::Result<TcpSocket>> + '_ {
         Incoming {
             listener: &self.socket,
@@ -311,11 +319,6 @@ impl TcpListener {
 
 pin_project_lite::pin_project! {
     /// A stream of connections accepted by a [`TcpListener`].
-    ///
-    /// # Panics
-    ///
-    /// Polling may panic outside the [`Driver`](crate::Driver) context that
-    /// owns the listener.
     struct Incoming<'a> {
         listener: &'a socket::Socket,
         #[pin]
@@ -545,10 +548,11 @@ impl TcpSocket {
     /// # Errors
     ///
     /// The request resolves with [`io::ErrorKind::InvalidInput`] when `flags`
-    /// contains `MSG_TRUNC` or `MSG_WAITALL`. `MSG_TRUNC` does not identify the
-    /// number of buffers selected by a bundle receive, and a partial
-    /// `MSG_WAITALL` retry can commit buffers that the completion does not
-    /// report.
+    /// contains `MSG_TRUNC`, `MSG_PEEK` or `MSG_WAITALL`. `MSG_TRUNC` does not
+    /// identify the number of buffers selected by a bundle receive, a kernel
+    /// bundle retry peeks the start of the queue again under `MSG_PEEK`, and a
+    /// partial `MSG_WAITALL` retry can commit buffers that the completion does
+    /// not report.
     pub fn recv_bundle_with_flags(
         &self,
         ring: &RecvBufRing,
@@ -575,8 +579,9 @@ impl TcpSocket {
     /// # Errors
     ///
     /// The stream yields [`io::ErrorKind::InvalidInput`] and terminates when
-    /// `flags` contains `MSG_TRUNC` or `MSG_WAITALL`. `MSG_TRUNC` does not
-    /// identify the number of selected buffers, and multishot receives do not
+    /// `flags` contains `MSG_TRUNC`, `MSG_PEEK`, or `MSG_WAITALL`. `MSG_TRUNC`
+    /// does not identify the number of selected buffers, a kernel bundle retry
+    /// peeks the start of the queue again, and multishot receives do not
     /// support `MSG_WAITALL`.
     pub fn recv_bundle_multi_with_flags(
         &self,
@@ -788,23 +793,20 @@ impl tokio::io::AsyncWrite for TcpStreamWriter {
         Poll::Ready(Ok(n))
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
-        use std::io::Write;
-        let this = self.project();
-        ready!(this
-            .inner
-            .poll_op(cx, |mut sock| sock.flush(), socket::WRITE_FLAGS as u32))?;
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        // TCP has no userspace buffer: every accepted write has already been
+        // handed to the kernel, so there is nothing to flush and no reason to
+        // wait for writability.
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        // `shutdown(SHUT_WR)` does not depend on send-buffer space, so it must
+        // not wait on the write readiness gate, which stays closed after an
+        // abandoned `EAGAIN` write until the peer drains the buffer.
         let this = self.project();
-        ready!(this.inner.poll_op(
-            cx,
-            |sock| sock.shutdown(std::net::Shutdown::Write),
-            socket::WRITE_FLAGS as u32
-        ))?;
-        Poll::Ready(Ok(()))
+        let sock = this.inner.project().inner.as_socket();
+        Poll::Ready(sock.shutdown(std::net::Shutdown::Write))
     }
 
     fn poll_write_vectored(
@@ -815,6 +817,10 @@ impl tokio::io::AsyncWrite for TcpStreamWriter {
         let this = self.project();
         // The kernel rejects more than IOV_MAX iovecs with EMSGSIZE. Like
         // `std`, pass only the first IOV_MAX slices; a short write is valid.
+        // Skip leading empty slices first, so non-empty input never caps down
+        // to a prefix of empty slices and reports `Ok(0)`.
+        let skip = bufs.iter().take_while(|buf| buf.is_empty()).count();
+        let bufs = &bufs[skip..];
         let bufs = &bufs[..bufs.len().min(IOV_MAX)];
         let n = ready!(this.inner.poll_op(
             cx,

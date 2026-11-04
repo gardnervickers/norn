@@ -9,6 +9,10 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+/// Listen backlog passed to Norn servers. Linux caps it at
+/// `net.core.somaxconn`, which defaults to 4096.
+const NORN_BACKLOG: u32 = 4_096;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     /// `norn-kv-server`: started on port zero; the announced address is used.
@@ -48,6 +52,11 @@ impl Process {
         match spec.kind {
             Kind::Norn => {
                 args.push("--listen=127.0.0.1:0".to_owned());
+                // Churn opens hundreds to thousands of connections a second.
+                // Pass the backlog explicitly so frozen baseline binaries with
+                // a smaller default do not overflow their accept queue and
+                // reset connections on a busy host.
+                args.push(format!("--backlog={NORN_BACKLOG}"));
                 args.push(format!("--workers={}", spec.workers));
                 if !spec.cpus.is_empty() {
                     args.push(format!("--worker-cpus={}", cpu_list(&spec.cpus)));

@@ -166,6 +166,30 @@ impl<T> Shared<T> {
     }
 }
 
+/// Stores `waker` in `slot` unless the stored waker already wakes the same task.
+///
+/// Dropping a waker runs arbitrary code that may re-enter the channel and
+/// touch this slot, so the clone happens before the borrow and the replaced
+/// waker is dropped after it is released.
+fn register_waker_in(slot: &RefCell<Option<Waker>>, waker: &Waker) {
+    if slot
+        .borrow()
+        .as_ref()
+        .is_some_and(|current| current.will_wake(waker))
+    {
+        return;
+    }
+    let new = waker.clone();
+    let old = slot.borrow_mut().replace(new);
+    drop(old);
+}
+
+/// Empties `slot`, dropping the stored waker after the borrow is released.
+fn clear_waker_in(slot: &RefCell<Option<Waker>>) {
+    let old = slot.borrow_mut().take();
+    drop(old);
+}
+
 struct Local<T> {
     shared: Arc<Shared<T>>,
     waker: RefCell<Option<Waker>>,
@@ -173,17 +197,11 @@ struct Local<T> {
 
 impl<T> Local<T> {
     fn register_waker(&self, waker: &Waker) {
-        let mut current = self.waker.borrow_mut();
-        if current
-            .as_ref()
-            .is_none_or(|current| !current.will_wake(waker))
-        {
-            *current = Some(waker.clone());
-        }
+        register_waker_in(&self.waker, waker);
     }
 
     fn clear_waker(&self) {
-        self.waker.borrow_mut().take();
+        clear_waker_in(&self.waker);
     }
 }
 
@@ -334,10 +352,23 @@ impl<T> Sender<T> {
     ///
     /// On failure, ownership of the message is returned to the caller.
     ///
+    /// # Closing
+    ///
+    /// `Ok(())` means the message was accepted by the channel, not that the
+    /// receiver will observe it. If [`Receiver::close`], driver shutdown, or
+    /// receiver drop runs concurrently with this call, the send may still
+    /// return `Ok(())` after the receiver has already reported
+    /// [`TryRecvError::Closed`]. Such a message is returned by a later receive
+    /// call, or is dropped exactly once when the receiver is dropped; it is
+    /// never leaked. See the [crate-level shutdown guidance](crate#shutdown)
+    /// for a lossless shutdown.
+    ///
     /// # Errors
     ///
     /// Returns [`TrySendError::Full`] when the bounded queue has no remaining
-    /// capacity, or [`TrySendError::Closed`] after the receiver closes.
+    /// capacity, or [`TrySendError::Closed`] when this send observed the
+    /// receiver closed, either before publishing or after finding the queue
+    /// full.
     pub fn try_send(&self, value: T) -> Result<(), TrySendError<T>> {
         if self.is_closed() {
             return Err(TrySendError::Closed(value));
@@ -370,6 +401,18 @@ impl<T> Sender<T> {
     /// the batch is being enqueued. Receiver closure is checked before the
     /// first enqueue and again after a failed enqueue; closure racing with an
     /// in-progress batch may therefore leave the whole prefix accepted.
+    ///
+    /// # Closing
+    ///
+    /// A returned count (`Ok(n)` or [`TrySendManyError::sent`]) means that
+    /// many messages were accepted by the channel, not that the receiver will
+    /// observe them. Because the caller's iterator runs between enqueues, the
+    /// window in which a concurrent [`Receiver::close`], driver shutdown, or
+    /// receiver drop can race with the batch is as long as the iterator takes.
+    /// Messages accepted after the receiver has reported
+    /// [`TryRecvError::Closed`] are returned by a later receive call, or are
+    /// dropped exactly once when the receiver is dropped; they are never
+    /// leaked. See the [crate-level shutdown guidance](crate#shutdown).
     ///
     /// # Errors
     ///
@@ -432,7 +475,13 @@ impl<T> Sender<T> {
 /// A receiver is neither cloneable nor [`Send`]. It stores ordinary Norn task
 /// wakers, which the channel driver invokes only on the destination thread.
 /// Dropping it closes the channel and discards buffered messages. A send
-/// already in progress may succeed, but its message will also be discarded.
+/// racing with the drop may return `Ok`, but the channel drops its message
+/// exactly once.
+///
+/// [`Receiver::close`] and driver shutdown are weaker than dropping: they stop
+/// new sends but do not wait for sends in progress, so [`TryRecvError::Closed`]
+/// covers only messages already published. See [`Receiver::close`] and the
+/// [crate-level shutdown guidance](crate#shutdown).
 pub struct Receiver<T> {
     local: Rc<Local<T>>,
     handle: Handle,
@@ -514,10 +563,29 @@ impl<T> Receiver<T> {
 
     /// Close the receiving side while retaining access to buffered messages.
     ///
-    /// Subsequent sends fail immediately. Receive operations may continue to
-    /// drain messages that were already buffered and then report closure.
-    /// A send already in progress may still succeed; this method does not
-    /// wait for such sends to finish.
+    /// Sends that observe the close fail with [`TrySendError::Closed`].
+    /// Receive operations may continue to drain buffered messages and then
+    /// report closure.
+    ///
+    /// # What `Closed` means
+    ///
+    /// This method does not wait for sends in progress, and `Closed` is not
+    /// sticky. [`TryRecvError::Closed`] (or `None` from [`Receiver::recv`])
+    /// covers only messages already published when the receiver found the
+    /// queue empty. A send that passed its closed check before this call can
+    /// still publish afterwards and return `Ok(())`. Such a message is
+    /// returned by a later receive call, or, if the receiver is not polled
+    /// again, is dropped exactly once when the receiver is dropped. It is never
+    /// leaked.
+    ///
+    /// Driver shutdown (dropping the [`Driver`](crate::Driver) or calling
+    /// `Park::shutdown`) closes every registered receiver. It has the same
+    /// effect on the channel as calling this method, and also wakes a pending
+    /// receive.
+    ///
+    /// Unlike `tokio::sync::mpsc::Receiver::close`, `close` followed by
+    /// draining to `None` is therefore not a lossless handshake. See the
+    /// [crate-level shutdown guidance](crate#shutdown) for one.
     pub fn close(&mut self) {
         self.local
             .shared
@@ -666,17 +734,11 @@ impl<T> ShardedLocal<T> {
     }
 
     fn register_waker(&self, waker: &Waker) {
-        let mut current = self.waker.borrow_mut();
-        if current
-            .as_ref()
-            .is_none_or(|current| !current.will_wake(waker))
-        {
-            *current = Some(waker.clone());
-        }
+        register_waker_in(&self.waker, waker);
     }
 
     fn clear_waker(&self) {
-        self.waker.borrow_mut().take();
+        clear_waker_in(&self.waker);
     }
 }
 
@@ -896,10 +958,22 @@ impl<T> ShardedSender<T> {
     /// On failure, ownership of the message is returned to the caller. A full
     /// result applies to this lane even if another lane still has capacity.
     ///
+    /// # Closing
+    ///
+    /// `Ok(())` means the message was accepted by this lane, not that the
+    /// receiver will observe it. If [`ShardedReceiver::close`], driver
+    /// shutdown, or receiver drop runs concurrently with this call, the send
+    /// may still return `Ok(())` after the receiver has already reported
+    /// [`TryRecvError::Closed`]. Such a message is returned by a later receive
+    /// call, or is dropped exactly once when the receiver is dropped; it is
+    /// never leaked. See the [crate-level shutdown guidance](crate#shutdown)
+    /// for a lossless shutdown.
+    ///
     /// # Errors
     ///
     /// Returns [`TrySendError::Full`] when this lane has no remaining capacity,
-    /// or [`TrySendError::Closed`] after the receiver closes.
+    /// or [`TrySendError::Closed`] when this send observed the receiver
+    /// closed, either before publishing or after finding the lane full.
     pub fn try_send(&self, value: T) -> Result<(), TrySendError<T>> {
         if self.is_closed() {
             return Err(TrySendError::Closed(value));
@@ -935,8 +1009,14 @@ impl<T> ShardedSender<T> {
 /// This receiver is neither cloneable nor [`Send`]. It drains its producer
 /// lanes round-robin and invokes stored task wakers only on the destination
 /// executor thread. Dropping it closes every lane and discards buffered
-/// messages. A send already in progress may succeed, but its message will
-/// also be discarded.
+/// messages. A send racing with the drop may return `Ok`, but the channel
+/// drops its message exactly once.
+///
+/// [`ShardedReceiver::close`] and driver shutdown are weaker than dropping:
+/// they stop new sends but do not wait for sends in progress, so
+/// [`TryRecvError::Closed`] covers only messages already published. See
+/// [`ShardedReceiver::close`] and the
+/// [crate-level shutdown guidance](crate#shutdown).
 pub struct ShardedReceiver<T> {
     local: Rc<ShardedLocal<T>>,
     handle: Handle,
@@ -1019,8 +1099,29 @@ impl<T> ShardedReceiver<T> {
 
     /// Close the receiver while retaining access to buffered messages.
     ///
-    /// A send already in progress may still succeed; this method does not
-    /// wait for such sends to finish.
+    /// Sends that observe the close fail with [`TrySendError::Closed`].
+    /// Receive operations may continue to drain buffered messages and then
+    /// report closure.
+    ///
+    /// # What `Closed` means
+    ///
+    /// This method does not wait for sends in progress, and `Closed` is not
+    /// sticky. [`TryRecvError::Closed`] (or `None` from
+    /// [`ShardedReceiver::recv`]) covers only messages already published when
+    /// the receiver found every lane empty. A send that passed its closed
+    /// check before this call can still publish afterwards and return
+    /// `Ok(())`. Such a message is returned by a later receive call, or, if the
+    /// receiver is not polled again, is dropped exactly once when the receiver
+    /// is dropped. It is never leaked.
+    ///
+    /// Driver shutdown (dropping the [`Driver`](crate::Driver) or calling
+    /// `Park::shutdown`) closes every registered receiver. It has the same
+    /// effect on the channel as calling this method, and also wakes a pending
+    /// receive.
+    ///
+    /// Unlike `tokio::sync::mpsc::Receiver::close`, `close` followed by
+    /// draining to `None` is therefore not a lossless handshake. See the
+    /// [crate-level shutdown guidance](crate#shutdown) for one.
     pub fn close(&mut self) {
         self.local
             .shared
@@ -1233,6 +1334,48 @@ mod tests {
 
     use super::*;
     use crate::{Driver, DriverBuilder, Endpoint};
+
+    struct SlotTouchOnDrop {
+        slot: *const RefCell<Option<Waker>>,
+    }
+
+    // Safety: the test waker is only dropped synchronously on the thread that
+    // owns `slot`, which outlives it.
+    unsafe impl Send for SlotTouchOnDrop {}
+    unsafe impl Sync for SlotTouchOnDrop {}
+
+    // The drop-time re-entry is the point of this waker.
+    #[allow(clippy::manual_noop_waker)]
+    impl Wake for SlotTouchOnDrop {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    impl Drop for SlotTouchOnDrop {
+        fn drop(&mut self) {
+            // Re-enter the slot while the old waker is being dropped.
+            drop(unsafe { (*self.slot).borrow_mut().take() });
+        }
+    }
+
+    #[test]
+    fn replaced_and_cleared_wakers_drop_outside_the_slot_borrow() {
+        let slot = RefCell::new(None);
+        let reentrant = || Waker::from(Arc::new(SlotTouchOnDrop { slot: &slot }));
+
+        register_waker_in(&slot, &reentrant());
+        // Replacing drops the old waker, which re-enters the slot and takes the
+        // new waker that was already stored.
+        register_waker_in(&slot, Waker::noop());
+        assert!(
+            slot.borrow().is_none(),
+            "the old waker was not dropped after the new one was stored"
+        );
+
+        *slot.borrow_mut() = None;
+        register_waker_in(&slot, &reentrant());
+        clear_waker_in(&slot);
+        assert!(slot.borrow().is_none());
+    }
 
     fn endpoint() -> (DriverBuilder, Endpoint) {
         let builder = DriverBuilder::new();
@@ -2047,5 +2190,217 @@ mod tests {
         let mut receiver = receiver.attach(&driver.handle());
         let mut output = Vec::new();
         let _ = receiver.try_recv_many(&mut output, 0);
+    }
+
+    // A send that passed its closed check, then publishes after the receiver
+    // has already reported `Closed`. `close()` does not wait for it, so the
+    // send returns `Ok` and the channel keeps the value: it is either received
+    // by a later call (`Closed` is not sticky) or dropped exactly once when the
+    // receiver drops. These tests pin that contract; see the crate-level
+    // "Shutdown" docs.
+    #[derive(Clone, Copy)]
+    enum Closer {
+        // `Receiver::close` / `ShardedReceiver::close`.
+        Receiver,
+        // Dropping the driver closes every registered receiver.
+        Driver,
+    }
+
+    trait TestReceiver {
+        fn test_close(&mut self);
+        fn test_try_recv(&mut self) -> Result<DropCount, TryRecvError>;
+    }
+
+    impl TestReceiver for Receiver<DropCount> {
+        fn test_close(&mut self) {
+            self.close();
+        }
+
+        fn test_try_recv(&mut self) -> Result<DropCount, TryRecvError> {
+            self.try_recv()
+        }
+    }
+
+    impl TestReceiver for ShardedReceiver<DropCount> {
+        fn test_close(&mut self) {
+            self.close();
+        }
+
+        fn test_try_recv(&mut self) -> Result<DropCount, TryRecvError> {
+            self.try_recv()
+        }
+    }
+
+    // Closes the channel through `closer`, then checks that the receiver
+    // reports `Closed` on an empty queue.
+    fn close_and_observe<R: TestReceiver>(
+        closer: Closer,
+        receiver: &Rc<RefCell<R>>,
+        driver: &Rc<RefCell<Option<Driver<SpinPark>>>>,
+    ) {
+        match closer {
+            Closer::Receiver => receiver.borrow_mut().test_close(),
+            Closer::Driver => drop(driver.borrow_mut().take()),
+        }
+        assert!(matches!(
+            receiver.borrow_mut().test_try_recv(),
+            Err(TryRecvError::Closed)
+        ));
+    }
+
+    struct Raced<R> {
+        sent: bool,
+        receiver: Rc<RefCell<R>>,
+        dropped: Arc<AtomicUsize>,
+        // Keeps the driver alive when the receiver, not the driver, closes.
+        _driver: Rc<RefCell<Option<Driver<SpinPark>>>>,
+    }
+
+    fn race_plain_try_send(closer: Closer) -> Raced<Receiver<DropCount>> {
+        let driver = Driver::new(SpinPark);
+        let (sender, receiver) = bounded::<DropCount>(&driver.endpoint(), 4);
+        let receiver = Rc::new(RefCell::new(receiver.attach(&driver.handle())));
+        let driver = Rc::new(RefCell::new(Some(driver)));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let (hook_rx, hook_driver) = (Rc::clone(&receiver), Rc::clone(&driver));
+        BEFORE_PUBLISH.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                close_and_observe(closer, &hook_rx, &hook_driver);
+            }));
+        });
+        let sent = sender.try_send(DropCount(dropped.clone())).is_ok();
+        Raced {
+            sent,
+            receiver,
+            dropped,
+            _driver: driver,
+        }
+    }
+
+    fn race_sharded_try_send(closer: Closer) -> Raced<ShardedReceiver<DropCount>> {
+        let driver = Driver::new(SpinPark);
+        let (mut senders, receiver) = bounded_sharded::<DropCount>(&driver.endpoint(), 4, 1);
+        let sender = senders.pop().unwrap();
+        let receiver = Rc::new(RefCell::new(receiver.attach(&driver.handle())));
+        let driver = Rc::new(RefCell::new(Some(driver)));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let (hook_rx, hook_driver) = (Rc::clone(&receiver), Rc::clone(&driver));
+        BEFORE_PUBLISH.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                close_and_observe(closer, &hook_rx, &hook_driver);
+            }));
+        });
+        let sent = sender.try_send(DropCount(dropped.clone())).is_ok();
+        Raced {
+            sent,
+            receiver,
+            dropped,
+            _driver: driver,
+        }
+    }
+
+    // `try_send_many` has no publish hook; the caller's iterator runs between
+    // enqueues, so it closes the channel after the first value is published.
+    // The receiver drains that first value, observes `Closed`, and then the
+    // second value is enqueued.
+    fn race_try_send_many(closer: Closer) -> Raced<Receiver<DropCount>> {
+        let driver = Driver::new(SpinPark);
+        let (sender, receiver) = bounded::<DropCount>(&driver.endpoint(), 4);
+        let receiver = Rc::new(RefCell::new(receiver.attach(&driver.handle())));
+        let driver = Rc::new(RefCell::new(Some(driver)));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let (iter_rx, iter_driver) = (Rc::clone(&receiver), Rc::clone(&driver));
+        let iter_dropped = dropped.clone();
+        let mut produced = 0;
+        let mut values = std::iter::from_fn(move || {
+            produced += 1;
+            match produced {
+                1 => Some(DropCount(iter_dropped.clone())),
+                2 => {
+                    // The first value was published before this call.
+                    match closer {
+                        Closer::Receiver => iter_rx.borrow_mut().test_close(),
+                        Closer::Driver => drop(iter_driver.borrow_mut().take()),
+                    }
+                    assert!(iter_rx.borrow_mut().test_try_recv().is_ok());
+                    assert!(matches!(
+                        iter_rx.borrow_mut().test_try_recv(),
+                        Err(TryRecvError::Closed)
+                    ));
+                    Some(DropCount(iter_dropped.clone()))
+                }
+                _ => None,
+            }
+        });
+        let sent = sender.try_send_many(&mut values).ok() == Some(2);
+        Raced {
+            sent,
+            receiver,
+            dropped,
+            _driver: driver,
+        }
+    }
+
+    fn assert_drops_once_at_receiver_drop<R>(raced: Raced<R>, already_dropped: usize) {
+        assert!(raced.sent, "the racing send returns Ok after Closed");
+        // The channel still owns the racing value.
+        assert_eq!(raced.dropped.load(Ordering::Relaxed), already_dropped);
+        assert_eq!(Rc::strong_count(&raced.receiver), 1);
+        let Raced {
+            receiver, dropped, ..
+        } = raced;
+        drop(receiver);
+        assert_eq!(dropped.load(Ordering::Relaxed), already_dropped + 1);
+    }
+
+    fn assert_later_receive_returns_value<R: TestReceiver>(
+        raced: Raced<R>,
+        already_dropped: usize,
+    ) {
+        assert!(raced.sent, "the racing send returns Ok after Closed");
+        assert_eq!(raced.dropped.load(Ordering::Relaxed), already_dropped);
+        // Pins that `Closed` is not sticky: the racing value is still there.
+        let value = raced.receiver.borrow_mut().test_try_recv();
+        let value = value.map_err(|_| ()).expect("racing value is received");
+        assert_eq!(raced.dropped.load(Ordering::Relaxed), already_dropped);
+        drop(value);
+        assert_eq!(raced.dropped.load(Ordering::Relaxed), already_dropped + 1);
+        assert!(matches!(
+            raced.receiver.borrow_mut().test_try_recv(),
+            Err(TryRecvError::Closed)
+        ));
+        // Received exactly once: dropping the receiver drops nothing more.
+        let Raced {
+            receiver, dropped, ..
+        } = raced;
+        drop(receiver);
+        assert_eq!(dropped.load(Ordering::Relaxed), already_dropped + 1);
+    }
+
+    macro_rules! close_race_tests {
+        ($($name:ident: $race:ident($closer:expr), $already:expr;)*) => {$(
+            mod $name {
+                use super::*;
+
+                #[test]
+                fn racing_send_is_ok_and_drops_once_at_receiver_drop() {
+                    assert_drops_once_at_receiver_drop($race($closer), $already);
+                }
+
+                #[test]
+                fn racing_send_is_received_by_a_later_receive() {
+                    assert_later_receive_returns_value($race($closer), $already);
+                }
+            }
+        )*};
+    }
+
+    close_race_tests! {
+        plain_try_send_racing_close: race_plain_try_send(Closer::Receiver), 0;
+        plain_try_send_racing_driver_shutdown: race_plain_try_send(Closer::Driver), 0;
+        sharded_try_send_racing_close: race_sharded_try_send(Closer::Receiver), 0;
+        sharded_try_send_racing_driver_shutdown: race_sharded_try_send(Closer::Driver), 0;
+        try_send_many_racing_close: race_try_send_many(Closer::Receiver), 1;
+        try_send_many_racing_driver_shutdown: race_try_send_many(Closer::Driver), 1;
     }
 }

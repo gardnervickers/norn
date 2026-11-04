@@ -1,6 +1,7 @@
 //! Norn TCP server for the in-memory protocol implementation.
 
 use std::cell::Cell;
+use std::future::Future;
 use std::io;
 use std::pin::pin;
 use std::rc::Rc;
@@ -19,6 +20,10 @@ const RECV_RING_BUFFERS: u16 = 8_192;
 const RECV_BUFFER_LEN: usize = 8 * 1024;
 const MAX_READY_RECEIVES_PER_BATCH: usize = 16;
 const ACCEPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
+/// Longest a failed connection keeps discarding input before it is closed.
+const LINGER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+/// Most input a failed connection discards before it is closed.
+const LINGER_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 /// Decide whether an accept failure should stop the listener.
 ///
@@ -50,6 +55,54 @@ pub(crate) async fn close_rejected(socket: TcpSocket) {
     }
 }
 
+/// Discard a failed connection's input before its socket is dropped.
+///
+/// Closing a socket with unread input makes the kernel send RST instead of
+/// FIN, and the peer then discards replies it has not read yet, including
+/// replies flushed just before the failure. Shutting down the write half
+/// queues FIN behind those replies, and `discard` reads input until the peer
+/// closes, so the caller's close is orderly. Discarding stops after
+/// [`LINGER_TIMEOUT`] or [`LINGER_MAX_BYTES`], and the close may then still
+/// reset the connection.
+pub(crate) async fn lingering_close(socket: &TcpSocket, discard: impl Future<Output = ()>) {
+    if socket.shutdown(std::net::Shutdown::Write).await.is_err() {
+        return;
+    }
+    let timeout = norn_uring::Handle::current().timeout(LINGER_TIMEOUT);
+    futures_util::future::select(pin!(discard), pin!(timeout)).await;
+}
+
+/// Discard multishot input for [`lingering_close`].
+pub(crate) async fn discard_multishot<S>(incoming: &mut S)
+where
+    S: Stream<Item = io::Result<BufRingBuf>> + Unpin,
+{
+    let mut discarded = 0;
+    while discarded < LINGER_MAX_BYTES {
+        match incoming.next().await {
+            Some(Ok(selected)) if !selected.is_empty() => discarded += selected.len(),
+            _ => return,
+        }
+    }
+}
+
+/// Discard input with owned-buffer receives for [`lingering_close`].
+async fn discard_exact(socket: &TcpSocket) {
+    let mut buffer = RecvBuffer::new();
+    let mut discarded = 0;
+    while discarded < LINGER_MAX_BYTES {
+        if buffer.reset(RECV_BUFFER_LEN).is_err() {
+            return;
+        }
+        let (result, returned) = socket.recv(buffer).await;
+        buffer = returned;
+        match result {
+            Ok(received) if received != 0 => discarded += received,
+            _ => return,
+        }
+    }
+}
+
 /// Socket receive strategy used by the networking experiment.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum RecvMode {
@@ -63,8 +116,7 @@ pub enum RecvMode {
 /// Largest request body the wire protocol can declare.
 ///
 /// The header's total body length field is 32 bits wide, so a larger
-/// `max_body_len` could never be reached and would only inflate the buffers
-/// each connection reserves up front.
+/// `max_body_len` could never be reached.
 const MAX_PROTOCOL_BODY_LEN: u64 = u32::MAX as u64;
 
 /// Runtime limits for the networking-first server.
@@ -72,9 +124,10 @@ const MAX_PROTOCOL_BODY_LEN: u64 = u32::MAX as u64;
 pub struct ServerConfig {
     /// Maximum request body accepted from one command.
     ///
-    /// Every connection reserves `max_body_len` plus a header up front, so
-    /// this must not exceed what the protocol's 32-bit body length field can
-    /// express; [`ServerConfig::validate`] rejects larger values.
+    /// Connection buffers grow to the frames and replies they actually carry,
+    /// not to this limit. It must not exceed what the protocol's 32-bit body
+    /// length field can express; [`ServerConfig::validate`] rejects larger
+    /// values.
     pub max_body_len: usize,
     /// Maximum number of concurrently active connection tasks.
     pub max_connections: usize,
@@ -205,7 +258,7 @@ async fn serve_connection_multishot(
 
     let mut incoming = Box::pin(socket.recv_ring_multi(&recv_ring));
     let mut pending = Vec::with_capacity(RECV_BUFFER_LEN);
-    let mut response = Vec::with_capacity(config.max_body_len + HEADER_LEN);
+    let mut response = Vec::with_capacity(RECV_BUFFER_LEN);
 
     loop {
         response.clear();
@@ -218,17 +271,40 @@ async fn serve_connection_multishot(
         if !response.is_empty() {
             response = send_all(&socket, response).await?;
         }
-        if !matches!(outcome, Ok(false)) {
-            drop(incoming);
-            return outcome.map(drop);
+        match outcome {
+            Ok(BatchEnd::Open) => {}
+            Ok(BatchEnd::PeerClosed) => {
+                drop(incoming);
+                return Ok(());
+            }
+            Ok(BatchEnd::Quit) => {
+                // Requests pipelined after QUIT are left unread.
+                lingering_close(&socket, discard_multishot(&mut incoming)).await;
+                return Ok(());
+            }
+            Err(error) => {
+                lingering_close(&socket, discard_multishot(&mut incoming)).await;
+                return Err(error);
+            }
         }
     }
 }
 
+/// How a batch left the connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BatchEnd {
+    /// Keep serving.
+    Open,
+    /// The peer closed its write half after complete frames.
+    PeerClosed,
+    /// A QUIT was executed; the peer may still be sending.
+    Quit,
+}
+
 /// Execute one batch of buffered and newly received frames.
 ///
-/// Replies are appended to `response`. Returns whether the connection should
-/// close after the batch. On error, `response` still holds the replies of the
+/// Replies are appended to `response`. Returns whether and why the connection
+/// should close after the batch. On error, `response` still holds the replies of the
 /// frames executed before the failure, and the caller sends them before
 /// failing the connection.
 async fn fill_batch<S>(
@@ -237,19 +313,18 @@ async fn fill_batch<S>(
     config: ServerConfig,
     pending: &mut Vec<u8>,
     response: &mut Vec<u8>,
-) -> io::Result<bool>
+) -> io::Result<BatchEnd>
 where
     S: Stream<Item = io::Result<BufRingBuf>> + Unpin,
 {
     let mut commands = 0;
-    let mut close = false;
 
-    if !pending.is_empty() {
-        close = process_pending(handler, config, pending, response, &mut commands)?;
+    if !pending.is_empty() && process_pending(handler, config, pending, response, &mut commands)? {
+        return Ok(BatchEnd::Quit);
     }
 
     for selected_count in 0..MAX_READY_RECEIVES_PER_BATCH {
-        if close || batch_full(config, commands, response.len()) {
+        if batch_full(config, commands, response.len()) {
             break;
         }
 
@@ -261,17 +336,21 @@ where
             };
             next
         };
-        let Some(next) = next else {
-            if pending.is_empty() {
-                close = true;
-            } else {
+        let selected = match next {
+            Some(Ok(selected)) if !selected.is_empty() => selected,
+            Some(Err(error)) => return Err(error),
+            Some(Ok(_)) | None => {
+                if pending.is_empty() {
+                    return Ok(BatchEnd::PeerClosed);
+                }
                 return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
             }
-            break;
         };
-        close = process_selected_buffer(next?, handler, config, pending, response, &mut commands)?;
+        if process_selected_buffer(selected, handler, config, pending, response, &mut commands)? {
+            return Ok(BatchEnd::Quit);
+        }
     }
-    Ok(close)
+    Ok(BatchEnd::Open)
 }
 
 fn process_selected_buffer(
@@ -282,26 +361,40 @@ fn process_selected_buffer(
     response: &mut Vec<u8>,
     commands: &mut usize,
 ) -> io::Result<bool> {
-    if selected.is_empty() {
-        if pending.is_empty() {
-            return Ok(true);
-        }
-        return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
-    }
-
+    debug_assert!(!selected.is_empty(), "the caller handles EOF");
     let close = if pending.is_empty() {
         let outcome =
             process_available_frames(handler, config, selected.as_slice(), response, commands)?;
         if outcome.consumed != selected.len() {
+            grow_pending(pending, selected.len() - outcome.consumed)?;
             pending.extend_from_slice(&selected[outcome.consumed..]);
         }
         outcome.close
     } else {
+        grow_pending(pending, selected.len())?;
         pending.extend_from_slice(selected.as_slice());
         process_pending(handler, config, pending, response, commands)?
     };
 
     Ok(close)
+}
+
+/// Reserve room to buffer `additional` more received bytes.
+///
+/// A client can stream up to `max_body_len` of one frame's body before the
+/// frame completes, so growth must fail only this connection rather than
+/// abort the process.
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::OutOfMemory`] if the buffer cannot grow.
+pub(crate) fn grow_pending(pending: &mut Vec<u8>, additional: usize) -> io::Result<()> {
+    pending.try_reserve(additional).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            "cannot grow the partial request buffer",
+        )
+    })
 }
 
 fn process_pending(
@@ -385,14 +478,36 @@ async fn serve_connection(
 ) -> io::Result<()> {
     socket.set_nodelay(true).await?;
 
-    let mut header_buf = RecvBuffer::new(HEADER_LEN);
-    let mut body_buf = RecvBuffer::new(config.max_body_len);
-    let mut response = Vec::with_capacity(config.max_body_len + HEADER_LEN);
+    match serve_exact_frames(&socket, handler, config).await {
+        Ok(BatchEnd::Quit) => {
+            // Requests pipelined after QUIT are left unread.
+            lingering_close(&socket, discard_exact(&socket)).await;
+            Ok(())
+        }
+        Ok(BatchEnd::PeerClosed | BatchEnd::Open) => socket.close().await,
+        Err(error) => {
+            lingering_close(&socket, discard_exact(&socket)).await;
+            Err(error)
+        }
+    }
+}
+
+/// Serve frames until the peer closes or sends QUIT.
+async fn serve_exact_frames(
+    socket: &TcpSocket,
+    handler: MemoryHandler,
+    config: ServerConfig,
+) -> io::Result<BatchEnd> {
+    let mut header_buf = RecvBuffer::new();
+    // Grows to the largest body this connection receives, so a large
+    // `max_body_len` costs memory only when a client sends such a frame.
+    let mut body_buf = RecvBuffer::new();
+    let mut response = Vec::with_capacity(RECV_BUFFER_LEN);
 
     loop {
-        header_buf.reset(HEADER_LEN);
-        let Some(returned) = recv_exact(&socket, header_buf).await? else {
-            return socket.close().await;
+        header_buf.reset(HEADER_LEN)?;
+        let Some(returned) = recv_exact(socket, header_buf).await? else {
+            return Ok(BatchEnd::PeerClosed);
         };
         header_buf = returned;
 
@@ -408,9 +523,9 @@ async fn serve_connection(
             ));
         }
 
-        body_buf.reset(header.body_len());
+        body_buf.reset(header.body_len())?;
         if header.body_len() != 0 {
-            body_buf = recv_exact(&socket, body_buf)
+            body_buf = recv_exact(socket, body_buf)
                 .await?
                 .ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))?;
         }
@@ -424,10 +539,10 @@ async fn serve_connection(
             .map_err(encode_error)?;
 
         if !response.is_empty() {
-            response = send_all(&socket, response).await?;
+            response = send_all(socket, response).await?;
         }
         if action == ConnectionAction::Close {
-            return socket.close().await;
+            return Ok(BatchEnd::Quit);
         }
     }
 }
@@ -469,58 +584,70 @@ fn encode_error(error: EncodeError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error)
 }
 
-#[derive(Debug)]
+/// Receive buffer filled up to a per-receive limit.
+///
+/// The received bytes are the vector's initialized length; receives write
+/// into its spare capacity.
+#[derive(Debug, Default)]
 struct RecvBuffer {
-    storage: Box<[u8]>,
-    filled: usize,
+    storage: Vec<u8>,
     limit: usize,
 }
 
 impl RecvBuffer {
-    fn new(capacity: usize) -> Self {
-        Self {
-            storage: vec![0_u8; capacity].into_boxed_slice(),
-            filled: 0,
-            limit: capacity,
-        }
+    fn new() -> Self {
+        Self::default()
     }
 
-    fn reset(&mut self, limit: usize) {
-        assert!(limit <= self.storage.len());
-        self.filled = 0;
+    /// Empty the buffer and accept up to `limit` bytes, growing the storage
+    /// if it is smaller.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::OutOfMemory`] if the storage cannot grow, so
+    /// only the connection that declared the frame fails.
+    fn reset(&mut self, limit: usize) -> io::Result<()> {
+        self.storage.clear();
+        self.storage.try_reserve_exact(limit).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                format!("cannot allocate a {limit}-byte receive buffer"),
+            )
+        })?;
         self.limit = limit;
+        Ok(())
     }
 
     fn filled(&self) -> usize {
-        self.filled
+        self.storage.len()
     }
 
     fn is_full(&self) -> bool {
-        self.filled == self.limit
+        self.storage.len() == self.limit
     }
 
     fn filled_slice(&self) -> &[u8] {
-        &self.storage[..self.filled]
+        &self.storage
     }
 }
 
-// Safety: the box keeps its allocation stable while the wrapper moves. The
-// wrapper is exclusively owned by each receive operation, and the exposed tail
-// remains within the initialized boxed allocation.
+// Safety: the vector's heap allocation stays put while the wrapper moves, and
+// it is not resized while a receive operation owns the wrapper. The exposed
+// tail is spare capacity: `len <= limit <= capacity`.
 unsafe impl StableBufMut for RecvBuffer {
     fn stable_ptr_mut(&mut self) -> *mut u8 {
-        // Safety: `filled <= limit <= storage.len()` and one-past is permitted
-        // when the remaining length is zero.
-        unsafe { self.storage.as_mut_ptr().add(self.filled) }
+        self.storage.spare_capacity_mut().as_mut_ptr().cast()
     }
 
     fn bytes_remaining(&self) -> usize {
-        self.limit - self.filled
+        self.limit - self.storage.len()
     }
 
     unsafe fn set_init(&mut self, init_len: usize) {
         assert!(init_len <= self.bytes_remaining());
-        self.filled += init_len;
+        // Safety: the caller initialized `init_len` bytes of spare capacity,
+        // which fits because `len + init_len <= limit <= capacity`.
+        unsafe { self.storage.set_len(self.storage.len() + init_len) };
     }
 }
 
@@ -717,8 +844,8 @@ mod tests {
 
     #[test]
     fn receive_buffer_advances_without_overwriting() {
-        let mut buffer = RecvBuffer::new(8);
-        buffer.reset(5);
+        let mut buffer = RecvBuffer::new();
+        buffer.reset(5).unwrap();
         let first = buffer.stable_ptr_mut();
         unsafe {
             first.write(1);

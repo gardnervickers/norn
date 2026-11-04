@@ -43,7 +43,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     fn parse() -> io::Result<Config> {
         let mut config = Config {
             listen: "127.0.0.1:11211".parse().unwrap(),
-            backlog: 1_024,
+            backlog: 4_096,
             ring_entries: 256,
             workers: 1,
             worker_cpus: Vec::new(),
@@ -222,6 +222,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let config = parse()?;
+    // Report an invalid limit before binding or announcing the listener.
+    config.server.validate()?;
     if config.workers > 1 {
         let server = ShardedServer::start(ShardedServerConfig {
             listen: config.listen,

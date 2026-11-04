@@ -34,7 +34,10 @@ use smallvec::SmallVec;
 use crate::codec::{DecodeStatus, DecodedFrame, FrameDecoder, ResponseEncoder};
 use crate::handler::{ConnectionAction, HandlerConfig, MemoryHandler};
 use crate::protocol::{Command, EncodeError, RequestHeader, Status, HEADER_LEN};
-use crate::server::{close_rejected, recover_from_accept_error, RecvMode, ServerConfig};
+use crate::server::{
+    close_rejected, discard_multishot, lingering_close, recover_from_accept_error, RecvMode,
+    ServerConfig,
+};
 
 const INLINE_KEY_LEN: usize = 32;
 const DEFAULT_PAIR_CAPACITY: usize = 1_024;
@@ -81,7 +84,7 @@ impl Default for ShardedServerConfig {
     fn default() -> Self {
         Self {
             listen: "127.0.0.1:11211".parse().unwrap(),
-            backlog: 1_024,
+            backlog: 4_096,
             ring_entries: 256,
             workers: 2,
             worker_cpus: Vec::new(),
@@ -880,7 +883,7 @@ async fn serve_sharded_connection(
     let mut incoming = Box::pin(socket.recv_ring_multi(&recv_ring));
     let decoder = FrameDecoder::new(config.max_body_len);
     let mut pending = Vec::with_capacity(RECV_BUFFER_LEN);
-    let mut output = Vec::with_capacity(config.max_body_len + HEADER_LEN);
+    let mut output = Vec::with_capacity(RECV_BUFFER_LEN);
     let mut stop_dispatch = false;
     let mut close_ready = false;
     let mut peer_eof = false;
@@ -964,19 +967,19 @@ async fn serve_sharded_connection(
         }
         if (close_ready || peer_eof || failure.is_some()) && replies.is_empty() {
             if let Some(error) = failure {
-                drop(incoming);
-                drop(socket);
+                lingering_close(&socket, discard_multishot(&mut incoming)).await;
                 return Err(error);
             }
             if peer_eof {
                 drop(incoming);
                 return socket.close().await;
             }
-            // QUIT leaves the peer open and the multishot receive armed.
-            // Dropping both lets the receive's terminal cancellation retain
-            // the descriptor until its ordinary deferred close boundary.
-            drop(incoming);
-            drop(socket);
+            // QUIT leaves the peer open and the multishot receive armed, and
+            // requests pipelined after it are unread. Linger so they do not
+            // reset the replies; if the budget runs out, dropping the stream
+            // lets the receive's terminal cancellation retain the descriptor
+            // until its ordinary deferred close boundary.
+            lingering_close(&socket, discard_multishot(&mut incoming)).await;
             return Ok(());
         }
         if !need_more
@@ -1011,7 +1014,12 @@ async fn serve_sharded_connection(
 
         match event {
             Event::Receive(Some(Ok(selected))) if !selected.is_empty() => {
-                pending.extend_from_slice(selected.as_slice());
+                if let Err(error) = crate::server::grow_pending(&mut pending, selected.len()) {
+                    failure = Some(error);
+                    stop_dispatch = true;
+                } else {
+                    pending.extend_from_slice(selected.as_slice());
+                }
             }
             Event::Receive(Some(Ok(_)) | None) => {
                 if !pending.is_empty() {
@@ -1020,7 +1028,12 @@ async fn serve_sharded_connection(
                 }
                 peer_eof = true;
             }
-            Event::Receive(Some(Err(error))) => return Err(error),
+            Event::Receive(Some(Err(error))) => {
+                // Like the single-worker server, send the replies of requests
+                // already dispatched before failing the connection.
+                failure = Some(error);
+                stop_dispatch = true;
+            }
             Event::Response(response) => {
                 let response = response?;
                 close_ready |= response.action == ConnectionAction::Close;

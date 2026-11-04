@@ -62,6 +62,11 @@ fn readiness_does_not_accumulate_while_reader_keeps_up() -> Result<(), Box<dyn s
 
         // No data yet: the read observes EAGAIN and waits for readiness.
         assert!(read_once(reader.as_mut()).await.is_pending());
+        assert!(
+            WOULD_BLOCK.load(Ordering::SeqCst) > 0,
+            "the EAGAIN trace message was never logged; trace logging may be compiled out, \
+             which would make this test pass vacuously"
+        );
 
         // Keep exactly one byte of backlog so every read succeeds without
         // EAGAIN while each new arrival wakes the socket's wait queue.
@@ -88,6 +93,10 @@ fn readiness_does_not_accumulate_while_reader_keeps_up() -> Result<(), Box<dyn s
         let before = WOULD_BLOCK.load(Ordering::SeqCst);
         assert!(read_once(reader.as_mut()).await.is_pending());
         let retries = WOULD_BLOCK.load(Ordering::SeqCst) - before;
+        assert!(
+            retries >= 1,
+            "the EAGAIN of the final poll was not counted; the counter is not observing retries"
+        );
         assert!(
             retries <= 2,
             "one poll_read replayed {retries} stale readiness events, issuing a failing recv for each"

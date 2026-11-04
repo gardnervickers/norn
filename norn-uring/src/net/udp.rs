@@ -329,6 +329,15 @@ impl UdpSocket {
     /// Each yielded item includes payload bytes and the sender address.
     /// See [`UdpRecvFromRingMulti`] for recovery and backpressure behavior.
     ///
+    /// # Buffer sizing
+    ///
+    /// The kernel stores a 16-byte `io_uring_recvmsg_out` header and a 28-byte
+    /// sender address field ahead of the payload in each ring buffer, so each
+    /// buffer carries at most `ring.buf_capacity() - 44` payload bytes. A
+    /// larger datagram is truncated to fit, and the yielded
+    /// [`RecvMsgRingBuf::is_truncated`] returns `true`. Rings with buffers
+    /// shorter than 44 bytes cannot receive with this operation.
+    ///
     /// # Panics
     ///
     /// Panics when the buffer ring was registered with another driver.
@@ -373,10 +382,11 @@ impl UdpSocket {
     /// # Errors
     ///
     /// The request resolves with [`io::ErrorKind::InvalidInput`] when `flags`
-    /// contains `MSG_TRUNC` or `MSG_WAITALL`. `MSG_TRUNC` does not identify the
-    /// number of buffers selected by a bundle receive, and a partial
-    /// `MSG_WAITALL` retry can commit buffers that the completion does not
-    /// report.
+    /// contains `MSG_TRUNC`, `MSG_PEEK` or `MSG_WAITALL`. `MSG_TRUNC` does not
+    /// identify the number of buffers selected by a bundle receive, a kernel
+    /// bundle retry peeks the start of the queue again under `MSG_PEEK`, and a
+    /// partial `MSG_WAITALL` retry can commit buffers that the completion does
+    /// not report.
     pub fn recv_bundle_with_flags(
         &self,
         ring: &RecvBufRing,
@@ -409,8 +419,9 @@ impl UdpSocket {
     /// # Errors
     ///
     /// The stream yields [`io::ErrorKind::InvalidInput`] and terminates when
-    /// `flags` contains `MSG_TRUNC` or `MSG_WAITALL`. `MSG_TRUNC` does not
-    /// identify the number of selected buffers, and multishot receives do not
+    /// `flags` contains `MSG_TRUNC`, `MSG_PEEK`, or `MSG_WAITALL`. `MSG_TRUNC`
+    /// does not identify the number of selected buffers, a kernel bundle retry
+    /// peeks the start of the queue again, and multishot receives do not
     /// support `MSG_WAITALL`.
     pub fn recv_bundle_multi_with_flags(
         &self,

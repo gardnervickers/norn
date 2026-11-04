@@ -603,6 +603,57 @@ fn recv_msg_ring_buf_can_be_sent_directly() -> Result<(), Box<dyn std::error::Er
     })
 }
 
+/// Per-buffer overhead of `recv_from_ring_multi`: a 16-byte
+/// `io_uring_recvmsg_out` header plus a 28-byte `sockaddr_in6` name field.
+const RECV_FROM_RING_MULTI_OVERHEAD: usize = 44;
+
+#[test]
+fn recv_from_ring_multi_fills_buffer_after_overhead_without_truncation(
+) -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let ring = RecvBufRing::builder(17).buf_cnt(4).buf_len(1024).build()?;
+        let payload = vec![0x5a_u8; ring.buf_capacity() - RECV_FROM_RING_MULTI_OVERHEAD];
+
+        for bind in ["127.0.0.1:0", "[::1]:0"] {
+            let server = UdpSocket::bind(bind.parse()?).await?;
+            let sender = std::net::UdpSocket::bind(bind)?;
+            sender.send_to(&payload, server.local_addr()?)?;
+
+            let mut recv = pin!(server.recv_from_ring_multi(&ring));
+            let (buf, addr) = recv.next().await.expect("multishot stream ended")?;
+            assert_eq!(addr, sender.local_addr()?);
+            assert!(!buf.is_truncated(), "{bind}");
+            assert_eq!(buf.payload().len(), payload.len(), "{bind}");
+            assert!(buf.payload().iter().all(|&b| b == 0x5a), "{bind}");
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn recv_from_ring_multi_reports_truncated_datagrams() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let ring = RecvBufRing::builder(18).buf_cnt(4).buf_len(1024).build()?;
+        let room = ring.buf_capacity() - RECV_FROM_RING_MULTI_OVERHEAD;
+        let server = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0")?;
+        let mut recv = pin!(server.recv_from_ring_multi(&ring));
+
+        sender.send_to(&[0x5a; 1000], server.local_addr()?)?;
+        let (big, _) = recv.next().await.expect("multishot stream ended")?;
+        assert!(big.is_truncated());
+        assert_eq!(big.payload().len(), room);
+        drop(big);
+
+        // The stream keeps receiving after a truncated datagram.
+        sender.send_to(b"small", server.local_addr()?)?;
+        let (small, _) = recv.next().await.expect("multishot stream ended")?;
+        assert!(!small.is_truncated());
+        assert_eq!(&small[..], b"small");
+        Ok(())
+    })
+}
+
 #[test]
 fn connected_send_recv_ring_multi() -> Result<(), Box<dyn std::error::Error>> {
     util::with_test_env(|| async {
@@ -758,7 +809,7 @@ fn bundle_receive_rejects_invalid_flags_without_consuming_a_ring_buffer(
             .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
 
-        for flags in [libc::MSG_TRUNC, libc::MSG_WAITALL] {
+        for flags in [libc::MSG_TRUNC, libc::MSG_PEEK, libc::MSG_WAITALL] {
             let mut recv = pin!(s2.recv_bundle_multi_with_flags(&ring, flags));
             let err = recv
                 .next()

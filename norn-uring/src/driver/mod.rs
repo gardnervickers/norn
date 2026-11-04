@@ -643,6 +643,14 @@ impl Driver {
 
     /// Create a new [`Driver`] with the provided builder, size, and options.
     ///
+    /// When the builder enables `COOP_TASKRUN` or `DEFER_TASKRUN`, the driver
+    /// also enables `IORING_SETUP_TASKRUN_FLAG` so it can tell when deferred
+    /// completions need an enter to be posted. The driver first tries the
+    /// setup with that flag; the kernel rejects it with `EINVAL` for any other
+    /// configuration (including the default builder and SQPOLL), and the ring
+    /// is then built as configured. Such builders therefore make one extra,
+    /// failing `io_uring_setup` call.
+    ///
     /// # Errors
     ///
     /// Returns an error if the `io_uring` instance or its eventfd-based
@@ -652,7 +660,15 @@ impl Driver {
         size: u32,
         options: DriverOptions,
     ) -> io::Result<Self> {
-        let ring = builder.dontfork().build(size)?;
+        builder.dontfork();
+        // Request `IORING_SQ_TASKRUN` so a park can see deferred task work
+        // (see `Shared::submit_once`). The kernel accepts the flag only with
+        // `COOP_TASKRUN` or `DEFER_TASKRUN` and without `SQPOLL`; otherwise
+        // this probe fails with EINVAL and the ring is built as configured.
+        let ring = match builder.clone().setup_taskrun_flag().build(size) {
+            Err(err) if err.raw_os_error() == Some(libc::EINVAL) => builder.build(size)?,
+            ring => ring?,
+        };
         Ok(Self {
             options,
             shared: Rc::new(Shared {
@@ -1272,11 +1288,19 @@ impl Shared {
             }
             ParkMode::NoPark => {
                 let sq = ring.submission();
-                if sq.is_empty() {
-                    0
-                } else {
-                    drop(sq);
+                // The kernel may hold completions outside the CQ ring: in its
+                // overflow list, or in task work that has not run yet. Only an
+                // enter with GETEVENTS posts them, so a park that skips waiting
+                // must still make one; `Submitter::submit` adds GETEVENTS when
+                // either flag is set. Without either flag, an empty SQ needs no
+                // syscall.
+                let kernel_pending = sq.cq_overflow() || sq.taskrun();
+                let empty = sq.is_empty();
+                drop(sq);
+                if kernel_pending || !empty {
                     ring.submitter().submit()?
+                } else {
+                    0
                 }
             }
         })
@@ -2431,17 +2455,15 @@ mod tests {
             assert_ne!(unsafe { libc::fcntl(raw_fd, libc::F_GETFD) }, -1);
         }
 
-        fn assert_closed(raw_fd: libc::c_int) {
-            assert_eq!(unsafe { libc::fcntl(raw_fd, libc::F_GETFD) }, -1);
-            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
-        }
-
-        let mut pipe_fds = [0; 2];
-        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
+        // Observing the writer checks the pipe the driver closed, not the
+        // descriptor number. The number is safe to probe only because this test
+        // runs isolated, which the dup2 below also relies on.
+        let pipe_fds = crate::test_util::pipe_cloexec();
         let owned_fd = pipe_fds[0];
         let write_fd = pipe_fds[1];
-        let duplicate_fd = unsafe { libc::dup(owned_fd) };
-        assert!(duplicate_fd >= 0);
+        // An unrelated descriptor to place on `owned_fd`'s number below.
+        let spare_fds = crate::test_util::pipe_cloexec();
+        let duplicate_fd = spare_fds[0];
 
         let mut driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
         let weak_shared = Rc::downgrade(&driver.shared);
@@ -2479,7 +2501,7 @@ mod tests {
             1,
             "the cleanup-generated close must be compatible with IO_DRAIN"
         );
-        assert_closed(owned_fd);
+        crate::test_util::assert_pipe_reader_closed(write_fd);
         assert_open(duplicate_fd);
 
         // Reuse the exact integer descriptor before destroying the ring. A close SQE
@@ -2493,6 +2515,7 @@ mod tests {
             libc::close(owned_fd);
             libc::close(duplicate_fd);
             libc::close(write_fd);
+            libc::close(spare_fds[1]);
         }
     }
 
@@ -2757,12 +2780,7 @@ mod tests {
             // submit failure and reach the kernel on the next park.
             // Closure is observed through the pipe's write end rather than by
             // probing `raw_fd`, which a concurrent test could have reused.
-            let mut pipe_fds = [0; 2];
-            assert_eq!(
-                unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) },
-                0
-            );
-            let [raw_fd, write_end] = pipe_fds;
+            let [raw_fd, write_end] = crate::test_util::pipe_cloexec();
             driver.shared.fail_next_submit(errno);
             let result = driver.shared.close_fd(types::Fd(raw_fd));
             assert!(matches!(result, Err(CloseFdError::Queued(_))));
@@ -3066,5 +3084,90 @@ mod tests {
         assert!(!driver.shared.has_deferred_cancels());
         assert!(dropped.load(Ordering::Acquire));
         assert_eq!(Rc::strong_count(&driver.shared), 1);
+    }
+
+    /// Fill the kernel CQ ring and push `extra` further completions into the
+    /// kernel's overflow list (`IORING_FEAT_NODROP`).
+    fn overflow_cq(driver: &Driver, extra: usize) {
+        let nop = opcode::Nop::new()
+            .build()
+            .user_data(Driver::CANCELLATION_TOKEN as u64);
+        let mut ring = driver.shared.ring.borrow_mut();
+        let cq_capacity = ring.completion().capacity();
+        let mut posted = 0;
+        while posted < cq_capacity + extra {
+            let mut pushed = 0;
+            {
+                let mut sq = ring.submission();
+                while posted + pushed < cq_capacity + extra && !sq.is_full() {
+                    // Safety: a NOP carrying a reserved token that the driver ignores.
+                    unsafe { sq.push(&nop) }.unwrap();
+                    pushed += 1;
+                }
+            }
+            assert_eq!(ring.submitter().submit().unwrap(), pushed);
+            posted += pushed;
+        }
+        assert!(ring.submission().cq_overflow(), "CQ should have overflowed");
+    }
+
+    #[test]
+    fn cq_overflow_with_pending_remote_wake_does_not_strand_completions() {
+        // An armed eventfd read whose completion lands in the kernel overflow
+        // list leaves the unparker woken and parked. Every later waiting park
+        // then degrades to `NoPark` with an empty SQ, which must still enter the
+        // kernel to flush the overflow list.
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut driver = Driver::new(io_uring::IoUring::builder(), 2).unwrap();
+            // Arm the eventfd read, as any idle park does.
+            driver
+                .park(ParkMode::Timeout(Duration::from_millis(1)))
+                .unwrap();
+            assert!(driver.unparker.state().is_parked());
+
+            let reaped = Arc::new(AtomicUsize::new(0));
+            let mut op = Box::pin(driver.handle().submit(TrackedNop {
+                reaped: Arc::clone(&reaped),
+                completions_dropped: Arc::new(AtomicUsize::new(0)),
+                operations_dropped: Arc::new(AtomicUsize::new(0)),
+            }));
+            // A burst of completions overflows the CQ while the executor is busy.
+            overflow_cq(&driver, 1);
+            // The operation completes while the overflow is pending.
+            assert!(op
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending());
+            driver
+                .shared
+                .ring
+                .borrow_mut()
+                .submitter()
+                .submit()
+                .unwrap();
+
+            // A remote wake completes the eventfd read into the overflow list too.
+            let unparker = Arc::clone(&driver.unparker);
+            std::thread::spawn(move || unparker.wake()).join().unwrap();
+
+            let mut parks = 0;
+            while parks < 1000 && reaped.load(Ordering::SeqCst) == 0 {
+                driver.park(ParkMode::NextCompletion).unwrap();
+                parks += 1;
+            }
+            let overflow = driver.shared.ring.borrow_mut().submission().cq_overflow();
+            tx.send((reaped.load(Ordering::SeqCst), parks, overflow))
+                .unwrap();
+            drop(op);
+        });
+        let (reaped, parks, overflow) = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("driver thread blocked");
+        assert_eq!(
+            reaped, 1,
+            "operation never completed after {parks} NextCompletion parks \
+             (CQ overflow still pending: {overflow})"
+        );
     }
 }

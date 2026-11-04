@@ -131,7 +131,7 @@ fn failed_ring_receive_does_not_lose_a_committed_buffer() -> Result<(), Box<dyn 
             "receive after a failed receive returned {:?}; the failed CQE's buffer was lost",
             result.as_ref().err()
         );
-        let (buf, _) = result?;
+        let buf = result?;
         assert_eq!(&buf[..], b"hello");
         Ok(())
     });

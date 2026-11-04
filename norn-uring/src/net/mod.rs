@@ -2,7 +2,7 @@
 //!
 //! Unless otherwise documented, functions and methods in this module require
 //! an active [`crate::Driver`] context.
-mod socket;
+pub(crate) mod socket;
 mod tcp;
 mod udp;
 
