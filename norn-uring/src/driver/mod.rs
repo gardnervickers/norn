@@ -2490,90 +2490,6 @@ mod tests {
         assert_eq!(driver.shared.in_flight(), 0);
     }
 
-    /// A NOP that records whether it was synthetic and whether it succeeded.
-    struct RecordedNop(Rc<Cell<Option<(bool, bool)>>>);
-
-    // Safety: a NOP references no memory and posts one terminal CQE.
-    unsafe impl Operation for RecordedNop {
-        type Completion = ();
-
-        fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
-            Ok(opcode::Nop::new().build())
-        }
-
-        unsafe fn reap(&mut self, result: CQEResult) {
-            self.0
-                .set(Some((result.is_synthetic(), result.result.is_ok())));
-        }
-    }
-
-    impl Singleshot for RecordedNop {
-        type Output = ();
-
-        fn complete(self, _: ()) {}
-    }
-
-    #[test]
-    fn dropping_a_submitted_then_always_chain_cancels_only_its_first_request() {
-        let mut driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
-        let handle = driver.handle();
-        let dropped = Arc::new(AtomicBool::new(false));
-        let outcome = Rc::new(Cell::new(None));
-        let mut chain = Box::pin(
-            long_lived_read(&handle, &dropped)
-                .then_always(handle.submit(RecordedNop(Rc::clone(&outcome)))),
-        );
-        let waker = futures_test::task::noop_waker();
-        assert!(chain
-            .as_mut()
-            .poll(&mut Context::from_waker(&waker))
-            .is_pending());
-        driver.park(ParkMode::NoPark).unwrap();
-
-        drop(chain);
-        assert!(park_until(&mut driver, 20, || dropped
-            .load(Ordering::Acquire)
-            && outcome.get().is_some()));
-        assert_eq!(
-            outcome.get(),
-            Some((false, true)),
-            "the NOP ran in the kernel once the read was cancelled"
-        );
-    }
-
-    #[test]
-    fn a_queued_then_always_chain_dropped_still_runs_its_second_request() {
-        for always in [true, false] {
-            let mut driver = Driver::new(io_uring::IoUring::builder(), 2).unwrap();
-            let handle = driver.handle();
-            fill_sq(&driver);
-            let dropped = Arc::new(AtomicBool::new(false));
-            let outcome = Rc::new(Cell::new(None));
-            let read = long_lived_read(&handle, &dropped);
-            let nop = handle.submit(RecordedNop(Rc::clone(&outcome)));
-            let waker = futures_test::task::noop_waker();
-            let mut cx = Context::from_waker(&waker);
-            if always {
-                let mut chain = pin!(read.then_always(nop));
-                assert!(chain.as_mut().poll(&mut cx).is_pending());
-                assert_eq!(handle.queued_entries(), 2);
-            } else {
-                let mut chain = pin!(read.then(nop));
-                assert!(chain.as_mut().poll(&mut cx).is_pending());
-                assert_eq!(handle.queued_entries(), 2);
-            }
-
-            // The read is cancelled where it waits. A hard-linked NOP still
-            // reaches the kernel; a soft-linked one fails with it.
-            assert!(park_until(&mut driver, 20, || dropped
-                .load(Ordering::Acquire)
-                && outcome.get().is_some()));
-            let expected = if always { (false, true) } else { (true, false) };
-            assert_eq!(outcome.get(), Some(expected), "always={always}");
-            assert_eq!(handle.queued_entries(), 0);
-        }
-    }
-
     #[test]
     fn iopoll_rings_are_rejected() {
         let mut builder = io_uring::IoUring::builder();
@@ -3600,6 +3516,90 @@ mod tests {
             driver.park(ParkMode::NoPark).unwrap();
         }
         done()
+    }
+
+    /// A NOP that records whether it was synthetic and whether it succeeded.
+    struct RecordedNop(Rc<Cell<Option<(bool, bool)>>>);
+
+    // Safety: a NOP references no memory and posts one terminal CQE.
+    unsafe impl Operation for RecordedNop {
+        type Completion = ();
+
+        fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+            Ok(opcode::Nop::new().build())
+        }
+
+        unsafe fn reap(&mut self, result: CQEResult) {
+            self.0
+                .set(Some((result.is_synthetic(), result.result.is_ok())));
+        }
+    }
+
+    impl Singleshot for RecordedNop {
+        type Output = ();
+
+        fn complete(self, _: ()) {}
+    }
+
+    #[test]
+    fn dropping_a_submitted_then_always_chain_cancels_only_its_first_request() {
+        let mut driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let handle = driver.handle();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let outcome = Rc::new(Cell::new(None));
+        let mut chain = Box::pin(
+            long_lived_read(&handle, &dropped)
+                .then_always(handle.submit(RecordedNop(Rc::clone(&outcome)))),
+        );
+        let waker = futures_test::task::noop_waker();
+        assert!(chain
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending());
+        driver.park(ParkMode::NoPark).unwrap();
+
+        drop(chain);
+        assert!(park_until(&mut driver, 20, || dropped
+            .load(Ordering::Acquire)
+            && outcome.get().is_some()));
+        assert_eq!(
+            outcome.get(),
+            Some((false, true)),
+            "the NOP ran in the kernel once the read was cancelled"
+        );
+    }
+
+    #[test]
+    fn a_queued_then_always_chain_dropped_still_runs_its_second_request() {
+        for always in [true, false] {
+            let mut driver = Driver::new(io_uring::IoUring::builder(), 2).unwrap();
+            let handle = driver.handle();
+            fill_sq(&driver);
+            let dropped = Arc::new(AtomicBool::new(false));
+            let outcome = Rc::new(Cell::new(None));
+            let read = long_lived_read(&handle, &dropped);
+            let nop = handle.submit(RecordedNop(Rc::clone(&outcome)));
+            let waker = futures_test::task::noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            if always {
+                let mut chain = pin!(read.then_always(nop));
+                assert!(chain.as_mut().poll(&mut cx).is_pending());
+                assert_eq!(handle.queued_entries(), 2);
+            } else {
+                let mut chain = pin!(read.then(nop));
+                assert!(chain.as_mut().poll(&mut cx).is_pending());
+                assert_eq!(handle.queued_entries(), 2);
+            }
+
+            // The read is cancelled where it waits. A hard-linked NOP still
+            // reaches the kernel; a soft-linked one fails with it.
+            assert!(park_until(&mut driver, 20, || dropped
+                .load(Ordering::Acquire)
+                && outcome.get().is_some()));
+            let expected = if always { (false, true) } else { (true, false) };
+            assert_eq!(outcome.get(), Some(expected), "always={always}");
+            assert_eq!(handle.queued_entries(), 0);
+        }
     }
 
     struct MultishotPoll {
