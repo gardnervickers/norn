@@ -576,6 +576,46 @@ fn recv_bundle_recycles_compact_and_materialized_buffers() -> Result<(), Box<dyn
     })
 }
 
+/// A partial `MSG_WAITALL` bundle can leave the kernel's buffer commits out of
+/// step with its completion, letting the kernel reselect a buffer the bundle
+/// owns. Single-shot bundles reject the flag before consuming input.
+#[test]
+fn recv_bundle_rejects_waitall_without_consuming_input() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let (server, client) = connected_pair().await?;
+        let ring = RecvBufRing::builder(15).buf_cnt(2).buf_len(256).build()?;
+
+        // The payload fills the whole ring, so an accepted receive would
+        // complete rather than wait for more data.
+        let payload = vec![0x22; 512];
+        let (send_result, payload) = client.send(payload).await;
+        assert_eq!(send_result?, payload.len());
+
+        let err = server
+            .recv_bundle_with_flags(&ring, libc::MSG_WAITALL)
+            .await
+            .expect_err("MSG_WAITALL bundle receive must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        let mut received = Vec::with_capacity(payload.len());
+        while received.len() < payload.len() {
+            let bundle = match server.recv_bundle(&ring).await {
+                Ok(bundle) => bundle,
+                Err(err) if util::recv_bundle_unsupported(&err) => break,
+                Err(err) => return Err(err.into()),
+            };
+            received.extend(bundle.iter().flatten().copied());
+        }
+        if !received.is_empty() {
+            assert_eq!(received, payload);
+        }
+
+        server.close().await?;
+        client.close().await?;
+        Ok(())
+    })
+}
+
 #[test]
 fn recv_bundle_shared_ring_handles_reverse_poll_order() -> Result<(), Box<dyn std::error::Error>> {
     util::with_test_env(|| async {
