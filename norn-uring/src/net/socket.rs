@@ -215,6 +215,15 @@ fn validate_recv_bundle_flags(flags: i32) -> io::Result<()> {
             "MSG_TRUNC is unsupported for receive bundles because the completion byte count does not identify how many buffers were selected",
         ));
     }
+    // After a full bundle with more data queued, the kernel retries into
+    // further buffers. A peek leaves the queue intact, so the retry copies its
+    // start again and the bundle reports more bytes than were queued.
+    if flags & libc::MSG_PEEK != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "MSG_PEEK is unsupported for receive bundles because a kernel bundle retry peeks the start of the queue again",
+        ));
+    }
     Ok(())
 }
 
@@ -2345,27 +2354,24 @@ mod tests {
 
     #[test]
     fn recv_bundle_flag_validation_matches_single_and_multishot_contracts() {
-        for flags in [
-            0,
-            libc::MSG_WAITALL,
-            libc::MSG_PEEK,
-            libc::MSG_WAITALL | libc::MSG_PEEK,
-        ] {
+        for flags in [0, libc::MSG_WAITALL] {
             validate_recv_bundle_flags(flags).unwrap();
 
             let err = validate_recv_bundle_flags(flags | libc::MSG_TRUNC).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
             assert!(err.to_string().contains("MSG_TRUNC"));
+
+            for validate in [validate_recv_bundle_flags, validate_recv_multi_bundle_flags] {
+                let err = validate(flags | libc::MSG_PEEK).unwrap_err();
+                assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+                assert!(err.to_string().contains("MSG_PEEK"));
+            }
         }
 
-        for flags in [0, libc::MSG_PEEK] {
-            validate_recv_multi_bundle_flags(flags).unwrap();
-        }
-        for flags in [libc::MSG_WAITALL, libc::MSG_WAITALL | libc::MSG_PEEK] {
-            let err = validate_recv_multi_bundle_flags(flags).unwrap_err();
-            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-            assert!(err.to_string().contains("MSG_WAITALL"));
-        }
+        validate_recv_multi_bundle_flags(0).unwrap();
+        let err = validate_recv_multi_bundle_flags(libc::MSG_WAITALL).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("MSG_WAITALL"));
         let err =
             validate_recv_multi_bundle_flags(libc::MSG_TRUNC | libc::MSG_WAITALL).unwrap_err();
         assert!(err.to_string().contains("MSG_TRUNC"));
