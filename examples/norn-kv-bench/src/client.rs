@@ -674,15 +674,25 @@ impl<'a> Worker<'a> {
                     if header.opcode != proto::OP_GET
                         || header.status != proto::STATUS_SUCCESS
                         || extras != 4
+                        || header.key_len != 0
                         || value.len() != len as usize
                     {
                         return Err(format!(
                             "connection {}: bad GET response status {:#x} opcode {:#x} \
-                             extras {extras} value {} (want {len})",
+                             extras {extras} key {} value {} (want {len})",
                             conn.id,
                             header.status,
                             header.opcode,
+                            header.key_len,
                             value.len()
+                        ));
+                    }
+                    // The workload stores every value with flags 0.
+                    if body[..extras] != [0; 4] {
+                        return Err(format!(
+                            "connection {}: GET response flags {:02x?} (want zero)",
+                            conn.id,
+                            &body[..extras]
                         ));
                     }
                     if value != w.pool.value(tag, len as usize) {
@@ -700,10 +710,13 @@ impl<'a> Worker<'a> {
                     }
                 }
                 Expect::Stored => {
-                    if header.opcode != proto::OP_SET || header.status != proto::STATUS_SUCCESS {
+                    if header.opcode != proto::OP_SET
+                        || header.status != proto::STATUS_SUCCESS
+                        || header.body_len != 0
+                    {
                         return Err(format!(
-                            "connection {}: SET failed with status {:#x}",
-                            conn.id, header.status
+                            "connection {}: bad SET response status {:#x} body {}",
+                            conn.id, header.status, header.body_len
                         ));
                     }
                 }
