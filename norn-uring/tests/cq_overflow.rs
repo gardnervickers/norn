@@ -200,3 +200,45 @@ fn defer_taskrun_does_not_starve_completions_while_tasks_are_runnable() {
         "a 1 ms timeout did not complete during 2 s of cooperative work"
     );
 }
+
+/// On an SQPOLL ring the kernel thread posts completions without the driver
+/// entering the kernel, so a burst of no-ops overflows a small CQ. Another
+/// thread keeps unparking the runtime, so every park is non-blocking. The
+/// overflow list is only flushed by an enter, which an empty SQ never made.
+#[test]
+fn sqpoll_overflow_with_remote_wakes_does_not_livelock_the_executor() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for _ in 0..5 {
+            let mut builder = io_uring::IoUring::builder();
+            builder.setup_sqpoll(10);
+            let driver = Driver::new(builder, 4).unwrap();
+            let unparker = driver.unparker();
+            let stop = Arc::new(AtomicBool::new(false));
+            let waker = {
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        unparker.unpark();
+                        std::thread::yield_now();
+                    }
+                })
+            };
+            let mut executor = LocalExecutor::new(driver);
+            executor.block_on(async {
+                for _ in 0..20 {
+                    let ops: Vec<_> = (0..64).map(|_| norn_uring::noop()).collect();
+                    futures_util::future::join_all(ops).await;
+                }
+            });
+            stop.store(true, Ordering::Relaxed);
+            waker.join().unwrap();
+        }
+        tx.send(()).unwrap();
+    });
+    rx.recv_timeout(Duration::from_secs(10))
+        .expect("executor livelocked: SQPOLL overflow was never flushed");
+}
