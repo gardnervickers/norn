@@ -60,10 +60,21 @@ pub enum RecvMode {
     Multishot,
 }
 
+/// Largest request body the wire protocol can declare.
+///
+/// The header's total body length field is 32 bits wide, so a larger
+/// `max_body_len` could never be reached and would only inflate the buffers
+/// each connection reserves up front.
+const MAX_PROTOCOL_BODY_LEN: u64 = u32::MAX as u64;
+
 /// Runtime limits for the networking-first server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ServerConfig {
     /// Maximum request body accepted from one command.
+    ///
+    /// Every connection reserves `max_body_len` plus a header up front, so
+    /// this must not exceed what the protocol's 32-bit body length field can
+    /// express; [`ServerConfig::validate`] rejects larger values.
     pub max_body_len: usize,
     /// Maximum number of concurrently active connection tasks.
     pub max_connections: usize,
@@ -96,7 +107,8 @@ impl ServerConfig {
     /// # Errors
     ///
     /// Returns [`io::ErrorKind::InvalidInput`] when a numeric limit is zero or
-    /// the maximum frame length cannot be represented by `usize`.
+    /// the maximum frame length cannot be represented by `usize` or exceeds the
+    /// protocol's 32-bit body length field.
     pub fn validate(&self) -> io::Result<()> {
         if self.max_body_len == 0
             || self.max_connections == 0
@@ -114,6 +126,12 @@ impl ServerConfig {
                 "maximum frame length overflows usize",
             )
         })?;
+        if self.max_body_len as u64 > MAX_PROTOCOL_BODY_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "maximum body length exceeds the protocol's 32-bit limit",
+            ));
+        }
         Ok(())
     }
 }
@@ -602,6 +620,26 @@ mod tests {
         let error = config.validate().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert_eq!(error.to_string(), "maximum frame length overflows usize");
+    }
+
+    #[test]
+    fn server_config_rejects_body_beyond_protocol_limit() {
+        let accepted = ServerConfig {
+            max_body_len: u32::MAX as usize,
+            ..ServerConfig::default()
+        };
+        accepted.validate().unwrap();
+
+        let config = ServerConfig {
+            max_body_len: u32::MAX as usize + 1,
+            ..ServerConfig::default()
+        };
+        let error = config.validate().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            "maximum body length exceeds the protocol's 32-bit limit"
+        );
     }
 
     #[test]
