@@ -884,6 +884,10 @@ async fn serve_sharded_connection(
     let mut stop_dispatch = false;
     let mut close_ready = false;
     let mut peer_eof = false;
+    // A protocol failure ends the connection like QUIT does: stop admitting
+    // requests, drain and send the replies of requests already dispatched,
+    // then report the failure.
+    let mut failure: Option<io::Error> = None;
 
     loop {
         let mut consumed = 0;
@@ -894,12 +898,18 @@ async fn serve_sharded_connection(
             && dispatched < config.max_batch_commands
             && output.len() < config.max_batch_response_bytes
         {
+            let status = match decoder.decode(&pending[consumed..]) {
+                Ok(status) => status,
+                Err(error) => {
+                    failure = Some(io::Error::new(io::ErrorKind::InvalidData, error));
+                    stop_dispatch = true;
+                    break;
+                }
+            };
             let DecodeStatus::Frame {
                 frame,
                 consumed: frame_len,
-            } = decoder
-                .decode(&pending[consumed..])
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+            } = status
             else {
                 need_more = true;
                 break;
@@ -927,10 +937,11 @@ async fn serve_sharded_connection(
             pending.truncate(remaining);
         }
         if need_more && pending.len() > config.max_body_len + HEADER_LEN {
-            return Err(io::Error::new(
+            failure = Some(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "partial request frame exceeds configured maximum",
             ));
+            stop_dispatch = true;
         }
 
         let mut completed = 0;
@@ -951,7 +962,12 @@ async fn serve_sharded_connection(
             output = send_all(&socket, output).await?;
             output.clear();
         }
-        if (close_ready || peer_eof) && replies.is_empty() {
+        if (close_ready || peer_eof || failure.is_some()) && replies.is_empty() {
+            if let Some(error) = failure {
+                drop(incoming);
+                drop(socket);
+                return Err(error);
+            }
             if peer_eof {
                 drop(incoming);
                 return socket.close().await;
@@ -999,7 +1015,8 @@ async fn serve_sharded_connection(
             }
             Event::Receive(Some(Ok(_)) | None) => {
                 if !pending.is_empty() {
-                    return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+                    failure = Some(io::Error::from(io::ErrorKind::UnexpectedEof));
+                    stop_dispatch = true;
                 }
                 peer_eof = true;
             }

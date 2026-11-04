@@ -53,8 +53,9 @@ impl FrameDecoder {
     ///
     /// Returns [`DecodeError`] when a complete header is malformed or declares
     /// a body larger than the configured limit. Command-specific validation
-    /// errors are returned as [`DecodedFrame::Invalid`] because the frame
-    /// boundary remains trustworthy and the server can send an error response.
+    /// errors, including an over-long key or an unsupported data type, are
+    /// returned as [`DecodedFrame::Invalid`] because the frame boundary
+    /// remains trustworthy and the server can send an error response.
     pub fn decode<'a>(&self, bytes: &'a [u8]) -> Result<DecodeStatus<'a>, DecodeError> {
         if bytes.len() < HEADER_LEN {
             return Ok(DecodeStatus::NeedMore);

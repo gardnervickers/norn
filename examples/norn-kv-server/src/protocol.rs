@@ -37,6 +37,7 @@ pub const OP_DELETEQ: u8 = 0x14;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestHeader {
     opcode: u8,
+    data_type: u8,
     key_len: usize,
     extras_len: usize,
     body_len: usize,
@@ -49,8 +50,12 @@ impl RequestHeader {
     ///
     /// # Errors
     ///
-    /// Returns [`ProtocolError`] when the header length, magic, data type, or
-    /// declared key/extras lengths are invalid.
+    /// Returns [`ProtocolError`] when the header length or magic is invalid,
+    /// or the declared key and extras do not fit in the declared body. These
+    /// are the errors that leave the frame boundary untrustworthy. An
+    /// unsupported data type or an over-long key is reported by
+    /// [`Request::decode`] instead, because the body length still delimits
+    /// the frame.
     pub fn decode(bytes: &[u8]) -> Result<Self, ProtocolError> {
         if bytes.len() != HEADER_LEN {
             return Err(ProtocolError::HeaderLength(bytes.len()));
@@ -58,10 +63,6 @@ impl RequestHeader {
         if bytes[0] != REQUEST_MAGIC {
             return Err(ProtocolError::Magic(bytes[0]));
         }
-        if bytes[5] != 0 {
-            return Err(ProtocolError::DataType(bytes[5]));
-        }
-
         let key_len = u16::from_be_bytes([bytes[2], bytes[3]]) as usize;
         let extras_len = bytes[4] as usize;
         let body_len = u32::from_be_bytes(bytes[8..12].try_into().unwrap()) as usize;
@@ -71,12 +72,10 @@ impl RequestHeader {
         if prefix_len > body_len {
             return Err(ProtocolError::BodyLayout);
         }
-        if key_len > MAX_KEY_LEN {
-            return Err(ProtocolError::KeyTooLong(key_len));
-        }
 
         Ok(Self {
             opcode: bytes[1],
+            data_type: bytes[5],
             key_len,
             extras_len,
             body_len,
@@ -161,14 +160,21 @@ impl<'a> Request<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`ProtocolError`] when the body length or command-specific
-    /// extras/key/value layout is invalid. Expiration and CAS are unsupported.
+    /// Returns [`ProtocolError`] when the body length, data type, key length,
+    /// or command-specific extras/key/value layout is invalid. Expiration and
+    /// CAS are unsupported.
     pub fn decode(header: RequestHeader, body: &'a [u8]) -> Result<Self, ProtocolError> {
         if body.len() != header.body_len {
             return Err(ProtocolError::BodyLength {
                 declared: header.body_len,
                 actual: body.len(),
             });
+        }
+        if header.data_type != 0 {
+            return Err(ProtocolError::DataType(header.data_type));
+        }
+        if header.key_len > MAX_KEY_LEN {
+            return Err(ProtocolError::KeyTooLong(header.key_len));
         }
 
         let key_start = header.extras_len;
@@ -444,6 +450,25 @@ mod tests {
         assert_eq!(
             Request::decode(get_header, b"xk"),
             Err(ProtocolError::CommandLayout)
+        );
+    }
+
+    #[test]
+    fn data_type_and_key_length_errors_remain_framed() {
+        let long_key = [b'k'; MAX_KEY_LEN + 1];
+        let get_header =
+            RequestHeader::decode(&header(OP_GET, long_key.len() as u16, 0, 251)).unwrap();
+        assert_eq!(
+            Request::decode(get_header, &long_key),
+            Err(ProtocolError::KeyTooLong(MAX_KEY_LEN + 1))
+        );
+
+        let mut typed = header(OP_GET, 1, 0, 1);
+        typed[5] = 1;
+        let typed_header = RequestHeader::decode(&typed).unwrap();
+        assert_eq!(
+            Request::decode(typed_header, b"k"),
+            Err(ProtocolError::DataType(1))
         );
     }
 
