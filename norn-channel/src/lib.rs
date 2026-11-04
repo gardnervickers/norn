@@ -9,6 +9,38 @@
 //! explicitly sharded fan-in queue. Both provide bounded bulk receive support
 //! in [`mpsc`].
 //!
+//! # Shutdown
+//!
+//! Dropping the last sender is the lossless way to end a channel. Every value
+//! accepted by a send (`Ok`) happens-before the final sender drop, so a
+//! receiver that drains until [`recv`](mpsc::Receiver::recv) returns `None`
+//! sees all of them. To shut down without losing accepted values:
+//!
+//! 1. Stop producing out of band (a flag, a cancellation token, joining the
+//!    producer threads) and drop every sender, including clones.
+//! 2. Keep receiving until `recv` returns `None` (or `try_recv` returns
+//!    [`Closed`](mpsc::TryRecvError::Closed)).
+//!
+//! [`Receiver::close`](mpsc::Receiver::close),
+//! [`ShardedReceiver::close`](mpsc::ShardedReceiver::close), and driver
+//! shutdown (dropping a [`Driver`] or `Park::shutdown`) only refuse sends that
+//! observe the close. They do not wait for sends already past their closed
+//! check, so a racing send may return `Ok` after the receiver has reported
+//! `Closed`. Such a value is returned by a later receive call or dropped
+//! exactly once when the receiver is dropped; it is never leaked, and `Closed`
+//! is not sticky.
+//!
+//! This differs from `tokio::sync::mpsc`, where `close()` followed by draining
+//! to `None` is lossless: every send first takes a permit that `close()`
+//! accounts for, so a send is either rejected or received before `None`.
+//! Here, `close()` followed by draining to `None` is lossless only if no send
+//! can race it, for example because all senders have already been dropped or
+//! stopped. Do not use `close()` as a drain handshake with live producers.
+//!
+//! Dropping the receiver is separate: it discards buffered values, and a send
+//! racing with the drop may return `Ok` while the channel drops the value
+//! exactly once.
+//!
 //! # Application shape
 //!
 //! A sharded application can assemble its channels before starting any Norn

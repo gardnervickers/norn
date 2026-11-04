@@ -108,6 +108,70 @@ impl Header {
     ///
     /// Existing wakers will be overwritten.
     pub(crate) fn set_waker(&self, waker: &Waker) {
-        *self.waker.borrow_mut() = Some(waker.clone());
+        let new = waker.clone();
+        // Dropping a waker runs arbitrary code that may re-enter this header,
+        // so release the borrow before the replaced waker is dropped.
+        let old = self.waker.borrow_mut().replace(new);
+        drop(old);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::task::Wake;
+
+    use super::*;
+
+    static VTABLE: VTable = VTable {
+        drop_ref: |_| {},
+        clone_ref: |_| {},
+        reap: |_, _| {},
+    };
+
+    struct ReentrantDrop {
+        header: *const Header,
+        drops: Arc<AtomicUsize>,
+    }
+
+    // Safety: the test waker is only dropped synchronously on the thread that
+    // owns `header`, which outlives it.
+    unsafe impl Send for ReentrantDrop {}
+    unsafe impl Sync for ReentrantDrop {}
+
+    // The drop-time re-entry is the point of this waker.
+    #[allow(clippy::manual_noop_waker)]
+    impl Wake for ReentrantDrop {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    impl Drop for ReentrantDrop {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::Relaxed);
+            // Re-enter the header while its old waker is being dropped.
+            drop(unsafe { (*self.header).take_waker() });
+        }
+    }
+
+    #[test]
+    fn replaced_waker_is_dropped_outside_the_waker_borrow() {
+        let header = Header::new(&VTABLE);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let old = Waker::from(Arc::new(ReentrantDrop {
+            header: &header,
+            drops: Arc::clone(&drops),
+        }));
+        let (new, _) = futures_test::task::new_count_waker();
+
+        header.set_waker(&old);
+        drop(old);
+        header.set_waker(&new);
+
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        assert!(
+            header.take_waker().is_none(),
+            "the old waker was not dropped after the new one was stored"
+        );
     }
 }
