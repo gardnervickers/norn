@@ -1,8 +1,10 @@
 #![cfg(target_os = "linux")]
 
+use std::future::poll_fn;
 use std::io;
 use std::net::SocketAddr;
-use std::pin::pin;
+use std::pin::{pin, Pin};
+use std::task::Poll;
 
 use bytes::BytesMut;
 use futures_core::Stream;
@@ -11,7 +13,7 @@ use norn_executor::spawn;
 use norn_uring::buf::StableBuf;
 use norn_uring::bufring::RecvBufRing;
 use norn_uring::net::{SendZcUsage, TcpListener, TcpListenerOptions, TcpSocket};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 mod util;
 
@@ -740,4 +742,67 @@ impl EchoServer {
         }
         Ok(())
     }
+}
+
+/// Fill the send path of a connection whose peer never reads, abandon the
+/// pending write, and return the stream with its readiness gate closed.
+async fn stream_with_abandoned_write(
+) -> Result<(Pin<Box<norn_uring::net::TcpStream>>, std::net::TcpStream), Box<dyn std::error::Error>>
+{
+    let listener = TcpListener::bind("127.0.0.1:0".parse()?, 8).await?;
+    let peer = std::net::TcpStream::connect(listener.local_addr()?)?;
+    let (server, _) = listener.accept().await?;
+    let mut stream = Box::pin(server.into_stream());
+
+    let chunk = vec![0_u8; 64 * 1024];
+    for _ in 0..4096 {
+        match poll_fn(|cx| Poll::Ready(stream.as_mut().poll_write(cx, &chunk))).await {
+            Poll::Ready(Ok(_)) => {}
+            Poll::Ready(Err(err)) => return Err(err.into()),
+            // The application abandons the write here, for example after a
+            // write timeout.
+            Poll::Pending => return Ok((stream, peer)),
+        }
+    }
+    panic!("the send path never filled");
+}
+
+/// `poll_shutdown` must not wait for `POLLOUT`: `shutdown(SHUT_WR)` is valid
+/// even when the send buffer is full and the peer has stopped reading.
+#[test]
+fn shutdown_after_abandoned_write_does_not_wait_for_writability(
+) -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let (mut stream, peer) = stream_with_abandoned_write().await?;
+        let mut shutdown = pin!(poll_fn(|cx| stream.as_mut().poll_shutdown(cx)));
+        for _ in 0..200 {
+            if let Poll::Ready(result) = futures_util::poll!(shutdown.as_mut()) {
+                result?;
+                drop(peer);
+                return Ok(());
+            }
+            norn_uring::noop().await;
+        }
+        panic!("shutdown(SHUT_WR) is still waiting for POLLOUT from a peer that does not read");
+    })
+}
+
+/// A TCP stream has no userspace buffer, so `poll_flush` must complete without
+/// waiting for `POLLOUT`.
+#[test]
+fn flush_after_abandoned_write_does_not_wait_for_writability(
+) -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let (mut stream, peer) = stream_with_abandoned_write().await?;
+        let mut flush = pin!(poll_fn(|cx| stream.as_mut().poll_flush(cx)));
+        for _ in 0..200 {
+            if let Poll::Ready(result) = futures_util::poll!(flush.as_mut()) {
+                result?;
+                drop(peer);
+                return Ok(());
+            }
+            norn_uring::noop().await;
+        }
+        panic!("flush is still waiting for POLLOUT from a peer that does not read");
+    })
 }

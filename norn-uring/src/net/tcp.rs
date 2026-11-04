@@ -779,23 +779,20 @@ impl tokio::io::AsyncWrite for TcpStreamWriter {
         Poll::Ready(Ok(n))
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
-        use std::io::Write;
-        let this = self.project();
-        ready!(this
-            .inner
-            .poll_op(cx, |mut sock| sock.flush(), socket::WRITE_FLAGS as u32))?;
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        // TCP has no userspace buffer: every accepted write has already been
+        // handed to the kernel, so there is nothing to flush and no reason to
+        // wait for writability.
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        // `shutdown(SHUT_WR)` does not depend on send-buffer space, so it must
+        // not wait on the write readiness gate, which stays closed after an
+        // abandoned `EAGAIN` write until the peer drains the buffer.
         let this = self.project();
-        ready!(this.inner.poll_op(
-            cx,
-            |sock| sock.shutdown(std::net::Shutdown::Write),
-            socket::WRITE_FLAGS as u32
-        ))?;
-        Poll::Ready(Ok(()))
+        let sock = this.inner.project().inner.as_socket();
+        Poll::Ready(sock.shutdown(std::net::Shutdown::Write))
     }
 
     fn poll_write_vectored(
