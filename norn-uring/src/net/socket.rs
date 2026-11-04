@@ -1082,12 +1082,27 @@ impl Singleshot for RecvRing {
     }
 }
 
+/// Bytes reserved for the sender address at the start of each buffer selected
+/// by a multishot recvmsg.
+///
+/// The kernel writes a fixed-size name field of exactly `msg_namelen` bytes
+/// into every selected buffer, so this is sized for the largest UDP address
+/// (`sockaddr_in6`) rather than a full `sockaddr_storage`.
+const RECVMSG_MULTI_NAME_LEN: usize = std::mem::size_of::<libc::sockaddr_in6>();
+
 /// A bufring-backed receive buffer that exposes only payload bytes for `RecvMsgMulti`.
+///
+/// Each selected ring buffer begins with a 16-byte `io_uring_recvmsg_out`
+/// header followed by a 28-byte sender address field, so a buffer of
+/// [`RecvBufRing::buf_capacity`] bytes holds at most `buf_capacity() - 44`
+/// payload bytes. Larger datagrams are truncated to fit and report
+/// [`is_truncated`](Self::is_truncated).
 #[derive(Debug)]
 pub struct RecvMsgRingBuf {
     buf: BufRingBuf,
     payload_offset: usize,
     payload_len: usize,
+    truncated: bool,
 }
 
 impl std::ops::Deref for RecvMsgRingBuf {
@@ -1099,20 +1114,40 @@ impl std::ops::Deref for RecvMsgRingBuf {
 }
 
 impl RecvMsgRingBuf {
-    fn new(buf: BufRingBuf, payload_offset: usize, payload_len: usize) -> Self {
+    fn new(buf: BufRingBuf, payload_offset: usize, payload_len: usize, truncated: bool) -> Self {
         Self {
             buf,
             payload_offset,
             payload_len,
+            truncated,
         }
     }
 
     /// Returns the payload bytes from the received message.
+    ///
+    /// When [`is_truncated`](Self::is_truncated) is `true`, these are only the
+    /// leading bytes of the datagram; the remainder was discarded.
     pub fn payload(&self) -> &[u8] {
         &self.buf[self.payload_offset..self.payload_offset + self.payload_len]
     }
 
+    /// Returns whether the datagram was larger than the space left in the ring
+    /// buffer and its payload was truncated.
+    ///
+    /// The kernel reports this with `MSG_TRUNC`. The discarded bytes cannot be
+    /// recovered; use a ring with larger buffers to receive such datagrams in
+    /// full.
+    #[must_use]
+    pub fn is_truncated(&self) -> bool {
+        self.truncated
+    }
+
     /// Returns the underlying full buffer including recvmsg metadata prefix.
+    ///
+    /// The prefix is the 16-byte `io_uring_recvmsg_out` header followed by a
+    /// 28-byte name field (`sockaddr_in6`), not a full `sockaddr_storage`. Code
+    /// that parses this buffer with `RecvMsgOut::parse` must pass a `msghdr`
+    /// whose `msg_namelen` is 28.
     pub fn as_raw(&self) -> &[u8] {
         &self.buf
     }
@@ -1160,6 +1195,14 @@ impl RecvFromRingMulti {
                 "invalid recvmsg multishot completion layout",
             )
         })?;
+        if recvmsg.is_name_data_truncated() {
+            // Unreachable for IPv4 and IPv6 sockets, whose addresses fit the
+            // reserved field. Refuse to parse a partial address.
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "recvmsg multishot sender address does not fit the reserved name field",
+            ));
+        }
         let addr = if recvmsg.name_data().is_empty() {
             as_socket_addr_or_peer(&self.fd, &self.addr, 0)?
         } else {
@@ -1169,7 +1212,11 @@ impl RecvFromRingMulti {
         let payload = recvmsg.payload_data();
         let payload_offset = payload.as_ptr() as usize - base_ptr;
         let payload_len = payload.len();
-        Ok((RecvMsgRingBuf::new(buf, payload_offset, payload_len), addr))
+        let truncated = recvmsg.is_payload_truncated();
+        Ok((
+            RecvMsgRingBuf::new(buf, payload_offset, payload_len, truncated),
+            addr,
+        ))
     }
 }
 
@@ -1183,9 +1230,13 @@ unsafe impl Operation for RecvFromRingMulti {
         self.ring.ensure_accepting_receives()?;
         let this = self;
         let msghdr = this.msghdr.as_mut_ptr();
+        // The kernel reserves exactly `msg_namelen` bytes for the sender
+        // address in every selected buffer; it does not write through
+        // `msg_name`. Reserve only what UDP needs.
+        debug_assert!(RECVMSG_MULTI_NAME_LEN <= this.addr.len() as usize);
         unsafe {
             (*msghdr).msg_name = this.addr.as_ptr() as *mut libc::c_void;
-            (*msghdr).msg_namelen = this.addr.len() as _;
+            (*msghdr).msg_namelen = RECVMSG_MULTI_NAME_LEN as _;
             (*msghdr).msg_control = std::ptr::null_mut();
             (*msghdr).msg_controllen = 0;
             (*msghdr).msg_iov = std::ptr::null_mut();
