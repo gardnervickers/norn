@@ -534,7 +534,7 @@ async fn norn_tcp_recv_exact_ring(
 ) -> io::Result<()> {
     let mut read = 0;
     while read < payload_len {
-        let (buf, _) = socket.recv_ring(ring).await?;
+        let buf = socket.recv_ring(ring).await?;
         if buf.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -749,7 +749,7 @@ async fn norn_tcp_echo_connection_bufring_linked(
     for _ in 0..requests {
         let (recv_res, (send_res, next_send_buf)) =
             socket.recv_ring(&ring).then(socket.send(send_buf)).await;
-        let (buf, _) = recv_res?;
+        let buf = recv_res?;
         norn_tcp_validate_exact_ring_buf(buf, 0x5A, payload_len)?;
         send_buf = next_send_buf;
         let sent = send_res?;
@@ -890,7 +890,7 @@ async fn norn_tcp_request_response_client_bufring(
                 send_buf = next_send_buf;
                 let sent = send_res?;
                 assert_eq!(sent, payload_len);
-                let (buf, _) = recv_res?;
+                let buf = recv_res?;
                 norn_tcp_validate_exact_ring_buf(buf, 0x5A, payload_len)?;
             }
         }
