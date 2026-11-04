@@ -291,7 +291,7 @@ counters.
   about 300k; `mixed-4w` capacity is about 1.06M, with the CPUs about 94%
   busy at 680k. Its top rate is set lower (560k). That margin was chosen
   when exhausting the receive buffer ring reset connections and invalidated
-  the run; exhaustion now stalls instead (below), so the margin only keeps a
+  the run; exhaustion is now rare and stalls instead (below), so the margin only keeps a
   slower, shared host below the knee. On another host, find the knee with a
   few trial rates (watch `core` and p50), then freeze the rates in a copied
   profile.
@@ -300,16 +300,19 @@ counters.
   connection whose task stops polling its multishot receive keeps taking a
   whole buffer for every arriving segment: in the sharded server while it
   waits for a pair credit, has 32 replies in flight, or blocks in a send; in
-  the single-worker server while it blocks in a send. When the ring runs out,
-  norn-uring no longer resets connections (`ENOBUFS`); every receive on that
-  worker waits for a buffer return instead. Overload runs therefore stay
-  valid, but their latency includes these stalls.
-- A client that pipelines requests and never reads the responses stalls
-  every connection on its worker indefinitely: its connection's send blocks,
-  its unpolled receive takes the whole ring, and no buffer returns until the
-  client closes. The bench client always reads, so it never does this. The
-  ignored `non_reading_peer_does_not_stall_*` tests in `norn-kv-server`
-  reproduce it.
+  the single-worker server while it blocks in a send. Both servers bound
+  this at 64 buffers per connection (`max_unconsumed_per_receive`): at the
+  bound the connection's receive pauses, without losing data, until the
+  connection polls again. Exhausting the ring then takes 128 connections
+  stalled at once. If it does run out, every receive on that worker waits
+  for a buffer return; norn-uring no longer resets connections (`ENOBUFS`).
+  Overload runs stay valid either way, but their latency includes pauses
+  and any such waits.
+- A client that pipelines requests and never reads the responses holds at
+  most 64 buffers of its worker's ring, and its socket then applies TCP
+  back-pressure. Other connections keep their progress unless 128 such
+  clients share one worker. The `non_reading_peer_does_not_stall_*` tests in
+  `norn-kv-server` cover this.
 
 ## Tests
 
