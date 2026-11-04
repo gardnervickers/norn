@@ -2,6 +2,7 @@
 
 use std::cell::Cell;
 use std::io;
+use std::num::NonZeroUsize;
 use std::pin::pin;
 use std::rc::Rc;
 
@@ -17,6 +18,11 @@ use crate::protocol::{EncodeError, RequestHeader, HEADER_LEN};
 
 const RECV_RING_BUFFERS: u16 = 8_192;
 const RECV_BUFFER_LEN: usize = 8 * 1024;
+/// Buffers one connection's receive may hold before it pauses. This sits
+/// above the backlog a polling connection builds up between polls in the
+/// benchmark (at most 32 buffers in `mixed-1w`; `mixed-4w` did not pause),
+/// and 128 stalled connections are needed to exhaust the 8192-buffer ring.
+const MAX_UNCONSUMED_PER_RECEIVE: NonZeroUsize = NonZeroUsize::new(64).unwrap();
 const MAX_READY_RECEIVES_PER_BATCH: usize = 16;
 const ACCEPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
 
@@ -139,13 +145,14 @@ impl ServerConfig {
 /// Build the provided-buffer ring that every multishot connection on a worker
 /// shares.
 ///
-/// A connection whose task stops polling its receive stream keeps consuming
-/// buffers from this ring; see the `Limitations` section of the
-/// `norn-kv-bench` README.
+/// A connection whose task stops polling its receive stream, for example
+/// while a send blocks, pauses after holding [`MAX_UNCONSUMED_PER_RECEIVE`]
+/// buffers instead of taking the whole ring.
 pub(crate) fn recv_ring(buffers: u16) -> io::Result<RecvBufRing> {
     RecvBufRing::builder(1)
         .buf_cnt(buffers)
         .buf_len(RECV_BUFFER_LEN)
+        .max_unconsumed_per_receive(MAX_UNCONSUMED_PER_RECEIVE)
         .build()
 }
 
@@ -903,7 +910,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "a non-reading peer stalls every connection on its worker until norn-uring bounds the buffers one receive may hold"]
     fn non_reading_peer_does_not_stall_other_connections() {
         crate::slow_peer::hog_does_not_stall_other_connections(|_, socket, ring| {
             serve_connection_multishot(
