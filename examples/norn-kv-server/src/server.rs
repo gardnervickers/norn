@@ -63,8 +63,7 @@ pub enum RecvMode {
 /// Largest request body the wire protocol can declare.
 ///
 /// The header's total body length field is 32 bits wide, so a larger
-/// `max_body_len` could never be reached and would only inflate the buffers
-/// each connection reserves up front.
+/// `max_body_len` could never be reached.
 const MAX_PROTOCOL_BODY_LEN: u64 = u32::MAX as u64;
 
 /// Runtime limits for the networking-first server.
@@ -72,9 +71,10 @@ const MAX_PROTOCOL_BODY_LEN: u64 = u32::MAX as u64;
 pub struct ServerConfig {
     /// Maximum request body accepted from one command.
     ///
-    /// Every connection reserves `max_body_len` plus a header up front, so
-    /// this must not exceed what the protocol's 32-bit body length field can
-    /// express; [`ServerConfig::validate`] rejects larger values.
+    /// Connection buffers grow to the frames and replies they actually carry,
+    /// not to this limit. It must not exceed what the protocol's 32-bit body
+    /// length field can express; [`ServerConfig::validate`] rejects larger
+    /// values.
     pub max_body_len: usize,
     /// Maximum number of concurrently active connection tasks.
     pub max_connections: usize,
@@ -205,7 +205,7 @@ async fn serve_connection_multishot(
 
     let mut incoming = Box::pin(socket.recv_ring_multi(&recv_ring));
     let mut pending = Vec::with_capacity(RECV_BUFFER_LEN);
-    let mut response = Vec::with_capacity(config.max_body_len + HEADER_LEN);
+    let mut response = Vec::with_capacity(RECV_BUFFER_LEN);
 
     loop {
         response.clear();
@@ -385,12 +385,14 @@ async fn serve_connection(
 ) -> io::Result<()> {
     socket.set_nodelay(true).await?;
 
-    let mut header_buf = RecvBuffer::new(HEADER_LEN);
-    let mut body_buf = RecvBuffer::new(config.max_body_len);
-    let mut response = Vec::with_capacity(config.max_body_len + HEADER_LEN);
+    let mut header_buf = RecvBuffer::new();
+    // Grows to the largest body this connection receives, so a large
+    // `max_body_len` costs memory only when a client sends such a frame.
+    let mut body_buf = RecvBuffer::new();
+    let mut response = Vec::with_capacity(RECV_BUFFER_LEN);
 
     loop {
-        header_buf.reset(HEADER_LEN);
+        header_buf.reset(HEADER_LEN)?;
         let Some(returned) = recv_exact(&socket, header_buf).await? else {
             return socket.close().await;
         };
@@ -408,7 +410,7 @@ async fn serve_connection(
             ));
         }
 
-        body_buf.reset(header.body_len());
+        body_buf.reset(header.body_len())?;
         if header.body_len() != 0 {
             body_buf = recv_exact(&socket, body_buf)
                 .await?
@@ -469,58 +471,70 @@ fn encode_error(error: EncodeError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error)
 }
 
-#[derive(Debug)]
+/// Receive buffer filled up to a per-receive limit.
+///
+/// The received bytes are the vector's initialized length; receives write
+/// into its spare capacity.
+#[derive(Debug, Default)]
 struct RecvBuffer {
-    storage: Box<[u8]>,
-    filled: usize,
+    storage: Vec<u8>,
     limit: usize,
 }
 
 impl RecvBuffer {
-    fn new(capacity: usize) -> Self {
-        Self {
-            storage: vec![0_u8; capacity].into_boxed_slice(),
-            filled: 0,
-            limit: capacity,
-        }
+    fn new() -> Self {
+        Self::default()
     }
 
-    fn reset(&mut self, limit: usize) {
-        assert!(limit <= self.storage.len());
-        self.filled = 0;
+    /// Empty the buffer and accept up to `limit` bytes, growing the storage
+    /// if it is smaller.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::OutOfMemory`] if the storage cannot grow, so
+    /// only the connection that declared the frame fails.
+    fn reset(&mut self, limit: usize) -> io::Result<()> {
+        self.storage.clear();
+        self.storage.try_reserve_exact(limit).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                format!("cannot allocate a {limit}-byte receive buffer"),
+            )
+        })?;
         self.limit = limit;
+        Ok(())
     }
 
     fn filled(&self) -> usize {
-        self.filled
+        self.storage.len()
     }
 
     fn is_full(&self) -> bool {
-        self.filled == self.limit
+        self.storage.len() == self.limit
     }
 
     fn filled_slice(&self) -> &[u8] {
-        &self.storage[..self.filled]
+        &self.storage
     }
 }
 
-// Safety: the box keeps its allocation stable while the wrapper moves. The
-// wrapper is exclusively owned by each receive operation, and the exposed tail
-// remains within the initialized boxed allocation.
+// Safety: the vector's heap allocation stays put while the wrapper moves, and
+// it is not resized while a receive operation owns the wrapper. The exposed
+// tail is spare capacity: `len <= limit <= capacity`.
 unsafe impl StableBufMut for RecvBuffer {
     fn stable_ptr_mut(&mut self) -> *mut u8 {
-        // Safety: `filled <= limit <= storage.len()` and one-past is permitted
-        // when the remaining length is zero.
-        unsafe { self.storage.as_mut_ptr().add(self.filled) }
+        self.storage.spare_capacity_mut().as_mut_ptr().cast()
     }
 
     fn bytes_remaining(&self) -> usize {
-        self.limit - self.filled
+        self.limit - self.storage.len()
     }
 
     unsafe fn set_init(&mut self, init_len: usize) {
         assert!(init_len <= self.bytes_remaining());
-        self.filled += init_len;
+        // Safety: the caller initialized `init_len` bytes of spare capacity,
+        // which fits because `len + init_len <= limit <= capacity`.
+        unsafe { self.storage.set_len(self.storage.len() + init_len) };
     }
 }
 
@@ -717,8 +731,8 @@ mod tests {
 
     #[test]
     fn receive_buffer_advances_without_overwriting() {
-        let mut buffer = RecvBuffer::new(8);
-        buffer.reset(5);
+        let mut buffer = RecvBuffer::new();
+        buffer.reset(5).unwrap();
         let first = buffer.stable_ptr_mut();
         unsafe {
             first.write(1);
