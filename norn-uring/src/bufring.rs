@@ -84,8 +84,6 @@ impl RecvBufRing {
                 registration,
                 storage,
                 max_unconsumed_per_receive,
-                #[cfg(test)]
-                pauses: Cell::new(0),
             }),
         }
     }
@@ -114,8 +112,6 @@ impl RecvBufRing {
     /// Request cancellation of a multishot receive on this ring, so that it
     /// stops selecting buffers. This never enters the kernel.
     pub(crate) fn pause_receive(&self, target: OpTarget) {
-        #[cfg(test)]
-        self.rc.pauses.set(self.rc.pauses.get() + 1);
         self.rc.registration.cancel_op(target)
     }
 
@@ -195,23 +191,6 @@ impl RecvBufRing {
 
     pub(crate) fn bgid(&self) -> Bgid {
         self.rc.bgid
-    }
-
-    /// Count the buffers that completions or their consumers hold.
-    #[cfg(test)]
-    pub(crate) fn test_owned_buffers(&self) -> usize {
-        self.rc.tracker.borrow().owned()
-    }
-
-    /// Count the pauses requested by receives on this ring.
-    #[cfg(test)]
-    pub(crate) fn test_pauses(&self) -> usize {
-        self.rc.pauses.get()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn test_quarantine(&self) {
-        let _ = self.rc.poison("test quarantine");
     }
 
     pub(crate) fn same_driver(&self, handle: &Handle) -> bool {
@@ -928,8 +907,6 @@ struct InnerBufRing {
     registration: BufRingRegistration,
     storage: Rc<BufRingStorage>,
     max_unconsumed_per_receive: Option<NonZeroUsize>,
-    #[cfg(test)]
-    pauses: Cell<usize>,
 }
 
 impl ops::Deref for InnerBufRing {
