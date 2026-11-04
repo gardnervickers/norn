@@ -27,7 +27,11 @@ fn finish_outside_context<F: Future>(
         let mut cx = Context::from_waker(Waker::noop());
         match fut.as_mut().poll(&mut cx) {
             Poll::Ready(output) => return output,
-            Poll::Pending => executor.block_on(norn_uring::noop()),
+            Poll::Pending => {
+                // Only the driver turn matters, not `noop()`'s result.
+                #[allow(clippy::let_unit_value)]
+                let _turn = executor.block_on(norn_uring::noop());
+            }
         }
     }
 }
