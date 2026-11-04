@@ -1,10 +1,13 @@
 //! A panicking scheduler destructor must not stop `TaskSet` shutdown.
-use std::cell::Cell;
-use std::future::pending;
+use std::cell::{Cell, RefCell};
+use std::future::{pending, Future};
 use std::panic::{self, AssertUnwindSafe};
+use std::pin::Pin;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::task::{Context, Wake, Waker};
 
-use norn_task::{RegisteredTask, Runnable, Schedule, TaskSet};
+use norn_task::{JoinHandle, RegisteredTask, Runnable, Schedule, TaskSet};
 
 struct CountDrop(Rc<Cell<usize>>);
 
@@ -59,4 +62,50 @@ fn scheduler_drop_panic_during_shutdown_still_destroys_remaining_futures() {
     assert!(dropped.is_err());
     assert_eq!(drops.get(), 1, "second future outlived the set");
     drop(second_runnable);
+}
+
+thread_local! {
+    static JOIN: RefCell<Option<JoinHandle<()>>> = const { RefCell::new(None) };
+}
+
+/// A join waker that drops the last other reference to its task, then panics.
+struct DropJoinThenPanic;
+
+impl Wake for DropJoinThenPanic {
+    fn wake(self: Arc<Self>) {
+        let join = JOIN.with(|join| join.borrow_mut().take());
+        drop(join);
+        panic!("join waker panicked");
+    }
+}
+
+struct AlwaysPanicOnDrop;
+
+impl Schedule for AlwaysPanicOnDrop {
+    fn schedule(&self, _runnable: Runnable) {}
+    fn unbind(&self, _registered: &RegisteredTask) {}
+}
+
+impl Drop for AlwaysPanicOnDrop {
+    fn drop(&mut self) {
+        panic!("scheduler drop panicked");
+    }
+}
+
+/// When `shutdown()` panics and the scheduler's destructor panics too, the
+/// second panic must not unwind through the first and abort the process.
+#[test]
+fn join_waker_panic_and_scheduler_drop_panic_do_not_abort() {
+    let set = TaskSet::new();
+    let (runnable, mut join) = unsafe { set.bind(pending::<()>(), AlwaysPanicOnDrop) };
+    drop(runnable);
+    let waker = Waker::from(Arc::new(DropJoinThenPanic));
+    assert!(Pin::new(&mut join)
+        .poll(&mut Context::from_waker(&waker))
+        .is_pending());
+    drop(waker);
+    JOIN.with(|slot| *slot.borrow_mut() = Some(join));
+
+    let result = panic::catch_unwind(AssertUnwindSafe(|| drop(set)));
+    assert!(result.is_err());
 }
