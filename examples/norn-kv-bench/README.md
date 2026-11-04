@@ -8,7 +8,10 @@ omission-corrected latency per request class.
 
 The client deliberately depends on no Norn crate: it is a separate epoll-based
 implementation, so a runtime change under test cannot change the load
-generator. Every response is validated byte-for-byte.
+generator. Every response is validated against its request: opcode, status,
+data type, opaque, key and extras lengths, flags, and the exact value bytes.
+Only the server-assigned CAS and the text of a miss's error body are not
+checked.
 
 ## Why this benchmark
 

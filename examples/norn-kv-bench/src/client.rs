@@ -666,6 +666,13 @@ impl<'a> Worker<'a> {
                     conn.id, header.opaque, pending.opaque
                 ));
             }
+            // Only the raw data type is defined.
+            if header.data_type != 0 {
+                return Err(format!(
+                    "connection {}: response data type {:#04x} (want 0)",
+                    conn.id, header.data_type
+                ));
+            }
             let body = &frame[HEADER_LEN..total];
             match pending.expect {
                 Expect::Value { tag, len } => {
@@ -700,12 +707,21 @@ impl<'a> Worker<'a> {
                     }
                 }
                 Expect::Miss => {
+                    // A miss carries no flags or key; any body is an error
+                    // message, which servers may word freely.
                     if header.opcode != proto::OP_GET
                         || header.status != proto::STATUS_KEY_NOT_FOUND
+                        || header.extras_len != 0
+                        || header.key_len != 0
                     {
                         return Err(format!(
-                            "connection {}: expected miss, status {:#x}",
-                            conn.id, header.status
+                            "connection {}: bad miss response status {:#x} opcode {:#x} \
+                             extras {} key {}",
+                            conn.id,
+                            header.status,
+                            header.opcode,
+                            header.extras_len,
+                            header.key_len
                         ));
                     }
                 }
