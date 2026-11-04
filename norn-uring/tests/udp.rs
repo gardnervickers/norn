@@ -809,7 +809,7 @@ fn bundle_receive_rejects_invalid_flags_without_consuming_a_ring_buffer(
             .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
 
-        for flags in [libc::MSG_TRUNC, libc::MSG_WAITALL] {
+        for flags in [libc::MSG_TRUNC, libc::MSG_PEEK, libc::MSG_WAITALL] {
             let mut recv = pin!(s2.recv_bundle_multi_with_flags(&ring, flags));
             let err = recv
                 .next()

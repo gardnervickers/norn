@@ -1163,9 +1163,10 @@ impl RecvMsgRingBuf {
     /// Returns the underlying full buffer including recvmsg metadata prefix.
     ///
     /// The prefix is the 16-byte `io_uring_recvmsg_out` header followed by a
-    /// 28-byte name field (`sockaddr_in6`), not a full `sockaddr_storage`. Code
-    /// that parses this buffer with `RecvMsgOut::parse` must pass a `msghdr`
-    /// whose `msg_namelen` is 28.
+    /// name field. The name field is currently 28 bytes (`sockaddr_in6`), not a
+    /// full `sockaddr_storage`; that size is an implementation detail and can
+    /// change. Code that parses this buffer with `RecvMsgOut::parse` must pass a
+    /// `msghdr` whose `msg_namelen` matches it, so prefer [`payload`](Self::payload).
     pub fn as_raw(&self) -> &[u8] {
         &self.buf
     }
@@ -2463,9 +2464,9 @@ mod tests {
         drop(socket.recv_from_ring_multi(ring));
         drop(socket.recv_ring_multi(ring));
         drop(socket.recv_ring_bundle(ring));
-        drop(socket.recv_ring_bundle_with_flags(ring, libc::MSG_PEEK));
+        drop(socket.recv_ring_bundle_with_flags(ring, 0));
         drop(socket.recv_ring_bundle_multi_with_flags(ring, 0));
-        drop(socket.recv_ring_bundle_multi_with_flags(ring, libc::MSG_PEEK));
+        drop(socket.recv_ring_bundle_multi_with_flags(ring, 0));
     }
 
     #[test]
@@ -2492,13 +2493,13 @@ mod tests {
         assert_driver_mismatch(|| drop(socket.recv_ring_multi(&first_ring)));
         assert_driver_mismatch(|| drop(socket.recv_ring_bundle(&first_ring)));
         assert_driver_mismatch(|| {
-            drop(socket.recv_ring_bundle_with_flags(&first_ring, libc::MSG_PEEK));
+            drop(socket.recv_ring_bundle_with_flags(&first_ring, 0));
         });
         assert_driver_mismatch(|| {
             drop(socket.recv_ring_bundle_multi_with_flags(&first_ring, 0));
         });
         assert_driver_mismatch(|| {
-            drop(socket.recv_ring_bundle_multi_with_flags(&first_ring, libc::MSG_PEEK));
+            drop(socket.recv_ring_bundle_multi_with_flags(&first_ring, 0));
         });
         Ok(())
     }
