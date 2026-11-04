@@ -1004,6 +1004,7 @@ unsafe impl Operation for RecvFromRing {
 
     unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
         let (result, flags) = result.into_parts();
+        let result = result.map_err(|error| self.ring.release_failed(error, flags));
         result.and_then(|n| {
             // The kernel recycles the selected buffer when nothing was
             // received: a stream EOF or an empty datagram completes with no
@@ -1196,7 +1197,9 @@ unsafe impl Operation for RecvFromRingMulti {
     unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
         let (result, flags) = result.into_parts();
         RingRecvCompletion {
-            result: result.and_then(|n| self.ring.get_buf(n, flags)),
+            result: result
+                .map_err(|error| self.ring.release_failed(error, flags))
+                .and_then(|n| self.ring.get_buf(n, flags)),
             terminal: !io_uring::cqueue::more(flags),
         }
     }
@@ -1246,6 +1249,7 @@ unsafe impl Operation for RecvRingMulti {
 
     unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
         let (result, flags) = result.into_parts();
+        let result = result.map_err(|error| self.ring.release_failed(error, flags));
         let result = result.and_then(|n| {
             if n == 0 && io_uring::cqueue::buffer_select(flags).is_none() {
                 Ok(BufRingBuf::empty(self.ring.clone()))
@@ -1302,7 +1306,9 @@ unsafe impl Operation for RecvRingBundle {
 
     unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
         let (result, flags) = result.into_parts();
-        result.and_then(|n| self.ring.get_buf_bundle(n, flags))
+        result
+            .map_err(|error| self.ring.release_failed(error, flags))
+            .and_then(|n| self.ring.get_buf_bundle(n, flags))
     }
 }
 
@@ -1344,6 +1350,7 @@ unsafe impl Operation for RecvRingBundleMulti {
 
     unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
         let (result, flags) = result.into_parts();
+        let result = result.map_err(|error| self.ring.release_failed(error, flags));
         let result = result.and_then(|n| {
             if n == 0 && io_uring::cqueue::buffer_select(flags).is_none() {
                 Ok(BufRingBufBundle::empty())

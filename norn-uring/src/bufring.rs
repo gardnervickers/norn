@@ -140,6 +140,28 @@ impl RecvBufRing {
         self.rc.get_buf_bundle(self.clone(), res, flags)
     }
 
+    /// Republish the buffer a failed receive completion still names, then
+    /// return the completion's error.
+    ///
+    /// A receive issued from io-wq commits its selected buffer before it can
+    /// fail, and the error CQE then carries that buffer id. Such a receive
+    /// selects exactly one buffer, bundles included, so at most one
+    /// publication is claimed here.
+    pub(crate) fn release_failed(&self, error: io::Error, flags: u32) -> io::Error {
+        if io_uring::cqueue::buffer_select(flags).is_some() {
+            // Dropping the claimed buffer republishes it.
+            if let Err(claim_error) = self.get_buf(0, flags) {
+                warn!(
+                    target: "norn_uring::bufring",
+                    "failed receive for group {} named an unclaimable buffer: {}",
+                    self.rc.bgid,
+                    claim_error
+                );
+            }
+        }
+        error
+    }
+
     pub(crate) fn bgid(&self) -> Bgid {
         self.rc.bgid
     }
