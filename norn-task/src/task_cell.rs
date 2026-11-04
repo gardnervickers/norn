@@ -337,8 +337,12 @@ where
         // the notification.
         if state.is_complete() {
             let future_cell = this.as_ref().future_cell();
-            let output = future_cell.take_output();
-            *out = Poll::Ready(output);
+            match future_cell.take_output() {
+                Some(output) => *out = Poll::Ready(output),
+                // Shutdown marks the task complete before cancellation stores
+                // its result, and it notifies the join handle once it has.
+                None => this.as_ref().header().set_waker(waker),
+            }
         }
     }
 
