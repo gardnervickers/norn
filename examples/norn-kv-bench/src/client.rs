@@ -273,6 +273,31 @@ impl Conn {
         self.next_opaque = self.next_opaque.wrapping_add(1);
         self.next_opaque
     }
+
+    /// Whether requests are still outstanding or unsent on this connection.
+    fn is_busy(&self) -> bool {
+        !self.pending.is_empty() || self.wpos != self.wbuf.len()
+    }
+
+    /// Identify the connection for error reports. The local address matches
+    /// it to server logs and packet captures.
+    fn describe(&self) -> String {
+        let local = self
+            .stream
+            .local_addr()
+            .map_or_else(|_| "unknown address".to_owned(), |addr| addr.to_string());
+        format!(
+            "{} connection {} from {local} with {} outstanding, {} unsent bytes",
+            if self.persistent {
+                "persistent"
+            } else {
+                "churn"
+            },
+            self.id,
+            self.pending.len(),
+            self.wbuf.len() - self.wpos,
+        )
+    }
 }
 
 struct Epoll {
@@ -526,17 +551,34 @@ impl<'a> Worker<'a> {
             .find(|s| (at * 1e9) < s.end_ns as f64)
             .map_or("drain", |s| s.name.as_str());
         format!(
-            "{op} on {} connection {} at {at:.3}s ({segment}) with {} outstanding, \
-             {} unsent bytes: {error}",
-            if conn.persistent {
-                "persistent"
-            } else {
-                "churn"
-            },
-            conn.id,
-            conn.pending.len(),
-            conn.wbuf.len() - conn.wpos,
+            "{op} on {} at {at:.3}s ({segment}): {error}",
+            conn.describe()
         )
+    }
+
+    /// Report a drain timeout with the connections still waiting on the
+    /// server, so a stall can be traced to specific sockets.
+    fn drain_timeout_error(&self) -> String {
+        const LISTED: usize = 16;
+        let stuck: Vec<_> = self
+            .conns
+            .iter()
+            .flatten()
+            .filter(|conn| conn.is_busy())
+            .collect();
+        let mut message = format!(
+            "drain timed out with {} requests outstanding on {} connections",
+            self.outstanding,
+            stuck.len()
+        );
+        for conn in stuck.iter().take(LISTED) {
+            message.push_str("\n  ");
+            message.push_str(&conn.describe());
+        }
+        if stuck.len() > LISTED {
+            message.push_str(&format!("\n  ... and {} more", stuck.len() - LISTED));
+        }
+        message
     }
 
     fn flush(&mut self) -> Result<(), String> {
@@ -1064,10 +1106,7 @@ impl<'a> Worker<'a> {
             self.poll(1)?;
             self.refill.clear();
             if shared.now_ns() > drain_deadline {
-                return Err(format!(
-                    "drain timed out with {} requests outstanding",
-                    self.outstanding
-                ));
+                return Err(self.drain_timeout_error());
             }
         }
         let drain_ns = shared.now_ns() - drain_start;
