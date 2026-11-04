@@ -1088,8 +1088,9 @@ async fn dispatch_frame(
 
     // Acquire before copying key/value bytes. If the pair has exhausted its
     // credits, this task stops polling the multishot stream and owns no remote
-    // request body. The already-armed kernel receive is bounded by the fixed
-    // per-worker provided-buffer ring; it is not an unbounded owned backlog.
+    // request body. The already-armed kernel receive pauses once it holds 64
+    // buffers of the worker's ring (`max_unconsumed_per_receive`), so a
+    // connection waiting here cannot take the whole ring.
     let permit = router.acquire(owner).await?;
     let command = OwnedCommand::copy_from(command).expect("keyed command must be ownable");
     router.submit_remote(replies, permit, worker, owner, header, command)?;
