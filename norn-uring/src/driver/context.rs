@@ -25,7 +25,29 @@ impl DriverContext {
             assert!(old.is_none(), "driver already set");
             *old = Some(handle);
         });
-        DriverContextGuard {}
+        DriverContextGuard {
+            entered: true,
+            prev: None,
+        }
+    }
+
+    /// Install `handle` for teardown.
+    ///
+    /// Unlike [`DriverContext::enter`], this tolerates an existing context,
+    /// which is restored when the guard drops, and thread-local storage that
+    /// has already been destroyed (during thread exit), in which case no
+    /// context is installed.
+    pub(crate) fn enter_for_shutdown(handle: Handle) -> DriverContextGuard {
+        match CURRENT.try_with(|current| current.handle.replace(Some(handle))) {
+            Ok(prev) => DriverContextGuard {
+                entered: true,
+                prev,
+            },
+            Err(_) => DriverContextGuard {
+                entered: false,
+                prev: None,
+            },
+        }
     }
 
     /// Returns a reference to the current executor.
@@ -37,14 +59,23 @@ impl DriverContext {
 #[derive(Debug)]
 // This type is exposed only as `Park::ContextGuard`; callers never construct it.
 #[allow(unnameable_types)]
-pub struct DriverContextGuard;
+pub struct DriverContextGuard {
+    /// Whether this guard installed a handle that it must remove.
+    entered: bool,
+    /// The handle to restore when this guard drops.
+    prev: Option<Handle>,
+}
 
 impl Drop for DriverContextGuard {
     fn drop(&mut self) {
-        CURRENT.with(|current| {
+        if !self.entered {
+            return;
+        }
+        let prev = self.prev.take();
+        let _current = CURRENT.try_with(|current| {
             let mut executor = current.handle.borrow_mut();
             assert!(executor.is_some(), "driver not set");
-            *executor = None;
+            std::mem::replace(&mut *executor, prev)
         });
     }
 }
