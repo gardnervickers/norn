@@ -165,6 +165,54 @@ fn read_write() -> Result<(), Box<dyn std::error::Error>> {
     })
 }
 
+/// io_uring treats an SQE offset of `-1` (`u64::MAX`) as "use the file
+/// cursor". Positional operations must reject every offset above `i64::MAX`
+/// instead of silently reading or writing at the cursor.
+#[test]
+fn positional_ops_reject_offsets_above_i64_max() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let dir = util::ThreadNameTestDir::new();
+        let path = dir.join("offset");
+        std::fs::write(&path, b"hello world")?;
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).read(true);
+        let file = opts.open(&path).await?;
+
+        for offset in [u64::MAX, i64::MAX as u64 + 1] {
+            let (result, buf) = file.write_at(&b"XY"[..], offset).await;
+            assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+            assert_eq!(buf, b"XY");
+
+            let (result, buf) = file.read_at(vec![0_u8; 4], offset).await;
+            assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+            assert_eq!(buf, [0_u8; 4]);
+
+            let (result, bufs) = file.writev_at(vec![b"XY".to_vec()], offset).await;
+            assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+            assert_eq!(bufs, [b"XY".to_vec()]);
+
+            let (result, bufs) = file.readv_at(vec![vec![0_u8; 4]], offset).await;
+            assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+            assert_eq!(bufs, [vec![0_u8; 4]]);
+
+            let pool = norn_uring::Handle::current()
+                .register_fixed_buffers(vec![b"fixed payload".to_vec()])?;
+            let (result, buf) = file.write_fixed_at(pool.try_acquire()?, offset).await;
+            assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+            assert_eq!(&*buf, b"fixed payload");
+            let (result, buf) = file.read_fixed_at(buf, offset).await;
+            assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+            assert_eq!(&*buf, b"fixed payload");
+            drop(buf);
+            assert_eq!(pool.unregister()?.len(), 1);
+        }
+
+        assert_eq!(std::fs::read(&path)?, b"hello world");
+        file.close().await?;
+        Ok(())
+    })
+}
+
 #[repr(C, align(4096))]
 struct AlignedBlock([u8; 4096]);
 

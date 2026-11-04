@@ -127,6 +127,12 @@ impl File {
     /// Read bytes from the file into the specified buffer.
     ///
     /// The read will start at the provided offset.
+    ///
+    /// # Errors
+    ///
+    /// Fails with `EINVAL` ([`io::ErrorKind::InvalidInput`]) before
+    /// submission when `offset` exceeds `i64::MAX`; `io_uring` would otherwise
+    /// treat `u64::MAX` as "use the file cursor". The buffer is still returned.
     pub fn read_at<B>(
         &self,
         buf: B,
@@ -142,6 +148,12 @@ impl File {
     /// Write the specified buffer to the file.
     ///
     /// The write will start at the provided offset.
+    ///
+    /// # Errors
+    ///
+    /// Fails with `EINVAL` ([`io::ErrorKind::InvalidInput`]) before
+    /// submission when `offset` exceeds `i64::MAX`; `io_uring` would otherwise
+    /// treat `u64::MAX` as "use the file cursor". The buffer is still returned.
     pub fn write_at<B>(
         &self,
         buf: B,
@@ -158,6 +170,12 @@ impl File {
     ///
     /// The read starts at `offset` and may fill the buffer's entire selected
     /// capacity. The operation returns ownership of the buffer with its result.
+    ///
+    /// # Errors
+    ///
+    /// Fails with `EINVAL` ([`io::ErrorKind::InvalidInput`]) before
+    /// submission when `offset` exceeds `i64::MAX`; `io_uring` would otherwise
+    /// treat `u64::MAX` as "use the file cursor". The buffer is still returned.
     ///
     /// # Panics
     ///
@@ -187,6 +205,12 @@ impl File {
     /// Short writes can be retried by calling [`FixedBuf::consume`] on the
     /// returned buffer and advancing `offset` by the completed byte count.
     ///
+    /// # Errors
+    ///
+    /// Fails with `EINVAL` ([`io::ErrorKind::InvalidInput`]) before
+    /// submission when `offset` exceeds `i64::MAX`; `io_uring` would otherwise
+    /// treat `u64::MAX` as "use the file cursor". The buffers are still returned.
+    ///
     /// # Panics
     ///
     /// Panics when the fixed buffer was registered with another driver.
@@ -210,6 +234,12 @@ impl File {
     /// Read bytes from the file into a set of buffers.
     ///
     /// The read starts at the provided offset and fills each buffer in order.
+    ///
+    /// # Errors
+    ///
+    /// Fails with `EINVAL` ([`io::ErrorKind::InvalidInput`]) before
+    /// submission when `offset` exceeds `i64::MAX`; `io_uring` would otherwise
+    /// treat `u64::MAX` as "use the file cursor". The buffers are still returned.
     pub async fn readv_at<B>(&self, bufs: Vec<B>, offset: u64) -> (io::Result<usize>, Vec<B>)
     where
         B: StableBufMut + 'static,
@@ -221,6 +251,12 @@ impl File {
     /// Write bytes from a set of buffers to the file.
     ///
     /// The write starts at the provided offset and consumes each buffer in order.
+    ///
+    /// # Errors
+    ///
+    /// Fails with `EINVAL` ([`io::ErrorKind::InvalidInput`]) before
+    /// submission when `offset` exceeds `i64::MAX`; `io_uring` would otherwise
+    /// treat `u64::MAX` as "use the file cursor". The buffers are still returned.
     pub async fn writev_at<B>(&self, bufs: Vec<B>, offset: u64) -> (io::Result<usize>, Vec<B>)
     where
         B: StableBuf + 'static,
@@ -643,10 +679,11 @@ where
     type Completion = CQEResult;
 
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+        let offset = checked_file_offset(self.offset)?;
         let len = usize_to_u32(self.submitted_len, "read buffer length")?;
         let buf = self.buf.stable_ptr_mut();
         Ok(opcode::Read::new(self.fd.fd(), buf, len)
-            .offset(self.offset)
+            .offset(offset)
             .build())
     }
 
@@ -696,11 +733,12 @@ unsafe impl<B: 'static> Operation for ReadFixedAt<B> {
     type Completion = CQEResult;
 
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+        let offset = checked_file_offset(self.offset)?;
         let ptr = self.buf.fixed_ptr_mut();
         let len = self.buf.read_capacity_u32();
         let index = self.buf.kernel_index();
         Ok(opcode::ReadFixed::new(self.fd.fd(), ptr, len, index)
-            .offset(self.offset)
+            .offset(offset)
             .build())
     }
 
@@ -747,10 +785,11 @@ where
     type Completion = CQEResult;
 
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+        let offset = checked_file_offset(self.offset)?;
         let len = usize_to_u32(self.buf.bytes_init(), "write buffer length")?;
         let buf = self.buf.stable_ptr();
         Ok(opcode::Write::new(self.fd.fd(), buf, len)
-            .offset(self.offset)
+            .offset(offset)
             .build())
     }
 
@@ -792,11 +831,12 @@ unsafe impl<B: 'static> Operation for WriteFixedAt<B> {
     type Completion = CQEResult;
 
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+        let offset = checked_file_offset(self.offset)?;
         let ptr = self.buf.fixed_ptr();
         let len = self.buf.write_len_u32();
         let index = self.buf.kernel_index();
         Ok(opcode::WriteFixed::new(self.fd.fd(), ptr, len, index)
-            .offset(self.offset)
+            .offset(offset)
             .build())
     }
 
@@ -844,6 +884,7 @@ where
 
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
+        let offset = checked_file_offset(this.offset)?;
         this.iovecs.clear();
         this.iovecs.reserve(this.bufs.len());
         for buf in &mut this.bufs {
@@ -856,7 +897,7 @@ where
         let ptr = this.iovecs.as_ptr();
         let len = this.iovecs.len() as u32;
         Ok(opcode::Readv::new(this.fd.fd(), ptr, len)
-            .offset(this.offset)
+            .offset(offset)
             .build())
     }
 
@@ -934,6 +975,7 @@ where
 
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
+        let offset = checked_file_offset(this.offset)?;
         this.iovecs.clear();
         this.iovecs.reserve(this.bufs.len());
         for buf in &this.bufs {
@@ -946,7 +988,7 @@ where
         let ptr = this.iovecs.as_ptr();
         let len = this.iovecs.len() as u32;
         Ok(opcode::Writev::new(this.fd.fd(), ptr, len)
-            .offset(this.offset)
+            .offset(offset)
             .build())
     }
 
@@ -1376,6 +1418,20 @@ impl Singleshot for TeeOp {
 
     fn complete(self, result: CQEResult) -> Self::Output {
         result.result.map(|n| n as usize)
+    }
+}
+
+/// Validate an absolute file offset before it is placed in an SQE.
+///
+/// The kernel interprets the SQE offset as `loff_t`, and `-1` (`u64::MAX`)
+/// means "use and advance the file cursor". Reject every offset above
+/// `i64::MAX` so a positional operation can never silently fall back to the
+/// cursor.
+fn checked_file_offset(offset: u64) -> io::Result<u64> {
+    if i64::try_from(offset).is_ok() {
+        Ok(offset)
+    } else {
+        Err(io::Error::from_raw_os_error(libc::EINVAL))
     }
 }
 
