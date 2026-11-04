@@ -327,7 +327,7 @@ fn echo() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
-fn recv_ring_stream_socket_reports_peer() -> Result<(), Box<dyn std::error::Error>> {
+fn recv_ring_receives_payload_from_connected_peer() -> Result<(), Box<dyn std::error::Error>> {
     util::with_test_env(|| async {
         let listener = TcpListener::bind("127.0.0.1:0".parse()?, 32).await?;
         let addr = listener.local_addr()?;
@@ -341,9 +341,9 @@ fn recv_ring_stream_socket_reports_peer() -> Result<(), Box<dyn std::error::Erro
         let (send_res, payload) = client.send(payload).await;
         assert_eq!(send_res?, payload.len());
 
-        let (buf, recv_peer) = server.recv_ring(&ring).await?;
+        let buf = server.recv_ring(&ring).await?;
         assert_eq!(&buf[..payload.len()], payload.as_slice());
-        assert_eq!(recv_peer, peer_addr);
+        assert_eq!(server.peer_addr()?, peer_addr);
 
         server.close().await?;
         client.close().await?;
@@ -359,7 +359,7 @@ fn recv_ring_buf_can_be_echoed_directly() -> Result<(), Box<dyn std::error::Erro
         let payload = b"direct-tcp-echo".to_vec();
 
         client.send(payload.clone()).await.0?;
-        let (buf, _) = server.recv_ring(&ring).await?;
+        let buf = server.recv_ring(&ring).await?;
         assert_eq!(buf.as_slice(), payload.as_slice());
 
         let (send_result, buf) = server.send(buf).await;
@@ -384,11 +384,53 @@ fn recv_ring_reports_orderly_peer_close_as_empty_buffer() -> Result<(), Box<dyn 
         let ring = RecvBufRing::builder(14).buf_cnt(1).buf_len(1024).build()?;
         client.close().await?;
 
-        let (buf, _) = server.recv_ring(&ring).await?;
+        let buf = server.recv_ring(&ring).await?;
         assert!(buf.is_empty(), "EOF should yield an empty buffer");
 
         drop(buf);
         server.close().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn recv_ring_returns_data_queued_before_peer_reset() -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write;
+
+    util::with_test_env(|| async {
+        let listener = TcpListener::bind("127.0.0.1:0".parse()?, 8).await?;
+        let mut peer = std::net::TcpStream::connect(listener.local_addr()?)?;
+        let (server, _) = listener.accept().await?;
+        let ring = RecvBufRing::builder(15).buf_cnt(2).buf_len(1024).build()?;
+
+        peer.write_all(b"final words")?;
+        socket2::SockRef::from(&peer).set_linger(Some(std::time::Duration::ZERO))?;
+        drop(peer);
+        // Let loopback deliver both the payload and the RST.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let buf = server.recv_ring(&ring).await?;
+        assert_eq!(&buf[..], b"final words");
+        Ok(())
+    })
+}
+
+#[test]
+fn recv_ring_reports_eof_after_both_sides_shut_down() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let listener = TcpListener::bind("127.0.0.1:0".parse()?, 8).await?;
+        let peer = std::net::TcpStream::connect(listener.local_addr()?)?;
+        let (server, _) = listener.accept().await?;
+        let ring = RecvBufRing::builder(16).buf_cnt(2).buf_len(1024).build()?;
+
+        peer.shutdown(std::net::Shutdown::Write)?;
+        server.shutdown(std::net::Shutdown::Write).await?;
+        // Let the final ACK move the server socket from LAST_ACK to CLOSE.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let buf = server.recv_ring(&ring).await?;
+        assert!(buf.is_empty(), "EOF should yield an empty buffer");
+        drop(peer);
         Ok(())
     })
 }
@@ -449,7 +491,7 @@ fn recv_ring_buf_can_be_echoed_with_send_zc() -> Result<(), Box<dyn std::error::
 
         let payload = b"direct-tcp-zc-echo".to_vec();
         client.send(payload.clone()).await.0?;
-        let (buf, _) = server.recv_ring(&ring).await?;
+        let buf = server.recv_ring(&ring).await?;
 
         let (send_result, buf) = server.send_zc(buf).await;
         let sent = match send_result {

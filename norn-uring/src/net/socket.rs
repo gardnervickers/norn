@@ -377,6 +377,12 @@ impl Socket {
         self.fd.submit(op)
     }
 
+    pub(crate) fn recv_ring(&self, ring: &RecvBufRing) -> Op<RecvRing> {
+        self.assert_bufring_driver(ring);
+        let op = RecvRing::new(self.fd.lease(), ring.clone());
+        self.fd.submit(op)
+    }
+
     pub(crate) fn recv_from_ring_multi(&self, ring: &RecvBufRing) -> Op<RecvFromRingMulti> {
         self.assert_bufring_driver(ring);
         let op = RecvFromRingMulti::new(self.fd.lease(), ring.clone());
@@ -1024,6 +1030,54 @@ impl Singleshot for RecvFromRing {
         unsafe { this.addr.set_length(msg_namelen) };
         let addr = as_socket_addr_or_peer(&this.fd, &this.addr, msg_namelen)?;
         Ok((buf, addr))
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct RecvRing {
+    fd: NornFd,
+    ring: RecvBufRing,
+}
+
+impl RecvRing {
+    pub(crate) fn new(fd: NornFd, ring: RecvBufRing) -> Self {
+        Self { fd, ring }
+    }
+}
+
+// Safety: `NornFd` and `RecvBufRing` retain the socket and registered buffer
+// group; `reap` converts every selected buffer into an owned completion before
+// waking application code.
+unsafe impl Operation for RecvRing {
+    type Completion = io::Result<BufRingBuf>;
+
+    fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+        self.ring.ensure_accepting_receives()?;
+        // A zero length lets the kernel use the selected buffer's full length.
+        Ok(opcode::Recv::new(self.fd.fd(), std::ptr::null_mut(), 0)
+            .buf_group(self.ring.bgid())
+            .build()
+            .flags(Flags::BUFFER_SELECT))
+    }
+
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+        let (result, flags) = result.into_parts();
+        result.and_then(|n| {
+            // A stream EOF completes with no buffer id; see `RecvFromRing`.
+            if n == 0 && io_uring::cqueue::buffer_select(flags).is_none() {
+                Ok(BufRingBuf::empty(self.ring.clone()))
+            } else {
+                self.ring.get_buf(n, flags)
+            }
+        })
+    }
+}
+
+impl Singleshot for RecvRing {
+    type Output = io::Result<BufRingBuf>;
+
+    fn complete(self, completion: Self::Completion) -> Self::Output {
+        completion
     }
 }
 

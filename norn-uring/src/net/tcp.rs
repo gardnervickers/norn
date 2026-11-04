@@ -496,7 +496,10 @@ impl TcpSocket {
     ///
     /// A buffer will be taken from the ring when the operation is completed
     /// and returned. If there are no buffers available, the operation will
-    /// fail.
+    /// fail. An orderly end of stream yields an empty buffer.
+    ///
+    /// Use [`TcpSocket::peer_addr`] for the remote address; it cannot be read
+    /// after the connection has been reset or fully closed.
     ///
     /// # Panics
     ///
@@ -504,8 +507,8 @@ impl TcpSocket {
     pub fn recv_ring(
         &self,
         ring: &RecvBufRing,
-    ) -> impl crate::Request<Output = io::Result<(BufRingBuf, SocketAddr)>> {
-        self.socket.recv_from_ring(ring)
+    ) -> impl crate::Request<Output = io::Result<BufRingBuf>> {
+        self.socket.recv_ring(ring)
     }
 
     /// Receive data using a multishot recv operation and a provided buffer ring.
