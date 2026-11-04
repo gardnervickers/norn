@@ -44,15 +44,17 @@ impl Header {
     }
 
     pub(crate) fn notify_join_handle(&self) {
-        let waker = {
-            let w = unsafe { &mut *self.waker.get() };
-            if let Some(waker) = w.take() {
-                waker
-            } else {
-                return;
-            }
-        };
-        waker.wake();
+        if let Some(waker) = self.take_waker() {
+            waker.wake();
+        }
+    }
+
+    /// Remove the registered join waker without invoking it.
+    ///
+    /// The caller decides whether to wake or drop it after the slot borrow
+    /// ends, since both may re-enter the task system.
+    pub(crate) fn take_waker(&self) -> Option<Waker> {
+        unsafe { &mut *self.waker.get() }.take()
     }
 
     pub(crate) fn set_waker(&self, waker: &Waker) {

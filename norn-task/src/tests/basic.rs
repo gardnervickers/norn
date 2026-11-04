@@ -152,3 +152,38 @@ fn run_and_self_abort_and_yield() {
     put_handle_here.borrow_mut().replace(handle);
     spawner.next().unwrap().run();
 }
+
+#[test]
+fn drop_handle_releases_join_waker() {
+    use std::sync::Arc;
+    use std::task::{Context, Wake, Waker};
+
+    #[derive(Default)]
+    struct TrackedWaker(std::sync::atomic::AtomicBool);
+
+    impl Wake for TrackedWaker {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    let _e = TestState::enter();
+    let spawner = super::TestSpawner::new();
+    let mut handle = spawner.spawn(std::future::pending::<()>());
+    let join_waker = Arc::new(TrackedWaker::default());
+    let waker = Waker::from(Arc::clone(&join_waker));
+    assert!(handle
+        .poll_unpin(&mut Context::from_waker(&waker))
+        .is_pending());
+    drop(waker);
+    assert_eq!(Arc::strong_count(&join_waker), 2);
+
+    drop(handle);
+    assert_eq!(
+        Arc::strong_count(&join_waker),
+        1,
+        "dropping the handle of an incomplete task must release its join waker"
+    );
+    spawner.shutdown();
+    assert!(!join_waker.0.load(std::sync::atomic::Ordering::Relaxed));
+}
