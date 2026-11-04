@@ -2448,6 +2448,26 @@ mod tests {
     }
 
     #[test]
+    fn a_dropped_operation_does_not_wake_its_last_waker() {
+        let mut driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let handle = driver.handle();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut read = Box::pin(long_lived_read(&handle, &dropped));
+        let (waker, wakes) = futures_test::task::new_count_waker();
+        assert!(read
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending());
+        driver.park(ParkMode::NoPark).unwrap();
+
+        // Nothing will poll the read again, so its cancellation must not wake
+        // the task that dropped it.
+        drop(read);
+        assert!(park_until(&mut driver, 20, || dropped.load(Ordering::Acquire)));
+        assert_eq!(wakes.get(), 0);
+    }
+
+    #[test]
     fn iopoll_rings_are_rejected() {
         let mut builder = io_uring::IoUring::builder();
         builder.setup_iopoll();

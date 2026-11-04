@@ -313,6 +313,9 @@ pin_project_lite::pin_project! {
             match this.state {
                 State::Submitted { inner } => {
                     if inner.needs_cancel() {
+                        // Nothing will poll this future again, so its later
+                        // completions must not wake the task that dropped it.
+                        drop(inner.inner.inner.header().take_waker());
                         this.reactor.cancel_op(
                             OpTarget {
                                 handle: inner.inner.inner.clone(),
