@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::io;
 use std::mem::ManuallyDrop;
 use std::net::SocketAddr;
@@ -818,10 +819,22 @@ impl tokio::io::AsyncWrite for TcpStreamWriter {
 }
 
 pin_project_lite::pin_project! {
+    /// Readiness-driven nonblocking I/O on one direction of a socket.
+    ///
+    /// The operation is attempted first. Only after it returns `EAGAIN` is a
+    /// singleshot poll armed, and the poll is dropped once it reports
+    /// readiness. At most one readiness notification is therefore pending,
+    /// and the kernel posts no completions while the caller keeps up without
+    /// blocking. A multishot poll would instead post a completion for every
+    /// wait queue wakeup for the life of the socket, queued on the operation
+    /// until an `EAGAIN` consumed them one at a time.
+    ///
+    /// A singleshot poll checks the current readiness mask when it is armed,
+    /// so readiness that arrives between the `EAGAIN` and the arm is not lost.
     struct ReadyStream {
         inner: socket::Socket,
         #[pin]
-        armed: Option<Op<socket::Poll<true>>>,
+        armed: Option<Op<socket::Poll<false>>>,
         notified: bool,
     }
 }
@@ -876,14 +889,14 @@ impl ReadyStream {
                 return Poll::Ready(Ok(()));
             }
             if let Some(armed) = this.armed.as_mut().as_pin_mut() {
-                if let Some(res) = ready!(armed.poll_next(cx)) {
-                    log::trace!(target: LOG, "poll_op.ready.stream_notified");
-                    let _ = res?;
-                    *this.notified = true;
-                } else {
-                    log::trace!(target: LOG, "poll_op.ready.stream_done");
-                    this.armed.set(None);
-                }
+                let res = ready!(armed.poll(cx));
+                // The poll's only completion is terminal, so dropping it
+                // submits no cancellation. After an error the next wait arms
+                // a fresh poll.
+                this.armed.set(None);
+                log::trace!(target: LOG, "poll_op.ready.stream_notified");
+                let _ = res?;
+                *this.notified = true;
             } else {
                 log::trace!(target: LOG, "poll_op.ready.stream_arm");
                 this.armed.set(Some(this.inner.poll_readiness(flags)));
