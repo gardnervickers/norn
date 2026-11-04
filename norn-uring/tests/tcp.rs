@@ -741,3 +741,25 @@ impl EchoServer {
         Ok(())
     }
 }
+
+/// `poll_write_vectored` must accept more than `IOV_MAX` (1024) slices and
+/// write a prefix of them, as `std` does, instead of failing with `EMSGSIZE`.
+#[test]
+fn write_vectored_accepts_more_than_iov_max_slices() -> Result<(), Box<dyn std::error::Error>> {
+    use std::future::poll_fn;
+    use tokio::io::AsyncWrite;
+
+    util::with_test_env(|| async {
+        let listener = TcpListener::bind("127.0.0.1:0".parse()?, 8).await?;
+        let peer = std::net::TcpStream::connect(listener.local_addr()?)?;
+        let (server, _) = listener.accept().await?;
+        let mut stream = pin!(server.into_stream());
+
+        let bytes = vec![7_u8; 2048];
+        let slices: Vec<io::IoSlice<'_>> = bytes.chunks(1).map(io::IoSlice::new).collect();
+        let written = poll_fn(|cx| stream.as_mut().poll_write_vectored(cx, &slices)).await?;
+        assert!(written > 0 && written <= bytes.len());
+        drop(peer);
+        Ok(())
+    })
+}
