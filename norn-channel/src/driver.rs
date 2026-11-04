@@ -315,6 +315,10 @@ where
         self.inner.enter()
     }
 
+    fn enter_for_shutdown(&self) -> Self::Guard {
+        self.inner.enter_for_shutdown()
+    }
+
     fn unparker(&self) -> Self::Unparker {
         self.inner.unparker()
     }

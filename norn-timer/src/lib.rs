@@ -193,6 +193,11 @@ where
         (guard, self.inner.enter())
     }
 
+    fn enter_for_shutdown(&self) -> Self::Guard {
+        let guard = context::Context::enter_for_shutdown(self.handle());
+        (guard, self.inner.enter_for_shutdown())
+    }
+
     fn unparker(&self) -> Self::Unparker {
         self.inner.unparker()
     }

@@ -230,7 +230,13 @@ where
 
 impl<P: park::Park> Drop for LocalExecutor<P> {
     fn drop(&mut self) {
-        let _g = self.enter();
+        // Task destructors may need this executor's context, but `Drop` can
+        // run inside another executor or after thread-local storage is gone.
+        // Install this context temporarily instead of asserting it is empty.
+        let _g = (
+            self.park.enter_for_shutdown(),
+            context::Context::enter_for_shutdown(self.handle()),
+        );
         self.taskqueue.shutdown();
         self.park.shutdown();
     }

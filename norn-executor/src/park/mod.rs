@@ -81,6 +81,23 @@ pub trait Park {
     /// to handle requests.
     fn enter(&self) -> Self::Guard;
 
+    /// Get a [`Park::Guard`] for tearing down this [`Park`] instance.
+    ///
+    /// [`LocalExecutor`] calls this from its `Drop`, before shutting down its
+    /// tasks and calling [`Park::shutdown`]. An executor can be dropped while
+    /// another runtime's context is installed on the thread, or during thread
+    /// exit after thread-local storage has been destroyed, so implementations
+    /// should neither panic in those cases nor require an empty context. A
+    /// context that was already installed should be restored when the guard
+    /// drops.
+    ///
+    /// The default implementation calls [`Park::enter`].
+    ///
+    /// [`LocalExecutor`]: crate::LocalExecutor
+    fn enter_for_shutdown(&self) -> Self::Guard {
+        self.enter()
+    }
+
     /// Returns an unparker associated with this [`Park`] instance.
     fn unparker(&self) -> Self::Unparker;
 

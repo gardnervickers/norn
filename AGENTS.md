@@ -46,7 +46,9 @@ The project is intentionally not general-purpose today; APIs are still in flux i
   3. `park(mode)`.
 - `Handle::current()` comes from TLS context and panics outside executor context.
 - `try_block_on` propagates park errors; `block_on` panics on them.
-- `Drop` enters context, shuts down `TaskQueue`, then calls `Park::shutdown`.
+- `Drop` installs its context via `Park::enter_for_shutdown` (restoring any
+  existing context; tolerating destroyed TLS), shuts down `TaskQueue`, then
+  calls `Park::shutdown`.
 
 ### `norn-timer` model
 

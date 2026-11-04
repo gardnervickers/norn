@@ -941,6 +941,10 @@ impl Park for Driver {
         context::DriverContext::enter(self.handle())
     }
 
+    fn enter_for_shutdown(&self) -> Self::Guard {
+        context::DriverContext::enter_for_shutdown(self.handle())
+    }
+
     fn unparker(&self) -> Self::Unparker {
         Arc::clone(&self.unparker)
     }
