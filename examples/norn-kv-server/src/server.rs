@@ -189,6 +189,19 @@ impl ServerConfig {
     }
 }
 
+/// Build the provided-buffer ring that every multishot connection on a worker
+/// shares.
+///
+/// A connection whose task stops polling its receive stream keeps consuming
+/// buffers from this ring; see the `Limitations` section of the
+/// `norn-kv-bench` README.
+pub(crate) fn recv_ring(buffers: u16) -> io::Result<RecvBufRing> {
+    RecvBufRing::builder(1)
+        .buf_cnt(buffers)
+        .buf_len(RECV_BUFFER_LEN)
+        .build()
+}
+
 /// Accept connections and serve requests until the listener fails or closes.
 ///
 /// # Errors
@@ -204,12 +217,7 @@ pub async fn serve(
     let active = Rc::new(Cell::new(0_usize));
     let recv_ring = match config.recv_mode {
         RecvMode::Exact => None,
-        RecvMode::Multishot => Some(
-            RecvBufRing::builder(1)
-                .buf_cnt(RECV_RING_BUFFERS)
-                .buf_len(RECV_BUFFER_LEN)
-                .build()?,
-        ),
+        RecvMode::Multishot => Some(recv_ring(RECV_RING_BUFFERS)?),
     };
     let mut incoming = pin!(listener.incoming());
     while let Some(next) = incoming.next().await {
@@ -1019,6 +1027,19 @@ mod tests {
         let mut body = vec![0_u8; body_len];
         stream.read_exact(&mut body).unwrap();
         (header, body)
+    }
+
+    #[test]
+    #[ignore = "a non-reading peer stalls every connection on its worker until norn-uring bounds the buffers one receive may hold"]
+    fn non_reading_peer_does_not_stall_other_connections() {
+        crate::slow_peer::hog_does_not_stall_other_connections(|_, socket, ring| {
+            serve_connection_multishot(
+                socket,
+                MemoryHandler::fixed_response(crate::slow_peer::HOG_RESPONSE_BYTES),
+                ServerConfig::default(),
+                ring,
+            )
+        });
     }
 
     #[test]

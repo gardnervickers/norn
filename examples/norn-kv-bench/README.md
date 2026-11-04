@@ -289,12 +289,27 @@ counters.
   requests in flight and the server amortizes each wakeup over large
   batches: `mixed-1w` capacity is about 600k requests/s but its knee is
   about 300k; `mixed-4w` capacity is about 1.06M, with the CPUs about 94%
-  busy at 680k. Its top rate is set lower (560k) so that a slower, shared
-  host does not reach the sharded server's `ENOBUFS` reset (below). On another host, find the knee with a few trial rates
-  (watch `core` and p50), then freeze the rates in a copied profile.
-- An open-loop rate above the knee drives the server into overload. The
-  sharded server currently resets connections when multishot receive
-  exhausts its provided-buffer ring (`ENOBUFS`), which makes the run invalid.
+  busy at 680k. Its top rate is set lower (560k). That margin was chosen
+  when exhausting the receive buffer ring reset connections and invalidated
+  the run; exhaustion now stalls instead (below), so the margin only keeps a
+  slower, shared host below the knee. On another host, find the knee with a
+  few trial rates (watch `core` and p50), then freeze the rates in a copied
+  profile.
+- An open-loop rate above the knee drives the server into overload. Each
+  worker's connections share one ring of 8192 receive buffers of 8 KiB. A
+  connection whose task stops polling its multishot receive keeps taking a
+  whole buffer for every arriving segment: in the sharded server while it
+  waits for a pair credit, has 32 replies in flight, or blocks in a send; in
+  the single-worker server while it blocks in a send. When the ring runs out,
+  norn-uring no longer resets connections (`ENOBUFS`); every receive on that
+  worker waits for a buffer return instead. Overload runs therefore stay
+  valid, but their latency includes these stalls.
+- A client that pipelines requests and never reads the responses stalls
+  every connection on its worker indefinitely: its connection's send blocks,
+  its unpolled receive takes the whole ring, and no buffer returns until the
+  client closes. The bench client always reads, so it never does this. The
+  ignored `non_reading_peer_does_not_stall_*` tests in `norn-kv-server`
+  reproduce it.
 
 ## Tests
 

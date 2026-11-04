@@ -522,10 +522,7 @@ async fn worker_main(
                 )
             })?;
     let address = listener.local_addr()?;
-    let recv_ring = RecvBufRing::builder(1)
-        .buf_cnt(RECV_RING_BUFFERS)
-        .buf_len(RECV_BUFFER_LEN)
-        .build()?;
+    let recv_ring = crate::server::recv_ring(RECV_RING_BUFFERS)?;
     startup.ready(address);
 
     match control_rx.recv().await {
@@ -2872,6 +2869,29 @@ mod tests {
             server.shutdown()?;
         }
         Ok(())
+    }
+
+    #[test]
+    #[ignore = "a non-reading peer stalls every connection on its worker until norn-uring bounds the buffers one receive may hold"]
+    fn non_reading_peer_does_not_stall_other_sharded_connections() {
+        crate::slow_peer::hog_does_not_stall_other_connections(
+            |connection, socket, ring| async move {
+                // One worker keeps every key local: the hog stops polling only
+                // because its sends block.
+                let (router, _requests, _fatal, _driver) = router_fixture(1);
+                serve_sharded_connection(
+                    socket,
+                    0,
+                    1,
+                    connection,
+                    MemoryHandler::fixed_response(crate::slow_peer::HOG_RESPONSE_BYTES),
+                    router,
+                    ring,
+                    ServerConfig::default(),
+                )
+                .await
+            },
+        );
     }
 
     #[test]
