@@ -1,6 +1,7 @@
 use std::cell::{Cell, UnsafeCell};
 use std::collections::VecDeque;
 use std::future::Future;
+use std::panic::{self, AssertUnwindSafe};
 use std::rc::Rc;
 
 use crate::{JoinHandle, Runnable, Schedule, TaskSet};
@@ -139,8 +140,13 @@ impl Schedule for Rc<Shared> {
 impl Shared {
     /// Shutdown all tasks and release their queued runnable references.
     fn shutdown(&self) {
-        self.taskset.shutdown();
+        // Queued runnables reference this queue through their scheduler. Clear
+        // them even if a join waker panics, or the cycle leaks every task.
+        let result = panic::catch_unwind(AssertUnwindSafe(|| self.taskset.shutdown()));
         self.clear_runqueue();
+        if let Err(payload) = result {
+            panic::resume_unwind(payload);
+        }
     }
 
     /// Push a runnable into the queue.

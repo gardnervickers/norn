@@ -1,6 +1,7 @@
 use std::cell::UnsafeCell;
 use std::future::Future;
 use std::marker::PhantomData;
+use std::panic::{self, AssertUnwindSafe};
 
 use crate::header::Header;
 use crate::{JoinHandle, RegisteredTask, Runnable, Schedule};
@@ -55,6 +56,7 @@ impl TaskSet {
     /// even if a runnable or waker still references its task allocation. A
     /// completed output remains owned by its [`JoinHandle`]; dropping the handle
     /// destroys that output immediately, even if task wakers still exist.
+    /// This holds even if a join waker panics during shutdown.
     pub unsafe fn bind<T, S>(
         &self,
         future: T,
@@ -82,18 +84,31 @@ impl TaskSet {
     /// Shutdown all tasks in the [`TaskSet`].
     ///
     /// This will prevent any new tasks from being added to the [`TaskSet`].
+    ///
+    /// # Panics
+    /// If a join waker panics, every remaining task is still shut down before
+    /// the first panic is propagated.
     pub fn shutdown(&self) {
         // Safety: `TaskSet` is `!Send` and only accessed from one thread. Each
         // mutable borrow ends before a task is cancelled or dropped, since both
         // operations may run arbitrary user destructors and re-enter this set.
         unsafe { (*self.inner.get()).closed = true };
 
+        // Waking a join handle runs user code, which may panic. Keep going so
+        // no incomplete future outlives the set, since callers of `bind` may
+        // free borrowed data as soon as shutdown returns.
+        let mut first_panic = None;
         loop {
             let task = unsafe { (*self.inner.get()).list.pop_front() };
             let Some(task) = task else {
                 break;
             };
-            task.shutdown();
+            if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| task.shutdown())) {
+                first_panic.get_or_insert(payload);
+            }
+        }
+        if let Some(payload) = first_panic {
+            panic::resume_unwind(payload);
         }
     }
 
