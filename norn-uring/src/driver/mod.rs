@@ -167,6 +167,8 @@ struct Shared {
     /// Each target retains its operation's identity until the cancellation is
     /// queued. Parks retry these after draining completions.
     deferred_cancels: RefCell<VecDeque<OpTarget>>,
+    /// Set once shutdown has requested cancellation of every outstanding request.
+    cancel_all_requested: Cell<bool>,
     submit_error: RefCell<Option<(io::ErrorKind, String)>>,
     shutdown_outcome: Cell<Option<ShutdownOutcome>>,
     #[cfg(test)]
@@ -519,6 +521,11 @@ impl Handle {
         self.shared.close_fd(fd)
     }
 
+    /// Whether shutdown may have cancelled any submitted request.
+    pub(crate) fn cancel_all_requested(&self) -> bool {
+        self.shared.cancel_all_requested.get()
+    }
+
     pub(crate) fn reserve_fixed_buffers(
         &self,
     ) -> Result<FixedBufReservation, ReserveFixedBufError> {
@@ -654,6 +661,7 @@ impl Driver {
                 receive_shutdown: Notify::default(),
                 status: Cell::new(Status::Running),
                 deferred_cancels: RefCell::new(VecDeque::new()),
+                cancel_all_requested: Cell::new(false),
                 submit_error: RefCell::new(None),
                 shutdown_outcome: Cell::new(None),
                 #[cfg(test)]
@@ -1501,6 +1509,7 @@ impl Shared {
 
     /// Cancel all outstanding requests synchronously.
     pub(crate) fn cancel_all(&self) -> io::Result<()> {
+        self.cancel_all_requested.set(true);
         #[cfg(test)]
         {
             self.shutdown_test
