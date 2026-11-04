@@ -81,7 +81,7 @@ impl Default for ShardedServerConfig {
     fn default() -> Self {
         Self {
             listen: "127.0.0.1:11211".parse().unwrap(),
-            backlog: 1_024,
+            backlog: 4_096,
             ring_entries: 256,
             workers: 2,
             worker_cpus: Vec::new(),
