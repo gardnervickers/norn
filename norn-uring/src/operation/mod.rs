@@ -15,7 +15,7 @@ pub(crate) use raw::{OperationId, RawOpRef};
 use io_uring::squeue::Flags;
 use smallvec::SmallVec;
 
-use crate::driver::{PushFuture, TryPush};
+use crate::driver::{CancelRetry, PushFuture, TryPush};
 use crate::error::SubmitError;
 
 /// Low-level request customization for advanced `io_uring` users.
@@ -208,6 +208,7 @@ impl std::fmt::Debug for OpTarget {
 /// cancellation can still reach the kernel.
 pub(crate) struct AsyncCancel {
     target: OpTarget,
+    retry: Option<CancelRetry>,
 }
 
 impl AsyncCancel {
@@ -215,8 +216,8 @@ impl AsyncCancel {
     ///
     /// The entry carries the only reference to the cancellation request.
     /// Dropping the entry without pushing it releases the request.
-    pub(crate) fn entry(target: OpTarget) -> ConfiguredEntry {
-        let handle = TypedHandle::new(Self { target });
+    pub(crate) fn entry(target: OpTarget, retry: Option<CancelRetry>) -> ConfiguredEntry {
+        let handle = TypedHandle::new(Self { target, retry });
         let entry = handle
             .data_mut()
             .expect("new cancellation missing data")
@@ -236,7 +237,24 @@ unsafe impl Operation for AsyncCancel {
         Ok(io_uring::opcode::AsyncCancel2::new(criteria).build())
     }
 
-    unsafe fn reap(&mut self, _result: CQEResult) -> Self::Completion {}
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+        // For a linked request, ENOENT while the target is still incomplete
+        // can mean the kernel has not issued it yet: its predecessor completed
+        // but the task work that issues it had not run. Schedule the one
+        // allowed retry. ENOENT can also mean the target is issued but not
+        // cancellable, which is why the retry is bounded. Other results end
+        // the attempt: success and EALREADY mean the kernel found the target.
+        let Some(retry) = self.retry.take() else {
+            return;
+        };
+        let not_found = matches!(
+            result.into_result(),
+            Err(err) if err.raw_os_error() == Some(libc::ENOENT)
+        );
+        if not_found && !self.target.is_complete() {
+            retry.schedule(self.target.clone());
+        }
+    }
 }
 
 pin_project_lite::pin_project! {
@@ -250,6 +268,9 @@ pin_project_lite::pin_project! {
         submit: Option<PushFuture>,
         state: State<T>,
         reactor: crate::Handle,
+        // The request linked immediately before this one, when it was
+        // submitted as a later member of a linked batch.
+        predecessor: Option<OpTarget>,
     }
 
     impl<T> PinnedDrop for Op<T> where T: 'static {
@@ -258,9 +279,12 @@ pin_project_lite::pin_project! {
             match this.state {
                 State::Submitted { inner } => {
                     if inner.needs_cancel() {
-                        this.reactor.cancel_op(OpTarget {
-                            handle: inner.inner.inner.clone(),
-                        });
+                        this.reactor.cancel_op(
+                            OpTarget {
+                                handle: inner.inner.inner.clone(),
+                            },
+                            this.predecessor.take(),
+                        );
                     }
                 }
                 State::Prepared { .. } | State::Waiting { .. } | State::Done => {}
@@ -384,6 +408,7 @@ where
                 handle: TypedHandle::new(data),
             },
             reactor,
+            predecessor: None,
         }
     }
 
@@ -411,7 +436,15 @@ where
         batch: &mut SmallVec<[ConfiguredEntry; 4]>,
     ) -> bool {
         let this = self.as_mut().project();
-        this.state.prepare_batch(batch)
+        let predecessor = batch.last().map(|entry| OpTarget {
+            handle: entry.handle.clone(),
+        });
+        let len = batch.len();
+        let can_continue = this.state.prepare_batch(batch);
+        if batch.len() > len {
+            *this.predecessor = predecessor;
+        }
+        can_continue
     }
 
     pub(crate) fn cancel_unsubmitted(mut self: Pin<&mut Self>) {
@@ -600,9 +633,9 @@ pub(crate) unsafe fn reap_operation(entry: &io_uring::cqueue::Entry) {
 ///
 /// A link joins an entry to the next SQE in the shared queue, which may belong
 /// to another task; the driver sets `IO_LINK` itself for requests submitted
-/// together. A request that skips its success CQE never releases its operation,
-/// and once one is submitted the kernel rejects every later `IO_DRAIN` entry,
-/// including the barriers that driver shutdown waits on.
+/// together. A request that skips its success CQE never releases its operation
+/// or leaves the in-flight count that driver shutdown drains to zero, and once
+/// one is submitted the kernel rejects every later `IO_DRAIN` entry.
 const RESERVED_SQE_FLAGS: Flags = Flags::IO_LINK
     .union(Flags::IO_HARDLINK)
     .union(Flags::SKIP_SUCCESS);
