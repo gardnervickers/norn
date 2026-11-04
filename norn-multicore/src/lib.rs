@@ -941,7 +941,6 @@ impl RuntimeGroup {
     /// whose receiver the caller polls, or for the caller to drain shared
     /// credits, the two deadlock. Call it from outside the group, or only
     /// once no other worker depends on the calling worker making progress.
-    /// Dropping the group joins the other workers the same way.
     pub fn join(mut self) -> Result<(), JoinError> {
         let failures = collect_worker_failures(self.take_other_workers());
         if failures.is_empty() {
@@ -960,7 +959,9 @@ impl RuntimeGroup {
     ///
     /// Waiting blocks the calling thread, as [`join`](Self::join) does. On a
     /// worker this deadlocks if another worker's shutdown path waits on the
-    /// calling worker, for example to drain a channel it receives from.
+    /// calling worker, for example for the calling worker to drain a channel
+    /// that the other worker sends on. Dropping the group requests shutdown
+    /// and then blocks the same way.
     pub fn shutdown(self) -> Result<(), JoinError> {
         self.request_shutdown();
         self.join()
