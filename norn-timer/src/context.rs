@@ -22,7 +22,10 @@ impl Context {
             // Safety: This context is thread-local and only accessed on the
             // current thread.
             let old = unsafe { &mut *current.handle.get() };
-            assert!(old.is_none(), "executor already set");
+            assert!(
+                old.is_none(),
+                "a timer driver is already entered on this thread; drivers cannot be nested"
+            );
             *old = Some(handle);
         });
         ContextGuard {

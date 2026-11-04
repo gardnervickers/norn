@@ -44,6 +44,10 @@ pub trait Request: Future + Sized + private::Chainable {
     /// If an operation fails during configuration, earlier configured operations are still
     /// submitted, while that operation reports its configuration error and later linked
     /// operations complete with `ECANCELED` without reaching the kernel.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `self` and `next` target different drivers.
     fn then<R>(self, next: R) -> Then<Self, R>
     where
         R: Request,
@@ -55,6 +59,10 @@ pub trait Request: Future + Sized + private::Chainable {
     ///
     /// Configuration failures short-circuit later linked operations in the same way as
     /// [`Request::then`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `self` and `next` target different drivers.
     fn then_aux<R>(self, next: R) -> ThenAux<Self, R>
     where
         R: Request,

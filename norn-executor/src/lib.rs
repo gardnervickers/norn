@@ -125,7 +125,11 @@ impl<P: park::Park> LocalExecutor<P> {
     /// and drive the [`park::Park`] instance.
     ///
     /// ### Panics
-    /// Panics if [`park::Park::park`] returns an error.
+    /// Panics if [`park::Park::park`] returns an error, or if an executor is
+    /// already running on this thread: `block_on` and [`try_block_on`] cannot
+    /// be nested, including from inside a spawned task.
+    ///
+    /// [`try_block_on`]: LocalExecutor::try_block_on
     pub fn block_on<F>(&mut self, fut: F) -> F::Output
     where
         F: Future,
@@ -145,6 +149,11 @@ impl<P: park::Park> LocalExecutor<P> {
     ///
     /// Returns an error when the underlying [`park::Park::park`] operation
     /// fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics, instead of returning an error, if an executor is already running
+    /// on this thread: like [`LocalExecutor::block_on`], it cannot be nested.
     pub fn try_block_on<F>(&mut self, fut: F) -> Result<F::Output, std::io::Error>
     where
         F: Future,
@@ -210,6 +219,15 @@ impl Handle {
     /// Spawn a [`Future`] onto the [`LocalExecutor`].
     ///
     /// The spawned future will run on the thread driving the [`LocalExecutor`].
+    ///
+    /// # Aborts
+    ///
+    /// The task belongs to the thread that runs it. Cloning, waking or dropping
+    /// its waker from any other thread aborts the process (after printing a
+    /// message), so a future must not hand its waker to another thread or to
+    /// something completed there, such as a `std::thread` or a cross-thread
+    /// channel. The process also aborts, instead of unwinding, if dropping the
+    /// future or its output panics, or if the task's reference count overflows.
     pub fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
     where
         F: Future + 'static,
@@ -221,6 +239,22 @@ impl Handle {
 /// Spawn a [`Future`] onto the [`LocalExecutor`].
 ///
 /// The spawned future will run on the thread driving the [`LocalExecutor`].
+///
+/// # Panics
+///
+/// Panics if called outside a [`LocalExecutor`] context, for example from
+/// another thread or from a plain function that no executor is driving. That
+/// includes a destructor that runs at thread exit, after the thread's executor
+/// context has been destroyed.
+///
+/// # Aborts
+///
+/// The task belongs to the thread that runs it. Cloning, waking or dropping
+/// its waker from any other thread aborts the process (after printing a
+/// message), so a future must not hand its waker to another thread or to
+/// something completed there, such as a `std::thread` or a cross-thread
+/// channel. The process also aborts, instead of unwinding, if dropping the
+/// future or its output panics, or if the task's reference count overflows.
 pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
 where
     F: Future + 'static,

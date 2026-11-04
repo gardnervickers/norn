@@ -366,6 +366,14 @@ where
         let tid = ptr.as_ref().thread;
         let caller_thread = Self::current_thread_id();
         if tid != caller_thread {
+            // Unwinding from a waker vtable function is not an option, but a
+            // bare abort gives no hint what went wrong. Ignore write errors:
+            // there is nothing left to do with them.
+            let _ = std::io::Write::write_all(
+                &mut std::io::stderr(),
+                b"norn-task: a task waker was cloned, woken or dropped on a different \
+                  thread than the one that owns the task; aborting\n",
+            );
             std::process::abort();
         }
     }

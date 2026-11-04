@@ -22,7 +22,10 @@ impl DriverContext {
     pub(crate) fn enter(handle: Handle) -> DriverContextGuard {
         CURRENT.with(|current| {
             let mut old = current.handle.borrow_mut();
-            assert!(old.is_none(), "driver already set");
+            assert!(
+                old.is_none(),
+                "an io_uring driver is already entered on this thread; drivers cannot be nested"
+            );
             *old = Some(handle);
         });
         DriverContextGuard {

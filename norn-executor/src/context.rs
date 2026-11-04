@@ -22,7 +22,10 @@ impl Context {
             // Safety: This context is thread-local and only accessed on the
             // current thread.
             let old = unsafe { &mut *current.handle.get() };
-            assert!(old.is_none(), "executor already set");
+            assert!(
+                old.is_none(),
+                "an executor is already running on this thread; `block_on` cannot be nested"
+            );
             *old = Some(handle);
         });
         ContextGuard {

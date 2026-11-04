@@ -75,8 +75,9 @@ where
     /// the cancellation result has been stored.
     ///
     /// # Panic
-    /// If the future has not been polled to completion, or if it has been destroyed,
-    /// this method will panic.
+    /// If the future has not been polled to completion, or if the output was
+    /// already taken (a [`JoinHandle`](crate::JoinHandle) polled again after it
+    /// returned `Ready`), this method will panic.
     pub(crate) fn take_output(&self) -> Option<Result<F::Output, TaskError>> {
         // Safety: task state permits output access only after polling has
         // finished, and the single-thread task contract excludes concurrency.
@@ -84,7 +85,10 @@ where
         match this.state {
             State::FutureResult => {}
             State::Dropping => return None,
-            State::Future | State::Empty => panic!("future not polled to completion"),
+            State::Future => panic!("task output requested before the task completed"),
+            State::Empty => panic!(
+                "task output already taken: a JoinHandle was polled again after returning Ready"
+            ),
         }
         this.state = State::Empty;
         Some(unsafe { ManuallyDrop::take(&mut this.storage.output) })
