@@ -9,7 +9,7 @@ use std::{io, mem};
 
 use io_uring::squeue::{Flags, PushError};
 use io_uring::types::{self, CancelBuilder, SubmitArgs, Timespec};
-use io_uring::{cqueue, opcode, EnterFlags, IoUring, Submitter};
+use io_uring::{cqueue, opcode, IoUring, Submitter};
 use log::{debug, trace, warn};
 use norn_executor::park::{Park, ParkMode};
 use smallvec::SmallVec;
@@ -1056,7 +1056,7 @@ impl Driver {
                     // Issue linked dependents whose heads have already completed, so
                     // the synchronous cancel can find them. Under DEFER_TASKRUN only a
                     // GETEVENTS enter runs that task work.
-                    self.shared.run_task_work();
+                    self.shared.run_all_task_work();
 
                     if let Err(err) = self.shared.cancel_all() {
                         if Self::sync_cancel_unsupported(&err) {
@@ -1716,29 +1716,17 @@ impl Shared {
         Ok(())
     }
 
-    /// Run deferred task work without waiting for a completion.
+    /// Run deferred task work until the kernel reports none left.
     ///
     /// The kernel issues a linked dependent from task work once its head
-    /// completes. Under `DEFER_TASKRUN` that work runs only in an enter with
-    /// `GETEVENTS`; the completions it posts are reaped by later drains.
-    fn run_task_work(&self) {
-        // An enter that waits for nothing runs a bounded batch of deferred work
-        // (20 items in 6.18). With `IORING_SETUP_TASKRUN_FLAG` the kernel reports
-        // what remains through `IORING_SQ_TASKRUN`; without it this runs once,
-        // and the bounded re-cancel while draining covers what is left.
+    /// completes, and an enter that waits for nothing runs a bounded batch of
+    /// that work (20 items in 6.18). Without `IORING_SETUP_TASKRUN_FLAG` one
+    /// enter is taken to have run it all, and the bounded re-cancel while
+    /// draining covers what is left.
+    fn run_all_task_work(&self) {
         const MAX_ENTERS: usize = 64;
-        let mut ring = self.ring.borrow_mut();
         for _ in 0..MAX_ENTERS {
-            // Safety: no extended argument is passed, and no entries are submitted.
-            let result = unsafe {
-                ring.submitter()
-                    .enter::<libc::sigset_t>(0, 0, EnterFlags::GETEVENTS.bits(), None)
-            };
-            if let Err(err) = result {
-                trace!(target: LOG, "shutdown.run_task_work {err:?}");
-                return;
-            }
-            if !ring.submission().taskrun() {
+            if self.run_task_work() {
                 return;
             }
         }
