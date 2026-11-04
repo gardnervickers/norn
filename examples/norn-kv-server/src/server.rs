@@ -1,6 +1,7 @@
 //! Norn TCP server for the in-memory protocol implementation.
 
 use std::cell::Cell;
+use std::future::Future;
 use std::io;
 use std::pin::pin;
 use std::rc::Rc;
@@ -19,6 +20,10 @@ const RECV_RING_BUFFERS: u16 = 8_192;
 const RECV_BUFFER_LEN: usize = 8 * 1024;
 const MAX_READY_RECEIVES_PER_BATCH: usize = 16;
 const ACCEPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
+/// Longest a failed connection keeps discarding input before it is closed.
+const LINGER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+/// Most input a failed connection discards before it is closed.
+const LINGER_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 /// Decide whether an accept failure should stop the listener.
 ///
@@ -47,6 +52,52 @@ pub(crate) async fn recover_from_accept_error(error: io::Error) -> io::Result<()
 pub(crate) async fn close_rejected(socket: TcpSocket) {
     if let Err(error) = socket.close().await {
         eprintln!("closing rejected connection failed: {error}");
+    }
+}
+
+/// Discard a failed connection's input before its socket is dropped.
+///
+/// Closing a socket with unread input makes the kernel send RST instead of
+/// FIN, and the peer then discards replies it has not read yet, including
+/// replies flushed just before the failure. Shutting down the write half
+/// queues FIN behind those replies, and `discard` reads input until the peer
+/// closes, so the caller's close is orderly. Discarding stops after
+/// [`LINGER_TIMEOUT`] or [`LINGER_MAX_BYTES`], and the close may then still
+/// reset the connection.
+pub(crate) async fn lingering_close(socket: &TcpSocket, discard: impl Future<Output = ()>) {
+    if socket.shutdown(std::net::Shutdown::Write).await.is_err() {
+        return;
+    }
+    let timeout = norn_uring::Handle::current().timeout(LINGER_TIMEOUT);
+    futures_util::future::select(pin!(discard), pin!(timeout)).await;
+}
+
+/// Discard multishot input for [`lingering_close`].
+pub(crate) async fn discard_multishot<S>(incoming: &mut S)
+where
+    S: Stream<Item = io::Result<BufRingBuf>> + Unpin,
+{
+    let mut discarded = 0;
+    while discarded < LINGER_MAX_BYTES {
+        match incoming.next().await {
+            Some(Ok(selected)) if !selected.is_empty() => discarded += selected.len(),
+            _ => return,
+        }
+    }
+}
+
+/// Discard input with owned-buffer receives for [`lingering_close`].
+async fn discard_exact(socket: &TcpSocket) {
+    let mut buffer = RecvBuffer::new(RECV_BUFFER_LEN);
+    let mut discarded = 0;
+    while discarded < LINGER_MAX_BYTES {
+        buffer.reset(RECV_BUFFER_LEN);
+        let (result, returned) = socket.recv(buffer).await;
+        buffer = returned;
+        match result {
+            Ok(received) if received != 0 => discarded += received,
+            _ => return,
+        }
     }
 }
 
@@ -218,9 +269,16 @@ async fn serve_connection_multishot(
         if !response.is_empty() {
             response = send_all(&socket, response).await?;
         }
-        if !matches!(outcome, Ok(false)) {
-            drop(incoming);
-            return outcome.map(drop);
+        match outcome {
+            Ok(false) => {}
+            Ok(true) => {
+                drop(incoming);
+                return Ok(());
+            }
+            Err(error) => {
+                lingering_close(&socket, discard_multishot(&mut incoming)).await;
+                return Err(error);
+            }
         }
     }
 }
@@ -385,14 +443,29 @@ async fn serve_connection(
 ) -> io::Result<()> {
     socket.set_nodelay(true).await?;
 
+    match serve_exact_frames(&socket, handler, config).await {
+        Ok(()) => socket.close().await,
+        Err(error) => {
+            lingering_close(&socket, discard_exact(&socket)).await;
+            Err(error)
+        }
+    }
+}
+
+/// Serve frames until the peer closes or sends QUIT.
+async fn serve_exact_frames(
+    socket: &TcpSocket,
+    handler: MemoryHandler,
+    config: ServerConfig,
+) -> io::Result<()> {
     let mut header_buf = RecvBuffer::new(HEADER_LEN);
     let mut body_buf = RecvBuffer::new(config.max_body_len);
     let mut response = Vec::with_capacity(config.max_body_len + HEADER_LEN);
 
     loop {
         header_buf.reset(HEADER_LEN);
-        let Some(returned) = recv_exact(&socket, header_buf).await? else {
-            return socket.close().await;
+        let Some(returned) = recv_exact(socket, header_buf).await? else {
+            return Ok(());
         };
         header_buf = returned;
 
@@ -410,7 +483,7 @@ async fn serve_connection(
 
         body_buf.reset(header.body_len());
         if header.body_len() != 0 {
-            body_buf = recv_exact(&socket, body_buf)
+            body_buf = recv_exact(socket, body_buf)
                 .await?
                 .ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))?;
         }
@@ -424,10 +497,10 @@ async fn serve_connection(
             .map_err(encode_error)?;
 
         if !response.is_empty() {
-            response = send_all(&socket, response).await?;
+            response = send_all(socket, response).await?;
         }
         if action == ConnectionAction::Close {
-            return socket.close().await;
+            return Ok(());
         }
     }
 }

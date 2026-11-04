@@ -34,7 +34,10 @@ use smallvec::SmallVec;
 use crate::codec::{DecodeStatus, DecodedFrame, FrameDecoder, ResponseEncoder};
 use crate::handler::{ConnectionAction, HandlerConfig, MemoryHandler};
 use crate::protocol::{Command, EncodeError, RequestHeader, Status, HEADER_LEN};
-use crate::server::{close_rejected, recover_from_accept_error, RecvMode, ServerConfig};
+use crate::server::{
+    close_rejected, discard_multishot, lingering_close, recover_from_accept_error, RecvMode,
+    ServerConfig,
+};
 
 const INLINE_KEY_LEN: usize = 32;
 const DEFAULT_PAIR_CAPACITY: usize = 1_024;
@@ -964,8 +967,7 @@ async fn serve_sharded_connection(
         }
         if (close_ready || peer_eof || failure.is_some()) && replies.is_empty() {
             if let Some(error) = failure {
-                drop(incoming);
-                drop(socket);
+                lingering_close(&socket, discard_multishot(&mut incoming)).await;
                 return Err(error);
             }
             if peer_eof {
@@ -1020,7 +1022,12 @@ async fn serve_sharded_connection(
                 }
                 peer_eof = true;
             }
-            Event::Receive(Some(Err(error))) => return Err(error),
+            Event::Receive(Some(Err(error))) => {
+                // Like the single-worker server, send the replies of requests
+                // already dispatched before failing the connection.
+                failure = Some(error);
+                stop_dispatch = true;
+            }
             Event::Response(response) => {
                 let response = response?;
                 close_ready |= response.action == ConnectionAction::Close;
