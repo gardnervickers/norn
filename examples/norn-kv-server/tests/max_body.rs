@@ -14,6 +14,9 @@ const HEADER_LEN: usize = 24;
 /// Address-space limit for the server process, far below the 4 GB limit the
 /// tests configure.
 const ADDRESS_SPACE_LIMIT: libc::rlim_t = 1 << 30;
+/// Body bytes streamed for one frame before giving up on the server failing
+/// the connection; more than [`ADDRESS_SPACE_LIMIT`].
+const STREAM_LIMIT: u32 = 3 << 30;
 
 fn noop_request() -> [u8; HEADER_LEN] {
     let mut bytes = [0; HEADER_LEN];
@@ -136,18 +139,27 @@ fn large_limit_serves_connections(mode: &str) {
     assert_noop_round_trips(address);
 
     // A frame declaring a body larger than the address-space limit can only
-    // fail its own connection.
+    // fail its own connection. Exact mode sizes the body buffer from the
+    // header and fails at once; multishot modes buffer what arrives, so
+    // stream the body until the server gives up on the connection.
     {
         let mut stream = TcpStream::connect(address).unwrap();
-        stream.write_all(&set_header(3_900_000_000)).unwrap();
-        stream.write_all(&[0; 64 * 1024]).unwrap();
-        // Exact mode sizes the body buffer from the header and fails the
-        // connection; multishot modes buffer only what arrives and keep
-        // waiting.
         stream
-            .set_read_timeout(Some(Duration::from_secs(1)))
+            .set_write_timeout(Some(Duration::from_secs(30)))
             .unwrap();
-        let _ = stream.read(&mut [0; 1]);
+        stream.write_all(&set_header(3_900_000_000)).unwrap();
+        let chunk = vec![0; 1024 * 1024];
+        let mut streamed = 0_u64;
+        while streamed < u64::from(STREAM_LIMIT) {
+            if stream.write_all(&chunk).is_err() {
+                break;
+            }
+            streamed += chunk.len() as u64;
+        }
+        assert!(
+            streamed < u64::from(STREAM_LIMIT),
+            "server buffered {streamed} bytes of one frame without failing"
+        );
     }
     assert_noop_round_trips(address);
 

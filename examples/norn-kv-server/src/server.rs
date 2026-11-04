@@ -366,15 +366,35 @@ fn process_selected_buffer(
         let outcome =
             process_available_frames(handler, config, selected.as_slice(), response, commands)?;
         if outcome.consumed != selected.len() {
+            grow_pending(pending, selected.len() - outcome.consumed)?;
             pending.extend_from_slice(&selected[outcome.consumed..]);
         }
         outcome.close
     } else {
+        grow_pending(pending, selected.len())?;
         pending.extend_from_slice(selected.as_slice());
         process_pending(handler, config, pending, response, commands)?
     };
 
     Ok(close)
+}
+
+/// Reserve room to buffer `additional` more received bytes.
+///
+/// A client can stream up to `max_body_len` of one frame's body before the
+/// frame completes, so growth must fail only this connection rather than
+/// abort the process.
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::OutOfMemory`] if the buffer cannot grow.
+pub(crate) fn grow_pending(pending: &mut Vec<u8>, additional: usize) -> io::Result<()> {
+    pending.try_reserve(additional).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            "cannot grow the partial request buffer",
+        )
+    })
 }
 
 fn process_pending(

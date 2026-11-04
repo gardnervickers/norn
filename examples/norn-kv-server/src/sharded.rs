@@ -1014,7 +1014,12 @@ async fn serve_sharded_connection(
 
         match event {
             Event::Receive(Some(Ok(selected))) if !selected.is_empty() => {
-                pending.extend_from_slice(selected.as_slice());
+                if let Err(error) = crate::server::grow_pending(&mut pending, selected.len()) {
+                    failure = Some(error);
+                    stop_dispatch = true;
+                } else {
+                    pending.extend_from_slice(selected.as_slice());
+                }
             }
             Event::Receive(Some(Ok(_)) | None) => {
                 if !pending.is_empty() {
