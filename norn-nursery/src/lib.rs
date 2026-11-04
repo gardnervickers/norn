@@ -204,14 +204,16 @@ where
 
     fn poll_tasks(&self) -> bool {
         for _ in 0..TASK_POLL_BUDGET {
+            // Check before each pop: the body may have terminated the scope
+            // before any child ran.
+            if self.terminated.borrow().is_some() {
+                return false;
+            }
             let runnable = self.shared.runqueue.borrow_mut().pop_front();
             let Some(runnable) = runnable else {
                 return false;
             };
             runnable.run();
-            if self.terminated.borrow().is_some() {
-                return false;
-            }
         }
 
         !self.shared.runqueue.borrow().is_empty()
