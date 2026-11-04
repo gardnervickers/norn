@@ -20,6 +20,10 @@ struct CancelBench {
     timers: usize,
 }
 
+struct CancelWithParkBench {
+    timers: usize,
+}
+
 struct TokioCancelBench {
     timers: usize,
 }
@@ -46,6 +50,35 @@ impl bencher::TDynBenchFn for CancelBench {
             // in ascending deadline order stresses minimum-deadline maintenance.
             for sleep in sleeps {
                 drop(sleep);
+            }
+        });
+    }
+}
+
+impl bencher::TDynBenchFn for CancelWithParkBench {
+    fn run(&self, b: &mut Bencher) {
+        let clock = Clock::simulated();
+        let mut driver = Driver::new(FastPark(clock.clone()), clock);
+        let handle = driver.handle();
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let timers = self.timers;
+
+        b.iter(|| {
+            let mut sleeps = (0..timers)
+                .map(|offset| Box::pin(handle.sleep(Duration::from_millis(4096 + offset as u64))))
+                .collect::<Vec<_>>();
+
+            for sleep in &mut sleeps {
+                assert!(matches!(sleep.as_mut().poll(&mut cx), Poll::Pending));
+            }
+
+            // Request timeouts usually finish oldest first, and the runtime
+            // parks between completions. Each park recomputes the next
+            // deadline after the earliest timer was cancelled.
+            for sleep in sleeps {
+                drop(sleep);
+                driver.park(ParkMode::NoPark).unwrap();
             }
         });
     }
@@ -187,6 +220,15 @@ pub fn benches() -> ::std::vec::Vec<TestDescAndFn> {
                 ignore: false,
             },
             testfn: TestFn::DynBenchFn(Box::new(TokioCancelBench { timers })),
+        });
+        benches.push(TestDescAndFn {
+            desc: TestDesc {
+                name: Cow::from(format!(
+                    "bench_cancel_oldest_with_park/runtime=norn/timers={timers}"
+                )),
+                ignore: false,
+            },
+            testfn: TestFn::DynBenchFn(Box::new(CancelWithParkBench { timers })),
         });
     }
     benches

@@ -7,7 +7,7 @@ use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::time::Duration;
 
 use norn_kv_server::handler::HandlerConfig;
-use norn_kv_server::server::ServerConfig;
+use norn_kv_server::server::{RecvMode, ServerConfig};
 use norn_kv_server::sharded::{ShardedServer, ShardedServerConfig};
 
 const HEADER_LEN: usize = 24;
@@ -80,6 +80,10 @@ fn exchange(address: SocketAddr, wire: Vec<u8>) -> Vec<(u8, u16, u32)> {
 }
 
 fn single_worker() -> SocketAddr {
+    single_worker_with(RecvMode::Multishot)
+}
+
+fn single_worker_with(recv_mode: RecvMode) -> SocketAddr {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let driver = norn_uring::Driver::new(io_uring::IoUring::builder(), 256).unwrap();
@@ -92,7 +96,10 @@ fn single_worker() -> SocketAddr {
                 norn_kv_server::server::serve(
                     listener,
                     HandlerConfig::Memory.build(),
-                    ServerConfig::default(),
+                    ServerConfig {
+                        recv_mode,
+                        ..ServerConfig::default()
+                    },
                 )
                 .await
             })
@@ -147,10 +154,13 @@ fn long_key_is_answered_with_invalid_arguments() {
         (OP_GET, STATUS_INVALID_ARGUMENTS, 2),
         (OP_GET, STATUS_SUCCESS, 3),
     ];
-    assert_eq!(
-        rejected_frame_pipeline(single_worker(), &long_key),
-        expected
-    );
+    for mode in [RecvMode::Multishot, RecvMode::Exact] {
+        assert_eq!(
+            rejected_frame_pipeline(single_worker_with(mode), &long_key),
+            expected,
+            "{mode:?}"
+        );
+    }
     let server = two_workers();
     let replies = rejected_frame_pipeline(server.local_addr(), &long_key);
     server.shutdown().unwrap();
@@ -167,10 +177,13 @@ fn unsupported_data_type_is_answered_with_invalid_arguments() {
         (OP_GET, STATUS_INVALID_ARGUMENTS, 2),
         (OP_GET, STATUS_SUCCESS, 3),
     ];
-    assert_eq!(
-        rejected_frame_pipeline(single_worker(), &bad_type),
-        expected
-    );
+    for mode in [RecvMode::Multishot, RecvMode::Exact] {
+        assert_eq!(
+            rejected_frame_pipeline(single_worker_with(mode), &bad_type),
+            expected,
+            "{mode:?}"
+        );
+    }
     let server = two_workers();
     let replies = rejected_frame_pipeline(server.local_addr(), &bad_type);
     server.shutdown().unwrap();

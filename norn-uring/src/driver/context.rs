@@ -22,7 +22,10 @@ impl DriverContext {
     pub(crate) fn enter(handle: Handle) -> DriverContextGuard {
         CURRENT.with(|current| {
             let mut old = current.handle.borrow_mut();
-            assert!(old.is_none(), "driver already set");
+            assert!(
+                old.is_none(),
+                "an io_uring driver is already entered on this thread; drivers cannot be nested, which includes a nested `block_on` over an io_uring driver"
+            );
             *old = Some(handle);
         });
         DriverContextGuard {
@@ -51,8 +54,14 @@ impl DriverContext {
     }
 
     /// Returns a reference to the current executor.
+    ///
+    /// Returns `None` when no driver is set, including when thread-local
+    /// storage has already been destroyed (a destructor running at thread exit).
     pub(crate) fn handle() -> Option<Handle> {
-        CURRENT.with(|c| c.handle.borrow().clone())
+        CURRENT
+            .try_with(|c| c.handle.borrow().clone())
+            .ok()
+            .flatten()
     }
 }
 

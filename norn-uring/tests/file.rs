@@ -431,7 +431,7 @@ fn submitted_then_cancelled_fixed_op_holds_slot_until_terminal_cqe(
 
         let mut recovered = None;
         for _ in 0..4 {
-            norn_uring::noop().await;
+            norn_uring::noop().await.unwrap();
             if let Ok(buffer) = pool.try_acquire() {
                 recovered = Some(buffer);
                 break;

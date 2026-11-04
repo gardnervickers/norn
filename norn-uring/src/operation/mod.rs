@@ -60,6 +60,11 @@ pub unsafe trait Operation {
 
     /// Configure a new [`io_uring::squeue::Entry`] for this operation.
     ///
+    /// The runtime calls this once, when the operation is first polled or when a linked
+    /// request containing it is first polled. An operation dropped before then is never
+    /// configured. A panic in `configure` propagates out of that poll and leaves the operation
+    /// unusable: polling it again panics.
+    ///
     /// Configuration failures are delivered through the operation's normal completion path;
     /// the operation is not submitted to the kernel.
     ///
@@ -189,6 +194,14 @@ impl std::fmt::Debug for OpTarget {
 
 /// A driver-internal asynchronous cancellation of a submitted operation.
 ///
+/// The cancellation names its target by `user_data`, so it can match only that
+/// one request. It is not the `IORING_ASYNC_CANCEL_FD` or `_ANY` form, which
+/// match every request on a descriptor or every request at all (shutdown uses
+/// the latter through the driver's `cancel_all`). Its own completion
+/// says only whether the kernel found the target (`0`, `-ENOENT`,
+/// `-EALREADY`), not how the target finished; the target's own CQE is
+/// authoritative.
+///
 /// The request owns its target's identity until the kernel reports the
 /// cancellation's own terminal CQE. The target allocation, and therefore the
 /// numeric `user_data` the cancellation matches, cannot be reused while the
@@ -274,33 +287,29 @@ pin_project_lite::pin_project! {
                         );
                     }
                 }
-                State::Prepared { .. }
-                | State::ConfigureFailed { .. }
-                | State::Waiting { .. }
-                | State::Done => {}
+                State::Prepared { .. } | State::Waiting { .. } | State::Done => {}
             }
         }
     }
 }
 
+/// Where an [`Op`] is in submission.
+///
+/// An operation is configured when it is first submitted, not when it is
+/// created, so its SQE moves from [`Operation::configure`] straight toward the
+/// submission queue instead of being carried in every operation future.
 enum State<T>
 where
     T: 'static,
 {
-    Prepared {
-        handle: Option<TypedHandle<T>>,
-        entry: Option<ConfiguredEntry>,
-    },
-    ConfigureFailed {
-        handle: Option<TypedHandle<T>>,
-        error: Option<io::Error>,
-    },
-    Waiting {
-        handle: Option<TypedHandle<T>>,
-    },
-    Submitted {
-        inner: SubmittedOp<T>,
-    },
+    /// Not configured yet.
+    Prepared { handle: TypedHandle<T> },
+    /// Configured; the entry is waiting for SQ space in the operation's push
+    /// future or in a linked batch.
+    Waiting { handle: TypedHandle<T> },
+    /// Queued to the kernel, or completed without it by a synthetic completion.
+    Submitted { inner: SubmittedOp<T> },
+    /// Placeholder while moving between states.
     Done,
 }
 
@@ -308,116 +317,82 @@ impl<T> State<T>
 where
     T: Operation + 'static,
 {
-    fn prepare_batch(&mut self, batch: &mut SmallVec<[ConfiguredEntry; 4]>) -> bool {
-        let state = mem::replace(self, State::Done);
-        match state {
-            State::Prepared {
-                mut handle,
-                mut entry,
-            } => {
-                let entry = entry.take().expect("entry already prepared");
-                *self = State::Waiting {
-                    handle: Some(handle.take().expect("handle missing")),
-                };
-                batch.push(entry);
-                true
-            }
-            State::ConfigureFailed {
-                mut handle,
-                mut error,
-            } => {
-                let handle = handle.take().expect("handle missing");
-                let result =
-                    CQEResult::synthetic(Err(error.take().expect("configuration error missing")));
-                // Safety: this synthetic completion was created once for the
-                // operation retained by `handle`; no SQE reached the kernel.
-                unsafe { handle.untyped().reap(result) };
-                *self = State::Submitted {
-                    inner: SubmittedOp { inner: handle },
-                };
-                false
-            }
-            state => {
-                *self = state;
-                false
-            }
+    /// Configure a prepared operation's entry.
+    ///
+    /// A configured operation waits for its entry to be queued. A configuration
+    /// failure instead completes it synthetically, so nothing reaches the
+    /// kernel. Returns `None` for that failure and for any state other than
+    /// prepared.
+    fn configure(&mut self) -> Option<ConfiguredEntry> {
+        if !matches!(self, State::Prepared { .. }) {
+            return None;
         }
-    }
-
-    fn start_submit(&mut self) -> Option<ConfiguredEntry> {
-        // Keep ordinary submissions on the direct path. Linked requests use
-        // `prepare_batch`, which carries the configuration-failure semantics.
-        let state = mem::replace(self, State::Done);
-        match state {
-            State::Prepared {
-                mut handle,
-                mut entry,
-            } => {
-                let entry = entry.take().expect("entry missing");
-                *self = State::Waiting {
-                    handle: Some(handle.take().expect("handle missing")),
-                };
+        let State::Prepared { handle } = mem::replace(self, State::Done) else {
+            unreachable!("operation state changed during configuration");
+        };
+        match handle.configure() {
+            Ok(entry) => {
+                *self = State::Waiting { handle };
                 Some(entry)
             }
-            state => {
-                *self = state;
+            Err(err) => {
+                Self::complete_synthetic(self, handle, err);
                 None
             }
         }
     }
 
+    fn prepare_batch(&mut self, batch: &mut SmallVec<[ConfiguredEntry; 4]>) -> bool {
+        match self.configure() {
+            Some(entry) => {
+                batch.push(entry);
+                true
+            }
+            None => false,
+        }
+    }
+
     fn cancel_unsubmitted(&mut self) -> bool {
-        let state = mem::replace(self, State::Done);
-        let handle = match state {
-            State::Prepared { mut handle, entry } => {
-                drop(entry);
-                handle.take().expect("handle missing")
-            }
-            State::ConfigureFailed { mut handle, error } => {
-                drop(error);
-                handle.take().expect("handle missing")
-            }
-            state => {
-                *self = state;
-                return false;
-            }
+        if !matches!(self, State::Prepared { .. }) {
+            return false;
+        }
+        let State::Prepared { handle } = mem::replace(self, State::Done) else {
+            unreachable!("operation state changed during cancellation");
         };
-        let result = CQEResult::synthetic(Err(io::Error::from_raw_os_error(libc::ECANCELED)));
-        // Safety: this synthetic cancellation belongs to the prepared
-        // operation retained by `handle`, and it is produced only on this state transition.
-        unsafe { handle.untyped().reap(result) };
-        *self = State::Submitted {
-            inner: SubmittedOp { inner: handle },
-        };
+        Self::complete_synthetic(self, handle, io::Error::from_raw_os_error(libc::ECANCELED));
         true
     }
 
     fn finish_submit(&mut self) {
-        let state = mem::replace(self, State::Done);
-        *self = match state {
-            State::Waiting { mut handle } => State::Submitted {
-                inner: SubmittedOp {
-                    inner: handle.take().expect("handle missing"),
-                },
-            },
-            state => state,
+        if !matches!(self, State::Waiting { .. }) {
+            return;
+        }
+        let State::Waiting { handle } = mem::replace(self, State::Done) else {
+            unreachable!("operation state changed during submission");
+        };
+        *self = State::Submitted {
+            inner: SubmittedOp { inner: handle },
         };
     }
 
     fn fail_submit(&mut self, err: &SubmitError) {
-        let state = mem::replace(self, State::Done);
-        *self = match state {
-            State::Waiting { mut handle } => {
-                let handle = handle.take().expect("handle missing");
-                let result = CQEResult::synthetic(Err(err.to_io_error()));
-                // Safety: submission failed for the operation retained by
-                // `handle`, so this is its unreaped synthetic terminal completion.
-                unsafe { handle.untyped().reap(result) };
-                State::Submitted {
-                    inner: SubmittedOp { inner: handle },
-                }
-            }
-            state => state,
+        if !matches!(self, State::Waiting { .. }) {
+            return;
+        }
+        let State::Waiting { handle } = mem::replace(self, State::Done) else {
+            unreachable!("operation state changed during submission");
+        };
+        Self::complete_synthetic(self, handle, err.to_io_error());
+    }
+
+    /// Complete an operation whose entry never reached the kernel.
+    fn complete_synthetic(state: &mut Self, handle: TypedHandle<T>, err: io::Error) {
+        // Safety: no entry for `handle`'s operation reached the kernel, and every
+        // caller leaves the operation submitted, so this is its only terminal
+        // completion.
+        unsafe { handle.untyped().reap(CQEResult::synthetic(Err(err))) };
+        *state = State::Submitted {
+            inner: SubmittedOp { inner: handle },
         };
     }
 }
@@ -427,64 +402,25 @@ where
     T: Operation + 'static,
 {
     pub(crate) fn new(data: T, reactor: crate::Handle) -> Self {
-        let (handle, entry) = Self::prepare(data);
-        match entry {
-            Ok(entry) => Self::from_parts(handle, entry, reactor),
-            Err(err) => Self::configure_failed(handle, err, reactor),
+        Self {
+            submit: None,
+            state: State::Prepared {
+                handle: TypedHandle::new(data),
+            },
+            reactor,
+            predecessor: None,
         }
     }
 
     pub(crate) fn new_with_target(data: T, reactor: crate::Handle) -> (Self, OpTarget) {
-        let (handle, entry) = Self::prepare(data);
+        let operation = Self::new(data, reactor);
+        let State::Prepared { handle } = &operation.state else {
+            unreachable!("new operation is not prepared");
+        };
         let target = OpTarget {
             handle: handle.untyped(),
         };
-        let operation = match entry {
-            Ok(entry) => Self::from_parts(handle, entry, reactor),
-            Err(err) => Self::configure_failed(handle, err, reactor),
-        };
         (operation, target)
-    }
-
-    fn prepare(data: T) -> (TypedHandle<T>, io::Result<ConfiguredEntry>) {
-        let handle = TypedHandle::new(data);
-        let mut data = handle.data_mut().expect("operation already completed");
-
-        // Check the entry by reference: threading it through `Result`
-        // combinators moves the 64-byte SQE several times on the hot path.
-        let entry = match T::configure(&mut data) {
-            Ok(entry) if has_reserved_flags(&entry) => Err(reserved_flags_error()),
-            Ok(entry) => Ok(ConfiguredEntry::new(handle.untyped(), entry)),
-            Err(err) => Err(err),
-        };
-        drop(data);
-        (handle, entry)
-    }
-
-    fn from_parts(handle: TypedHandle<T>, entry: ConfiguredEntry, reactor: crate::Handle) -> Self {
-        Self {
-            submit: None,
-            state: State::Prepared {
-                handle: Some(handle),
-                entry: Some(entry),
-            },
-            reactor,
-            predecessor: None,
-        }
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn configure_failed(handle: TypedHandle<T>, error: io::Error, reactor: crate::Handle) -> Self {
-        Self {
-            submit: None,
-            state: State::ConfigureFailed {
-                handle: Some(handle),
-                error: Some(error),
-            },
-            reactor,
-            predecessor: None,
-        }
     }
 
     pub(crate) fn handle(&self) -> &crate::Handle {
@@ -527,19 +463,9 @@ where
     }
 
     fn poll_submit(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        {
-            let mut this = self.as_mut().project();
-            if this.submit.is_none() && matches!(this.state, State::ConfigureFailed { .. }) {
-                let mut batch = SmallVec::new();
-                let can_continue = this.state.prepare_batch(&mut batch);
-                debug_assert!(!can_continue);
-                debug_assert!(batch.is_empty());
-            }
-            if this.submit.is_none() && matches!(this.state, State::Prepared { .. }) {
-                let entry = this
-                    .state
-                    .start_submit()
-                    .expect("prepared operation missing entry");
+        let mut this = self.as_mut().project();
+        if this.submit.is_none() {
+            if let Some(entry) = this.state.configure() {
                 match this.reactor.try_push(entry) {
                     TryPush::Submitted => this.state.finish_submit(),
                     TryPush::Full(entry) => this.submit.set(Some(this.reactor.push(entry))),
@@ -548,11 +474,9 @@ where
             }
         }
 
-        let mut this = self.as_mut().project();
         let Some(fut) = this.submit.as_mut().as_pin_mut() else {
             return Poll::Ready(());
         };
-
         match ready!(fut.poll(cx)) {
             Ok(()) => this.state.finish_submit(),
             Err(err) => this.state.fail_submit(&err),
@@ -627,6 +551,20 @@ where
     #[inline]
     pub(crate) fn untyped(&self) -> RawOpRef {
         self.inner.clone()
+    }
+
+    /// Configure this operation's entry, which carries a kernel reference.
+    fn configure(&self) -> io::Result<ConfiguredEntry> {
+        let mut data = self.data_mut().expect("operation already completed");
+        // Check the entry by reference: threading it through `Result`
+        // combinators moves the 64-byte SQE several times on the hot path.
+        let entry = match T::configure(&mut data) {
+            Ok(entry) if has_reserved_flags(&entry) => Err(reserved_flags_error()),
+            Ok(entry) => Ok(ConfiguredEntry::new(self.untyped(), entry)),
+            Err(err) => Err(err),
+        };
+        drop(data);
+        entry
     }
 
     fn raw(&self) -> &raw::RawOp<T> {
@@ -1468,6 +1406,99 @@ mod tests {
         let op = op.as_ref().get_ref();
         assert!(op.submit.is_none());
         assert!(matches!(op.state, State::Submitted { .. }));
+    }
+
+    #[derive(Debug)]
+    struct CountedNop(Rc<Cell<usize>>);
+
+    unsafe impl Operation for CountedNop {
+        type Completion = CQEResult;
+
+        fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+            self.0.set(self.0.get() + 1);
+            Ok(io_uring::opcode::Nop::new().build())
+        }
+
+        unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+            result
+        }
+    }
+
+    impl Singleshot for CountedNop {
+        type Output = io::Result<u32>;
+
+        fn complete(self, result: CQEResult) -> Self::Output {
+            result.into_result()
+        }
+    }
+
+    #[test]
+    fn operation_is_configured_once_when_first_polled() {
+        let driver = crate::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let handle = driver.handle();
+        let configured = Rc::new(Cell::new(0));
+
+        drop(handle.submit(CountedNop(Rc::clone(&configured))));
+        assert_eq!(
+            configured.get(),
+            0,
+            "a dropped operation must not be configured"
+        );
+
+        let mut op = std::pin::pin!(handle.submit(CountedNop(Rc::clone(&configured))));
+        assert_eq!(
+            configured.get(),
+            0,
+            "creating an operation must not configure it"
+        );
+        let waker = futures_test::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(Future::poll(op.as_mut(), &mut cx).is_pending());
+        assert!(Future::poll(op.as_mut(), &mut cx).is_pending());
+        assert_eq!(configured.get(), 1);
+    }
+
+    #[test]
+    fn queued_operation_is_configured_once_and_submitted_after_backpressure() {
+        let driver = crate::Driver::new(io_uring::IoUring::builder(), 1).unwrap();
+        let handle = driver.handle();
+        let mut ex = norn_executor::LocalExecutor::new(driver);
+        let configured = Rc::new(Cell::new(0));
+
+        let results = ex.block_on(async {
+            let mut ops = Vec::new();
+            for _ in 0..4 {
+                ops.push(Box::pin(handle.submit(CountedNop(Rc::clone(&configured)))));
+            }
+            // Poll every operation once against a one-entry SQ so that later
+            // ones wait for capacity with their entries already configured.
+            let waker = futures_test::task::noop_waker();
+            let mut cx = std::task::Context::from_waker(&waker);
+            for op in &mut ops {
+                assert!(Future::poll(op.as_mut(), &mut cx).is_pending());
+            }
+            assert!(
+                ops[1].submit.is_some(),
+                "the full SQ should apply backpressure"
+            );
+            let mut results = Vec::new();
+            for op in ops {
+                results.push(op.await);
+            }
+            results
+        });
+
+        assert!(results.iter().all(|result| matches!(result, Ok(0))));
+        assert_eq!(configured.get(), 4);
+    }
+
+    #[test]
+    fn operation_future_does_not_carry_its_sqe() {
+        assert!(
+            mem::size_of::<Op<CountedNop>>()
+                < mem::size_of::<Option<PushFuture>>() + mem::size_of::<io_uring::squeue::Entry>(),
+            "an Op should hold only its handle until it is configured"
+        );
     }
 
     #[test]

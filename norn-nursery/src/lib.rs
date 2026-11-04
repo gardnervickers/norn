@@ -38,6 +38,17 @@ const TASK_POLL_BUDGET: usize = 32;
 /// all driven to completion before the scope completes, unless the scope is
 /// terminated early via [`Scope::terminate`].
 ///
+/// # Aborts
+///
+/// Child jobs are `norn-task` tasks bound to the thread that runs the scope.
+/// Cloning, waking or dropping a job's waker from any other thread aborts the
+/// process (after printing a message), so a job must not hand its waker to
+/// another thread, or to a channel or oneshot from another runtime (for example
+/// `futures::channel` or `tokio::sync`) whose sender completes on another
+/// thread. `norn-channel` is safe: it wakes receivers only on their own runtime
+/// thread. The process also aborts, instead of unwinding, if dropping a job's
+/// future or its output panics.
+///
 /// # Examples
 ///
 /// ```rust

@@ -428,4 +428,63 @@ mod tests {
         assert!(next.is_none());
         assert!(third.as_mut().poll(&mut cx).is_ready());
     }
+
+    #[test]
+    fn cancelling_timers_oldest_first_preserves_exact_deadline() {
+        let mut cx = futures_test::task::noop_context();
+        let timer = Driver::new((), Clock::simulated());
+        let handle = timer.handle();
+        // Registered in deadline order within one higher-level slot, like
+        // request timeouts that share a duration.
+        let mut sleeps = (0..64)
+            .map(|offset| Box::pin(handle.sleep(Duration::from_millis(4096 + offset))))
+            .collect::<VecDeque<_>>();
+        for sleep in &mut sleeps {
+            assert!(sleep.as_mut().poll(&mut cx).is_pending());
+        }
+
+        for offset in 0..63 {
+            let (expired, next) = timer.wheels.advance(0);
+            assert_eq!(expired, 0);
+            assert_eq!(next.unwrap().deadline(), 4096 + offset);
+            drop(sleeps.pop_front());
+        }
+
+        let (expired, next) = timer.wheels.advance(4096 + 63);
+        assert_eq!(expired, 1);
+        assert!(next.is_none());
+        assert!(sleeps[0].as_mut().poll(&mut cx).is_ready());
+    }
+
+    #[test]
+    fn cancelling_earliest_timer_after_out_of_order_registration_preserves_exact_deadline() {
+        let mut cx = futures_test::task::noop_context();
+        let timer = Driver::new((), Clock::simulated());
+        let handle = timer.handle();
+        let mut middle = Box::pin(handle.sleep(Duration::from_millis(4098)));
+        let mut latest = pin!(handle.sleep(Duration::from_millis(4100)));
+        let mut earliest = Box::pin(handle.sleep(Duration::from_millis(4096)));
+
+        assert!(middle.as_mut().poll(&mut cx).is_pending());
+        assert!(latest.as_mut().poll(&mut cx).is_pending());
+        // Registering an earlier deadline last leaves the slot unordered, so
+        // removing it requires a scan.
+        assert!(earliest.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(timer.wheels.advance(0).1.unwrap().deadline(), 4096);
+
+        drop(earliest);
+        assert_eq!(timer.wheels.advance(0).1.unwrap().deadline(), 4098);
+
+        // The scan found the remaining entries ordered, so the next refresh
+        // reads the new minimum from the back of the slot.
+        drop(middle);
+        let (expired, next) = timer.wheels.advance(0);
+        assert_eq!(expired, 0);
+        assert_eq!(next.unwrap().deadline(), 4100);
+
+        let (expired, next) = timer.wheels.advance(4100);
+        assert_eq!(expired, 1);
+        assert!(next.is_none());
+        assert!(latest.as_mut().poll(&mut cx).is_ready());
+    }
 }

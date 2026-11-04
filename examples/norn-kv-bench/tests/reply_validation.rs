@@ -2,8 +2,9 @@
 //! request's correct memcached-binary response.
 //!
 //! Each fake server answers every GET and SET correctly except for one field.
-//! The README promises that every response is validated byte-for-byte, so
-//! each corrupted run must be reported as `valid=false`.
+//! The README promises that every response field except the CAS and a miss's
+//! error text is validated, so each corrupted run must be reported as
+//! `valid=false`.
 #![cfg(target_os = "linux")]
 
 use std::collections::HashMap;
@@ -23,6 +24,12 @@ enum Fault {
     GetEchoesKey,
     /// SET replies carry a non-empty body.
     SetReplyBody,
+    /// Every reply has a nonzero data type byte.
+    DataType,
+    /// GET misses carry flags extras.
+    MissExtras,
+    /// GET misses echo the key.
+    MissEchoesKey,
 }
 
 fn fake_server(fault: Fault) -> SocketAddr {
@@ -79,9 +86,24 @@ fn serve(mut stream: TcpStream, store: &Mutex<HashMap<Vec<u8>, Vec<u8>>>, fault:
                     }
                     response.extend_from_slice(value);
                 }
-                None => response[7] = 1,
+                None => {
+                    response[7] = 1;
+                    if matches!(fault, Fault::MissExtras) {
+                        response[4] = 4;
+                        response.extend_from_slice(&[0; 4]);
+                    }
+                    if matches!(fault, Fault::MissEchoesKey) {
+                        response[2..4].copy_from_slice(&(key.len() as u16).to_be_bytes());
+                        response.extend_from_slice(&key);
+                    }
+                    // Real memcached explains a miss in the body.
+                    response.extend_from_slice(b"Not found");
+                }
             },
             _ => response[7] = 0x81,
+        }
+        if matches!(fault, Fault::DataType) {
+            response[5] = 1;
         }
         let body_len = (response.len() - HEADER_LEN) as u32;
         response[8..12].copy_from_slice(&body_len.to_be_bytes());
@@ -160,5 +182,32 @@ fn bench_rejects_set_reply_with_a_body() {
     assert!(
         summary.contains("valid=false"),
         "SET replies carrying a body were accepted: {summary}"
+    );
+}
+
+#[test]
+fn bench_rejects_nonzero_data_type() {
+    let summary = run_bench(fake_server(Fault::DataType), "datatype");
+    assert!(
+        summary.contains("valid=false"),
+        "replies with data type 0x01 were accepted: {summary}"
+    );
+}
+
+#[test]
+fn bench_rejects_miss_with_extras() {
+    let summary = run_bench(fake_server(Fault::MissExtras), "missextras");
+    assert!(
+        summary.contains("valid=false"),
+        "GET misses carrying extras were accepted: {summary}"
+    );
+}
+
+#[test]
+fn bench_rejects_miss_that_echoes_the_key() {
+    let summary = run_bench(fake_server(Fault::MissEchoesKey), "misskey");
+    assert!(
+        summary.contains("valid=false"),
+        "GET misses carrying a key were accepted: {summary}"
     );
 }
