@@ -3,6 +3,7 @@
 use std::cell::Cell;
 use std::future::Future;
 use std::io;
+use std::num::NonZeroUsize;
 use std::pin::pin;
 use std::rc::Rc;
 
@@ -22,7 +23,7 @@ const RECV_BUFFER_LEN: usize = 8 * 1024;
 /// above the backlog a polling connection builds up between polls in the
 /// benchmark (at most 32 buffers in `mixed-1w`; `mixed-4w` did not pause),
 /// and 128 stalled connections are needed to exhaust the 8192-buffer ring.
-const MAX_UNCONSUMED_PER_RECEIVE: usize = 64;
+const MAX_UNCONSUMED_PER_RECEIVE: NonZeroUsize = NonZeroUsize::new(64).unwrap();
 const MAX_READY_RECEIVES_PER_BATCH: usize = 16;
 const ACCEPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
 /// Longest a failed connection keeps discarding input before it is closed.
