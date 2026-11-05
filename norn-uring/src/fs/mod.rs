@@ -15,7 +15,7 @@ pub use dir::{
     create_dir, get_xattr, hard_link, metadata, remove_dir, remove_file, rename, set_xattr, statx,
     symlink,
 };
-pub use file::{pipe, File, PipeReader, PipeWriter};
+pub use file::{pipe, File, PipeReadRingMulti, PipeReader, PipeWriter};
 pub use opts::OpenOptions;
 
 fn complete_get_xattr<B>(buf: &mut B, submitted_len: u32, result: u32) -> io::Result<usize>
