@@ -571,23 +571,28 @@ impl TcpSocket {
     /// Send the payload published to a send buffer ring as `io_uring` bundles.
     ///
     /// The kernel transmits published buffers in publication order, waiting
-    /// until each selected bundle is fully transmitted, and continues with
-    /// further bundles while buffers remain published, including buffers
-    /// published while the request is in flight. Transmitted buffers return to
-    /// the ring for reuse. The request completes when the kernel finds the
-    /// ring empty. Requires Linux 6.10 or newer.
+    /// until each selected bundle is fully transmitted, and may continue with
+    /// further bundles while buffers remain published. Transmitted buffers
+    /// return to the ring for reuse. A request can complete with buffers still
+    /// queued, for example when the kernel stops after a bundle that waited
+    /// for socket space, so call it again while [`SendBufRing::queued`] is
+    /// nonzero. Requires Linux 6.10 or newer.
     ///
-    /// One bundle send may own a ring at a time, from the request's first poll
-    /// until it completes or is dropped.
+    /// One bundle send owns a ring at a time, from the request's first poll
+    /// until its terminal completion. A dropped request keeps the ring until
+    /// the kernel reports that completion, which the driver reaps on a later
+    /// turn, so a send started right after such a drop fails with `EBUSY`.
+    /// Yield to the driver, for example with [`noop`](crate::noop), before
+    /// retrying.
     ///
-    /// If the socket fails partway through a bundle, Linux reports the
-    /// transmitted byte count rather than the error, and buffers it selected
-    /// but did not transmit are still consumed. In that case
-    /// [`SendBundleResult::bytes_released`] exceeds
-    /// [`SendBundleResult::bytes_sent`], the byte stream has a gap, and the
-    /// connection should be abandoned. The same applies after a cancelled or
-    /// failed request: buffers it consumed are released and the remainder stay
-    /// published.
+    /// The kernel commits the buffers it selects when it selects them. If the
+    /// socket fails partway through a bundle, or the request is canceled or
+    /// dropped after the kernel selected payload, that payload is consumed
+    /// without being transmitted. The byte stream then has a gap: the request
+    /// fails, the ring is quarantined so that no later send continues the
+    /// stream past the gap, and the connection should be abandoned. A deadline
+    /// on a send therefore suits connections that are abandoned when it
+    /// expires.
     ///
     /// # Errors
     ///

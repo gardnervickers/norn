@@ -26,7 +26,7 @@ pub use send::{
     PublishError, PublishErrorKind, SendBuf, SendBufRing, SendBufRingBuilder, SendBundleError,
     SendBundleResult,
 };
-pub(crate) use send::{SendBundleProgress, SendClaim};
+pub(crate) use send::{Quarantine, SendBundleProgress, SendClaim};
 
 use tracker::{BufferToken, BundleClaim, PublicationTracker, TrackerError};
 

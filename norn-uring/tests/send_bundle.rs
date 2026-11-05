@@ -1,5 +1,6 @@
 #![cfg(target_os = "linux")]
 
+use std::error::Error;
 use std::future::Future;
 use std::io;
 use std::task::Poll;
@@ -39,6 +40,17 @@ async fn recv_exact(socket: &TcpSocket, len: usize) -> io::Result<Vec<u8>> {
 
 fn pattern(index: usize, len: usize) -> Vec<u8> {
     (0..len).map(|offset| (index * 31 + offset) as u8).collect()
+}
+
+/// Assert that the ring accepts neither new payload nor another bundle send.
+async fn assert_quarantined(ring: &SendBufRing, socket: &TcpSocket) {
+    let mut buf = ring.try_acquire().expect("free send buffer");
+    buf.extend_from_slice(b"late");
+    let error = ring.publish(buf).unwrap_err();
+    assert_eq!(error.kind(), PublishErrorKind::Quarantined);
+    let error = socket.send_bundle(ring).await.unwrap_err();
+    assert!(error.is_quarantined());
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
 }
 
 #[test]
@@ -226,7 +238,7 @@ fn send_bundle_spans_bundles_backpressure_and_racing_publication(
 }
 
 #[test]
-fn failed_bundle_releases_selected_buffers_from_kernel_head(
+fn failed_bundle_releases_selected_buffers_and_quarantines_the_gap(
 ) -> Result<(), Box<dyn std::error::Error>> {
     util::with_test_env(|| async {
         let (_server, client) = tcp_pair().await?;
@@ -237,10 +249,15 @@ fn failed_bundle_releases_selected_buffers_from_kernel_head(
         client.shutdown(std::net::Shutdown::Write).await?;
 
         // The kernel selects and commits the buffers before sendmsg fails, but
-        // the error completion does not say how many it selected.
+        // the error completion does not say how many it selected. They were
+        // consumed without being transmitted, which leaves a gap.
         let error = client.send_bundle(&ring).await.unwrap_err();
-        assert_eq!(error.error().raw_os_error(), Some(libc::EPIPE));
-        assert!(!error.is_quarantined());
+        assert!(error.is_quarantined());
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let cause = error
+            .source()
+            .and_then(|err| err.downcast_ref::<io::Error>());
+        assert_eq!(cause.and_then(io::Error::raw_os_error), Some(libc::EPIPE));
         // The error reports the consumed but untransmitted payload.
         let progress = error.progress();
         assert_eq!(progress.bytes_sent(), 0);
@@ -249,17 +266,13 @@ fn failed_bundle_releases_selected_buffers_from_kernel_head(
         assert_eq!(ring.queued(), 0, "selected buffers must be attributed");
         assert_eq!(ring.available(), 4);
 
-        // Accounting stays usable: the ring is not quarantined.
-        publish(&ring, b"four");
-        let error = io::Error::from(client.send_bundle(&ring).await.unwrap_err());
-        assert_eq!(error.raw_os_error(), Some(libc::EPIPE));
-        assert_eq!(ring.available(), 4);
+        assert_quarantined(&ring, &client).await;
         Ok(())
     })
 }
 
 #[test]
-fn cancelled_bundle_releases_its_claim_and_consumed_buffers(
+fn dropped_bundle_releases_consumed_buffers_and_quarantines_the_gap(
 ) -> Result<(), Box<dyn std::error::Error>> {
     const BUF_CNT: usize = 32;
     const BUF_LEN: usize = 64 * 1024;
@@ -300,7 +313,9 @@ fn cancelled_bundle_releases_its_claim_and_consumed_buffers(
         // only after the kernel head proves consumption.
         assert_eq!(ring.available() + ring.queued(), BUF_CNT);
 
-        // The claim is released with the terminal completion.
+        // It transmitted only part of what it consumed, so no later send may
+        // continue the byte stream, even though nobody saw its result.
+        assert_quarantined(&ring, &client).await;
         let drain = norn_executor::spawn(async move {
             let mut total = 0;
             loop {
@@ -311,13 +326,9 @@ fn cancelled_bundle_releases_its_claim_and_consumed_buffers(
                 }
             }
         });
-        if ring.queued() > 0 {
-            let sent = client.send_bundle(&ring).await?;
-            assert_eq!(sent.bytes_sent(), sent.bytes_released());
-        }
-        assert_eq!(ring.available(), BUF_CNT);
         client.shutdown(std::net::Shutdown::Write).await?;
-        assert!(drain.await.unwrap() > 0);
+        let received = drain.await.unwrap();
+        assert!(received > 0 && received < BUF_CNT * BUF_LEN);
         Ok(())
     })
 }

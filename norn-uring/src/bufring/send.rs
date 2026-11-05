@@ -12,6 +12,13 @@
 //! kernel's consumption head with `IORING_REGISTER_PBUF_STATUS` and releases
 //! exactly the consumed buffers. If that fails, the ring is quarantined:
 //! published buffers stay unavailable until the ring is unregistered.
+//!
+//! A committed buffer cannot be put back, so a request that ends before
+//! transmitting everything it selected, because the socket failed or the
+//! request was canceled or dropped, consumes payload it never sent. The byte
+//! stream then has a gap, and the ring is quarantined as well, so that no
+//! later send continues the stream past the gap. The request's own result
+//! reports the gap even when nobody observes it.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -121,7 +128,7 @@ impl SendBufRing {
             Some(PublishErrorKind::ForeignRing)
         } else if buf.len == 0 {
             Some(PublishErrorKind::Empty)
-        } else if self.rc.storage.state.borrow().poisoned {
+        } else if self.rc.storage.state.borrow().quarantine.is_some() {
             Some(PublishErrorKind::Quarantined)
         } else {
             None
@@ -171,8 +178,8 @@ impl SendBufRing {
         self.rc.registration.same_driver(handle)
     }
 
-    pub(crate) fn is_quarantined(&self) -> bool {
-        self.rc.storage.state.borrow().poisoned
+    pub(crate) fn quarantine(&self) -> Option<Quarantine> {
+        self.rc.storage.state.borrow().quarantine
     }
 
     /// Reserve the ring for one bundle send.
@@ -181,8 +188,8 @@ impl SendBufRing {
     /// attributable to that request alone.
     pub(crate) fn claim_sender(&self) -> io::Result<SendClaim> {
         let mut state = self.rc.storage.state.borrow_mut();
-        if state.poisoned {
-            return Err(quarantined_error(None));
+        if let Some(reason) = state.quarantine {
+            return Err(quarantined_error(reason, None));
         }
         if state.sending {
             return Err(io::Error::from_raw_os_error(libc::EBUSY));
@@ -190,13 +197,25 @@ impl SendBufRing {
         state.sending = true;
         Ok(SendClaim {
             ring: self.clone(),
-            uncertain: false,
+            request: RequestAccounting::default(),
         })
     }
 }
 
-fn quarantined_error(cause: Option<io::Error>) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, QuarantineError { cause })
+/// Why a send ring was quarantined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Quarantine {
+    /// A terminal completion's consumed buffers could not be identified.
+    Unidentified,
+    /// A request consumed payload it did not transmit.
+    Gap,
+}
+
+fn quarantined_error(reason: Quarantine, cause: Option<io::Error>) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        QuarantineError { reason, cause },
+    )
 }
 
 fn is_quarantine_error(err: &io::Error) -> bool {
@@ -207,14 +226,21 @@ fn is_quarantine_error(err: &io::Error) -> bool {
 // socket error, if any, that the quarantining completion reported.
 #[derive(Debug)]
 struct QuarantineError {
+    reason: Quarantine,
     cause: Option<io::Error>,
 }
 
 impl fmt::Display for QuarantineError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(
-            "send buffer ring is quarantined because consumed buffers could not be identified",
-        )
+        f.write_str(match self.reason {
+            Quarantine::Unidentified => {
+                "send buffer ring is quarantined because consumed buffers could not be identified"
+            }
+            Quarantine::Gap => {
+                "send buffer ring is quarantined because a bundle send consumed payload it did \
+                 not transmit, leaving a gap in the byte stream"
+            }
+        })
     }
 }
 
@@ -433,7 +459,8 @@ pub enum PublishErrorKind {
     Empty,
     /// The buffer was acquired from another ring.
     ForeignRing,
-    /// Ownership accounting failed, so the ring accepts no more payload.
+    /// Ownership accounting failed, or a bundle send left a gap in the byte
+    /// stream, so the ring accepts no more payload.
     Quarantined,
 }
 
@@ -491,10 +518,12 @@ impl Error for PublishError {}
 /// A successful request returns it directly; a failed request reports the
 /// progress it made before failing through [`SendBundleError::progress`].
 ///
-/// Linux reports the transmitted byte count instead of an error when a socket
-/// fails partway through a bundle. Released payload is consumed from the ring
-/// even if it was not transmitted, so `bytes_released() > bytes_sent()` means
-/// the byte stream is no longer contiguous and the connection should be
+/// A successful request transmitted every byte it released. Released payload
+/// is consumed from the ring even if it was not transmitted, for example when
+/// the socket fails partway through a bundle (Linux then reports the
+/// transmitted byte count instead of the error). Such a request fails and
+/// quarantines the ring, and its progress shows `bytes_released() >
+/// bytes_sent()`: the byte stream has a gap, and the connection should be
 /// abandoned.
 #[must_use = "the transmitted and released byte counts must be checked"]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -531,9 +560,10 @@ impl SendBundleResult {
 ///
 /// One request can transmit several bundles before a later completion fails,
 /// and it releases the buffers the kernel consumed even when it fails.
-/// [`progress`](Self::progress) accounts for every completion of the request,
-/// so `progress().bytes_released() > progress().bytes_sent()` still means the
-/// byte stream has a gap. Payload that stays published was not consumed.
+/// [`progress`](Self::progress) accounts for every completion of the request.
+/// When `progress().bytes_released() > progress().bytes_sent()`, the request
+/// left a gap in the byte stream and quarantined the ring. Payload that stays
+/// published was not consumed.
 ///
 /// Display and [`source`](Error::source) are those of [`error`](Self::error).
 /// Converting into [`io::Error`] returns that error and discards the progress.
@@ -567,10 +597,11 @@ impl SendBundleError {
 
     /// Return whether the request failed because the ring is quarantined.
     ///
-    /// The request either quarantined the ring because it could not identify
-    /// the buffers it consumed, or found it already quarantined. Buffers that
-    /// remain published are then unavailable until the ring is dropped, and
-    /// publication and further bundle sends fail.
+    /// The request quarantined the ring because it could not identify the
+    /// buffers it consumed or because it consumed payload it did not transmit,
+    /// or it found the ring already quarantined. Buffers that remain published
+    /// are then unavailable until the ring is dropped, and publication and
+    /// further bundle sends fail.
     pub fn is_quarantined(&self) -> bool {
         self.quarantined
     }
@@ -603,19 +634,19 @@ impl From<SendBundleError> for io::Error {
 #[derive(Debug, Default)]
 pub(crate) struct SendBundleProgress {
     progress: SendBundleResult,
-    quarantined: bool,
+    quarantine: Option<Quarantine>,
 }
 
 impl SendBundleProgress {
     /// Record a request that found the ring already quarantined.
-    pub(crate) fn mark_quarantined(&mut self) {
-        self.quarantined = true;
+    pub(crate) fn mark_quarantined(&mut self, reason: Quarantine) {
+        self.quarantine = Some(reason);
     }
 
     /// Record the accounting of one completion.
-    pub(crate) fn record(&mut self, progress: SendBundleResult, quarantined: bool) {
+    pub(crate) fn record(&mut self, progress: SendBundleResult, quarantine: Option<Quarantine>) {
         self.progress.add(progress);
-        self.quarantined |= quarantined;
+        self.quarantine = self.quarantine.or(quarantine);
     }
 
     /// Resolve the request from its terminal completion result, after that
@@ -624,48 +655,57 @@ impl SendBundleProgress {
         self,
         result: io::Result<u32>,
     ) -> Result<SendBundleResult, SendBundleError> {
-        let error = match result {
-            Ok(_) if !self.quarantined => return Ok(self.progress),
-            Ok(_) => quarantined_error(None),
+        let error = match (result, self.quarantine) {
+            (Ok(_), None) => return Ok(self.progress),
+            (Ok(_), Some(reason)) => quarantined_error(reason, None),
             // A failed claim already reports the quarantine.
-            Err(err) if self.quarantined && !is_quarantine_error(&err) => {
-                quarantined_error(Some(err))
+            (Err(err), Some(reason)) if !is_quarantine_error(&err) => {
+                quarantined_error(reason, Some(err))
             }
-            Err(err) => err,
+            (Err(err), _) => err,
         };
         Err(SendBundleError {
             error,
             progress: self.progress,
-            quarantined: self.quarantined,
+            quarantined: self.quarantine.is_some(),
         })
     }
 }
 
 /// Exclusive use of a send ring by one bundle send request.
 ///
-/// Dropping the claim, which happens when the request is dropped or
-/// completes, permits another bundle send.
+/// The operation owns the claim until its terminal completion, even after the
+/// request is dropped; dropping the claim then permits another bundle send.
 pub(crate) struct SendClaim {
     ring: SendBufRing,
+    request: RequestAccounting,
+}
+
+/// What one bundle send request has consumed and transmitted so far.
+#[derive(Debug, Default)]
+struct RequestAccounting {
     // A completion did not identify exactly which buffers were consumed.
     uncertain: bool,
+    bytes_sent: usize,
+    bytes_released: usize,
 }
 
 impl SendClaim {
     /// Account for one kernel completion of the owning bundle send.
     ///
-    /// Returns the progress attributable to the completion and whether the
-    /// ring was quarantined while accounting for it.
+    /// This runs in `reap`, so it also accounts for an abandoned request.
+    /// Returns the progress attributable to the completion and why the ring
+    /// was quarantined while accounting for it, if it was.
     pub(crate) fn complete(
         &mut self,
         result: &io::Result<u32>,
         flags: u32,
-    ) -> (SendBundleResult, bool) {
+    ) -> (SendBundleResult, Option<Quarantine>) {
         let inner = &self.ring.rc;
         let terminal = !io_uring::cqueue::more(flags);
         let selected = io_uring::cqueue::buffer_select(flags);
         let mut state = inner.storage.state.borrow_mut();
-        state.complete(result, selected, terminal, &mut self.uncertain, || {
+        state.complete(result, selected, terminal, &mut self.request, || {
             inner.registration.kernel_head(inner.storage.bgid)
         })
     }
@@ -681,7 +721,7 @@ impl fmt::Debug for SendClaim {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SendClaim")
             .field("bgid", &self.ring.bgid())
-            .field("uncertain", &self.uncertain)
+            .field("request", &self.request)
             .finish()
     }
 }
@@ -703,7 +743,7 @@ struct SendRingState {
     queued_bytes: usize,
     free: Vec<Bid>,
     sending: bool,
-    poisoned: bool,
+    quarantine: Option<Quarantine>,
 }
 
 impl SendRingState {
@@ -716,7 +756,7 @@ impl SendRingState {
             // Pop from the end so low BIDs are acquired first.
             free: (0..buf_cnt).rev().collect(),
             sending: false,
-            poisoned: false,
+            quarantine: None,
         }
     }
 
@@ -735,9 +775,9 @@ impl SendRingState {
         result: &io::Result<u32>,
         selected: Option<Bid>,
         terminal: bool,
-        uncertain: &mut bool,
+        request: &mut RequestAccounting,
         kernel_head: impl FnOnce() -> io::Result<u16>,
-    ) -> (SendBundleResult, bool) {
+    ) -> (SendBundleResult, Option<Quarantine>) {
         let mut progress = SendBundleResult::default();
         if let Ok(n) = result {
             progress.bytes_sent = *n as usize;
@@ -747,7 +787,9 @@ impl SendRingState {
             // buffer. Transmitted buffers are a prefix of the selection, so
             // releasing them never releases a buffer the kernel may still read.
             (Ok(n), Some(bid))
-                if *n > 0 && !*uncertain && self.queued.front().map(|e| e.bid) == Some(bid) =>
+                if *n > 0
+                    && !request.uncertain
+                    && self.queued.front().map(|e| e.bid) == Some(bid) =>
             {
                 let mut released = 0usize;
                 while released < *n as usize {
@@ -759,23 +801,39 @@ impl SendRingState {
                 // A partial final buffer, or a count beyond the queue, means
                 // the selection is not known from the byte count.
                 if released != *n as usize {
-                    *uncertain = true;
+                    request.uncertain = true;
                 }
             }
-            // Selection failed because the ring was empty.
-            (Err(err), None) if err.raw_os_error() == Some(libc::ENOBUFS) => {}
-            // Errors and cancellations may follow selection without
+            // These errors arise before the kernel selects a buffer, such as
+            // an empty ring or a kernel without bundle sends, and the
+            // completion names no buffer, so nothing was consumed.
+            (Err(err), None)
+                if matches!(
+                    err.raw_os_error(),
+                    Some(
+                        libc::ENOBUFS
+                            | libc::EINVAL
+                            | libc::ENOMEM
+                            | libc::EBADF
+                            | libc::ENOTSOCK
+                            | libc::EOPNOTSUPP
+                    )
+                ) => {}
+            // Other errors and cancellations may follow selection without
             // identifying it; a mismatched BID means earlier consumption was
             // not attributed.
-            _ => *uncertain = true,
+            _ => request.uncertain = true,
         }
 
-        // A successful terminal completion means the kernel found the ring
-        // empty, so remaining queued buffers are either newly published or
-        // were consumed without being transmitted. Only the kernel head can
-        // tell them apart.
-        let mut poisoned = false;
-        if terminal && !self.poisoned && (*uncertain || !self.queued.is_empty()) {
+        // Buffers can remain queued after a successful terminal completion:
+        // ones published after the kernel's last selection, and, after a short
+        // final bundle, ones it consumed without transmitting. Only the kernel
+        // head can tell them apart.
+        let mut quarantine = None;
+        if terminal
+            && self.quarantine.is_none()
+            && (request.uncertain || (result.is_ok() && !self.queued.is_empty()))
+        {
             match kernel_head() {
                 Ok(head) => {
                     let consumed = usize::from(head.wrapping_sub(self.head));
@@ -783,18 +841,30 @@ impl SendRingState {
                         for _ in 0..consumed {
                             self.release_front(&mut progress);
                         }
-                        *uncertain = false;
+                        request.uncertain = false;
                     } else {
-                        poisoned = true;
+                        quarantine = Some(Quarantine::Unidentified);
                     }
                 }
-                Err(_) => poisoned = true,
-            }
-            if poisoned {
-                self.poisoned = true;
+                Err(_) => quarantine = Some(Quarantine::Unidentified),
             }
         }
-        (progress, poisoned)
+        request.bytes_sent += progress.bytes_sent;
+        request.bytes_released += progress.bytes_released;
+        // Released payload that was never transmitted is a gap in the byte
+        // stream. Quarantine the ring so that no later send continues past it,
+        // even if nobody observes this request's result.
+        if terminal
+            && self.quarantine.is_none()
+            && quarantine.is_none()
+            && request.bytes_released > request.bytes_sent
+        {
+            quarantine = Some(Quarantine::Gap);
+        }
+        if quarantine.is_some() {
+            self.quarantine = quarantine;
+        }
+        (progress, quarantine)
     }
 }
 
@@ -884,12 +954,17 @@ mod tests {
         panic!("exact accounting must not query the kernel head")
     }
 
+    fn errno(code: i32) -> io::Result<u32> {
+        Err(io::Error::from_raw_os_error(code))
+    }
+
     #[test]
     fn exact_completion_releases_transmitted_prefix() {
         let mut state = state_with(&[4, 6, 8]);
-        let mut uncertain = false;
-        let (progress, poisoned) = state.complete(&Ok(10), Some(0), false, &mut uncertain, no_head);
-        assert!(!poisoned && !uncertain);
+        let mut request = RequestAccounting::default();
+        let (progress, quarantine) = state.complete(&Ok(10), Some(0), false, &mut request, no_head);
+        assert_eq!(quarantine, None);
+        assert!(!request.uncertain);
         assert_eq!(progress.bytes_sent(), 10);
         assert_eq!(progress.buffers_released(), 2);
         assert_eq!(progress.bytes_released(), 10);
@@ -897,50 +972,53 @@ mod tests {
         assert_eq!(state.queued_bytes, 8);
 
         // The terminal completion drains the queue, so no status query.
-        let (progress, poisoned) = state.complete(&Ok(8), Some(2), true, &mut uncertain, no_head);
-        assert!(!poisoned);
+        let (progress, quarantine) = state.complete(&Ok(8), Some(2), true, &mut request, no_head);
+        assert_eq!(quarantine, None);
         assert_eq!(progress.buffers_released(), 1);
         assert!(state.queued.is_empty());
         assert_eq!(state.free.len(), 5);
     }
 
     #[test]
-    fn partial_buffer_defers_to_kernel_head() {
+    fn partial_buffer_defers_to_kernel_head_and_is_a_gap() {
         let mut state = state_with(&[4, 6, 8]);
-        let mut uncertain = false;
+        let mut request = RequestAccounting::default();
         // Bytes end inside the second buffer: it is consumed but partial.
-        let (progress, _) = state.complete(&Ok(7), Some(0), false, &mut uncertain, no_head);
-        assert!(uncertain);
+        let (progress, _) = state.complete(&Ok(7), Some(0), false, &mut request, no_head);
+        assert!(request.uncertain);
         assert_eq!(progress.buffers_released(), 2);
 
         // The kernel also consumed the third buffer before failing.
-        let err = Err(io::Error::from_raw_os_error(libc::EPIPE));
-        let (progress, poisoned) = state.complete(&err, Some(2), true, &mut uncertain, || Ok(3));
-        assert!(!poisoned && !uncertain);
+        let (progress, quarantine) =
+            state.complete(&errno(libc::EPIPE), Some(2), true, &mut request, || Ok(3));
+        assert!(!request.uncertain);
         assert_eq!(progress.buffers_released(), 1);
         assert_eq!(progress.bytes_released(), 8);
         assert!(state.queued.is_empty());
+        // 18 bytes were consumed and 7 transmitted.
+        assert_eq!(quarantine, Some(Quarantine::Gap));
+        assert_eq!(state.quarantine, Some(Quarantine::Gap));
     }
 
     #[test]
     fn boundary_aligned_short_send_is_found_at_terminal_completion() {
         let mut state = state_with(&[4, 6, 8]);
-        let mut uncertain = false;
+        let mut request = RequestAccounting::default();
         // The kernel selected all three buffers but transmitted two before a
         // swallowed socket error; the byte count matches a buffer boundary.
-        let (progress, poisoned) = state.complete(&Ok(10), Some(0), true, &mut uncertain, || Ok(3));
-        assert!(!poisoned);
+        let (progress, quarantine) = state.complete(&Ok(10), Some(0), true, &mut request, || Ok(3));
         assert_eq!(progress.bytes_sent(), 10);
         assert_eq!(progress.buffers_released(), 3);
         assert_eq!(progress.bytes_released(), 18);
+        assert_eq!(quarantine, Some(Quarantine::Gap));
     }
 
     #[test]
     fn newly_published_buffers_survive_the_head_check() {
         let mut state = state_with(&[4, 6]);
-        let mut uncertain = false;
-        let (progress, poisoned) = state.complete(&Ok(4), Some(0), true, &mut uncertain, || Ok(1));
-        assert!(!poisoned);
+        let mut request = RequestAccounting::default();
+        let (progress, quarantine) = state.complete(&Ok(4), Some(0), true, &mut request, || Ok(1));
+        assert_eq!(quarantine, None);
         assert_eq!(progress.buffers_released(), 1);
         assert_eq!(state.queued.len(), 1);
     }
@@ -950,22 +1028,46 @@ mod tests {
         let mut state = state_with(&[4, 6, 8]);
         state.head = u16::MAX;
         state.local_tail = 2;
-        let mut uncertain = false;
-        let (progress, poisoned) = state.complete(&Ok(8), Some(2), true, &mut uncertain, || Ok(2));
-        assert!(!poisoned);
-        assert_eq!(progress.bytes_sent(), 8);
+        let mut request = RequestAccounting::default();
+        let (progress, quarantine) = state.complete(&Ok(18), Some(2), true, &mut request, || Ok(2));
+        assert_eq!(quarantine, None);
+        assert_eq!(progress.bytes_sent(), 18);
         assert_eq!(progress.buffers_released(), 3);
         assert_eq!(state.head, 2);
     }
 
     #[test]
-    fn empty_ring_selection_failure_needs_no_head() {
+    fn errors_before_selection_need_no_head() {
         let mut state = state_with(&[]);
-        let mut uncertain = false;
-        let err = Err(io::Error::from_raw_os_error(libc::ENOBUFS));
-        let (progress, poisoned) = state.complete(&err, None, true, &mut uncertain, no_head);
-        assert!(!poisoned);
+        let mut request = RequestAccounting::default();
+        let (progress, quarantine) =
+            state.complete(&errno(libc::ENOBUFS), None, true, &mut request, no_head);
+        assert_eq!(quarantine, None);
         assert_eq!(progress, SendBundleResult::default());
+
+        // A kernel without bundle sends rejects the request at preparation,
+        // so published buffers stay queued and the ring stays usable.
+        let mut state = state_with(&[4, 6]);
+        let mut request = RequestAccounting::default();
+        let (progress, quarantine) =
+            state.complete(&errno(libc::EINVAL), None, true, &mut request, no_head);
+        assert_eq!(quarantine, None);
+        assert_eq!(progress, SendBundleResult::default());
+        assert_eq!(state.queued.len(), 2);
+    }
+
+    #[test]
+    fn cancellation_after_selection_is_a_gap() {
+        let mut state = state_with(&[4, 6, 8]);
+        let mut request = RequestAccounting::default();
+        let (progress, quarantine) =
+            state.complete(&errno(libc::ECANCELED), Some(0), true, &mut request, || {
+                Ok(3)
+            });
+        assert_eq!(progress.buffers_released(), 3);
+        assert_eq!(progress.bytes_sent(), 0);
+        assert_eq!(quarantine, Some(Quarantine::Gap));
+        assert_eq!(state.quarantine, Some(Quarantine::Gap));
     }
 
     // Accounts for each completion, then resolves the request as
@@ -974,16 +1076,16 @@ mod tests {
         state: &mut SendRingState,
         completions: Vec<(io::Result<u32>, Option<Bid>, io::Result<u16>)>,
     ) -> Result<SendBundleResult, SendBundleError> {
-        let mut request = SendBundleProgress::default();
-        let mut uncertain = false;
+        let mut progress = SendBundleProgress::default();
+        let mut request = RequestAccounting::default();
         let last = completions.len() - 1;
         for (index, (result, selected, head)) in completions.into_iter().enumerate() {
             let terminal = index == last;
-            let (progress, quarantined) =
-                state.complete(&result, selected, terminal, &mut uncertain, || head);
-            request.record(progress, quarantined);
+            let (completion, quarantine) =
+                state.complete(&result, selected, terminal, &mut request, || head);
+            progress.record(completion, quarantine);
             if terminal {
-                return request.finish(result);
+                return progress.finish(result);
             }
         }
         unreachable!()
@@ -991,6 +1093,13 @@ mod tests {
 
     fn unused_head() -> io::Result<u16> {
         Err(io::Error::other("head not expected"))
+    }
+
+    fn source_errno(error: &SendBundleError) -> Option<i32> {
+        error
+            .source()
+            .and_then(|err| err.downcast_ref::<io::Error>())
+            .and_then(io::Error::raw_os_error)
     }
 
     #[test]
@@ -1003,46 +1112,76 @@ mod tests {
                 (Ok(10), Some(0), unused_head()),
                 (Ok(8), Some(2), unused_head()),
                 // The third selects the last buffer and fails.
-                (
-                    Err(io::Error::from_raw_os_error(libc::ECONNRESET)),
-                    None,
-                    Ok(4),
-                ),
+                (errno(libc::ECONNRESET), None, Ok(4)),
             ],
         )
         .unwrap_err();
-        assert_eq!(error.error().raw_os_error(), Some(libc::ECONNRESET));
-        assert!(!error.is_quarantined());
+        // The last buffer was consumed without being transmitted.
+        assert!(error.is_quarantined());
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(source_errno(&error), Some(libc::ECONNRESET));
         let progress = error.progress();
         assert_eq!(progress.bytes_sent(), 18);
         assert_eq!(progress.buffers_released(), 4);
         assert_eq!(progress.bytes_released(), 23);
         assert!(state.queued.is_empty());
-
-        let error: io::Error = error.into();
-        assert_eq!(error.raw_os_error(), Some(libc::ECONNRESET));
     }
 
     #[test]
-    fn ordinary_errors_report_their_own_progress() {
+    fn errors_without_a_gap_report_their_own_progress() {
         // Nothing was published.
         let mut state = state_with(&[]);
-        let err = Err(io::Error::from_raw_os_error(libc::ENOBUFS));
-        let error = run_request(&mut state, vec![(err, None, unused_head())]).unwrap_err();
+        let error = run_request(
+            &mut state,
+            vec![(errno(libc::ENOBUFS), None, unused_head())],
+        )
+        .unwrap_err();
         assert_eq!(error.error().raw_os_error(), Some(libc::ENOBUFS));
         assert_eq!(error.progress(), SendBundleResult::default());
         assert!(!error.is_quarantined());
 
-        // The request selected two buffers and transmitted nothing.
+        // Two full bundles, then the socket fails before selecting more.
         let mut state = state_with(&[4, 6, 8]);
-        let err = Err(io::Error::from_raw_os_error(libc::EPIPE));
-        let error = run_request(&mut state, vec![(err, None, Ok(2))]).unwrap_err();
+        let error = run_request(
+            &mut state,
+            vec![
+                (Ok(10), Some(0), unused_head()),
+                (errno(libc::EPIPE), None, Ok(2)),
+            ],
+        )
+        .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
         assert!(!error.is_quarantined());
+        assert_eq!(error.progress().bytes_sent(), 10);
+        assert_eq!(error.progress().bytes_released(), 10);
+        assert_eq!(state.queued.len(), 1);
+        assert_eq!(state.quarantine, None);
+
+        let error: io::Error = error.into();
+        assert_eq!(error.raw_os_error(), Some(libc::EPIPE));
+    }
+
+    #[test]
+    fn gap_quarantine_reports_the_socket_error_and_blocks_the_ring() {
+        // The request selected two buffers and transmitted nothing.
+        let mut state = state_with(&[4, 6, 8]);
+        let error = run_request(&mut state, vec![(errno(libc::EPIPE), None, Ok(2))]).unwrap_err();
+        assert!(error.is_quarantined());
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(source_errno(&error), Some(libc::EPIPE));
         assert_eq!(error.progress().bytes_sent(), 0);
         assert_eq!(error.progress().buffers_released(), 2);
         assert_eq!(error.progress().bytes_released(), 10);
         assert_eq!(state.queued.len(), 1);
+        assert_eq!(state.quarantine, Some(Quarantine::Gap));
+
+        // A swallowed socket error leaves a successful terminal completion.
+        let mut state = state_with(&[4, 6]);
+        let error = run_request(&mut state, vec![(Ok(4), Some(0), Ok(2))]).unwrap_err();
+        assert!(error.is_quarantined());
+        assert!(error.source().is_none());
+        assert_eq!(error.progress().bytes_sent(), 4);
+        assert_eq!(error.progress().bytes_released(), 10);
     }
 
     #[test]
@@ -1053,7 +1192,7 @@ mod tests {
             vec![
                 (Ok(4), Some(0), unused_head()),
                 (
-                    Err(io::Error::from_raw_os_error(libc::ECANCELED)),
+                    errno(libc::ECANCELED),
                     None,
                     Err(io::Error::from_raw_os_error(libc::EINVAL)),
                 ),
@@ -1062,14 +1201,11 @@ mod tests {
         .unwrap_err();
         assert!(error.is_quarantined());
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        let cause = error
-            .source()
-            .and_then(|err| err.downcast_ref::<io::Error>())
-            .expect("socket error is the source");
-        assert_eq!(cause.raw_os_error(), Some(libc::ECANCELED));
+        assert_eq!(source_errno(&error), Some(libc::ECANCELED));
         assert_eq!(error.progress().bytes_sent(), 4);
         assert_eq!(error.progress().bytes_released(), 4);
         assert_eq!(state.queued.len(), 2);
+        assert_eq!(state.quarantine, Some(Quarantine::Unidentified));
 
         // A successful terminal completion can also quarantine.
         let mut state = state_with(&[4, 6]);
@@ -1081,9 +1217,11 @@ mod tests {
 
         // A request that finds the ring quarantined keeps the claim error.
         let mut request = SendBundleProgress::default();
-        request.mark_quarantined();
-        request.record(SendBundleResult::default(), false);
-        let error = request.finish(Err(quarantined_error(None))).unwrap_err();
+        request.mark_quarantined(Quarantine::Gap);
+        request.record(SendBundleResult::default(), None);
+        let error = request
+            .finish(Err(quarantined_error(Quarantine::Gap, None)))
+            .unwrap_err();
         assert!(error.is_quarantined());
         assert!(is_quarantine_error(error.error()));
         assert!(error.source().is_none());
@@ -1093,10 +1231,11 @@ mod tests {
     fn impossible_or_unknown_head_quarantines() {
         for head in [Ok(4), Err(io::Error::from_raw_os_error(libc::EINVAL))] {
             let mut state = state_with(&[4, 6, 8]);
-            let mut uncertain = false;
-            let err = Err(io::Error::from_raw_os_error(libc::ECANCELED));
-            let (progress, poisoned) = state.complete(&err, None, true, &mut uncertain, || head);
-            assert!(poisoned && state.poisoned);
+            let mut request = RequestAccounting::default();
+            let (progress, quarantine) =
+                state.complete(&errno(libc::ECANCELED), None, true, &mut request, || head);
+            assert_eq!(quarantine, Some(Quarantine::Unidentified));
+            assert_eq!(state.quarantine, Some(Quarantine::Unidentified));
             assert_eq!(progress.buffers_released(), 0);
             assert_eq!(
                 state.queued.len(),

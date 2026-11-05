@@ -16,8 +16,8 @@ use std::task::{ready, Context, Poll as TaskPoll};
 
 use crate::buf::{set_init_checked, StableBuf, StableBufMut};
 use crate::bufring::{
-    BufRingBuf, BufRingBufBundle, RecvBufRing, SendBufRing, SendBundleError, SendBundleProgress,
-    SendBundleResult, SendClaim,
+    BufRingBuf, BufRingBufBundle, Quarantine, RecvBufRing, SendBufRing, SendBundleError,
+    SendBundleProgress, SendBundleResult, SendClaim,
 };
 use crate::fd::{NornFd, UringFd};
 use crate::operation::{CQEResult, Multishot, Op, OpTarget, Operation, OperationId, Singleshot};
@@ -2090,7 +2090,7 @@ where
 pub(crate) struct SendBundleCompletion {
     result: io::Result<u32>,
     progress: SendBundleResult,
-    quarantined: bool,
+    quarantine: Option<Quarantine>,
 }
 
 #[derive(Debug)]
@@ -2098,7 +2098,8 @@ pub(crate) struct SendBundle {
     fd: NornFd,
     ring: SendBufRing,
     // Acquired by `configure`; dropped with the operation after its terminal
-    // completion, or when it is abandoned before submission.
+    // completion, even when the request was dropped first, or when it is
+    // abandoned before submission.
     claim: Option<SendClaim>,
     progress: SendBundleProgress,
 }
@@ -2125,8 +2126,8 @@ unsafe impl Operation for SendBundle {
 
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let claim = self.ring.claim_sender().inspect_err(|_| {
-            if self.ring.is_quarantined() {
-                self.progress.mark_quarantined();
+            if let Some(reason) = self.ring.quarantine() {
+                self.progress.mark_quarantined(reason);
             }
         })?;
         self.claim = Some(claim);
@@ -2136,15 +2137,15 @@ unsafe impl Operation for SendBundle {
     unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
         let synthetic = result.is_synthetic();
         let (result, flags) = result.into_parts();
-        let (progress, quarantined) = match self.claim.as_mut() {
+        let (progress, quarantine) = match self.claim.as_mut() {
             // A synthetic completion never reached the kernel.
             Some(claim) if !synthetic => claim.complete(&result, flags),
-            _ => (SendBundleResult::default(), false),
+            _ => (SendBundleResult::default(), None),
         };
         SendBundleCompletion {
             result,
             progress,
-            quarantined,
+            quarantine,
         }
     }
 }
@@ -2155,12 +2156,12 @@ impl Singleshot for SendBundle {
     fn update(&mut self, completion: Self::Completion) {
         // Each non-terminal CQE reports one transmitted bundle.
         self.progress
-            .record(completion.progress, completion.quarantined);
+            .record(completion.progress, completion.quarantine);
     }
 
     fn complete(mut self, completion: Self::Completion) -> Self::Output {
         self.progress
-            .record(completion.progress, completion.quarantined);
+            .record(completion.progress, completion.quarantine);
         self.progress.finish(completion.result)
     }
 }
