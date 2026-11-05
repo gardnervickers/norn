@@ -192,7 +192,7 @@ impl UdpSocket {
     ///
     /// Returns an error if the socket cannot be connected to `addr`.
     pub async fn connect(&self, addr: SocketAddr) -> io::Result<()> {
-        self.inner.connect(addr).await
+        self.inner.connect(addr.into()).await
     }
 
     /// Returns the socket address that this socket was created from.
@@ -285,7 +285,7 @@ impl UdpSocket {
     where
         B: StableBufMut + 'static,
     {
-        self.inner.recv_from(buf)
+        self.inner.recv_from::<socket::Inet, B>(buf)
     }
 
     /// Receives a single datagram message on a connected socket.

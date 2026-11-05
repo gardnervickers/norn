@@ -21,7 +21,7 @@ The project is intentionally not general-purpose today; APIs are still in flux i
 - `norn-task/`: local-only task runtime primitives (`TaskQueue`, `TaskSet`, `JoinHandle`, `Runnable`, `Schedule`).
 - `norn-executor/`: single-thread executor and `Park` abstraction (`SpinPark`, `ThreadPark`).
 - `norn-timer/`: timer wheel + `Clock::{system, simulated}` as a `Park` wrapper.
-- `norn-uring/`: `io_uring` reactor, operation lifecycle, stable buffers, bufring, fs, tcp/udp.
+- `norn-uring/`: `io_uring` reactor, operation lifecycle, stable buffers, bufring, fs, tcp/udp/unix sockets.
 - `benches/`: `bencher` harness (`schedule_task`, `noop_submit`, `timers`, `hyper`).
 - `examples/norn-kv-bench/`: end-to-end mixed-workload benchmark driver for `norn-kv-server` (independent epoll client; Linux only).
 - `hack/`: helper scripts (`miri.sh`, `coverage.sh`).
@@ -220,6 +220,7 @@ The project is intentionally not general-purpose today; APIs are still in flux i
   - file open/read/write,
   - tcp accept/echo,
   - udp send/recv, bufring usage, exhaustion, close behavior.
+  - unix stream and datagram sockets: paths, abstract names, unnamed peers, options.
 
 ## Coding and Documentation Standards
 

@@ -50,9 +50,10 @@ impl RecvOptions {
     ///
     /// This sets `MSG_TRUNC`. The returned byte count is the datagram's full
     /// length and may exceed the initialized length of the returned buffer;
-    /// the excess is discarded. TCP receives reject it with
-    /// [`io::ErrorKind::InvalidInput`] and return the buffer unchanged, because
-    /// on a stream it discards input without filling the buffer.
+    /// the excess is discarded. Stream receives, on TCP and Unix stream
+    /// sockets, reject it with [`io::ErrorKind::InvalidInput`] and return the
+    /// buffer unchanged, because on a stream it discards input without
+    /// filling the buffer.
     ///
     /// [`io::ErrorKind::InvalidInput`]: std::io::ErrorKind::InvalidInput
     #[must_use]
