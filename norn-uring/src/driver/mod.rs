@@ -677,14 +677,15 @@ impl Handle {
             .update(&self.shared.ring, offset, fds)
     }
 
-    /// Release this ring's fixed-file table, retrying later if necessary.
-    pub(crate) fn unregister_files(&self) {
-        self.shared.registered_files.unregister(&self.shared.ring)
+    /// Record that this ring's fixed-file table has no owners left. The
+    /// kernel table is unregistered by the next registration.
+    pub(crate) fn retire_files(&self) {
+        self.shared.registered_files.retire()
     }
 
     #[cfg(test)]
-    pub(crate) fn test_fixed_files_stale(&self) -> bool {
-        self.shared.registered_files.test_is_stale()
+    pub(crate) fn test_fixed_files_retired(&self) -> bool {
+        self.shared.registered_files.test_is_retired()
     }
 
     pub(crate) fn fixed_buf_driver(&self) -> FixedBufDriver {

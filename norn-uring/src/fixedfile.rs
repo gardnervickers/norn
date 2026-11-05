@@ -46,6 +46,15 @@
 //! Sparse table registration requires Linux 5.19. [`FixedFd::install`]
 //! requires Linux 6.8. Kernels without a feature report an OS error from
 //! the corresponding call or request.
+//!
+//! Linux 6.13 or newer is recommended. Earlier kernels track registered files
+//! and buffers in shared generations: a file removed from a slot is closed
+//! only after every request that began before the removal and uses a
+//! registered file or buffer has completed. One long-lived request, such as a
+//! receive on an idle connection, can then keep other closed sockets open
+//! indefinitely. The same generations make unregistering a table wait for
+//! those requests, so Norn never unregisters from a drop; see
+//! [`Handle::register_fixed_files`].
 
 use std::cell::{Cell, RefCell};
 use std::ffi::CString;
@@ -73,18 +82,24 @@ const LOG: &str = "norn_uring::fixedfile";
 impl Handle {
     /// Register a sparse table of `slots` fixed files with this driver.
     ///
-    /// A ring has at most one file table. It remains registered until the
+    /// A ring has at most one file table. Another can be registered once the
     /// returned [`FixedFileTable`] and every [`FixedFd`] allocated from it are
-    /// dropped; a new table can be registered after that.
+    /// dropped. Dropping them clears every slot but leaves the kernel table
+    /// registered until the next registration unregisters it or the ring is
+    /// destroyed. On kernels before Linux 6.13 that unregistration waits for
+    /// every in-flight request that uses a registered file or buffer, so
+    /// register a new table only when no such request depends on this thread
+    /// to finish.
     ///
     /// # Errors
     ///
     /// Returns [`io::ErrorKind::InvalidInput`] when `slots` is zero or larger
     /// than `i32::MAX`, [`io::ErrorKind::AlreadyExists`] while another table is
     /// registered, [`io::ErrorKind::BrokenPipe`] after the driver stops, and
-    /// the kernel's error when registration fails. Linux reports `EMFILE` when
-    /// `slots` exceeds `RLIMIT_NOFILE`, and `EINVAL` when it exceeds the
-    /// kernel's table limit or sparse registration is unsupported.
+    /// the kernel's error when unregistering the previous table or
+    /// registering this one fails. Linux reports `EMFILE` when `slots` exceeds
+    /// `RLIMIT_NOFILE`, and `EINVAL` when it exceeds the kernel's table limit
+    /// or sparse registration is unsupported.
     pub fn register_fixed_files(&self, slots: u32) -> io::Result<FixedFileTable> {
         if slots == 0 || i32::try_from(slots).is_err() {
             return Err(io::Error::new(
@@ -420,6 +435,9 @@ impl FixedFd {
     /// reference keeps it open. On success the slot becomes available
     /// immediately.
     ///
+    /// After the driver stops, the close cannot be submitted, so the slot is
+    /// cleared synchronously instead, as dropping the value would.
+    ///
     /// # Errors
     ///
     /// Returns [`io::ErrorKind::WouldBlock`] while an operation still retains
@@ -434,6 +452,9 @@ impl FixedFd {
             ));
         }
         let handle = self.slot.handle().clone();
+        if handle.check_accepting_fixed_files().is_err() {
+            return self.slot.clear_now();
+        }
         handle.submit(CloseFixed { slot: self.slot }).await
     }
 }
@@ -470,6 +491,17 @@ impl Slot {
 
     fn handle(&self) -> &Handle {
         &self.inner.table.handle
+    }
+
+    /// Clear the kernel entry synchronously and release the index. If the
+    /// clear fails, releasing the index retries it and quarantines the index
+    /// when that fails too.
+    fn clear_now(self) -> io::Result<()> {
+        let result = self.inner.table.clear(self.inner.index);
+        if result.is_ok() {
+            self.inner.occupied.set(false);
+        }
+        result
     }
 }
 
@@ -583,8 +615,12 @@ impl Table {
 impl Drop for Table {
     fn drop(&mut self) {
         // Every slot retains the table, so only quarantined entries can still
-        // hold files. Unregistering releases them all.
-        self.handle.unregister_files();
+        // hold files. Give them one more chance to clear; one that still fails
+        // keeps its file until the next registration unregisters the kernel
+        // table or the ring is destroyed. Unregistering here could block this
+        // thread on kernels before 6.13.
+        self.retry_quarantined();
+        self.handle.retire_files();
     }
 }
 
@@ -790,8 +826,9 @@ impl Singleshot for CloseFixed {
 enum TableState {
     Empty,
     Registered,
-    /// Unregistration failed; it is retried before the next registration.
-    Stale,
+    /// The table's last owner dropped. The kernel table stays registered, with
+    /// its slots cleared, until the next registration unregisters it.
+    Retired,
 }
 
 /// Tracks the single registered file table owned by one ring.
@@ -815,14 +852,15 @@ impl Registry {
     }
 
     pub(crate) fn register(&self, ring: &RefCell<IoUring>, slots: u32) -> io::Result<()> {
-        if self.state.get() == TableState::Stale {
-            self.unregister(ring);
-        }
-        if self.state.get() != TableState::Empty {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "a fixed-file table is already registered with this driver",
-            ));
+        match self.state.get() {
+            TableState::Empty => {}
+            TableState::Registered => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "a fixed-file table is already registered with this driver",
+                ))
+            }
+            TableState::Retired => self.unregister(ring)?,
         }
         let ring = borrow_ring(ring)?;
         retry_interrupted(|| ring.submitter().register_files_sparse(slots))?;
@@ -843,30 +881,33 @@ impl Registry {
         retry_interrupted(|| ring.submitter().register_files_update(offset, fds))
     }
 
-    pub(crate) fn unregister(&self, ring: &RefCell<IoUring>) {
-        if self.state.get() == TableState::Empty {
-            return;
+    /// Record that the registered table's last owner dropped.
+    pub(crate) fn retire(&self) {
+        if self.state.get() == TableState::Registered {
+            self.state.set(TableState::Retired);
         }
+    }
+
+    /// Unregister a retired kernel table. On failure the table stays retired
+    /// and the error is returned.
+    fn unregister(&self, ring: &RefCell<IoUring>) -> io::Result<()> {
         let result = borrow_ring(ring)
             .and_then(|ring| retry_interrupted(|| ring.submitter().unregister_files()));
         match result {
-            Ok(()) => self.state.set(TableState::Empty),
+            Ok(()) => {}
             // The kernel has no table, so there is nothing left to release.
-            Err(err) if err.raw_os_error() == Some(libc::ENXIO) => {
-                self.state.set(TableState::Empty)
-            }
-            Err(err) => {
-                warn!(target: LOG, "unregister.deferred {err}");
-                self.state.set(TableState::Stale);
-            }
+            Err(err) if err.raw_os_error() == Some(libc::ENXIO) => {}
+            Err(err) => return Err(err),
         }
+        self.state.set(TableState::Empty);
+        Ok(())
     }
 }
 
 #[cfg(test)]
 impl Registry {
-    pub(crate) fn test_is_stale(&self) -> bool {
-        self.state.get() == TableState::Stale
+    pub(crate) fn test_is_retired(&self) -> bool {
+        self.state.get() == TableState::Retired
     }
 }
 
@@ -1111,16 +1152,59 @@ mod tests {
     }
 
     #[test]
-    fn failed_unregister_is_retried_before_registration() {
+    fn dropped_table_stays_registered_until_the_next_registration() {
         let driver = driver();
         let handle = driver.handle();
         let table = handle.register_fixed_files(1).unwrap();
+        // Dropping makes no syscall, so a borrowed ring does not matter.
         handle.test_with_ring_borrowed_mut(|| drop(table));
-        assert!(
-            handle.test_fixed_files_stale(),
-            "a borrowed ring defers unregistration"
-        );
+        assert!(handle.test_fixed_files_retired());
+
+        // The next registration unregisters the old table first, and reports
+        // why it could not.
+        let mut result = None;
+        handle.test_with_ring_borrowed_mut(|| result = Some(handle.register_fixed_files(1)));
+        let err = result.unwrap().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        assert!(handle.test_fixed_files_retired());
+
+        let table = handle.register_fixed_files(2).unwrap();
+        assert_eq!(table.capacity(), 2);
+    }
+
+    #[test]
+    fn dropping_the_table_retries_quarantined_slots() {
+        let driver = driver();
+        let handle = driver.handle();
         let table = handle.register_fixed_files(1).unwrap();
-        assert_eq!(table.capacity(), 1);
+        let (reader, writer) = pipe();
+        let fixed = table.insert_fd(writer.as_fd()).unwrap();
+        drop(writer);
+        handle.test_with_ring_borrowed_mut(|| drop(fixed));
+        assert!(!reader_sees_eof(&reader));
+
+        drop(table);
+        assert!(reader_sees_eof(&reader));
+    }
+
+    #[test]
+    fn close_after_shutdown_clears_the_slot_synchronously() {
+        use futures_util::FutureExt;
+
+        let driver = driver();
+        let handle = driver.handle();
+        let table = handle.register_fixed_files(1).unwrap();
+        let (reader, writer) = pipe();
+        let fixed = table.insert_fd(writer.as_fd()).unwrap();
+        drop(writer);
+
+        drop(driver);
+        let result = fixed
+            .close()
+            .now_or_never()
+            .expect("close completes at once");
+        result.unwrap();
+        assert!(reader_sees_eof(&reader));
+        assert_eq!(table.available(), 1);
     }
 }
