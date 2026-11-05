@@ -1,5 +1,19 @@
 use std::io;
+use std::time::Duration;
+
 pub(crate) mod notify;
+
+/// Convert `duration` to a kernel timespec, saturating at the longest time the
+/// kernel can represent.
+///
+/// The kernel reads the seconds as an `i64`, so a larger value, such as
+/// `Duration::MAX` used as "no deadline", would wrap to a negative timeout
+/// that has already expired, or that the kernel rejects with `EINVAL`.
+pub(crate) fn timespec(duration: Duration) -> io_uring::types::Timespec {
+    io_uring::types::Timespec::new()
+        .sec(duration.as_secs().min(i64::MAX as u64))
+        .nsec(duration.subsec_nanos())
+}
 
 /// A no-op operation, useful for testing.
 ///

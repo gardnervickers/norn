@@ -68,7 +68,10 @@ The project is intentionally not general-purpose today; APIs are still in flux i
   counting helper; only the fallback drain barrier is uncounted.
 - `Driver::new` rejects `IORING_SETUP_IOPOLL` and kernels without
   `IORING_FEAT_EXT_ARG`, and enables `IORING_SETUP_R_DISABLED` rings.
-- Entries that do not fit in the SQ wait in the driver's overflow queue.
+- An entry that does not fit in the SQ waits in the driver's overflow queue
+  (`Shared::overflow`). Parks move queued entries into the SQ in order before
+  entering the kernel, and a linked batch moves only whole. While the queue is
+  non-empty, new entries queue behind it and `needs_park` reports true.
 - Driver park loop drains the CQ before parking and treats `EBUSY`, `EAGAIN`
   and `ENOMEM` from `io_uring_enter` as transient: drain and retry, or yield.
   `EINTR` retries the enter, except in a timed park, which returns early so a
@@ -96,8 +99,14 @@ The project is intentionally not general-purpose today; APIs are still in flux i
 ### `norn-uring` operation lifecycle
 
 - `Op<T>` has staged state:
-  - `Unsubmitted` (waiting for SQ space),
-  - `Submitted` (awaiting completions).
+  - `Prepared` (not configured yet),
+  - `Waiting` (configured into a linked batch not yet handed to the driver),
+  - `Submitted` (handed to the driver: in the SQ, the overflow queue, or the
+    kernel, or completed synthetically).
+- Dropping an operation whose entry is still in the overflow queue cancels it
+  there: it completes with `ECANCELED` without reaching the kernel, and so does
+  the rest of its linked group. Shutdown fails queued entries with the shutdown
+  error.
 - Dropping submitted `Op` attempts cancellation (`cancel(user_data)`).
   Cancellations that report ENOENT are not retried, except once for a later
   member of a linked batch: the kernel issues it from task work after its
