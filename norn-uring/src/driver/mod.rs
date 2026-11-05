@@ -601,6 +601,11 @@ impl Handle {
         self.shared.cancel_all_requested.get()
     }
 
+    /// Whether the driver still accepts work.
+    pub(crate) fn is_running(&self) -> bool {
+        self.shared.status() == Status::Running
+    }
+
     pub(crate) fn reserve_fixed_buffers(
         &self,
     ) -> Result<FixedBufReservation, ReserveFixedBufError> {
@@ -1197,8 +1202,9 @@ impl Driver {
             // Like the first cancel, this matches every request. That includes a
             // drop-close (`CLOSE_FD_TOKEN`) still queued in io-wq, which only
             // happens for files whose close flushes (FUSE, NFS); cancelling one
-            // leaks its descriptor. This runs only after a full timeout with no
-            // completion.
+            // leaks its descriptor. This runs only after a wait that completed
+            // nothing, and a signal can cut that wait short: a timed park
+            // returns early on `EINTR`.
             debug!(
                 target: LOG,
                 "shutdown.recancel in_flight={}",
@@ -1612,9 +1618,7 @@ impl Shared {
         let mut ring = self.ring.borrow_mut();
         Ok(match mode {
             ParkMode::Timeout(duration) => {
-                let ts = Timespec::new()
-                    .sec(duration.as_secs())
-                    .nsec(duration.subsec_nanos());
+                let ts = crate::util::timespec(duration);
                 let args = SubmitArgs::new().timespec(&ts);
                 ring.submitter().submit_with_args(1, &args)?
             }
@@ -1851,9 +1855,14 @@ impl Shared {
     /// after the target was issued; a second ENOENT then means the target is
     /// issued but not cancellable, and there is no further retry.
     ///
+    /// Under SQPOLL, the kernel's SQ thread may run that task work instead of
+    /// the enter, so the retry can still arrive before the target is issued.
+    /// The target then runs until it completes on its own or shutdown cancels
+    /// it. This is suspected from the kernel source, not reproduced.
+    ///
     /// Retries run only while the driver accepts work. Shutdown reclaims the
-    /// remaining targets through synchronous cancellation and its drain
-    /// barriers instead.
+    /// remaining targets through synchronous cancellation and its re-cancels
+    /// instead.
     #[inline]
     fn retry_cancels(self: &Rc<Self>) {
         if self.cancel_retries.borrow().is_empty() {
@@ -2445,6 +2454,168 @@ mod tests {
         );
         assert!(dropped.load(Ordering::Acquire));
         assert_eq!(driver.shared.in_flight(), 0);
+    }
+
+    struct Nop;
+
+    // Safety: a NOP references no memory and posts one terminal CQE.
+    unsafe impl Operation for Nop {
+        type Completion = CQEResult;
+
+        fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+            Ok(opcode::Nop::new().build())
+        }
+
+        unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+            result
+        }
+    }
+
+    impl Singleshot for Nop {
+        type Output = io::Result<u32>;
+
+        fn complete(self, completion: Self::Completion) -> Self::Output {
+            completion.into_result()
+        }
+    }
+
+    #[test]
+    fn overflow_queue_keeps_order_and_moves_linked_groups_whole() {
+        let mut driver = Driver::new(io_uring::IoUring::builder(), 2).unwrap();
+        let handle = driver.handle();
+        let waker = futures_test::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        // One slot is left, too few for the batch, and the NOP after the batch
+        // must queue behind it rather than take the slot.
+        let mut first = pin!(handle.submit(Nop));
+        let mut batch = pin!(handle.submit(Nop).then(handle.submit(Nop)));
+        let mut last = pin!(handle.submit(Nop));
+        assert!(first.as_mut().poll(&mut cx).is_pending());
+        assert!(batch.as_mut().poll(&mut cx).is_pending());
+        assert!(last.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(handle.queued_entries(), 3);
+        assert!(driver.needs_park());
+
+        // The first park submits `first`; only then does the batch fit.
+        driver.park(ParkMode::NoPark).unwrap();
+        assert_eq!(handle.queued_entries(), 3);
+        driver.park(ParkMode::NoPark).unwrap();
+        assert_eq!(handle.queued_entries(), 1, "the batch moved whole");
+        driver.park(ParkMode::NoPark).unwrap();
+        assert_eq!(handle.queued_entries(), 0);
+
+        let (mut first_done, mut batch_done, mut last_done) = (false, false, false);
+        for _ in 0..10 {
+            first_done = first_done || first.as_mut().poll(&mut cx).is_ready();
+            batch_done = batch_done || batch.as_mut().poll(&mut cx).is_ready();
+            last_done = last_done || last.as_mut().poll(&mut cx).is_ready();
+            if first_done && batch_done && last_done {
+                return;
+            }
+            driver.park(ParkMode::NoPark).unwrap();
+        }
+        panic!("queued operations did not complete");
+    }
+
+    #[test]
+    fn a_queued_operation_dropped_before_it_reaches_the_kernel_is_never_pushed() {
+        let mut driver = Driver::new(io_uring::IoUring::builder(), 1).unwrap();
+        let handle = driver.handle();
+        fill_sq(&driver);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut read = Box::pin(long_lived_read(&handle, &dropped));
+        assert!(read
+            .as_mut()
+            .poll(&mut Context::from_waker(&futures_test::task::noop_waker()))
+            .is_pending());
+        assert_eq!(handle.queued_entries(), 1);
+
+        // Cancelled where it waits: no cancellation is pushed, and the read
+        // completes without ever being counted in flight.
+        drop(read);
+        assert_eq!(driver.shared.in_flight(), 0);
+        assert!(park_until(&mut driver, 10, || dropped.load(Ordering::Acquire)));
+        assert_eq!(handle.queued_entries(), 0);
+        assert_eq!(driver.shared.in_flight(), 0);
+    }
+
+    #[test]
+    fn shutdown_fails_queued_operations_without_the_kernel() {
+        let mut driver = Driver::new(io_uring::IoUring::builder(), 1).unwrap();
+        let handle = driver.handle();
+        fill_sq(&driver);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut read = Box::pin(long_lived_read(&handle, &dropped));
+        let waker = futures_test::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(read.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(handle.queued_entries(), 1);
+
+        assert_eq!(
+            driver.shutdown_with_outcome(),
+            ShutdownOutcome::CleanDrained
+        );
+        let Poll::Ready(Err(err)) = read.as_mut().poll(&mut cx) else {
+            panic!("a queued read must fail with the shutdown error");
+        };
+        assert_eq!(err.to_string(), "reactor is shutting down");
+        drop(read);
+        assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn a_dropped_operation_does_not_wake_its_last_waker() {
+        let mut driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let handle = driver.handle();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut read = Box::pin(long_lived_read(&handle, &dropped));
+        let (waker, wakes) = futures_test::task::new_count_waker();
+        assert!(read
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending());
+        driver.park(ParkMode::NoPark).unwrap();
+
+        // Nothing will poll the read again, so its cancellation must not wake
+        // the task that dropped it.
+        drop(read);
+        assert!(park_until(&mut driver, 20, || dropped.load(Ordering::Acquire)));
+        assert_eq!(wakes.get(), 0);
+    }
+
+    #[test]
+    fn incoming_ends_once_the_driver_stops_accepting_work() {
+        use futures_util::StreamExt;
+
+        let driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let handle = driver.handle();
+        let mut ex = norn_executor::LocalExecutor::new(driver);
+        let items = ex.block_on(async move {
+            let listener = crate::net::TcpListener::bind("127.0.0.1:0".parse().unwrap(), 8)
+                .await
+                .unwrap();
+            let mut incoming = pin!(listener.incoming());
+            assert!(futures_util::poll!(incoming.next()).is_pending());
+            crate::noop().await.unwrap();
+
+            // As after a health error: the driver stops accepting work, and the
+            // armed accept ends.
+            handle.shared.set_status(Status::Closing);
+            handle.shared.cancel_all().unwrap();
+            let mut items = Vec::new();
+            for _ in 0..8 {
+                match incoming.next().await {
+                    Some(item) => items.push(item.map(drop).map_err(|err| err.kind())),
+                    None => break,
+                }
+            }
+            items
+        });
+        assert!(
+            items.len() <= 1,
+            "incoming() kept re-arming into a stopped driver: {items:?}"
+        );
     }
 
     #[test]

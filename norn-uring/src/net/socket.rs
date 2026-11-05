@@ -465,6 +465,11 @@ impl Socket {
         Ok((socket, addr))
     }
 
+    /// Whether this socket's driver still accepts work.
+    pub(crate) fn driver_running(&self) -> bool {
+        self.fd.handle().is_running()
+    }
+
     /// Start a multishot accept that pauses itself once `limit` accepted
     /// connections wait to be yielded; `None` never pauses.
     pub(crate) fn accept_multi(&self, limit: Option<NonZeroUsize>) -> Op<AcceptMulti> {

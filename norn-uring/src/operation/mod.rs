@@ -312,6 +312,12 @@ pin_project_lite::pin_project! {
             let this = me.project();
             match this.state {
                 State::Submitted { inner } => {
+                    let header = inner.inner.inner.header();
+                    if !header.is_complete() {
+                        // Nothing will poll this future again, so its later
+                        // completions must not wake the task that dropped it.
+                        drop(header.take_waker());
+                    }
                     if inner.needs_cancel() {
                         this.reactor.cancel_op(
                             OpTarget {
