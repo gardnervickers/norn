@@ -2,9 +2,12 @@ use io_uring::types::FsyncFlags;
 use io_uring::{opcode, types};
 use std::future::Future;
 use std::io;
+use std::ops::Range;
 use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
+
+use smallvec::SmallVec;
 
 use crate::buf::{set_init_checked, StableBuf, StableBufMut};
 use crate::fd::{with_fd_target, NornFd, OpFd, UringFd};
@@ -250,6 +253,82 @@ impl File {
             "fixed buffer and file must target the same driver"
         );
         let write = WriteFixedAt::new(self.fd.lease(), buf, offset);
+        self.fd.submit(write)
+    }
+
+    /// Read bytes into several segments of one registered fixed buffer.
+    ///
+    /// Each segment is a non-empty byte range relative to the buffer's
+    /// selected range, as exposed by [`FixedBuf::as_full_slice`]. The read
+    /// starts at `offset` and fills the segments in order. Overlapping segments
+    /// are permitted; later bytes overwrite earlier ones.
+    ///
+    /// Unlike [`File::read_fixed_at`], this does not change the buffer's
+    /// logical length because the filled bytes need not form a prefix. The
+    /// operation returns ownership of the buffer with the number of bytes read.
+    /// Requires Linux 6.15 or newer; earlier kernels report `EINVAL`.
+    ///
+    /// # Errors
+    ///
+    /// The request resolves with [`io::ErrorKind::InvalidInput`], without
+    /// being submitted, when `segments` is empty, contains more than 1024
+    /// segments, or contains an empty or out-of-range segment.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixed buffer was registered with another driver.
+    #[track_caller]
+    pub fn readv_fixed_at<B>(
+        &self,
+        buf: FixedBuf<B>,
+        segments: &[Range<usize>],
+        offset: u64,
+    ) -> impl crate::Request<Output = (io::Result<usize>, FixedBuf<B>)>
+    where
+        B: 'static,
+    {
+        assert!(
+            buf.same_driver(self.fd.handle()),
+            "fixed buffer and file must target the same driver"
+        );
+        let read = VectoredFixedAt::<B, false>::new(self.fd.lease(), buf, segments, offset);
+        self.fd.submit(read)
+    }
+
+    /// Write bytes gathered from several segments of one registered fixed
+    /// buffer.
+    ///
+    /// Each segment is a non-empty byte range relative to the buffer's
+    /// selected range, as exposed by [`FixedBuf::as_full_slice`]. The write
+    /// starts at `offset` and consumes the segments in order; segments may
+    /// overlap. The buffer's logical length is not used. The operation
+    /// returns ownership of the buffer with the number of bytes written.
+    /// Requires Linux 6.15 or newer; earlier kernels report `EINVAL`.
+    ///
+    /// # Errors
+    ///
+    /// The request resolves with [`io::ErrorKind::InvalidInput`], without
+    /// being submitted, when `segments` is empty, contains more than 1024
+    /// segments, or contains an empty or out-of-range segment.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixed buffer was registered with another driver.
+    #[track_caller]
+    pub fn writev_fixed_at<B>(
+        &self,
+        buf: FixedBuf<B>,
+        segments: &[Range<usize>],
+        offset: u64,
+    ) -> impl crate::Request<Output = (io::Result<usize>, FixedBuf<B>)>
+    where
+        B: 'static,
+    {
+        assert!(
+            buf.same_driver(self.fd.handle()),
+            "fixed buffer and file must target the same driver"
+        );
+        let write = VectoredFixedAt::<B, true>::new(self.fd.lease(), buf, segments, offset);
         self.fd.submit(write)
     }
 
@@ -958,6 +1037,123 @@ impl<B: 'static, F: OpFd> Singleshot for WriteFixedAt<B, F> {
 
     fn complete(self, result: CQEResult) -> Self::Output {
         match result.result {
+            Ok(n) => (Ok(n as usize), self.buf),
+            Err(err) => (Err(err), self.buf),
+        }
+    }
+}
+
+/// The kernel's `UIO_MAXIOV` limit on one vectored request.
+const MAX_FIXED_SEGMENTS: usize = 1024;
+
+pub(crate) struct VectoredFixedAt<B: 'static, const WRITE: bool, F = NornFd> {
+    fd: F,
+    buf: FixedBuf<B>,
+    segments: SmallVec<[Range<usize>; 4]>,
+    iovecs: SmallVec<[libc::iovec; 4]>,
+    offset: u64,
+}
+
+impl<B: 'static, const WRITE: bool, F> VectoredFixedAt<B, WRITE, F> {
+    pub(crate) fn new(fd: F, buf: FixedBuf<B>, segments: &[Range<usize>], offset: u64) -> Self {
+        Self {
+            fd,
+            buf,
+            segments: segments.iter().cloned().collect(),
+            iovecs: SmallVec::new(),
+            offset,
+        }
+    }
+
+    fn validate_segments(&self) -> io::Result<()> {
+        if self.segments.is_empty() || self.segments.len() > MAX_FIXED_SEGMENTS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "fixed vectored I/O requires 1 to {MAX_FIXED_SEGMENTS} segments, got {}",
+                    self.segments.len()
+                ),
+            ));
+        }
+        let capacity = self.buf.capacity();
+        for segment in &self.segments {
+            if segment.start >= segment.end || segment.end > capacity {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "fixed vectored I/O segment {segment:?} is empty or exceeds the selected capacity {capacity}"
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn submitted_len(&self) -> usize {
+        self.iovecs.iter().map(|iovec| iovec.iov_len).sum()
+    }
+}
+
+// Safety: `FixedBuf` owns its whole registered slot until the terminal CQE,
+// and the same-driver check happens before construction. Every segment is
+// validated to lie within the selected view, so the operation-owned iovecs
+// name only memory in the slot identified by `kernel_index`. `F` retains the
+// descriptor through the terminal CQE.
+unsafe impl<B: 'static, const WRITE: bool, F: OpFd> Operation for VectoredFixedAt<B, WRITE, F> {
+    type Completion = CQEResult;
+
+    fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+        let offset = checked_file_offset(self.offset)?;
+        self.validate_segments()?;
+        let base = if WRITE {
+            self.buf.fixed_ptr().cast_mut()
+        } else {
+            self.buf.fixed_ptr_mut()
+        };
+        self.iovecs.clear();
+        for segment in &self.segments {
+            self.iovecs.push(libc::iovec {
+                // Safety: validation keeps the segment within the selected view.
+                iov_base: unsafe { base.add(segment.start) }.cast(),
+                iov_len: segment.end - segment.start,
+            });
+        }
+        let ptr = self.iovecs.as_ptr();
+        let len = self.iovecs.len() as u32;
+        let index = self.buf.kernel_index();
+        Ok(with_fd_target!(self.fd.target(), |fd| {
+            if WRITE {
+                opcode::WritevFixed::new(fd, ptr, len, index)
+                    .offset(offset)
+                    .build()
+            } else {
+                opcode::ReadvFixed::new(fd, ptr, len, index)
+                    .offset(offset)
+                    .build()
+            }
+        }))
+    }
+
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+        result
+    }
+}
+
+impl<B: 'static, const WRITE: bool, F: OpFd> Singleshot for VectoredFixedAt<B, WRITE, F> {
+    type Output = (io::Result<usize>, FixedBuf<B>);
+
+    fn complete(self, result: CQEResult) -> Self::Output {
+        let submitted_len = self.submitted_len();
+        match result.result {
+            Ok(n) if n as usize > submitted_len => (
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "kernel reported {n} bytes for fixed vectored I/O of {submitted_len} bytes"
+                    ),
+                )),
+                self.buf,
+            ),
             Ok(n) => (Ok(n as usize), self.buf),
             Err(err) => (Err(err), self.buf),
         }

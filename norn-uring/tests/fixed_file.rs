@@ -231,3 +231,44 @@ fn the_table_keeps_an_inserted_socket_open_until_its_slot_is_released(
         Ok(())
     })
 }
+
+#[test]
+#[allow(clippy::single_range_in_vec_init)]
+fn fixed_vectored_io_works_with_fixed_files() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = util::ThreadNameTestDir::new();
+    util::with_test_env(|| async move {
+        let handle = Handle::current();
+        let table = handle.register_fixed_files(1)?;
+        let pool = handle
+            .register_fixed_buffers(vec![vec![0_u8; 32]])
+            .map_err(|err| err.kind().to_string())?;
+        let file = table.open(dir.join("data"), &read_write_options()).await?;
+
+        let mut buf = pool.try_acquire()?;
+        buf.as_full_slice_mut()[..5].copy_from_slice(b"fixed");
+        buf.as_full_slice_mut()[16..22].copy_from_slice(b"-files");
+        let (written, buf) = file.writev_fixed_at(buf, &[0..5, 16..22], 1).await;
+        assert_eq!(written?, 11);
+        assert_eq!(std::fs::read(dir.join("data"))?, b"\0fixed-files");
+
+        // Invalid segments complete without reaching the kernel.
+        let (result, mut buf) = file.readv_fixed_at(buf, &[0..0], 0).await;
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+
+        // The operation retains the fixed-file slot until it completes, so
+        // closing fails and the slot is released only after the read.
+        buf.as_full_slice_mut().fill(b'.');
+        let read = file.readv_fixed_at(buf, &[20..26, 0..5], 1);
+        let err = file.close().await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(table.available(), 0);
+        let (read, buf) = read.await;
+        assert_eq!(read?, 11);
+        assert_eq!(&buf.as_full_slice()[20..26], b"fixed-");
+        assert_eq!(&buf.as_full_slice()[0..5], b"files");
+        assert_eq!(table.available(), 1);
+        drop(buf);
+        pool.unregister().map_err(|err| err.kind().to_string())?;
+        Ok(())
+    })
+}

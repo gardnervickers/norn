@@ -50,6 +50,7 @@
 use std::cell::{Cell, RefCell};
 use std::ffi::CString;
 use std::io;
+use std::ops::Range;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -310,6 +311,61 @@ impl FixedFd {
             "fixed buffer and fixed file must target the same driver"
         );
         let write = fs::WriteFixedAt::new(self.slot.clone(), buf, offset);
+        self.slot.handle().submit(write)
+    }
+
+    /// Read bytes into several segments of one registered fixed buffer.
+    ///
+    /// This behaves like [`fs::File::readv_fixed_at`], including its segment
+    /// validation and Linux 6.15 requirement.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixed buffer was registered with another driver.
+    #[track_caller]
+    pub fn readv_fixed_at<B>(
+        &self,
+        buf: FixedBuf<B>,
+        segments: &[Range<usize>],
+        offset: u64,
+    ) -> impl crate::Request<Output = (io::Result<usize>, FixedBuf<B>)>
+    where
+        B: 'static,
+    {
+        assert!(
+            buf.same_driver(self.slot.handle()),
+            "fixed buffer and fixed file must target the same driver"
+        );
+        let read =
+            fs::VectoredFixedAt::<B, false, Slot>::new(self.slot.clone(), buf, segments, offset);
+        self.slot.handle().submit(read)
+    }
+
+    /// Write bytes gathered from several segments of one registered fixed
+    /// buffer.
+    ///
+    /// This behaves like [`fs::File::writev_fixed_at`], including its segment
+    /// validation and Linux 6.15 requirement.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixed buffer was registered with another driver.
+    #[track_caller]
+    pub fn writev_fixed_at<B>(
+        &self,
+        buf: FixedBuf<B>,
+        segments: &[Range<usize>],
+        offset: u64,
+    ) -> impl crate::Request<Output = (io::Result<usize>, FixedBuf<B>)>
+    where
+        B: 'static,
+    {
+        assert!(
+            buf.same_driver(self.slot.handle()),
+            "fixed buffer and fixed file must target the same driver"
+        );
+        let write =
+            fs::VectoredFixedAt::<B, true, Slot>::new(self.slot.clone(), buf, segments, offset);
         self.slot.handle().submit(write)
     }
 
