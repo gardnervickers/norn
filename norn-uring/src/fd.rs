@@ -101,21 +101,29 @@ impl UringFd {
 
     /// Ask the kernel to cancel every in-flight request on this descriptor.
     ///
-    /// The request resolves to the number of matching requests the kernel
-    /// found. Each canceled request then completes through its own future or
-    /// stream, typically with `ECANCELED`, and releases its descriptor lease
-    /// when consumed or dropped. This lets one task interrupt operations owned
-    /// by other tasks, for example so that [`UringFd::close`] can succeed or a
+    /// The request resolves to the number of matches the kernel counted. Each
+    /// canceled request then completes through its own future or stream,
+    /// typically with `ECANCELED`, and releases its descriptor lease when
+    /// consumed or dropped. This lets one task interrupt operations owned by
+    /// other tasks, for example so that [`UringFd::close`] can succeed or a
     /// multishot stream ends after yielding the completions already posted.
     ///
-    /// Cancellation matches requests that reach the kernel before this one,
-    /// including requests already queued in the submission queue. Prepared
-    /// requests that have not been polled, requests still waiting for
-    /// submission-queue space, and requests submitted afterwards are not
-    /// matched.
-    /// Streams that transparently re-arm, such as
-    /// [`TcpListener::incoming`](crate::net::TcpListener::incoming), may submit
-    /// a new request after observing the cancellation.
+    /// Treat the count as a hint. Zero means the kernel found nothing to
+    /// cancel, but requests waiting for the same kernel worker can count once
+    /// together, and requests that a stream keeps armed internally count too.
+    ///
+    /// Cancellation matches requests submitted before this one, including
+    /// requests still waiting for submission-queue space, which are submitted
+    /// ahead of it. Prepared requests that have not been polled, requests
+    /// submitted afterwards, and linked requests the kernel has not issued yet
+    /// (`b` in `a.then(b)` while `a` runs) are not matched. Canceling the head
+    /// of a linked chain also fails the requests linked after it, whatever
+    /// their descriptor.
+    ///
+    /// Streams that re-arm themselves, such as
+    /// [`TcpListener::incoming`](crate::net::TcpListener::incoming) and
+    /// receives into a buffer ring that pause at their unconsumed limit, may
+    /// treat the cancellation as their own pause and submit a new request.
     ///
     /// The kernel matches requests by open file description, so in-flight
     /// requests on duplicates of this descriptor submitted to the same driver

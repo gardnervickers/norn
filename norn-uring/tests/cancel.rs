@@ -6,6 +6,7 @@ use std::pin::pin;
 use futures_util::StreamExt;
 use norn_uring::bufring::RecvBufRing;
 use norn_uring::net::UdpSocket;
+use norn_uring::Request;
 
 mod util;
 
@@ -106,6 +107,63 @@ fn cancel_pending_removes_multishot_poll() -> Result<(), Box<dyn std::error::Err
         }
 
         socket.close().await?;
+        Ok(())
+    })
+}
+
+/// Requests still waiting for submission-queue space are submitted ahead of
+/// the cancellation, so it matches them too.
+#[test]
+fn cancel_pending_matches_requests_waiting_for_queue_space(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let driver = norn_uring::Driver::new(io_uring::IoUring::builder(), 4)?;
+    let mut executor = norn_executor::LocalExecutor::new(driver);
+    executor.block_on(async {
+        let receiver = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        // Twice the ring's four entries, so half wait for queue space.
+        let mut receives: Vec<_> = (0..8)
+            .map(|_| Box::pin(receiver.recv(Vec::<u8>::with_capacity(8))))
+            .collect();
+        for receive in &mut receives {
+            assert!(futures_util::poll!(receive.as_mut()).is_pending());
+        }
+
+        assert!(receiver.as_uring_fd().cancel_pending().await? > 0);
+        for receive in receives {
+            assert_canceled(receive.await.0);
+        }
+        Ok(())
+    })
+}
+
+/// A request linked behind one on another descriptor is not issued until its
+/// predecessor completes, so the cancellation does not see it.
+#[test]
+fn cancel_pending_skips_link_successors_not_yet_issued() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let head = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let tail = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let sender = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let readable = libc::POLLIN as u32;
+        let mut chain = Box::pin(
+            head.poll_readiness(readable)
+                .then(tail.poll_readiness(readable)),
+        );
+        assert!(futures_util::poll!(chain.as_mut()).is_pending());
+
+        assert_eq!(tail.as_uring_fd().cancel_pending().await?, 0);
+
+        sender
+            .send_to(b"head".to_vec(), head.local_addr()?)
+            .await
+            .0?;
+        sender
+            .send_to(b"tail".to_vec(), tail.local_addr()?)
+            .await
+            .0?;
+        let (first, second) = chain.await;
+        assert!(first?.is_readable());
+        assert!(second?.is_readable());
         Ok(())
     })
 }
