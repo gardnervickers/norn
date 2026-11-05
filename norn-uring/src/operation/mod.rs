@@ -491,18 +491,6 @@ where
         can_continue
     }
 
-    /// Let this operation run to completion if it is dropped, instead of
-    /// cancelling it.
-    pub(crate) fn detach(self: Pin<&mut Self>) {
-        match &self.state {
-            State::Prepared { handle } | State::Waiting { handle } => {
-                handle.inner.header().detach()
-            }
-            State::Submitted { inner } => inner.inner.inner.header().detach(),
-            State::Done => {}
-        }
-    }
-
     pub(crate) fn cancel_unsubmitted(mut self: Pin<&mut Self>) {
         let this = self.as_mut().project();
         let _ = this.state.cancel_unsubmitted();
@@ -726,10 +714,8 @@ impl<T> SubmittedOp<T> {
     fn needs_cancel(&self) -> bool {
         // A terminal CQE ends kernel ownership. Cancelling after that point is
         // redundant, and the allocation's numeric user_data may be reused
-        // before a queued cancellation reaches the kernel. A detached
-        // operation runs to completion instead.
-        let header = self.inner.inner.header();
-        !header.is_complete() && !header.is_detached()
+        // before a queued cancellation reaches the kernel.
+        !self.inner.inner.is_complete()
     }
 }
 

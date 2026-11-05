@@ -374,10 +374,6 @@ impl private::Chainable for Timeout {
             }
         }
     }
-
-    fn detach(self: Pin<&mut Self>) {
-        self.project().inner.detach();
-    }
 }
 
 impl crate::Handle {
@@ -546,10 +542,6 @@ impl private::Chainable for LinkedTimeout {
                 panic!("cannot fail linked timeout submission more than once")
             }
         }
-    }
-
-    fn detach(self: Pin<&mut Self>) {
-        self.project().inner.detach();
     }
 }
 
@@ -848,12 +840,6 @@ impl private::Chainable for TimeoutRemove {
             inner.fail_submit(err);
         }
     }
-
-    fn detach(self: Pin<&mut Self>) {
-        if let Some(inner) = self.project().inner.as_pin_mut() {
-            inner.detach();
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -1035,12 +1021,6 @@ impl private::Chainable for TimeoutUpdate {
     fn fail_submit(self: Pin<&mut Self>, err: &SubmitError) {
         if let Some(inner) = self.project().inner.as_pin_mut() {
             inner.fail_submit(err);
-        }
-    }
-
-    fn detach(self: Pin<&mut Self>) {
-        if let Some(inner) = self.project().inner.as_pin_mut() {
-            inner.detach();
         }
     }
 }

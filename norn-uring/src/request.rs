@@ -33,9 +33,6 @@ mod private {
         fn cancel_unsubmitted(self: Pin<&mut Self>);
         fn finish_submit(self: Pin<&mut Self>);
         fn fail_submit(self: Pin<&mut Self>, err: &SubmitError);
-        /// Let every operation in this request run to completion if the
-        /// request is dropped, instead of cancelling it.
-        fn detach(self: Pin<&mut Self>);
     }
 }
 
@@ -65,9 +62,11 @@ pub trait Request: Future + Sized + private::Chainable {
     /// fails configuration. Both results are returned, as with
     /// [`Request::then`].
     ///
-    /// Dropping the returned request once it has been submitted cancels this
-    /// request only; `next` still runs, and its result is discarded. A chain
-    /// dropped before it is first polled runs nothing.
+    /// Dropping the returned request cancels both requests, as it does for
+    /// [`Request::then`]. Cancelling this request does not break a hard link,
+    /// so the kernel still issues `next`, and `next` is cancelled once it has
+    /// been issued. An operation that completes as soon as it is issued, such
+    /// as a close, can therefore still run.
     ///
     /// # Panics
     ///
@@ -194,25 +193,6 @@ pin_project_lite::pin_project! {
         state: ThenState<A, B>,
         // Whether `right` is hard-linked behind `left` (`then_always`).
         hard: bool,
-    }
-
-    impl<A, B> PinnedDrop for Then<A, B>
-    where
-        A: Request,
-        B: Request,
-    {
-        fn drop(this: Pin<&mut Self>) {
-            let this = this.project();
-            if !*this.hard {
-                return;
-            }
-            if let ThenStateProj::Pending { right, submitted, .. } = this.state.project() {
-                // Once submitted, `right` runs whatever happens to `left`.
-                if *submitted {
-                    right.detach();
-                }
-            }
-        }
     }
 }
 
@@ -527,10 +507,6 @@ where
     fn fail_submit(self: Pin<&mut Self>, err: &SubmitError) {
         Op::fail_submit(self, err);
     }
-
-    fn detach(self: Pin<&mut Self>) {
-        Op::detach(self);
-    }
 }
 
 impl<A, B> private::Chainable for Then<A, B>
@@ -616,19 +592,6 @@ where
         left.as_mut().fail_submit(err);
         right.as_mut().fail_submit(err);
         *submitted = true;
-    }
-
-    fn detach(self: Pin<&mut Self>) {
-        let this = self.project();
-        if let ThenStateProj::Pending {
-            mut left,
-            mut right,
-            ..
-        } = this.state.project()
-        {
-            left.as_mut().detach();
-            right.as_mut().detach();
-        }
     }
 }
 
@@ -716,19 +679,6 @@ where
         right.as_mut().fail_submit(err);
         *submitted = true;
     }
-
-    fn detach(self: Pin<&mut Self>) {
-        let this = self.project();
-        if let ThenAuxStateProj::Pending {
-            mut left,
-            mut right,
-            ..
-        } = this.state.project()
-        {
-            left.as_mut().detach();
-            right.as_mut().detach();
-        }
-    }
 }
 
 impl<R, F, U> private::Chainable for Map<R, F>
@@ -758,10 +708,6 @@ where
 
     fn fail_submit(self: Pin<&mut Self>, err: &SubmitError) {
         self.project().inner.fail_submit(err);
-    }
-
-    fn detach(self: Pin<&mut Self>) {
-        self.project().inner.detach();
     }
 }
 

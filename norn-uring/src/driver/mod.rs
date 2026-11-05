@@ -295,42 +295,6 @@ struct Queued {
     linked: bool,
 }
 
-/// Split a queued group in which an operation was cancelled.
-///
-/// A member fails if it was cancelled, or if it is soft-linked behind a member
-/// that failed; failed members go to `cancelled`. The rest are returned as one
-/// group. A survivor that follows failed members runs whatever the survivor
-/// before it does, so the link between them becomes a hard link.
-fn split_cancelled_group(
-    group: SmallVec<[Queued; 4]>,
-    cancelled: &mut SmallVec<[ConfiguredEntry; 4]>,
-) -> SmallVec<[Queued; 4]> {
-    let mut survivors = SmallVec::<[Queued; 4]>::new();
-    let mut previous_failed = false;
-    let mut hard_into = false;
-    let mut gap = false;
-    for queued in group {
-        let failed = queued.entry.cancelled_while_queued() || (previous_failed && !hard_into);
-        hard_into = queued.linked && queued.entry.link_flags() == Flags::IO_HARDLINK;
-        previous_failed = failed;
-        if failed {
-            gap = true;
-            cancelled.push(queued.entry);
-            continue;
-        }
-        if let Some(last) = survivors.last_mut().filter(|_| gap) {
-            last.entry.set_hard_link();
-        }
-        gap = false;
-        survivors.push(queued);
-    }
-    let count = survivors.len();
-    for (idx, queued) in survivors.iter_mut().enumerate() {
-        queued.linked = idx + 1 < count;
-    }
-    survivors
-}
-
 /// The length of the linked group at the front of the overflow queue.
 fn overflow_group_len(overflow: &VecDeque<Queued>) -> Option<usize> {
     overflow
@@ -1432,12 +1396,11 @@ impl Shared {
 
     /// Move queued entries into the SQ, in order, while they fit.
     ///
-    /// An operation cancelled while it waited completes with `ECANCELED`
-    /// without reaching the kernel, and so does every member the kernel would
-    /// fail with it: one soft-linked to a failed member. The members left run
-    /// as one group, so a member hard-linked behind a cancelled one still
-    /// runs after the members before it. Once the driver stops accepting
-    /// work, queued entries fail with the shutdown error instead.
+    /// A group in which an operation was cancelled while it waited completes
+    /// with `ECANCELED` without reaching the kernel. A group's members are
+    /// dropped together, so all of them were cancelled, including any behind
+    /// a hard link. Once the driver stops accepting work, queued entries fail
+    /// with the shutdown error instead.
     fn flush_overflow(&self) {
         loop {
             if self.overflow.borrow().is_empty() {
@@ -1458,13 +1421,7 @@ impl Shared {
                         .take(len)
                         .any(|queued| queued.entry.cancelled_while_queued())
                     {
-                        let group: SmallVec<[Queued; 4]> = overflow.drain(..len).collect();
-                        for queued in split_cancelled_group(group, &mut cancelled)
-                            .into_iter()
-                            .rev()
-                        {
-                            overflow.push_front(queued);
-                        }
+                        cancelled.extend(overflow.drain(..len).map(|queued| queued.entry));
                         continue;
                     }
                     if sq.capacity() - sq.len() < len {
@@ -3542,14 +3499,13 @@ mod tests {
     }
 
     #[test]
-    fn dropping_a_submitted_then_always_chain_cancels_only_its_first_request() {
+    fn dropping_a_submitted_then_always_chain_cancels_both_requests() {
         let mut driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
         let handle = driver.handle();
-        let dropped = Arc::new(AtomicBool::new(false));
-        let outcome = Rc::new(Cell::new(None));
+        let first = Arc::new(AtomicBool::new(false));
+        let second = Arc::new(AtomicBool::new(false));
         let mut chain = Box::pin(
-            long_lived_read(&handle, &dropped)
-                .then_always(handle.submit(RecordedNop(Rc::clone(&outcome)))),
+            long_lived_read(&handle, &first).then_always(long_lived_read(&handle, &second)),
         );
         let waker = futures_test::task::noop_waker();
         assert!(chain
@@ -3558,19 +3514,18 @@ mod tests {
             .is_pending());
         driver.park(ParkMode::NoPark).unwrap();
 
+        // Cancelling the first read does not break the hard link, so the
+        // kernel issues the second read, which is cancelled once issued.
         drop(chain);
-        assert!(park_until(&mut driver, 20, || dropped
-            .load(Ordering::Acquire)
-            && outcome.get().is_some()));
-        assert_eq!(
-            outcome.get(),
-            Some((false, true)),
-            "the NOP ran in the kernel once the read was cancelled"
+        assert!(
+            park_until(&mut driver, 20, || first.load(Ordering::Acquire)
+                && second.load(Ordering::Acquire)),
+            "both reads must end"
         );
     }
 
     #[test]
-    fn a_queued_then_always_chain_dropped_still_runs_its_second_request() {
+    fn dropping_a_queued_then_always_chain_cancels_both_requests() {
         for always in [true, false] {
             let mut driver = Driver::new(io_uring::IoUring::builder(), 2).unwrap();
             let handle = driver.handle();
@@ -3591,13 +3546,12 @@ mod tests {
                 assert_eq!(handle.queued_entries(), 2);
             }
 
-            // The read is cancelled where it waits. A hard-linked NOP still
-            // reaches the kernel; a soft-linked one fails with it.
+            // Both requests are cancelled where they wait, so neither reaches
+            // the kernel, whether the link is hard or soft.
             assert!(park_until(&mut driver, 20, || dropped
                 .load(Ordering::Acquire)
                 && outcome.get().is_some()));
-            let expected = if always { (false, true) } else { (true, false) };
-            assert_eq!(outcome.get(), Some(expected), "always={always}");
+            assert_eq!(outcome.get(), Some((true, false)), "always={always}");
             assert_eq!(handle.queued_entries(), 0);
         }
     }
