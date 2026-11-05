@@ -1736,7 +1736,7 @@ mod tests {
         drops: Rc<Cell<usize>>,
     }
 
-    // Safety: `bytes` is inline and the pool captures its address after final
+    // Safety: `bytes` is inline and the table captures its address after final
     // placement without exposing `DropTracked` again until release.
     unsafe impl FixedBuffer for DropTracked {
         fn fixed_region(&mut self) -> &mut [u8] {
@@ -1888,7 +1888,7 @@ mod tests {
             }])
             .map_err(|err| io::Error::other(err.to_string()))?;
 
-        // Holding a mutable ring borrow forces implicit pool release down its
+        // Holding a mutable ring borrow forces implicit table release down its
         // conservative retention path.
         handle.test_with_ring_borrowed_mut(|| drop(pool));
         assert_eq!(drops.get(), 0);

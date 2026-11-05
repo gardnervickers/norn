@@ -225,7 +225,8 @@ impl Registry {
         Retention::Retained
     }
 
-    /// Retry a best-effort pool-drop release before rejecting a new table.
+    /// Retry the best-effort release of a dropped table before rejecting a new
+    /// table.
     fn try_release_retained(&self, ring: &RefCell<IoUring>) {
         let retained_generation = match self.retained.try_borrow() {
             Ok(retained) if retained.is_empty() => return,
