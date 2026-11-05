@@ -261,7 +261,8 @@ impl File {
     /// Each segment is a non-empty byte range relative to the buffer's
     /// selected range, as exposed by [`FixedBuf::as_full_slice`]. The read
     /// starts at `offset` and fills the segments in order. Overlapping segments
-    /// are permitted; later bytes overwrite earlier ones.
+    /// are permitted, but the final contents of an overlapped byte are
+    /// unspecified: with `O_DIRECT` the device may fill segments in any order.
     ///
     /// Unlike [`File::read_fixed_at`], this does not change the buffer's
     /// logical length because the filled bytes need not form a prefix. The
