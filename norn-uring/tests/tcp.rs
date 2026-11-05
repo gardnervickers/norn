@@ -3,6 +3,7 @@
 use std::future::poll_fn;
 use std::io;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::pin::{pin, Pin};
 use std::task::Poll;
 
@@ -98,12 +99,13 @@ unsafe impl StableBuf for OversizedBuf {
 #[test]
 fn incoming_connections() -> Result<(), Box<dyn std::error::Error>> {
     util::with_test_env(|| async {
-        // Bind
-        let listener = TcpListener::bind("0.0.0.0:9090".parse()?, 32).await?;
+        // Bind an ephemeral port, so concurrent test runs cannot collide.
+        let listener = TcpListener::bind("127.0.0.1:0".parse()?, 32).await?;
+        let addr = listener.local_addr()?;
 
         // Connect
-        let handle = spawn(async {
-            let _ = TcpSocket::connect("0.0.0.0:9090".parse().unwrap()).await?;
+        let handle = spawn(async move {
+            let _ = TcpSocket::connect(addr).await?;
             io::Result::Ok(())
         });
 
@@ -144,6 +146,53 @@ fn incoming_rearms_multishot_accept_terminated_by_full_completion_queue(
         }
         Ok(())
     })
+}
+
+/// A stream pauses its accept once `limit` connections wait to be yielded, so
+/// later connections stay in the listen backlog, and resumes without an error
+/// once the consumer takes them. Without a limit the kernel accepts them all.
+#[test]
+fn incoming_pauses_its_accept_at_the_limit() -> Result<(), Box<dyn std::error::Error>> {
+    for (limit, ready) in [(NonZeroUsize::new(2), 2), (None, 6)] {
+        let driver = norn_uring::Driver::new(io_uring::IoUring::builder(), 32)?;
+        let mut executor = norn_executor::LocalExecutor::new(driver);
+        executor.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0".parse()?, 128).await?;
+            let addr = listener.local_addr()?;
+            let mut incoming = pin!(listener.incoming_with_limit(limit));
+            assert!(futures_util::poll!(incoming.next()).is_pending());
+
+            // The stream is not polled while these arrive, so they wait in it.
+            let mut clients = Vec::new();
+            for _ in 0..2 {
+                clients.push(std::net::TcpStream::connect(addr)?);
+            }
+            for _ in 0..4 {
+                norn_uring::noop().await?;
+            }
+            for _ in 0..4 {
+                clients.push(std::net::TcpStream::connect(addr)?);
+            }
+            for _ in 0..4 {
+                norn_uring::noop().await?;
+            }
+
+            let mut accepted = Vec::new();
+            while let Poll::Ready(next) = futures_util::poll!(incoming.next()) {
+                accepted.push(next.expect("accept stream ended")?);
+            }
+            assert_eq!(
+                accepted.len(),
+                ready,
+                "connections held with limit {limit:?}"
+            );
+            while accepted.len() < clients.len() {
+                accepted.push(incoming.next().await.expect("accept stream ended")?);
+            }
+            Ok::<_, Box<dyn std::error::Error>>(())
+        })?;
+    }
+    Ok(())
 }
 
 #[test]
