@@ -1,25 +1,29 @@
 # Registered Buffers API Design
 
-Status: implemented v1 candidate on the current feature branch. The API and
-safety model have completed independent design and implementation reviews;
-timed performance acceptance is still pending.
+Status: implemented. Dense and sparse registration produce one type,
+`FixedBufTable<B>`, whose slots can be installed, replaced, and removed one at
+a time; see [Installing, replacing, and removing slots](#installing-replacing-and-removing-slots).
+Timed performance acceptance is still pending.
 
 ## Decision
 
-V1 is an owned, dense, immutable fixed-buffer pool:
+The API is an owned fixed-buffer table:
 
-- callers choose the concrete buffer type and recover the original values;
+- callers choose the concrete buffer type and recover every installed value
+  by slot;
 - a safe registration method backed by an unsafe trait covers common and
   application-owned types;
 - an unsafe registration closure covers foreign types blocked by Rust's orphan
   rules;
-- the pool grants one non-cloneable `FixedBuf` per registered slot;
+- the table grants one non-cloneable `FixedBuf` per installed slot;
 - fixed operations consume and return that `FixedBuf`; and
 - the implementation caches raw descriptors after registration, so custom
   buffer code and dynamic dispatch never occur on the I/O path.
 
-Sparse tables, replacement, borrowed buffers, and disjoint leases are separate
-future designs. They are not hidden behind underspecified v1 hooks.
+`Handle::register_fixed_buffers` registers a table with every slot installed,
+in one call, and `Handle::register_sparse_fixed_buffers` registers one with
+every slot vacant. Borrowed buffers and disjoint leases remain separate future
+designs.
 
 ## Goals
 
@@ -30,8 +34,9 @@ future designs. They are not hidden behind underspecified v1 hooks.
   existing `RawOp` allocation remains.
 - Preserve Norn's convention that an operation owns its buffer and returns it
   with the completion result.
-- Make the common pool API ergonomic without exposing kernel table management.
-- Recover the exact original `Vec<B>` after successful unregistration.
+- Make the common table API ergonomic without exposing kernel table management.
+- Recover every installed value, in slot order, after successful
+  unregistration.
 
 ## Non-goals for v1
 
@@ -40,22 +45,23 @@ future designs. They are not hidden behind underspecified v1 hooks.
   `MaybeUninit<u8>` explicitly.
 - More than one simultaneous view of a registered slot, even for disjoint
   ranges.
-- Sparse registration, slot replacement, or resource-tag CQE handling.
+- Resource-tag CQE handling. Whole-slot leases make slot changes safe without
+  it; see [Installing, replacing, and removing slots](#installing-replacing-and-removing-slots).
 - Async waiting for a free slot.
 - Enforcing filesystem-specific `O_DIRECT` alignment rules.
 
 ## Public API at a glance
 
 ```rust
-use norn_uring::fixedbuf::{FixedBufPool, FixedBuffer};
+use norn_uring::fixedbuf::{FixedBufTable, FixedBuffer};
 
 let handle = Handle::current();
-let pool = handle.register_fixed_buffers(vec![
+let table = handle.register_fixed_buffers(vec![
     MyAlignedBlock::new(),
     MyAlignedBlock::new(),
 ])?;
 
-let mut buf = pool.try_acquire()?;
+let mut buf = table.try_acquire()?;
 buf.set_range(0..4096)?;
 let (result, mut buf) = file.read_fixed_at(buf, 0).await;
 let n = result?;
@@ -75,7 +81,7 @@ while !buf.is_empty() {
 }
 drop(buf);
 
-let original: Vec<MyAlignedBlock> = pool.unregister()?;
+let original: Vec<Option<MyAlignedBlock>> = table.unregister()?;
 ```
 
 One slot is one in-flight-I/O credit. A queue depth of 64 requires at least 64
@@ -102,7 +108,7 @@ The long-lived registered-memory contract belongs beside `StableBuf` and
 /// - the entire region must remain allocated, initialized, and writable;
 /// - no external alias may read or write it while the kernel or a `FixedBuf`
 ///   may write it;
-/// - regions selected for one pool must be pairwise disjoint;
+/// - regions selected for one table must be pairwise disjoint;
 /// - no safe method or interior-mutation path may expose, free, resize,
 ///   relocate, or overlap it; and
 /// - moving `self` is permitted only before registration and after release.
@@ -112,7 +118,7 @@ pub unsafe trait FixedBuffer {
 }
 ```
 
-The trait itself is not `'static`; v1's owned pool and operations impose that
+The trait itself is not `'static`; the owned table and operations impose that
 bound. This leaves the memory contract reusable if Norn later gains scoped
 operations.
 
@@ -124,7 +130,7 @@ Norn provides implementations for:
 - `[u8; N]`, and
 - `Box<T> where T: FixedBuffer + ?Sized`.
 
-The last implementation permits heterogeneous pools without hot-path dynamic
+The last implementation permits heterogeneous tables without hot-path dynamic
 dispatch:
 
 ```rust
@@ -132,10 +138,10 @@ let buffers: Vec<Box<dyn FixedBuffer>> = vec![
     Box::new(vec![0u8; 4096]),
     Box::new(MyAlignedBlock::new()),
 ];
-let pool = handle.register_fixed_buffers(buffers)?;
+let table = handle.register_fixed_buffers(buffers)?;
 ```
 
-Unregistration recovers `Vec<Box<dyn FixedBuffer>>`, so callers that need typed
+Unregistration recovers `Vec<Option<Box<dyn FixedBuffer>>>`, so callers that need typed
 recovery should use an application enum. The trait deliberately does not add
 `Any` or downcasting.
 
@@ -150,7 +156,7 @@ pub unsafe fn register_fixed_buffers_with<B, F>(
     &self,
     buffers: Vec<B>,
     region: F,
-) -> Result<FixedBufPool<B>, RegisterError<B>>
+) -> Result<FixedBufTable<B>, RegisterError<B>>
 where
     B: 'static,
     F: for<'a> FnMut(&'a mut B) -> &'a mut [u8];
@@ -163,25 +169,26 @@ active, cached pointers are discarded and recovered values may move. Its
 safety contract is the same as `FixedBuffer`: each slice must remain stable,
 live, writable, and unaliased until release. Registration also rejects
 pairwise-overlapping address intervals. The safe trait-based registration
-method delegates to this primitive.
+method delegates to this primitive. Installing or replacing a slot later takes
+`B: FixedBuffer`, so a table of foreign values can only have slots removed.
 
-## Pool construction and errors
+## Table construction and errors
 
 ```rust
-pub struct FixedBufPool<B: 'static> { /* private Rc */ }
+pub struct FixedBufTable<B: 'static> { /* private Rc */ }
 pub struct FixedBuf<B: 'static> { /* private Rc + cached descriptor */ }
 
 impl Handle {
     pub fn register_fixed_buffers<B>(
         &self,
         buffers: Vec<B>,
-    ) -> Result<FixedBufPool<B>, RegisterError<B>>
+    ) -> Result<FixedBufTable<B>, RegisterError<B>>
     where
         B: FixedBuffer + 'static;
 }
 ```
 
-`FixedBufPool` and `FixedBuf` are intentionally not `Clone`. The pool can be
+`FixedBufTable` and `FixedBuf` are intentionally not `Clone`. The table can be
 borrowed to acquire multiple slots; each fixed buffer has one unambiguous owner.
 
 Registration errors retain every input value in original order:
@@ -200,24 +207,27 @@ errors. Error formatting may mention locked-memory limits for `ENOMEM` without
 claiming that is always the cause.
 
 After cheaply reserving the driver's one fixed table, the implementation moves
-the buffers into final non-moving `Box<[UnsafeCell<B>]>` storage. Only then does
-it invoke `fixed_region`, validate the results and pairwise disjointness, and
-cache each pointer and length in separate dense metadata. `UnsafeCell` is
-required: an `Rc` gives shared access to the pool while fixed reads let the
-kernel mutate inline `B` storage.
+each buffer into its own non-moving `UnsafeCell<B>` allocation, one per slot,
+so a slot's region stays put while other slots change. Only then does it
+invoke `fixed_region`, validate the results and pairwise disjointness, cache
+each pointer and length in separate slot metadata, and register every region
+in one `io_uring_register(2)` call. `UnsafeCell` is required: an `Rc` gives
+shared access to the table while fixed reads let the kernel mutate inline `B`
+storage.
 
 ## Acquisition and views
 
 ```rust
-impl<B: 'static> FixedBufPool<B> {
-    /// Acquire any free slot. The common path uses an internal O(1) free list.
+impl<B: 'static> FixedBufTable<B> {
+    /// Acquire any free installed slot. The common path uses an internal O(1)
+    /// free list.
     pub fn try_acquire(&self) -> Result<FixedBuf<B>, AcquireError>;
 
     /// Acquire a specific kernel-table slot.
     pub fn try_acquire_at(&self, index: usize)
         -> Result<FixedBuf<B>, AcquireError>;
 
-    pub fn unregister(self) -> Result<Vec<B>, UnregisterError<B>>;
+    pub fn unregister(self) -> Result<Vec<Option<B>>, UnregisterError<B>>;
     pub fn len(&self) -> usize;
     pub fn is_empty(&self) -> bool;
 }
@@ -247,12 +257,12 @@ impl<B: 'static> FixedBuf<B> {
 }
 ```
 
-`AcquireError` distinguishes exhaustion, an invalid explicit index, and an
-already-acquired explicit index. Public indices are `usize`; the implementation
+`AcquireError` distinguishes exhaustion, an invalid explicit index, a vacant
+explicit index, and an already-acquired explicit index. Public indices are `usize`; the implementation
 validates and stores the kernel index as `u16` at registration/acquisition
 rather than converting on each SQE construction. Any-slot acquisition is O(1);
 explicit indexed acquisition searches the free list and is intended for setup,
-not a large-pool per-request hot path.
+not a large-table per-request hot path.
 
 A newly acquired slot selects the whole registered region and treats the whole
 initialized region as payload. Changing or resetting the range sets the
@@ -267,16 +277,85 @@ operations may use it through another driver because they carry a process
 address rather than a ring-local buffer index.
 
 The common any-slot acquisition path maintains a free list. Moving a
-`FixedBuf` through repeated I/O does not touch that list or clone its pool
+`FixedBuf` through repeated I/O does not touch that list or clone its table
 `Rc`; only initial acquisition and final release do. A fixed buffer caches its
 pointer, kernel index, view, capacity, and logical length, so SQE construction
-does not touch user `B`, dispatch through a trait object, or traverse pool
+does not touch user `B`, dispatch through a trait object, or traverse table
 metadata.
 
 The underlying `B` is deliberately inaccessible while registered. Applications
 with per-buffer metadata keep it externally and associate it through
 `FixedBuf::index()`; exact `B` values become accessible again after successful
 unregistration.
+
+## Installing, replacing, and removing slots
+
+```rust
+impl Handle {
+    pub fn register_sparse_fixed_buffers<B: 'static>(
+        &self,
+        len: usize,
+    ) -> Result<FixedBufTable<B>, RegisterErrorKind>;
+}
+
+impl<B: 'static> FixedBufTable<B> {
+    pub fn install(&self, index: usize, buffer: B) -> Result<(), SlotError<B>>
+    where
+        B: FixedBuffer;
+    pub fn replace(&self, index: usize, buffer: B) -> Result<B, SlotError<B>>
+    where
+        B: FixedBuffer;
+    pub fn remove(&self, index: usize) -> Result<B, SlotErrorKind>;
+    pub fn is_installed(&self, index: usize) -> bool;
+}
+```
+
+`register_sparse_fixed_buffers` registers `len` vacant kernel slots
+(`IORING_REGISTER_BUFFERS2` with `IORING_RSRC_REGISTER_SPARSE`, Linux 5.13).
+Vacant slots are not on the free list and cannot be acquired. Either kind of
+table occupies the driver's single fixed-buffer table, generation, and
+`Registry` state machine, so a driver holds one table at a time.
+
+`install`, `replace`, and `remove` work on every table, including one
+registered with every slot installed. They are synchronous single-slot
+`IORING_REGISTER_BUFFERS_UPDATE` calls (Linux 5.13). A single-slot update is
+the only shape whose failure proves the kernel table was left unchanged,
+because `io-uring` discards the updated-slot count.
+
+Slot changes are safe without resource tags because of the whole-slot lease
+rule:
+
+- a slot may change only while it is installed and not acquired;
+- fixed operations own their `FixedBuf` until the terminal CQE, including
+  while unpolled, queued, cancelled, or completion-pending; and
+- the kernel resolves the slot index when it issues an operation, which may be
+  after submission, but never for an operation without a live lease.
+
+So no submitted operation can reach the old region once the update succeeds,
+and the previous value can be returned to the caller immediately. The kernel
+may keep the old pages pinned until its own resource reference drops, but it no
+longer reads or writes them.
+
+Transactions keep the same conservative ownership as registration:
+
+- `install` places the new value in table storage before the kernel call, and
+  takes it back only if the update reports failure.
+- `replace` unlinks the slot from the free list and marks it acquired while
+  the new value is staged in table storage. On success the previous value is
+  returned; on failure the previous value stays installed and the new value
+  is returned. If the call unwinds, the slot stays unacquirable and both values
+  remain owned by the table until release.
+- `remove` updates the slot to an empty iovec before returning the value. Once
+  the ring is destroyed, removal returns the value without a kernel call.
+- Regions are validated as non-empty, at most `u32::MAX` bytes, and disjoint
+  from every other installed slot.
+- `install` and `replace` reject a stopped driver; removal is still allowed
+  after shutdown so callers can recover values.
+
+`SlotError<B>` returns the rejected buffer with a `SlotErrorKind`
+distinguishing invalid, occupied, vacant, and acquired slots, invalid or
+overlapping regions, a stopped or borrowed driver, a generation mismatch,
+resource exhaustion, and other OS errors.
 
 ## Fixed file operations
 
@@ -325,17 +404,17 @@ through audited `unsafe impl` blocks.
 
 ## Registration lifetime and panic safety
 
-The pool's inner allocation stores a weak driver token plus a generation. It
+The table's inner allocation stores a weak driver token plus a generation. It
 does not hold a strong `Handle`. Fixed operations already carry the file
-descriptor's driver ownership; the pool must not add a
-`RawOp -> FixedBuf -> pool -> Shared` cycle
+descriptor's driver ownership; the table must not add a
+`RawOp -> FixedBuf -> table -> Shared` cycle
 if fail-soft shutdown abandons completions. If the weak token cannot upgrade,
 ring destruction has already made the storage safe to release.
 
 Norn's pre-existing `RawOp -> NornFd -> Handle/Shared` ownership can itself
 form a fail-soft shutdown leak when an operation is permanently abandoned. A
 fixed operation adds no new edge to that cycle. It can increase the leaked
-footprint by retaining its pool and registered pages. Repairing that
+footprint by retaining its table and registered pages. Repairing that
 general operation/descriptor shutdown cycle is tracked as separate runtime
 work rather than weakening fixed-buffer lifetime safety.
 
@@ -351,7 +430,7 @@ Empty -> Registering(generation) -> Registered(generation)
 
 `Registry` owns the active state, generation allocation, failed-unregister
 retention, and retry logic. The driver supplies access to its `IoUring` and a
-small `Weak<Shared>` adapter used by published pools. Only the matching
+small `Weak<Shared>` adapter used by published tables. Only the matching
 generation may unregister, mark release, or clear state. A state mismatch is
 treated conservatively: backing memory is retained rather than freed.
 
@@ -359,10 +438,10 @@ Registration is a panic-safe transaction:
 
 1. Validate the cheap table-count constraints and reserve a fresh driver
    generation with a rollback guard.
-2. Move every `B` to final storage.
+2. Move every `B` to its final slot allocation.
 3. Invoke the region provider, validate regions and pairwise disjointness, and
-   preallocate all metadata/iovecs, pool state, and error-recovery state.
-4. Arm the pool's conservative registered-storage guard.
+   preallocate all metadata/iovecs, table state, and error-recovery state.
+4. Arm the table's conservative registered-storage guard.
 5. Call `register_buffers`; disarm the storage guard if the syscall reports
    failure.
 6. Publish `Registered(generation)` and disarm the reservation guard with an
@@ -371,16 +450,17 @@ Registration is a panic-safe transaction:
 From the instant the kernel call succeeds, unwinding can only successfully
 unregister or retain the storage. No panic path may free a registered address.
 
-`unregister(self)` first proves unique pool ownership, which also proves there
-are no fixed buffers or operations. On success it unregisters the matching
-table, clears the generation, and returns `Vec<B>` in original order. On busy,
-kernel error, or state mismatch, `UnregisterError<B>` owns the intact pool:
+`unregister(self)` first proves unique table ownership, which also proves
+there are no fixed buffers or operations. On success it unregisters the
+matching table, clears the generation, and returns `Vec<Option<B>>` in slot
+order. On busy, kernel error, or state mismatch, `UnregisterError<B>` owns the
+intact table:
 
 ```rust
 impl<B> UnregisterError<B> {
     pub fn kind(&self) -> &UnregisterErrorKind;
-    pub fn into_pool(self) -> FixedBufPool<B>;
-    pub fn into_parts(self) -> (UnregisterErrorKind, FixedBufPool<B>);
+    pub fn into_table(self) -> FixedBufTable<B>;
+    pub fn into_parts(self) -> (UnregisterErrorKind, FixedBufTable<B>);
 }
 ```
 
@@ -397,7 +477,7 @@ failures.
 
 Registration rejects before the syscall:
 
-- an empty pool;
+- an empty table;
 - an empty region;
 - pairwise-overlapping regions;
 - more than 16,384 regions (`IORING_MAX_FIXED_BUFS`);
@@ -416,15 +496,11 @@ and device.
 
 ## Evolution boundaries
 
-Dense `unregister() -> Vec<B>` is intentionally permanent for this type.
-Sparse slots need indexed optional recovery and resource retirement, so they
-should use a separate `SparseFixedBufTable<B>` (or builder-selected table type)
-rather than changing `FixedBufPool<B>` semantics.
-
-Safe replacement requires slot generations and retaining old buffers until a
-resource-tag CQE proves the kernel has released every old reference. Norn's CQ
-router must also recognize those tags before updates are exposed. Neither is a
-v1 implementation detail to guess at now.
+Slot changes rely on the whole-slot lease rule rather than resource tags. A
+design that lets an operation outlive its lease, such as shared or disjoint
+leases, would need tag-based retirement: retaining old buffers until a
+resource-tag CQE proves the kernel has released every old reference, with
+Norn's CQ router recognizing those tags.
 
 Disjoint leases similarly require a new exclusion model. V1's whole-slot rule
 is simple, auditable, and maps queue depth directly to registered entries.
@@ -438,8 +514,8 @@ Uninitialized spare-capacity registration needs a parallel trait that exposes
 - A custom inline `#[repr(align(4096))] [u8; N]` wrapper completes fixed reads
   and writes, proving pointers are captured after final placement.
 - `Vec<u8>`, `Box<[u8]>`, `BytesMut`, `[u8; N]`, a foreign type registered via
-  the region closure, and `Box<dyn FixedBuffer>` work as pools.
-- Invalid inputs, indices, ranges, double acquisition, and pool exhaustion fail
+  the region closure, and `Box<dyn FixedBuffer>` work as tables.
+- Invalid inputs, indices, ranges, double acquisition, and table exhaustion fail
   before submission.
 - Any-slot acquisition recycles released indices without per-I/O free-list work.
 - Range changes clear logical length; failed reads preserve it; successful reads
@@ -448,12 +524,14 @@ Uninitialized spare-capacity registration needs a parallel trait that exposes
 - The same fixed buffer remains usable in an ordinary operation on ring B.
 - Dropping unpolled and submitted/cancelled operations does not release a slot
   or backing memory early.
-- Explicit unregistration recovers original values in order and permits a new
-  registration on the same ring.
+- Explicit unregistration recovers installed values in slot order and permits a
+  new registration on the same ring.
+- Slots of a table registered full or sparse can be installed, replaced, and
+  removed, and fixed I/O sees each new region.
 - Injected panics immediately after kernel registration cannot free storage.
 - Injected unregister failure and generation mismatch retain storage.
-- Driver destruction before pool destruction safely releases storage.
-- Miri exercises pool/view/lease state; Linux integration tests exercise actual
+- Driver destruction before table destruction safely releases storage.
+- Miri exercises table/view/lease state; Linux integration tests exercise actual
   registration and fixed I/O.
 
 ## Performance validation contract to finalize before running
