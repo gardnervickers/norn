@@ -54,7 +54,9 @@
 //! - [`bufring`]: registered `io_uring` buffer-ring support.
 //! - [`fixedbuf`]: caller-owned buffers registered for fixed I/O.
 //! - [`fs`]: asynchronous filesystem operations.
+//! - [`mem`]: memory advice for owned buffers.
 //! - [`net`]: asynchronous TCP and UDP networking.
+//! - [`process`]: waiting for child processes to exit.
 //! - [`uring_cmd`]: the low-level device-command extension contract.
 //!
 //! # Low-level extension APIs
@@ -103,8 +105,12 @@ pub mod bufring;
 pub mod fixedbuf;
 /// Asynchronous filesystem operations.
 pub mod fs;
+/// Memory advice operations.
+pub mod mem;
 /// Asynchronous TCP and UDP networking.
 pub mod net;
+/// Child-process operations.
+pub mod process;
 /// Device-specific commands submitted through `IORING_OP_URING_CMD`.
 pub mod uring_cmd;
 
