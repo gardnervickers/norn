@@ -2,6 +2,7 @@ use std::future::Future;
 use std::io;
 use std::mem::ManuallyDrop;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
 
@@ -14,12 +15,15 @@ use crate::fd::UringFd;
 use crate::net::socket::{self, Event, SendZcResult};
 use crate::operation::Op;
 
-use super::socket::Accept;
+use super::socket::AcceptMulti;
 
 const LOG: &str = "norn_uring::net::tcp";
 
 /// Linux `IOV_MAX`: the most `iovec`s one `sendmsg(2)` call accepts.
 const IOV_MAX: usize = 1024;
+
+/// Accepted connections [`TcpListener::incoming`] holds before it pauses.
+const INCOMING_LIMIT: NonZeroUsize = NonZeroUsize::new(64).unwrap();
 
 /// A TCP listener.
 ///
@@ -311,6 +315,12 @@ impl TcpListener {
     /// without submitting a request per connection. Each socket is bound to the
     /// [`Driver`](crate::Driver) that owns the listener.
     ///
+    /// The kernel keeps accepting while the stream is not polled, and each
+    /// accepted connection holds a descriptor until it is yielded. Once 64
+    /// wait, the stream pauses its accept, and later connections stay in the
+    /// listen backlog until the consumer catches up.
+    /// [`incoming_with_limit`](Self::incoming_with_limit) sets another limit.
+    ///
     /// An error is yielded as an item and does not end the stream; the next
     /// poll accepts again. The kernel can end a multishot accept without an
     /// error, for example when it cannot post a completion to a full completion
@@ -318,8 +328,24 @@ impl TcpListener {
     /// ends (`None`) when one ends without producing any, or once the driver
     /// stops accepting work.
     pub fn incoming(&self) -> impl Stream<Item = io::Result<TcpSocket>> + '_ {
+        self.incoming_with_limit(Some(INCOMING_LIMIT))
+    }
+
+    /// Returns a stream of incoming connections that pauses its accept once
+    /// `limit` accepted connections wait to be yielded. With `None` it never
+    /// pauses, so a consumer that falls behind holds a descriptor for every
+    /// connection the kernel accepts.
+    ///
+    /// Connections the kernel accepted before a pause took effect are still
+    /// yielded, so the stream can briefly hold more than `limit`. Otherwise
+    /// it behaves like [`incoming`](Self::incoming).
+    pub fn incoming_with_limit(
+        &self,
+        limit: Option<NonZeroUsize>,
+    ) -> impl Stream<Item = io::Result<TcpSocket>> + '_ {
         Incoming {
             listener: &self.socket,
+            limit,
             current: None,
             accepted: false,
         }
@@ -354,8 +380,9 @@ pin_project_lite::pin_project! {
     /// A stream of connections accepted by a [`TcpListener`].
     struct Incoming<'a> {
         listener: &'a socket::Socket,
+        limit: Option<NonZeroUsize>,
         #[pin]
-        current: Option<Op<Accept<true>>>,
+        current: Option<Op<AcceptMulti>>,
         // Whether the current operation produced a connection.
         accepted: bool,
     }
@@ -383,9 +410,10 @@ impl Stream for Incoming<'_> {
                         this.current.set(None);
                         // The kernel also ends a multishot accept without an
                         // error, for example when it cannot post a completion
-                        // to a full completion queue. Re-arm after an
-                        // operation that accepted connections; one that ended
-                        // without producing anything ends the stream.
+                        // to a full completion queue, and a pause at the limit
+                        // ends one quietly. Re-arm after an operation that
+                        // accepted connections; one that ended without
+                        // producing anything ends the stream.
                         if !std::mem::take(this.accepted) {
                             return Poll::Ready(None);
                         }
@@ -397,7 +425,8 @@ impl Stream for Incoming<'_> {
             if !this.listener.driver_running() {
                 return Poll::Ready(None);
             }
-            this.current.set(Some(this.listener.accept_multi()));
+            this.current
+                .set(Some(this.listener.accept_multi(*this.limit)));
         }
     }
 

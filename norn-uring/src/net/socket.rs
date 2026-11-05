@@ -9,6 +9,7 @@ use socket2::{Domain, Protocol, SockAddr, SockAddrStorage, Type};
 use std::io;
 use std::mem::{ManuallyDrop, MaybeUninit};
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
 use std::pin::Pin;
 use std::task::{ready, Context, Poll as TaskPoll};
@@ -16,7 +17,7 @@ use std::task::{ready, Context, Poll as TaskPoll};
 use crate::buf::{set_init_checked, StableBuf, StableBufMut};
 use crate::bufring::{BufRingBuf, BufRingBufBundle, RecvBufRing};
 use crate::fd::{NornFd, UringFd};
-use crate::operation::{CQEResult, Multishot, Op, Operation, OperationId, Singleshot};
+use crate::operation::{CQEResult, Multishot, Op, OpTarget, Operation, OperationId, Singleshot};
 
 pub(crate) struct RingRecvCompletion<T> {
     result: io::Result<T>,
@@ -27,56 +28,81 @@ pub(crate) struct RingRecvCompletion<T> {
     paused: bool,
 }
 
-/// Buffers a multishot receive has reaped but its stream has not yet yielded.
+/// Items a multishot operation has reaped but its stream has not yet yielded:
+/// buffers for a ring receive, connections for an accept.
 ///
-/// The count changes only in the receive's own `reap` and `update`, which run
-/// on the driver thread, so it needs no synchronization.
-#[derive(Debug, Default)]
-struct ReceiveBacklog {
+/// The count changes only in the operation's own `reap` and `update`, which
+/// run on the driver thread, so it needs no synchronization.
+#[derive(Debug)]
+struct MultishotBacklog {
     unconsumed: usize,
-    // Cancellations requested so far: one at the limit, and one more at
-    // twice the limit in case the first did not take effect.
+    // The backlog at which to request the next pause: the limit, then twice
+    // the limit in case the first cancellation did not take effect, then
+    // never.
+    next_pause: usize,
+    // Cancellations requested so far.
     pause_requests: u8,
 }
 
-impl ReceiveBacklog {
-    /// Count the buffers of one reaped completion, and pause the receive
-    /// once its backlog reaches the ring's limit while the kernel keeps it
-    /// armed. If the backlog still grows to twice the limit, request the
-    /// cancellation again.
+impl MultishotBacklog {
+    /// A backlog that pauses its operation at `limit`, or never.
+    fn new(limit: Option<NonZeroUsize>) -> Self {
+        Self {
+            unconsumed: 0,
+            next_pause: limit.map_or(usize::MAX, NonZeroUsize::get),
+            pause_requests: 0,
+        }
+    }
+
+    /// Count the items of one reaped completion, and pause the operation
+    /// once its backlog reaches the limit while the kernel keeps it armed.
+    /// If the backlog still grows to twice the limit, request the
+    /// cancellation again. `pause` must queue the cancellation without
+    /// submitting it.
     ///
     /// # Safety
     ///
     /// `id` must come from the completion being reaped.
-    unsafe fn reaped(&mut self, ring: &RecvBufRing, id: Option<OperationId>, buffers: usize) {
-        self.unconsumed += buffers;
-        let Some(limit) = ring.max_unconsumed_per_receive() else {
-            return;
-        };
-        let threshold = match self.pause_requests {
-            0 => limit.get(),
-            1 => limit.get().saturating_mul(2),
-            _ => return,
-        };
-        if self.unconsumed < threshold {
-            return;
+    unsafe fn reaped(
+        &mut self,
+        id: Option<OperationId>,
+        items: usize,
+        pause: impl FnOnce(OpTarget),
+    ) {
+        self.unconsumed += items;
+        if self.unconsumed >= self.next_pause {
+            // Safety: upheld by the caller.
+            unsafe { self.request_pause(id, pause) };
         }
-        // A terminal completion has no id: the receive is ending anyway.
+    }
+
+    /// Request a pause at the current threshold, and raise the threshold.
+    ///
+    /// # Safety
+    ///
+    /// `id` must come from the completion being reaped.
+    #[cold]
+    unsafe fn request_pause(&mut self, id: Option<OperationId>, pause: impl FnOnce(OpTarget)) {
+        // A terminal completion has no id: the operation is ending anyway.
         let Some(id) = id else {
             return;
         };
         self.pause_requests += 1;
+        self.next_pause = match self.pause_requests {
+            1 => self.next_pause.saturating_mul(2),
+            _ => usize::MAX,
+        };
         // Safety: the caller is reaping the non-terminal completion `id` came
         // from. The cancellation is queued, never submitted from here, so
         // this does not re-enter the kernel or the completion drain.
-        ring.pause_receive(unsafe { id.target() });
+        pause(unsafe { id.target() });
     }
 
-    fn yielded(&mut self, buffers: usize) {
-        self.unconsumed -= buffers;
+    fn yielded(&mut self, items: usize) {
+        self.unconsumed -= items;
     }
 
-    /// Whether a terminal error ends a receive that paused itself.
+    /// Whether a terminal error ends an operation that paused itself.
     ///
     /// A terminal that races the cancellation wins: end of stream, a socket
     /// error, or `ENOBUFS` is handled as if no pause had been requested.
@@ -433,7 +459,7 @@ impl Socket {
     }
 
     pub(crate) async fn accept(&self) -> io::Result<(Self, SocketAddr)> {
-        let op = Accept::<false>::new(self.fd.lease());
+        let op = Accept::new(self.fd.lease());
         let (fd, addr) = self.fd.submit(op).await?;
         let socket = Self::from_fd(fd);
         Ok((socket, addr))
@@ -444,8 +470,10 @@ impl Socket {
         self.fd.handle().is_running()
     }
 
-    pub(crate) fn accept_multi(&self) -> Op<Accept<true>> {
-        let op = Accept::<true>::new(self.fd.lease());
+    /// Start a multishot accept that pauses itself once `limit` accepted
+    /// connections wait to be yielded; `None` never pauses.
+    pub(crate) fn accept_multi(&self, limit: Option<NonZeroUsize>) -> Op<AcceptMulti> {
+        let op = AcceptMulti::new(self.fd.lease(), self.fd.handle().clone(), limit);
         self.fd.submit(op)
     }
 
@@ -1264,7 +1292,7 @@ pub(crate) struct RecvFromRingMulti {
     ring: RecvBufRing,
     addr: SockAddr,
     msghdr: MaybeUninit<libc::msghdr>,
-    backlog: ReceiveBacklog,
+    backlog: MultishotBacklog,
 }
 
 impl RecvFromRingMulti {
@@ -1272,11 +1300,11 @@ impl RecvFromRingMulti {
         // Safety: We won't read from the socket addr until it's initialized by the kernel.
         let addr = unsafe { SockAddr::try_init(|_, _| Ok(())) }.unwrap().1;
         Self {
+            backlog: MultishotBacklog::new(ring.max_unconsumed_per_receive()),
             fd,
             ring,
             addr,
             msghdr: MaybeUninit::zeroed(),
-            backlog: ReceiveBacklog::default(),
         }
     }
 
@@ -1351,7 +1379,11 @@ unsafe impl Operation for RecvFromRingMulti {
             .and_then(|n| self.ring.get_buf(n, flags));
         let terminal = !io_uring::cqueue::more(flags);
         // Safety: `id` came from the completion being reaped.
-        unsafe { self.backlog.reaped(&self.ring, id, buffer_count(&result)) };
+        unsafe {
+            self.backlog.reaped(id, buffer_count(&result), |target| {
+                self.ring.pause_receive(target)
+            })
+        };
         RingRecvCompletion {
             paused: self.backlog.is_pause(terminal, &result),
             result,
@@ -1382,16 +1414,16 @@ pub(crate) struct RecvRingMulti {
     fd: NornFd,
     ring: RecvBufRing,
     flags: i32,
-    backlog: ReceiveBacklog,
+    backlog: MultishotBacklog,
 }
 
 impl RecvRingMulti {
     pub(crate) fn new(fd: NornFd, ring: RecvBufRing, flags: i32) -> Self {
         Self {
+            backlog: MultishotBacklog::new(ring.max_unconsumed_per_receive()),
             fd,
             ring,
             flags,
-            backlog: ReceiveBacklog::default(),
         }
     }
 }
@@ -1423,7 +1455,11 @@ unsafe impl Operation for RecvRingMulti {
         });
         let terminal = !io_uring::cqueue::more(flags);
         // Safety: `id` came from the completion being reaped.
-        unsafe { self.backlog.reaped(&self.ring, id, buffer_count(&result)) };
+        unsafe {
+            self.backlog.reaped(id, buffer_count(&result), |target| {
+                self.ring.pause_receive(target)
+            })
+        };
         RingRecvCompletion {
             paused: self.backlog.is_pause(terminal, &result),
             result,
@@ -1494,16 +1530,16 @@ pub(crate) struct RecvRingBundleMulti {
     fd: NornFd,
     ring: RecvBufRing,
     flags: i32,
-    backlog: ReceiveBacklog,
+    backlog: MultishotBacklog,
 }
 
 impl RecvRingBundleMulti {
     pub(crate) fn new(fd: NornFd, ring: RecvBufRing, flags: i32) -> Self {
         Self {
+            backlog: MultishotBacklog::new(ring.max_unconsumed_per_receive()),
             fd,
             ring,
             flags,
-            backlog: ReceiveBacklog::default(),
         }
     }
 }
@@ -1537,7 +1573,10 @@ unsafe impl Operation for RecvRingBundleMulti {
         let terminal = !io_uring::cqueue::more(flags);
         let buffers = result.as_ref().map_or(0, BufRingBufBundle::buffer_count);
         // Safety: `id` came from the completion being reaped.
-        unsafe { self.backlog.reaped(&self.ring, id, buffers) };
+        unsafe {
+            self.backlog
+                .reaped(id, buffers, |target| self.ring.pause_receive(target))
+        };
         RingRecvCompletion {
             paused: self.backlog.is_pause(terminal, &result),
             result,
@@ -1601,13 +1640,13 @@ fn socket_addr_from_name(name: &[u8]) -> io::Result<SocketAddr> {
     }
 }
 
-pub(crate) struct Accept<const MULTI: bool> {
+pub(crate) struct Accept {
     fd: NornFd,
     addr: SockAddr,
     addr_len: libc::socklen_t,
 }
 
-impl<const MULTI: bool> Accept<MULTI> {
+impl Accept {
     pub(crate) fn new(fd: NornFd) -> Self {
         // Safety: We won't read from the socket addr until it's initialized.
         let addr = unsafe { SockAddr::try_init(|_, _| Ok(())) }.unwrap().1;
@@ -1617,27 +1656,20 @@ impl<const MULTI: bool> Accept<MULTI> {
 }
 
 // Safety: `NornFd` retains the listener and the pinned socket-address storage
-// remains valid for every CQE. `reap` converts every accepted descriptor to
+// remains valid for the CQE. `reap` converts the accepted descriptor to
 // `OwnedFd` before waking application code.
-unsafe impl<const MULTI: bool> Operation for Accept<MULTI> {
+unsafe impl Operation for Accept {
     type Completion = io::Result<OwnedFd>;
 
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let this = self;
-        let fd = this.fd.fd();
-        if MULTI {
-            Ok(opcode::AcceptMulti::new(fd)
-                .flags(SOCK_NONBLOCK | SOCK_CLOEXEC)
-                .build())
-        } else {
-            Ok(opcode::Accept::new(
-                fd,
-                this.addr.as_ptr() as *mut _,
-                &mut this.addr_len as *mut _,
-            )
-            .flags(SOCK_NONBLOCK | SOCK_CLOEXEC)
-            .build())
-        }
+        Ok(opcode::Accept::new(
+            this.fd.fd(),
+            this.addr.as_ptr() as *mut _,
+            &mut this.addr_len as *mut _,
+        )
+        .flags(SOCK_NONBLOCK | SOCK_CLOEXEC)
+        .build())
     }
 
     unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
@@ -1645,7 +1677,7 @@ unsafe impl<const MULTI: bool> Operation for Accept<MULTI> {
     }
 }
 
-impl Singleshot for Accept<false> {
+impl Singleshot for Accept {
     type Output = io::Result<(NornFd, SocketAddr)>;
 
     fn complete(self, completion: Self::Completion) -> Self::Output {
@@ -1658,14 +1690,67 @@ impl Singleshot for Accept<false> {
     }
 }
 
-impl Multishot for Accept<true> {
+/// A multishot accept. The kernel keeps accepting while nothing consumes its
+/// connections, so it cancels itself once a limit of them wait to be yielded.
+pub(crate) struct AcceptMulti {
+    fd: NornFd,
+    // The driver the accept is submitted to, which queues its pause.
+    handle: crate::Handle,
+    backlog: MultishotBacklog,
+}
+
+impl AcceptMulti {
+    fn new(fd: NornFd, handle: crate::Handle, limit: Option<NonZeroUsize>) -> Self {
+        Self {
+            fd,
+            handle,
+            backlog: MultishotBacklog::new(limit),
+        }
+    }
+}
+
+// Safety: `NornFd` retains the listener through the terminal CQE. `reap`
+// converts every accepted descriptor to `OwnedFd` before waking application
+// code.
+unsafe impl Operation for AcceptMulti {
+    type Completion = io::Result<OwnedFd>;
+
+    fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+        Ok(opcode::AcceptMulti::new(self.fd.fd())
+            .flags(SOCK_NONBLOCK | SOCK_CLOEXEC)
+            .build())
+    }
+
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+        let id = result.operation_id();
+        let result = reap_owned_fd(result);
+        let handle = &self.handle;
+        // Safety: `id` came from the completion being reaped. An accept is
+        // never a later member of a linked batch, so it has no predecessor.
+        unsafe {
+            self.backlog
+                .reaped(id, usize::from(result.is_ok()), |target| {
+                    handle.cancel_op(target, None)
+                })
+        };
+        result
+    }
+}
+
+impl Multishot for AcceptMulti {
     type Item = io::Result<NornFd>;
 
     fn update(&mut self, completion: Self::Completion) -> Self::Item {
+        self.backlog.yielded(usize::from(completion.is_ok()));
         completion.map(|fd| bind_accepted_fd(fd, &self.fd))
     }
 
     fn complete(self, completion: Self::Completion) -> Option<Self::Item> {
+        // The cancellation requested at the limit ends the accept without an
+        // item, after every connection accepted before it.
+        if self.backlog.is_pause(true, &completion) {
+            return None;
+        }
         Some(completion.map(|fd| bind_accepted_fd(fd, &self.fd)))
     }
 }
@@ -2557,7 +2642,7 @@ mod tests {
             let connector = connect_from_thread(listener.local_addr()?);
 
             let socket = {
-                let mut incoming = pin!(listener.accept_multi());
+                let mut incoming = pin!(listener.accept_multi(None));
                 incoming
                     .next()
                     .await
