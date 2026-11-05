@@ -178,6 +178,10 @@ struct Shared {
     deferred_cancels: RefCell<VecDeque<PendingCancel>>,
     /// Set once shutdown has requested cancellation of every outstanding request.
     cancel_all_requested: Cell<bool>,
+    /// Set once a request with a hard link was created. Shutdown then cancels
+    /// again after each completion, because a hard-linked request is issued
+    /// only once the request before it ends.
+    hard_links: Cell<bool>,
     /// Linked requests whose first cancellation found nothing (ENOENT).
     ///
     /// A request linked behind another is invisible to cancellation until the
@@ -629,6 +633,12 @@ impl Handle {
         self.shared.cancel_all_requested.get()
     }
 
+    /// Record that a request with a hard link exists, so shutdown cancels
+    /// its later requests as soon as they are issued.
+    pub(crate) fn note_hard_link(&self) {
+        self.shared.hard_links.set(true);
+    }
+
     /// Whether the driver still accepts work.
     pub(crate) fn is_running(&self) -> bool {
         self.shared.status() == Status::Running
@@ -802,6 +812,7 @@ impl Driver {
                 status: Cell::new(Status::Running),
                 deferred_cancels: RefCell::new(VecDeque::new()),
                 cancel_all_requested: Cell::new(false),
+                hard_links: Cell::new(false),
                 cancel_retries: RefCell::new(Vec::new()),
                 submit_error: RefCell::new(None),
                 shutdown_outcome: Cell::new(None),
@@ -1212,6 +1223,16 @@ impl Driver {
             return;
         }
         if self.drain_exhaustive() > 0 {
+            // A hard-linked request is issued only once the request before it
+            // completes, so the cancel that ended its predecessor did not see
+            // it. Issue it and cancel it now, instead of after the timed wait
+            // below, which a chain would otherwise pay once per hard link.
+            if self.shared.hard_links.get() && self.shared.in_flight() > 0 {
+                self.shared.run_all_task_work();
+                if let Err(err) = self.shared.cancel_all() {
+                    trace!(target: LOG, "shutdown.hard_link_cancel {err:?}");
+                }
+            }
             return;
         }
         if self.shared.in_flight() == 0 {
@@ -3731,6 +3752,37 @@ mod tests {
                 && second.load(Ordering::Acquire)),
             "both reads must end"
         );
+    }
+
+    #[test]
+    fn shutdown_cancels_each_hard_linked_request_without_waiting() {
+        let mut driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let handle = driver.handle();
+        let ended: [Arc<AtomicBool>; 3] = std::array::from_fn(|_| Arc::new(AtomicBool::new(false)));
+        let mut chain = Box::pin(
+            long_lived_read(&handle, &ended[0])
+                .then_always(long_lived_read(&handle, &ended[1]))
+                .then_always(long_lived_read(&handle, &ended[2])),
+        );
+        let waker = futures_test::task::noop_waker();
+        assert!(chain
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending());
+        driver.park(ParkMode::NoPark).unwrap();
+
+        // Each read is issued only after the one before it ends, so shutdown
+        // cancels three times. Waiting out SHUTDOWN_CANCEL_TIMEOUT before each
+        // later cancel made this take two timeouts.
+        let started = std::time::Instant::now();
+        drop(driver);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < SHUTDOWN_CANCEL_TIMEOUT,
+            "shutdown took {elapsed:?}"
+        );
+        drop(chain);
+        assert!(ended.iter().all(|ended| ended.load(Ordering::Acquire)));
     }
 
     #[test]
