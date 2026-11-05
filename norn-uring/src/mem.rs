@@ -53,6 +53,12 @@ impl Advice {
 /// effect. Advice is most useful for page-aligned regions such as memory
 /// mappings exposed through a custom [`StableBuf`] implementation.
 ///
+/// [`Advice::Random`], [`Advice::Sequential`], and [`Advice::Normal`] record
+/// the advice on the memory mapping that holds the range, and split that
+/// mapping at the range's ends when the advice changes. Advising many separate
+/// heap buffers can therefore approach the `vm.max_map_count` limit, after
+/// which `mmap` and further advice fail with `ENOMEM`.
+///
 /// The request owns the buffer until completion and returns it with the
 /// result. The returned request is lazy and can be linked or given a timeout.
 ///

@@ -28,6 +28,15 @@ use crate::Handle;
 /// exits concurrently, the kernel may still reap it; the status is then
 /// discarded with the abandoned completion.
 ///
+/// Once a child is reaped, the system may give its PID to an unrelated
+/// process. Do not signal the PID after this request may have reaped the
+/// child, that is, after it succeeded, or after it was dropped once the child
+/// might have exited. [`std::process::Child::kill`] signals by PID, so it could
+/// then kill another process. To bound a wait and then kill the child, wait
+/// with [`observe_exit`], which never reaps, then call `Child::kill` and
+/// `Child::wait`. An unreaped child keeps its PID, so the signal cannot reach
+/// another process.
+///
 /// The returned request is lazy and can be linked or given a timeout.
 ///
 /// # Example
@@ -45,8 +54,8 @@ use crate::Handle;
 ///
 /// # Errors
 ///
-/// Returns [`io::ErrorKind::InvalidInput`] if `pid` is zero or exceeds the
-/// kernel's PID range, `ECHILD` if `pid` is not an unwaited child of the calling
+/// Returns [`io::ErrorKind::InvalidInput`] if `pid` is zero or above
+/// `i32::MAX`, `ECHILD` if `pid` is not an unwaited child of the calling
 /// process (including when `SIGCHLD` is ignored, which makes the kernel reap
 /// children automatically), or `ECANCELED` if the request is cancelled.
 ///
