@@ -404,3 +404,77 @@ fn sqpoll_issued_wait_shares_private_futex_key() -> TestResult {
         Ok(())
     })
 }
+
+/// A wait abandoned after a wake released it passes that wake on, so
+/// `wake(1)` still releases a live waiter.
+#[test]
+fn dropped_woken_wait_passes_its_wake_on() -> TestResult {
+    util::with_test_env(|| async {
+        if futex_unsupported().await? {
+            return Ok(());
+        }
+        let futex = Futex::new(0);
+        let mut first = Box::pin(futex.wait(0));
+        assert!(poll_once(&mut first).await.is_pending());
+        settle().await;
+        // The timeout turns a lost wake into a failure instead of a hang.
+        let mut second = Box::pin(futex.wait(0).timeout(Duration::from_secs(5)));
+        assert!(poll_once(&mut second).await.is_pending());
+        settle().await;
+
+        // Waiters are woken in queue order, so this releases `first`.
+        assert_eq!(futex.wake(1).await?, 1);
+        // Abandon the woken wait, as a losing `select!` arm would.
+        drop(first);
+        assert_eq!(second.await?, WaitOutcome::Woken);
+        Ok(())
+    })
+}
+
+#[test]
+fn consumed_wake_is_not_passed_on() -> TestResult {
+    util::with_test_env(|| async {
+        if futex_unsupported().await? {
+            return Ok(());
+        }
+        let futex = Futex::new(0);
+        let mut first = Box::pin(futex.wait(0));
+        assert!(poll_once(&mut first).await.is_pending());
+        settle().await;
+        let mut second = Box::pin(futex.wait(0));
+        assert!(poll_once(&mut second).await.is_pending());
+        settle().await;
+
+        assert_eq!(futex.wake(1).await?, 1);
+        assert_eq!(first.await?, WaitOutcome::Woken);
+        settle().await;
+        settle().await;
+        assert!(poll_once(&mut second).await.is_pending());
+
+        assert_eq!(futex.wake(1).await?, 1);
+        assert_eq!(second.await?, WaitOutcome::Woken);
+        Ok(())
+    })
+}
+
+#[test]
+fn dropped_woken_wait_any_passes_its_wake_on() -> TestResult {
+    util::with_test_env(|| async {
+        if futex_unsupported().await? {
+            return Ok(());
+        }
+        let futex = Futex::new(0);
+        let other = Futex::new(0);
+        let mut first = Box::pin(futex::wait_any(&[(&other, 0), (&futex, 0)]));
+        assert!(poll_once(&mut first).await.is_pending());
+        settle().await;
+        let mut second = Box::pin(futex.wait(0).timeout(Duration::from_secs(5)));
+        assert!(poll_once(&mut second).await.is_pending());
+        settle().await;
+
+        assert_eq!(futex.wake(1).await?, 1);
+        drop(first);
+        assert_eq!(second.await?, WaitOutcome::Woken);
+        Ok(())
+    })
+}

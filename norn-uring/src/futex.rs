@@ -106,9 +106,15 @@ impl Futex {
     /// [`WaitOutcome::Mismatch`]; otherwise it waits until a matching wake.
     /// The kernel treats a mismatch as a failed request, so it cancels later
     /// requests linked with [`Request::then`](crate::Request::then).
-    /// Dropping a submitted wait cancels it. Attach a deadline with
-    /// [`Request::timeout`](crate::Request::timeout), which reports expiry as
-    /// `ECANCELED`.
+    /// Attach a deadline with [`Request::timeout`](crate::Request::timeout),
+    /// which reports expiry as `ECANCELED`.
+    ///
+    /// Dropping a submitted wait cancels it. If a wake has already released
+    /// the wait, the waker counted it among the waiters it woke, so the wait
+    /// passes the wake on to another waiter on the word whose bitset
+    /// intersects its own. Abandoning a woken wait therefore never strands
+    /// the waiters that remain; the one that receives the passed wake sees it
+    /// as a spurious wake if its condition no longer holds.
     ///
     /// # Panics
     ///
@@ -230,7 +236,9 @@ pub enum WaitAnyOutcome {
 ///
 /// An empty list, or a list longer than the kernel's limit of 128 futexes,
 /// completes with [`io::ErrorKind::InvalidInput`] without reaching the kernel.
-/// Dropping a submitted wait cancels it.
+/// Dropping a submitted wait cancels it. As with [`Futex::wait`], a wait that
+/// a wake has already released passes that wake on to another waiter on the
+/// woken word.
 ///
 /// # Panics
 ///
@@ -271,11 +279,79 @@ struct Wait {
     bitset: u32,
 }
 
+/// A wake the kernel delivered to a wait.
+///
+/// The waker counts a released waiter in its result whether or not the
+/// application observes the wait's completion. Dropping the wake without
+/// [`DeliveredWake::accept`], as happens when an abandoned wait's completion is
+/// discarded, passes it on with a private `futex(2)` wake of one waiter, so no
+/// wake is lost to a waiter that no longer listens.
+struct DeliveredWake {
+    futex: Option<Futex>,
+    bitset: u32,
+}
+
+impl DeliveredWake {
+    fn new(futex: &Futex, bitset: u32) -> Self {
+        Self {
+            futex: Some(futex.clone()),
+            bitset,
+        }
+    }
+
+    /// Hand the wake to the application.
+    fn accept(mut self) {
+        self.futex = None;
+    }
+}
+
+impl Drop for DeliveredWake {
+    fn drop(&mut self) {
+        if let Some(futex) = self.futex.take() {
+            // Safety: `futex` keeps the aligned word alive for the call. A
+            // wake never blocks, so this is safe to run from the completion
+            // drain, and it does not touch the ring.
+            unsafe {
+                libc::syscall(
+                    libc::SYS_futex,
+                    futex.as_ptr(),
+                    libc::FUTEX_WAKE_BITSET | libc::FUTEX_PRIVATE_FLAG,
+                    1,
+                    std::ptr::null::<libc::timespec>(),
+                    std::ptr::null::<u32>(),
+                    self.bitset,
+                );
+            }
+        }
+    }
+}
+
+/// A wait's completion, with the wake it consumed when the kernel released it.
+struct WaitCompletion {
+    result: CQEResult,
+    wake: Option<DeliveredWake>,
+}
+
+impl WaitCompletion {
+    fn new(result: CQEResult, woken: impl FnOnce() -> DeliveredWake) -> Self {
+        let wake = result.result.is_ok().then(woken);
+        Self { result, wake }
+    }
+
+    /// Accept any delivered wake and return the completion's result.
+    fn accept(self) -> CQEResult {
+        if let Some(wake) = self.wake {
+            wake.accept();
+        }
+        self.result
+    }
+}
+
 // Safety: the SQE references only the futex word, which `futex` keeps
 // allocated at a stable address through the terminal CQE. The kernel reads the
 // word and never writes it for private, non-NUMA 32-bit futexes.
 unsafe impl Operation for Wait {
-    type Completion = CQEResult;
+    type Completion = WaitCompletion;
 
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let bitset = check_bitset(self.bitset)?;
@@ -289,14 +365,15 @@ unsafe impl Operation for Wait {
     }
 
     unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
-        result
+        WaitCompletion::new(result, || DeliveredWake::new(&self.futex, self.bitset))
     }
 }
 
 impl Singleshot for Wait {
     type Output = io::Result<WaitOutcome>;
 
-    fn complete(self, result: CQEResult) -> Self::Output {
+    fn complete(self, completion: WaitCompletion) -> Self::Output {
+        let result = completion.accept();
         if is_mismatch(&result) {
             return Ok(WaitOutcome::Mismatch);
         }
@@ -346,7 +423,7 @@ struct WaitAny {
 // allocated. Neither is moved, freed, or written by Rust before the terminal
 // CQE. The kernel only reads them.
 unsafe impl Operation for WaitAny {
-    type Completion = CQEResult;
+    type Completion = WaitCompletion;
 
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let len = self.futexes.len();
@@ -371,14 +448,22 @@ unsafe impl Operation for WaitAny {
     }
 
     unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
-        result
+        // The vectored wait observes only `MATCH_ANY` wakes, so the delivered
+        // wake is passed on the same way.
+        let woken = match &result.result {
+            Ok(index) => self.futexes.get(*index as usize),
+            Err(_) => None,
+        };
+        let wake = woken.map(|futex| DeliveredWake::new(futex, MATCH_ANY));
+        WaitCompletion { result, wake }
     }
 }
 
 impl Singleshot for WaitAny {
     type Output = io::Result<WaitAnyOutcome>;
 
-    fn complete(self, result: CQEResult) -> Self::Output {
+    fn complete(self, completion: WaitCompletion) -> Self::Output {
+        let result = completion.accept();
         if is_mismatch(&result) {
             return Ok(WaitAnyOutcome::Mismatch);
         }
@@ -404,27 +489,79 @@ mod tests {
         }
     }
 
+    fn complete_wait(mut op: Wait, result: CQEResult) -> io::Result<WaitOutcome> {
+        // Safety: the test supplies one completion for this unsubmitted op.
+        let completion = unsafe { op.reap(result) };
+        op.complete(completion)
+    }
+
     #[test]
     fn kernel_eagain_is_a_mismatch() {
-        let outcome = wait(MATCH_ANY).complete(CQEResult::new(Err(eagain()), 0));
+        let outcome = complete_wait(wait(MATCH_ANY), CQEResult::new(Err(eagain()), 0));
         assert_eq!(outcome.unwrap(), WaitOutcome::Mismatch);
     }
 
     #[test]
     fn synthetic_eagain_remains_an_error() {
-        let err = wait(MATCH_ANY)
-            .complete(CQEResult::synthetic(Err(eagain())))
-            .unwrap_err();
+        let err = complete_wait(wait(MATCH_ANY), CQEResult::synthetic(Err(eagain()))).unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::EAGAIN));
     }
 
     #[test]
     fn cancellation_is_reported_as_an_error() {
         let canceled = io::Error::from_raw_os_error(libc::ECANCELED);
-        let err = wait(MATCH_ANY)
-            .complete(CQEResult::new(Err(canceled), 0))
-            .unwrap_err();
+        let err = complete_wait(wait(MATCH_ANY), CQEResult::new(Err(canceled), 0)).unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::ECANCELED));
+    }
+
+    #[test]
+    fn only_a_woken_wait_holds_a_wake_to_pass_on() {
+        let mut op = wait(MATCH_ANY);
+        // Safety: each completion below is supplied once to this unsubmitted op.
+        let woken = unsafe { op.reap(CQEResult::new(Ok(0), 0)) };
+        assert!(woken.wake.is_some());
+        woken.accept();
+        for err in [eagain(), io::Error::from_raw_os_error(libc::ECANCELED)] {
+            // Safety: as above.
+            let failed = unsafe { op.reap(CQEResult::new(Err(err), 0)) };
+            assert!(failed.wake.is_none());
+        }
+    }
+
+    /// Wait in `futex(2)` on another thread until woken, and report whether
+    /// the wait ended within ten seconds.
+    fn thread_waiter(futex: &Futex) -> std::thread::JoinHandle<bool> {
+        let futex = futex.clone();
+        std::thread::spawn(move || {
+            let timeout = libc::timespec {
+                tv_sec: 10,
+                tv_nsec: 0,
+            };
+            // Safety: `futex` keeps the aligned word alive for the call.
+            let rc = unsafe {
+                libc::syscall(
+                    libc::SYS_futex,
+                    futex.as_ptr(),
+                    libc::FUTEX_WAIT | libc::FUTEX_PRIVATE_FLAG,
+                    0,
+                    &timeout,
+                )
+            };
+            rc == 0
+        })
+    }
+
+    #[test]
+    fn dropping_a_delivered_wake_wakes_another_waiter() {
+        let futex = Futex::new(0);
+        let waiter = thread_waiter(&futex);
+        // The thread may not be queued yet, so pass wakes until one lands. If
+        // dropping never wakes, the thread's own timeout ends the loop.
+        while !waiter.is_finished() {
+            drop(DeliveredWake::new(&futex, MATCH_ANY));
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(waiter.join().unwrap(), "no passed wake reached the waiter");
     }
 
     #[test]
@@ -444,12 +581,22 @@ mod tests {
     #[test]
     fn wait_any_outcome_reports_kernel_index() {
         let futexes = vec![Futex::new(0), Futex::new(0)];
-        let op = WaitAny {
+        let mut op = WaitAny {
             expected: vec![0; futexes.len()],
             futexes,
             vector: Box::default(),
         };
-        let outcome = op.complete(CQEResult::new(Ok(1), 0)).unwrap();
+        // Safety: the test supplies one completion for this unsubmitted op.
+        let completion = unsafe { op.reap(CQEResult::new(Ok(1), 0)) };
+        let woken = completion
+            .wake
+            .as_ref()
+            .and_then(|wake| wake.futex.as_ref());
+        assert!(std::ptr::eq(
+            woken.unwrap().as_ptr(),
+            op.futexes[1].as_ptr()
+        ));
+        let outcome = op.complete(completion).unwrap();
         assert_eq!(outcome, WaitAnyOutcome::Woken { index: 1 });
     }
 
