@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::VecDeque;
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::pin::Pin;
 use std::ptr;
 use std::task::Waker;
@@ -17,23 +18,6 @@ pub(crate) struct Wheels {
     next_expiration_dirty: Cell<bool>,
     // Reuse wake storage without retaining a borrow across user callbacks.
     wake_storage: RefCell<VecDeque<Waker>>,
-}
-
-struct WakeBatch(VecDeque<Waker>);
-
-impl WakeBatch {
-    fn wake_all(&mut self) {
-        while let Some(waker) = self.0.pop_front() {
-            waker.wake();
-        }
-    }
-}
-
-impl Drop for WakeBatch {
-    fn drop(&mut self) {
-        // If one callback unwinds, still notify the remaining completed timers.
-        self.wake_all();
-    }
 }
 
 impl Wheels {
@@ -243,12 +227,24 @@ impl Wheels {
         self.wake_all(wakers);
     }
 
-    fn wake_all(&self, wakers: VecDeque<Waker>) {
-        let mut batch = WakeBatch(wakers);
-        batch.wake_all();
+    /// Wake every waker in `wakers`, then resume the first panic, if any.
+    ///
+    /// Each waker runs under `catch_unwind`, so a panicking callback cannot
+    /// lose the remaining timers' wakeups, and a second panic does not unwind
+    /// during another and abort the process.
+    fn wake_all(&self, mut wakers: VecDeque<Waker>) {
+        let mut panic = None;
+        while let Some(waker) = wakers.pop_front() {
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| waker.wake())) {
+                panic.get_or_insert(payload);
+            }
+        }
         // Reentrant advancement may have populated its own empty storage. No
         // wakers are dropped while this cache is borrowed.
-        self.wake_storage.replace(std::mem::take(&mut batch.0));
+        self.wake_storage.replace(wakers);
+        if let Some(payload) = panic {
+            resume_unwind(payload);
+        }
     }
 }
 

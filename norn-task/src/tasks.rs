@@ -54,6 +54,9 @@ impl TaskSet {
     ///
     /// Closing or dropping the [`TaskSet`] destroys every incomplete future,
     /// even if a runnable or waker still references its task allocation. A
+    /// task that is being polled when the set closes, for example one that
+    /// closes or drops the set from inside its own poll, is not destroyed
+    /// mid-poll: its future is destroyed when that poll returns. A
     /// completed output remains owned by its [`JoinHandle`]; dropping the handle
     /// destroys that output immediately, even if task wakers still exist.
     /// This holds even if a join waker panics during shutdown.
