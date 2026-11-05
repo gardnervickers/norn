@@ -13,10 +13,12 @@
 //!
 //! None of these calls gives the kernel a reference to caller memory or
 //! creates a submission. Each is one synchronous `io_uring_register(2)` call
-//! which the kernel applies or rejects as a unit, and the kernel discards the
-//! settings when the ring is destroyed. They therefore neither extend nor
-//! depend on the driver's operation, registration, or shutdown lifecycles, and
-//! may be called in any driver state while a [`Handle`] keeps the ring alive.
+//! which the kernel applies or rejects as a unit. They therefore neither extend
+//! nor depend on the driver's operation, registration, or shutdown lifecycles,
+//! and may be called in any driver state while a [`Handle`] keeps the ring
+//! alive. NAPI settings belong to the ring and end with it. Worker-pool limits
+//! do not: they apply to the pool of each thread that uses the ring, and that
+//! pool can outlive the ring (see [`Handle::set_io_wq_max_workers`]).
 //!
 //! Every method returns [`io::ErrorKind::WouldBlock`] if the ring is
 //! momentarily borrowed by the driver, and the kernel's error otherwise.
@@ -67,8 +69,8 @@ impl Capabilities {
     /// Return whether the kernel reports `opcode` as supported.
     ///
     /// Pass an opcode code such as `io_uring::opcode::Read::CODE`. Support
-    /// reflects the kernel and any restrictions registered on the ring; it
-    /// does not prove that every flag or argument of that opcode is accepted.
+    /// reflects what the kernel implements; it does not prove that every flag
+    /// or argument of that opcode is accepted.
     pub fn supports_opcode(&self, opcode: u8) -> bool {
         self.opcodes[usize::from(opcode / 64)] & (1 << (opcode % 64)) != 0
     }
@@ -99,11 +101,13 @@ impl fmt::Debug for Capabilities {
 /// Worker-count limits for the kernel's async I/O worker pool (io-wq).
 ///
 /// When setting limits, `None` leaves that limit unchanged. When reporting
-/// limits, `None` means the kernel reported zero, which happens when no
-/// worker pool exists yet for the affected task.
+/// limits, `None` means the kernel reported zero, for example because no
+/// worker pool exists yet for the affected task. A reported `None` therefore
+/// cannot be passed back to restore a limit.
 ///
-/// Limits apply per NUMA node. Values above `i32::MAX` are rejected by the
-/// kernel.
+/// Since Linux 6.5 the limits apply to the whole pool; earlier kernels apply
+/// them to each NUMA node separately. Values above `i32::MAX` are rejected by
+/// the kernel.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct IoWqMaxWorkers {
     /// Limit for bounded workers, which run operations expected to finish in
@@ -247,6 +251,12 @@ impl Handle {
     /// uses; with SQPOLL it belongs to the polling thread. The previous limits
     /// are those of the calling thread's pool, or of the SQPOLL thread's pool.
     /// Requires Linux 5.15.
+    ///
+    /// Without SQPOLL the limits outlive the ring: the thread's pool keeps
+    /// them until the thread exits or they are set again, so a later ring on
+    /// the same thread starts with them. To confine limits to one driver, set
+    /// the returned previous limits again before dropping it. A previous limit
+    /// reported as `None` cannot be restored this way.
     ///
     /// # Errors
     ///
