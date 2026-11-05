@@ -274,6 +274,8 @@ async fn serve_connection_multishot(
     let mut incoming = Box::pin(socket.recv_ring_multi(&recv_ring));
     let mut pending = Vec::with_capacity(RECV_BUFFER_LEN);
     let mut response = Vec::with_capacity(RECV_BUFFER_LEN);
+    #[cfg(feature = "bundle-replies")]
+    let replies = bundle_replies::Replies::new()?;
 
     loop {
         response.clear();
@@ -284,7 +286,12 @@ async fn serve_connection_multishot(
         // Send them before acting on a close or a fatal protocol error, so a
         // rejected or truncated frame does not discard earlier replies.
         if !response.is_empty() {
-            response = send_all(&socket, response).await?;
+            #[cfg(feature = "bundle-replies")]
+            replies.send(&socket, &response).await?;
+            #[cfg(not(feature = "bundle-replies"))]
+            {
+                response = send_all(&socket, response).await?;
+            }
         }
         match outcome {
             Ok(BatchEnd::Open) => {}
@@ -575,6 +582,64 @@ async fn recv_exact(socket: &TcpSocket, mut buffer: RecvBuffer) -> io::Result<Op
         }
     }
     Ok(Some(buffer))
+}
+
+#[cfg(feature = "bundle-replies")]
+mod bundle_replies {
+    use std::cell::Cell;
+    use std::io;
+
+    use norn_uring::bufring::SendBufRing;
+    use norn_uring::net::TcpSocket;
+
+    const SEND_RING_BUFFERS: u16 = 32;
+    const SEND_BUFFER_LEN: usize = 16 * 1024;
+
+    thread_local! {
+        // Buffer group 1 is the shared receive ring.
+        static NEXT_BGID: Cell<u16> = const { Cell::new(2) };
+    }
+
+    /// A per-connection send ring: a send ring feeds exactly one byte stream.
+    pub(super) struct Replies {
+        ring: SendBufRing,
+    }
+
+    impl Replies {
+        pub(super) fn new() -> io::Result<Self> {
+            let bgid = NEXT_BGID.with(|next| {
+                let bgid = next.get();
+                next.set(bgid.checked_add(1).expect("send ring group IDs exhausted"));
+                bgid
+            });
+            let ring = SendBufRing::builder(bgid)
+                .buf_cnt(SEND_RING_BUFFERS)
+                .buf_len(SEND_BUFFER_LEN)
+                .build()?;
+            Ok(Self { ring })
+        }
+
+        /// Copy `bytes` into ring buffers and send them as bundles.
+        pub(super) async fn send(&self, socket: &TcpSocket, mut bytes: &[u8]) -> io::Result<()> {
+            while !bytes.is_empty() || self.ring.queued() > 0 {
+                while !bytes.is_empty() {
+                    let Some(mut buf) = self.ring.try_acquire() else {
+                        break;
+                    };
+                    let copied = buf.extend_from_slice(bytes);
+                    bytes = &bytes[copied..];
+                    self.ring
+                        .publish(buf)
+                        .map_err(|err| io::Error::other(err.to_string()))?;
+                }
+                let sent = socket.send_bundle(&self.ring).await?;
+                if sent.bytes_sent() == 0 {
+                    return Err(io::Error::from(io::ErrorKind::WriteZero));
+                }
+            }
+            Ok(())
+        }
+    }
 }
 
 async fn send_all(socket: &TcpSocket, buffer: Vec<u8>) -> io::Result<Vec<u8>> {

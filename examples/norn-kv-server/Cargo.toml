@@ -17,6 +17,11 @@ io-uring = "0.7"
 libc = "0.2.149"
 norn-uring = { path = "../../norn-uring" }
 
+[features]
+# Benchmark experiment: send replies through a per-connection send ring with
+# bundle sends instead of one coalesced send.
+bundle-replies = []
+
 [[bin]]
 name = "norn-kv-server"
 path = "src/main.rs"
