@@ -132,7 +132,8 @@ impl bencher::TDynBenchFn for RegistrationBench {
             let pool = handle
                 .register_fixed_buffers(buffers.take().expect("registration buffers missing"))
                 .unwrap();
-            buffers = Some(pool.unregister().unwrap());
+            let slots = pool.unregister().unwrap();
+            buffers = Some(slots.into_iter().map(|slot| slot.unwrap()).collect());
         });
 
         assert_eq!(buffers.as_ref().unwrap().len(), self.buffer_count);

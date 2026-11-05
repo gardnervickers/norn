@@ -338,14 +338,15 @@ fn fixed_buffers_support_heterogeneous_and_projected_types(
         drop(projected);
         let recovered = pool.unregister()?;
         assert_eq!(recovered.len(), 1);
-        assert_eq!(recovered[0].position(), 7);
-        assert_eq!(&recovered[0].get_ref()[8..15], b"foreign");
+        let recovered = recovered[0].as_ref().expect("the slot stays installed");
+        assert_eq!(recovered.position(), 7);
+        assert_eq!(&recovered.get_ref()[8..15], b"foreign");
         Ok(())
     })
 }
 
 #[test]
-fn fixed_buffer_pool_reports_exclusion_and_recovers() -> Result<(), Box<dyn std::error::Error>> {
+fn fixed_buffer_table_reports_exclusion_and_recovers() -> Result<(), Box<dyn std::error::Error>> {
     util::with_test_env(|| async {
         let handle = norn_uring::Handle::current();
         let pool = handle.register_fixed_buffers(vec![vec![0u8; 32]])?;
@@ -360,7 +361,7 @@ fn fixed_buffer_pool_reports_exclusion_and_recovers() -> Result<(), Box<dyn std:
             err.kind(),
             UnregisterErrorKind::Busy { acquired: 1 }
         ));
-        let pool = err.into_pool();
+        let pool = err.into_table();
         drop(held);
 
         let second = handle

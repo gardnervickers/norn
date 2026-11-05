@@ -118,3 +118,16 @@ pub fn xattr_unsupported(err: &io::Error) -> bool {
     err.kind() == io::ErrorKind::Unsupported
         || XATTR_UNSUPPORTED_ERRNOS.contains(&err.raw_os_error().unwrap_or_default())
 }
+
+/// Return whether the running kernel supports an `io_uring` opcode.
+///
+/// Tests for recently added opcodes use this to skip on older kernels.
+#[allow(dead_code)]
+pub fn opcode_supported(code: u8) -> bool {
+    let ring = io_uring::IoUring::new(2).expect("failed to create probe ring");
+    let mut probe = io_uring::Probe::new();
+    ring.submitter()
+        .register_probe(&mut probe)
+        .expect("failed to probe io_uring opcodes");
+    probe.is_supported(code)
+}

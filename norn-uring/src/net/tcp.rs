@@ -1,4 +1,3 @@
-use std::future::Future;
 use std::io;
 use std::mem::ManuallyDrop;
 use std::net::SocketAddr;
@@ -968,19 +967,38 @@ pin_project_lite::pin_project! {
     /// Readiness-driven nonblocking I/O on one direction of a socket.
     ///
     /// The operation is attempted first. Only after it returns `EAGAIN` is a
-    /// singleshot poll armed, and the poll is dropped once it reports
-    /// readiness. At most one readiness notification is therefore pending,
-    /// and the kernel posts no completions while the caller keeps up without
-    /// blocking. A multishot poll would instead post a completion for every
-    /// wait queue wakeup for the life of the socket, queued on the operation
-    /// until an `EAGAIN` consumed them one at a time.
+    /// multishot poll armed. It then stays armed for the life of the half, so
+    /// later waits submit nothing; the kernel posts a completion whenever the
+    /// socket becomes ready.
     ///
-    /// A singleshot poll checks the current readiness mask when it is armed,
-    /// so readiness that arrives between the `EAGAIN` and the arm is not lost.
+    /// The kernel also posts those completions while the caller keeps up
+    /// without waiting. Every completion queued on the poll was reaped before
+    /// the current attempt ran, so after the attempt none of them says
+    /// anything the attempt has not already observed: a success leaves the
+    /// half notified and the next call attempts the operation directly, and
+    /// an `EAGAIN` shows the readiness they reported has been consumed. Each
+    /// attempt therefore discards them without a syscall, which bounds the
+    /// queue by the completions reaped between two attempts. Readiness that
+    /// arrives after an `EAGAIN` wakes the socket's wait queue again and posts
+    /// a new completion, so discarding loses none.
+    ///
+    /// This relies on completions never being reaped while a task is being
+    /// polled. Only the driver's park drains the CQ, between task polls, so
+    /// nothing can be reaped between the attempt and the discard that
+    /// follows it. If completions were ever reaped during a poll (a drain
+    /// on the submit path, or a nested driver run from inside a task), a
+    /// completion for readiness that arrived after the attempt's `EAGAIN`
+    /// could be queued before the discard and dropped with the stale ones,
+    /// losing the wakeup.
+    ///
+    /// The kernel can end a multishot poll without an error, for example when
+    /// it cannot post a completion to a full CQ. The next wait then arms a
+    /// fresh poll, which checks the current readiness mask when it is armed,
+    /// so readiness that arrived in between is not lost.
     struct ReadyStream {
         inner: socket::Socket,
         #[pin]
-        armed: Option<Op<socket::Poll<false>>>,
+        armed: Option<Op<socket::Poll<true>>>,
         notified: bool,
     }
 }
@@ -1004,9 +1022,11 @@ impl ReadyStream {
             log::trace!(target: LOG, "poll_op");
             ready!(self.as_mut().poll_ready(cx, flags))?;
             log::trace!(target: LOG, "poll_op.ready");
-            let this = self.as_mut().project();
+            let mut this = self.as_mut().project();
             let sock = this.inner.as_socket();
-            match f(sock) {
+            let res = f(sock);
+            discard_stale(this.armed.as_mut());
+            match res {
                 Ok(res) => {
                     log::trace!(target: LOG, "poll_op.success");
                     return Poll::Ready(Ok(res));
@@ -1014,8 +1034,6 @@ impl ReadyStream {
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                     log::trace!(target: LOG, "poll_op.would_block");
                     *this.notified = false;
-                    ready!(self.as_mut().poll_ready(cx, flags))?;
-                    continue;
                 }
                 Err(err) => {
                     log::trace!(target: LOG, "poll_op.err");
@@ -1024,9 +1042,7 @@ impl ReadyStream {
             }
         }
     }
-}
 
-impl ReadyStream {
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>, flags: u32) -> Poll<io::Result<()>> {
         let mut this = self.project();
         loop {
@@ -1035,20 +1051,65 @@ impl ReadyStream {
                 return Poll::Ready(Ok(()));
             }
             if let Some(armed) = this.armed.as_mut().as_pin_mut() {
-                let res = ready!(armed.poll(cx));
-                // The poll's only completion is terminal, so dropping it
-                // submits no cancellation. After an error the next wait arms
-                // a fresh poll.
-                this.armed.set(None);
-                log::trace!(target: LOG, "poll_op.ready.stream_notified");
-                let _ = res?;
-                *this.notified = true;
+                match ready!(armed.poll_next(cx)) {
+                    Some(Ok(_)) => {
+                        log::trace!(target: LOG, "poll_op.ready.stream_notified");
+                        *this.notified = true;
+                    }
+                    Some(Err(err)) => {
+                        // A failed poll has ended; the next wait arms a fresh
+                        // one.
+                        this.armed.set(None);
+                        return Poll::Ready(Err(err));
+                    }
+                    // The kernel ended the poll without an error. Its terminal
+                    // completion has been delivered, so it may be replaced.
+                    None => {
+                        log::trace!(target: LOG, "poll_op.ready.stream_done");
+                        this.armed.set(None);
+                    }
+                }
             } else {
                 log::trace!(target: LOG, "poll_op.ready.stream_arm");
-                this.armed.set(Some(this.inner.poll_readiness(flags)));
+                this.armed
+                    .set(Some(this.inner.poll_readiness::<true>(flags)));
             }
         }
     }
+}
+
+/// Discard readiness events queued on `armed` without a syscall.
+///
+/// Called after an attempt, every queued event was reaped before the attempt
+/// ran and is stale, because the driver never reaps completions while a task
+/// is being polled; see [`ReadyStream`]. A poll that has ended, with or
+/// without an error, is dropped so the next wait arms a fresh one.
+#[inline]
+fn discard_stale(armed: Pin<&mut Option<Op<socket::Poll<true>>>>) {
+    if armed
+        .as_ref()
+        .get_ref()
+        .as_ref()
+        .is_some_and(Op::has_queued)
+    {
+        discard_stale_slow(armed);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn discard_stale_slow(mut armed: Pin<&mut Option<Op<socket::Poll<true>>>>) {
+    let Some(mut op) = armed.as_mut().as_pin_mut() else {
+        return;
+    };
+    loop {
+        match op.as_mut().poll_queued() {
+            Poll::Pending => return,
+            Poll::Ready(Some(Ok(_))) => log::trace!(target: LOG, "poll_op.stale"),
+            Poll::Ready(Some(Err(_)) | None) => break,
+        }
+    }
+    armed.set(None);
 }
 
 #[cfg(test)]
