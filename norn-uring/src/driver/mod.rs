@@ -2,7 +2,6 @@ use std::any::Any;
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
-use std::os::fd::RawFd;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,7 +19,6 @@ use crate::bufring::{
     ReserveError as ReserveBufRingError,
 };
 use crate::error::SubmitError;
-use crate::fixedfile::Registry as RegisteredFiles;
 use crate::operation::{reap_operation, AsyncCancel, ConfiguredEntry, Op, OpTarget, Operation};
 use crate::registered_buffers::Registry as RegisteredBuffers;
 pub(crate) use crate::registered_buffers::{
@@ -209,7 +207,6 @@ struct Shared {
     // order, so retained registered storage is released only after the ring.
     registered_buf_rings: RegisteredBufRings,
     registered_buffers: RegisteredBuffers,
-    registered_files: RegisteredFiles,
 }
 
 #[cfg(test)]
@@ -674,48 +671,6 @@ impl Handle {
         })
     }
 
-    /// Register this ring's sparse fixed-file table.
-    pub(crate) fn register_files_sparse(&self, slots: u32) -> io::Result<()> {
-        self.check_accepting_fixed_files()?;
-        self.shared
-            .registered_files
-            .register(&self.shared.ring, slots)
-    }
-
-    /// Fail unless the driver still admits new fixed-file registrations and
-    /// insertions. Clearing existing entries is not gated, so slots can still
-    /// be released after shutdown.
-    pub(crate) fn check_accepting_fixed_files(&self) -> io::Result<()> {
-        if self.shared.status() != Status::Running {
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "io_uring driver is not accepting fixed files",
-            ));
-        }
-        Ok(())
-    }
-
-    /// Synchronously replace entries in this ring's fixed-file table.
-    ///
-    /// This is not gated on driver status; callers installing new files must
-    /// check [`Handle::check_accepting_fixed_files`] first.
-    pub(crate) fn update_files(&self, offset: u32, fds: &[RawFd]) -> io::Result<usize> {
-        self.shared
-            .registered_files
-            .update(&self.shared.ring, offset, fds)
-    }
-
-    /// Record that this ring's fixed-file table has no owners left. The
-    /// kernel table is unregistered by the next registration.
-    pub(crate) fn retire_files(&self) {
-        self.shared.registered_files.retire()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn test_fixed_files_retired(&self) -> bool {
-        self.shared.registered_files.test_is_retired()
-    }
-
     pub(crate) fn fixed_buf_driver(&self) -> FixedBufDriver {
         FixedBufDriver {
             shared: Rc::downgrade(&self.shared),
@@ -857,7 +812,6 @@ impl Driver {
                 shutdown_test: ShutdownTest::default(),
                 registered_buf_rings: RegisteredBufRings::new(),
                 registered_buffers: RegisteredBuffers::new(),
-                registered_files: RegisteredFiles::new(),
             }),
             unparker: Arc::new(unpark::Unparker::new()?),
             unparker_buf: mem::ManuallyDrop::new(UnparkerBuffer::new()),
