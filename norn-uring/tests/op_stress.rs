@@ -1,9 +1,10 @@
 #![cfg(target_os = "linux")]
 
 //! Randomized stress of the operation lifecycle: submission under SQ
-//! backpressure, linked requests, configuration failures, cancellation by drop
-//! and abort, timeouts with control requests, and driver shutdown. Every
-//! operation's data is tracked so a leak or double drop is detected.
+//! backpressure, soft- and hard-linked requests, configuration failures,
+//! cancellation by drop and abort, timeouts with control requests, and driver
+//! shutdown. Every operation's data is tracked so a leak or double drop is
+//! detected.
 //!
 //! `OP_STRESS_SEEDS=<n>` sets how many seeds `op_lifecycle_stress` runs (20 by
 //! default), each on 1-, 2-, 4- and 64-entry rings, with and without
@@ -173,10 +174,15 @@ async fn run_scenario(seed: u64, iterations: usize, pipe: i32) {
                 }));
             }
             3 => {
-                let chain = handle
-                    .submit(Tracked::new(kind(&mut rng, pipe)))
-                    .then(handle.submit(Tracked::new(kind(&mut rng, pipe))))
-                    .then(handle.submit(Tracked::new(kind(&mut rng, pipe))));
+                let first = handle.submit(Tracked::new(kind(&mut rng, pipe)));
+                let second = handle.submit(Tracked::new(kind(&mut rng, pipe)));
+                // Half the chains hard-link their first pair.
+                let pair = if rng.below(2) == 0 {
+                    first.then(second)
+                } else {
+                    first.then_always(second)
+                };
+                let chain = pair.then(handle.submit(Tracked::new(kind(&mut rng, pipe))));
                 tasks.push(norn_executor::spawn(async move {
                     let _ = chain.await;
                 }));
