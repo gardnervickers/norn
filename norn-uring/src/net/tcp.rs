@@ -10,7 +10,9 @@ use futures_core::Stream;
 use socket2::{Domain, Type};
 
 use crate::buf::{StableBuf, StableBufMut};
-use crate::bufring::{BufRingBuf, BufRingBufBundle, RecvBufRing};
+use crate::bufring::{
+    BufRingBuf, BufRingBufBundle, RecvBufRing, SendBufRing, SendBundleError, SendBundleResult,
+};
 use crate::fd::UringFd;
 use crate::net::socket::{self, Event, SendZcResult};
 use crate::operation::Op;
@@ -564,6 +566,49 @@ impl TcpSocket {
         buf: B,
     ) -> impl crate::Request<Output = (io::Result<SendZcResult>, B)> {
         self.socket.send_msg_zc(buf)
+    }
+
+    /// Send the payload published to a send buffer ring as `io_uring` bundles.
+    ///
+    /// The kernel transmits published buffers in publication order, waiting
+    /// until each selected bundle is fully transmitted, and continues with
+    /// further bundles while buffers remain published, including buffers
+    /// published while the request is in flight. Transmitted buffers return to
+    /// the ring for reuse. The request completes when the kernel finds the
+    /// ring empty. Requires Linux 6.10 or newer.
+    ///
+    /// One bundle send may own a ring at a time, from the request's first poll
+    /// until it completes or is dropped.
+    ///
+    /// If the socket fails partway through a bundle, Linux reports the
+    /// transmitted byte count rather than the error, and buffers it selected
+    /// but did not transmit are still consumed. In that case
+    /// [`SendBundleResult::bytes_released`] exceeds
+    /// [`SendBundleResult::bytes_sent`], the byte stream has a gap, and the
+    /// connection should be abandoned. The same applies after a cancelled or
+    /// failed request: buffers it consumed are released and the remainder stay
+    /// published.
+    ///
+    /// # Errors
+    ///
+    /// The request resolves with a [`SendBundleError`] whose
+    /// [`error`](SendBundleError::error) is `ENOBUFS` when no buffer is
+    /// published, `EBUSY` when another bundle send owns the ring,
+    /// [`io::ErrorKind::InvalidData`] when the ring is quarantined, or the
+    /// socket error. The error also reports the payload transmitted and
+    /// released by earlier bundles of the request and while accounting for
+    /// the failure, and whether the ring is quarantined. Converting it into
+    /// [`io::Error`] discards that progress.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the send ring was registered with another driver.
+    #[track_caller]
+    pub fn send_bundle(
+        &self,
+        ring: &SendBufRing,
+    ) -> impl crate::Request<Output = Result<SendBundleResult, SendBundleError>> {
+        self.socket.send_bundle(ring)
     }
 
     /// Recv data using the given buffer ring.

@@ -3,6 +3,7 @@
 //! The original registration setup was derived from the `io-uring` crate's
 //! [registered buffer ring test](https://github.com/tokio-rs/io-uring/blob/master/io-uring-test/src/tests/register_buf_ring.rs).
 
+use std::any::Any;
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::num::NonZeroUsize;
 use std::rc::Rc;
@@ -18,7 +19,14 @@ use io_uring::types::{self, BufRingEntry};
 use io_uring::{IoUring, Submitter};
 use log::warn;
 
+mod send;
 mod tracker;
+
+pub use send::{
+    PublishError, PublishErrorKind, SendBuf, SendBufRing, SendBufRingBuilder, SendBundleError,
+    SendBundleResult,
+};
+pub(crate) use send::{SendBundleProgress, SendClaim};
 
 use tracker::{BufferToken, BundleClaim, PublicationTracker, TrackerError};
 
@@ -489,8 +497,9 @@ pub(crate) struct Registration {
     state: Cell<RegistrationState>,
     // The registry owns the backing storage before the kernel can observe it.
     // This lets drop request release without allocating or risking reclamation
-    // while an unregister attempt is deferred.
-    _storage: Rc<BufRingStorage>,
+    // while an unregister attempt is deferred. Receive and send rings use
+    // different storage types with the same registration lifecycle.
+    _storage: Rc<dyn Any>,
 }
 
 impl Registration {
@@ -594,7 +603,8 @@ impl Registry {
     pub(crate) fn reserve(
         &self,
         ring: &RefCell<IoUring>,
-        storage: Rc<BufRingStorage>,
+        bgid: Bgid,
+        storage: Rc<dyn Any>,
     ) -> Result<Rc<Registration>, ReserveError> {
         if let Err(err) = self.release_requested(ring) {
             warn!(target: REGISTRY_LOG, "release.retry_failed: {err:?}");
@@ -606,7 +616,7 @@ impl Registry {
             .map_err(|_| ReserveError::RegistryBorrowed)?;
         if registrations
             .iter()
-            .any(|registration| registration.bgid == storage.bgid)
+            .any(|registration| registration.bgid == bgid)
         {
             return Err(ReserveError::DuplicateBgid);
         }
@@ -614,7 +624,7 @@ impl Registry {
             .try_reserve(1)
             .map_err(|_| ReserveError::OutOfMemory)?;
         let registration = Rc::new(Registration {
-            bgid: storage.bgid,
+            bgid,
             state: Cell::new(RegistrationState::Registering),
             _storage: storage,
         });
@@ -913,7 +923,7 @@ impl Builder {
             b.buf_cnt,
             b.buf_len,
         )?);
-        let reservation = handle.reserve_buf_ring(Rc::clone(&storage))?;
+        let reservation = handle.reserve_buf_ring(b.bgid, Rc::clone(&storage) as Rc<dyn Any>)?;
         reservation.register(|submitter| storage.register(submitter))?;
         let registration = reservation.commit();
         Ok(RecvBufRing::new(
@@ -1016,57 +1026,14 @@ impl BufRingStorage {
     }
 
     fn register(&self, submitter: &Submitter<'_>) -> io::Result<()> {
-        let bgid = self.bgid;
-
-        let res = loop {
-            let result = unsafe {
-                submitter.register_buf_ring_with_flags(
-                    self.ring_start.as_ptr() as _,
-                    self.ring_entries(),
-                    bgid,
-                    0,
-                )
-            };
-            match result {
-                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-                result => break result,
-            }
-        };
-
-        if let Err(e) = res {
-            match e.raw_os_error() {
-                Some(libc::EINVAL) => {
-                    // using buf_ring requires kernel 5.19 or greater.
-                    return Err(io::Error::other(format!(
-                        "buf_ring.register returned {}, most likely indicating this kernel is not 5.19+",
-                        e
-                    )));
-                }
-                Some(libc::EEXIST) => {
-                    // Registering a duplicate bgid is not allowed. There is an `unregister`
-                    // operations that can remove the first, but care must be taken that there
-                    // are no outstanding operations that will still return a buffer from that
-                    // one.
-                    return Err(io::Error::other(format!(
-                        "buf_ring.register returned `{}`, indicating the attempted buffer group id {} was already registered",
-                        e, bgid
-                    )));
-                }
-                _ => {
-                    return Err(io::Error::other(format!(
-                        "buf_ring.register returned `{}` for group id {}",
-                        e, bgid
-                    )));
-                }
-            }
-        };
+        register_ring_memory(submitter, &self.ring_start, self.ring_entries(), self.bgid)?;
 
         for bid in 0..self.buf_cnt {
             self.buf_ring_push(bid);
         }
         self.buf_ring_sync();
 
-        res
+        Ok(())
     }
 
     // Returns the buffer group id.
@@ -1251,6 +1218,53 @@ impl BufRingStorage {
             (*shared_tail).store(self.local_tail.get(), atomic::Ordering::Release);
         }
     }
+}
+
+/// Register `ring_start` as the kernel-visible entry array for `bgid`.
+fn register_ring_memory(
+    submitter: &Submitter<'_>,
+    ring_start: &AnonymousMmap,
+    ring_entries: u16,
+    bgid: Bgid,
+) -> io::Result<()> {
+    let res = loop {
+        let result = unsafe {
+            submitter.register_buf_ring_with_flags(ring_start.as_ptr() as _, ring_entries, bgid, 0)
+        };
+        match result {
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            result => break result,
+        }
+    };
+
+    if let Err(e) = res {
+        match e.raw_os_error() {
+            Some(libc::EINVAL) => {
+                // using buf_ring requires kernel 5.19 or greater.
+                return Err(io::Error::other(format!(
+                    "buf_ring.register returned {}, most likely indicating this kernel is not 5.19+",
+                    e
+                )));
+            }
+            Some(libc::EEXIST) => {
+                // Registering a duplicate bgid is not allowed. There is an `unregister`
+                // operations that can remove the first, but care must be taken that there
+                // are no outstanding operations that will still return a buffer from that
+                // one.
+                return Err(io::Error::other(format!(
+                    "buf_ring.register returned `{}`, indicating the attempted buffer group id {} was already registered",
+                    e, bgid
+                )));
+            }
+            _ => {
+                return Err(io::Error::other(format!(
+                    "buf_ring.register returned `{}` for group id {}",
+                    e, bgid
+                )));
+            }
+        }
+    };
+    Ok(())
 }
 
 struct KernelBuffer {

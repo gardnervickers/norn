@@ -15,7 +15,7 @@ use norn_executor::park::{Park, ParkMode};
 use smallvec::SmallVec;
 
 use crate::bufring::{
-    BufRingStorage, Registration as RegisteredBufRing, Registry as RegisteredBufRings,
+    Bgid, Registration as RegisteredBufRing, Registry as RegisteredBufRings,
     ReserveError as ReserveBufRingError,
 };
 use crate::error::SubmitError;
@@ -465,6 +465,56 @@ impl BufRingRegistration {
     pub(crate) fn cancel_op(&self, target: OpTarget) {
         self.shared.cancel_op(target, None)
     }
+
+    /// Return the kernel's consumption head for this registered buffer ring.
+    ///
+    /// Uses `IORING_REGISTER_PBUF_STATUS` (Linux 6.8). The registration keeps
+    /// the ring, and therefore its descriptor, alive.
+    pub(crate) fn kernel_head(&self, bgid: Bgid) -> io::Result<u16> {
+        use std::os::fd::AsRawFd;
+
+        // Mirrors `struct io_uring_buf_status`.
+        #[repr(C)]
+        struct BufStatus {
+            buf_group: u32,
+            head: u32,
+            resv: [u32; 8],
+        }
+        const IORING_REGISTER_PBUF_STATUS: libc::c_long = 26;
+
+        let ring = self.shared.ring.try_borrow().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "io_uring is already borrowed during buffer-ring status query",
+            )
+        })?;
+        let mut status = BufStatus {
+            buf_group: u32::from(bgid),
+            head: 0,
+            resv: [0; 8],
+        };
+        loop {
+            // Safety: `status` is a valid, writable `io_uring_buf_status` and
+            // the borrowed ring keeps its descriptor open for the call.
+            let rc = unsafe {
+                libc::syscall(
+                    libc::SYS_io_uring_register,
+                    ring.as_raw_fd(),
+                    IORING_REGISTER_PBUF_STATUS,
+                    std::ptr::from_mut(&mut status),
+                    1,
+                )
+            };
+            if rc >= 0 {
+                // The kernel head is a 16-bit ring counter.
+                return Ok(status.head as u16);
+            }
+            let err = io::Error::last_os_error();
+            if err.kind() != io::ErrorKind::Interrupted {
+                return Err(err);
+            }
+        }
+    }
 }
 
 impl Drop for BufRingRegistration {
@@ -623,7 +673,8 @@ impl Handle {
 
     pub(crate) fn reserve_buf_ring(
         &self,
-        storage: Rc<BufRingStorage>,
+        bgid: Bgid,
+        storage: Rc<dyn Any>,
     ) -> io::Result<BufRingReservation> {
         if self.shared.status() != Status::Running {
             return Err(io::Error::new(
@@ -634,7 +685,7 @@ impl Handle {
         let registration = self
             .shared
             .registered_buf_rings
-            .reserve(&self.shared.ring, storage)
+            .reserve(&self.shared.ring, bgid, storage)
             .map_err(map_reserve_buf_ring_error)?;
         Ok(BufRingReservation {
             shared: Rc::clone(&self.shared),

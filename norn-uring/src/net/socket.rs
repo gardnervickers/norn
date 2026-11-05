@@ -15,7 +15,10 @@ use std::pin::Pin;
 use std::task::{ready, Context, Poll as TaskPoll};
 
 use crate::buf::{set_init_checked, StableBuf, StableBufMut};
-use crate::bufring::{BufRingBuf, BufRingBufBundle, RecvBufRing};
+use crate::bufring::{
+    BufRingBuf, BufRingBufBundle, RecvBufRing, SendBufRing, SendBundleError, SendBundleProgress,
+    SendBundleResult, SendClaim,
+};
 use crate::fd::{NornFd, UringFd};
 use crate::operation::{CQEResult, Multishot, Op, OpTarget, Operation, OperationId, Singleshot};
 
@@ -625,6 +628,16 @@ impl Socket {
         B: StableBufMut + 'static,
     {
         let op = Recv::new(self.fd.lease(), buf, flags);
+        self.fd.submit(op)
+    }
+
+    #[track_caller]
+    pub(crate) fn send_bundle(&self, ring: &SendBufRing) -> Op<SendBundle> {
+        assert!(
+            ring.same_driver(self.fd.handle()),
+            "send buffer ring and socket must target the same driver"
+        );
+        let op = SendBundle::new(self.fd.lease(), ring.clone());
         self.fd.submit(op)
     }
 
@@ -2071,6 +2084,84 @@ where
 
     fn complete(self, result: crate::operation::CQEResult) -> Self::Output {
         (result.result.map(|v| v as usize), self.buf)
+    }
+}
+
+pub(crate) struct SendBundleCompletion {
+    result: io::Result<u32>,
+    progress: SendBundleResult,
+    quarantined: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct SendBundle {
+    fd: NornFd,
+    ring: SendBufRing,
+    // Acquired by `configure`; dropped with the operation after its terminal
+    // completion, or when it is abandoned before submission.
+    claim: Option<SendClaim>,
+    progress: SendBundleProgress,
+}
+
+impl SendBundle {
+    pub(crate) fn new(fd: NornFd, ring: SendBufRing) -> Self {
+        Self {
+            fd,
+            ring,
+            claim: None,
+            progress: SendBundleProgress::default(),
+        }
+    }
+}
+
+// Safety: `NornFd` retains the socket and the `SendBufRing` retains the
+// registered group and its buffer storage through the terminal CQE. The SQE
+// references no other memory. Published buffers are never handed back to the
+// application; `reap` releases consumed buffers to the ring's free list only
+// after the CQE proves the kernel finished reading them, and the exclusive
+// claim makes kernel-head reconciliation attributable to this request.
+unsafe impl Operation for SendBundle {
+    type Completion = SendBundleCompletion;
+
+    fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+        let claim = self.ring.claim_sender().inspect_err(|_| {
+            if self.ring.is_quarantined() {
+                self.progress.mark_quarantined();
+            }
+        })?;
+        self.claim = Some(claim);
+        Ok(opcode::SendBundle::new(self.fd.fd(), self.ring.bgid()).build())
+    }
+
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+        let synthetic = result.is_synthetic();
+        let (result, flags) = result.into_parts();
+        let (progress, quarantined) = match self.claim.as_mut() {
+            // A synthetic completion never reached the kernel.
+            Some(claim) if !synthetic => claim.complete(&result, flags),
+            _ => (SendBundleResult::default(), false),
+        };
+        SendBundleCompletion {
+            result,
+            progress,
+            quarantined,
+        }
+    }
+}
+
+impl Singleshot for SendBundle {
+    type Output = Result<SendBundleResult, SendBundleError>;
+
+    fn update(&mut self, completion: Self::Completion) {
+        // Each non-terminal CQE reports one transmitted bundle.
+        self.progress
+            .record(completion.progress, completion.quarantined);
+    }
+
+    fn complete(mut self, completion: Self::Completion) -> Self::Output {
+        self.progress
+            .record(completion.progress, completion.quarantined);
+        self.progress.finish(completion.result)
     }
 }
 
