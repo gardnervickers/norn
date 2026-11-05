@@ -52,6 +52,7 @@
 //! - [`buf`]: stable buffer traits and adapters used by I/O operations.
 //! - [`block`]: typed commands for Linux block devices.
 //! - [`bufring`]: registered `io_uring` buffer-ring support.
+//! - [`epoll`]: epoll instances controlled and waited on through `io_uring`.
 //! - [`fixedbuf`]: caller-owned buffers registered for fixed I/O.
 //! - [`fs`]: asynchronous filesystem operations.
 //! - [`net`]: asynchronous TCP and UDP networking.
@@ -99,6 +100,8 @@ pub mod block;
 pub mod buf;
 /// Registered io_uring buffer-ring support.
 pub mod bufring;
+/// Epoll instances driven through io_uring.
+pub mod epoll;
 /// Owned caller-provided buffers registered for fixed I/O.
 pub mod fixedbuf;
 /// A managed table of registered file descriptors.

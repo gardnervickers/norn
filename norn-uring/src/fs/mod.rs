@@ -15,7 +15,7 @@ pub use dir::{
     create_dir, get_xattr, hard_link, metadata, remove_dir, remove_file, rename, set_xattr, statx,
     symlink,
 };
-pub use file::{pipe, File, PipeReader, PipeWriter};
+pub use file::{pipe, File, PipeReadRingMulti, PipeReader, PipeWriter};
 pub(crate) use file::{ReadAt, ReadFixedAt, Sync, VectoredFixedAt, WriteAt, WriteFixedAt};
 pub use opts::OpenOptions;
 

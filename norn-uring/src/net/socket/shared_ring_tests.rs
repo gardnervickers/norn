@@ -125,13 +125,13 @@ fn send_segments(
     sent
 }
 
-fn new_stream<T: RingReceive>(
+fn new_stream<T: RingReceive<Source = Socket>>(
     driver: &mut crate::Driver,
     socket: &Socket,
     ring: &RecvBufRing,
     cx: &mut Context<'_>,
 ) -> Pin<Box<RingRecvStream<T>>> {
-    let mut stream = Box::pin(RingRecvStream::<T>::new(socket, ring, 0));
+    let mut stream = Box::pin(RingRecvStream::<T>::new(socket.clone(), ring, 0));
     // The first poll submits the receive; nothing has arrived yet.
     assert!(stream.as_mut().poll_next(cx).is_pending());
     settle(driver);
@@ -218,7 +218,7 @@ fn assert_paused(
 /// An unpolled stream stops near its limit, another stream on the ring keeps
 /// receiving, and the paused stream later yields every byte in order and
 /// re-arms.
-fn pause_and_resume<T: RingReceive>()
+fn pause_and_resume<T: RingReceive<Source = Socket>>()
 where
     T::Buffer: Payload,
 {
@@ -338,7 +338,7 @@ fn bundle_limit_counts_buffers() {
 
 /// A UDP pause is lossless while the socket's receive buffer has room. Beyond
 /// that the kernel drops datagrams, as for any slow receiver.
-fn udp_pause<T: RingReceive>()
+fn udp_pause<T: RingReceive<Source = Socket>>()
 where
     T::Buffer: Payload,
 {
@@ -373,7 +373,7 @@ fn udp_pause_keeps_queued_datagrams() {
 /// Run a stream to its pause, then let `race` act on the peer, and check that
 /// the stream yields a prefix of what was sent and then ends as `check`
 /// expects.
-fn race_pause<T: RingReceive>(
+fn race_pause<T: RingReceive<Source = Socket>>(
     buf_cnt: u16,
     race: impl FnOnce(StdStream) -> Vec<u8>,
     check: impl FnOnce(End),
