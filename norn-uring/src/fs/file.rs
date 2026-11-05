@@ -224,7 +224,7 @@ impl File {
         &self,
         buf: B,
         offset: u64,
-    ) -> impl WithOptions<ReadOptions, Output = (io::Result<usize>, B)>
+    ) -> impl crate::Request<Output = (io::Result<usize>, B)> + WithOptions<ReadOptions>
     where
         B: StableBufMut + 'static,
     {
@@ -248,7 +248,7 @@ impl File {
         &self,
         buf: B,
         offset: u64,
-    ) -> impl WithOptions<WriteOptions, Output = (io::Result<usize>, B)>
+    ) -> impl crate::Request<Output = (io::Result<usize>, B)> + WithOptions<WriteOptions>
     where
         B: StableBuf + 'static,
     {
@@ -278,7 +278,7 @@ impl File {
         &self,
         buf: FixedBuf<B>,
         offset: u64,
-    ) -> impl WithOptions<ReadOptions, Output = (io::Result<usize>, FixedBuf<B>)>
+    ) -> impl crate::Request<Output = (io::Result<usize>, FixedBuf<B>)> + WithOptions<ReadOptions>
     where
         B: 'static,
     {
@@ -315,7 +315,7 @@ impl File {
         &self,
         buf: FixedBuf<B>,
         offset: u64,
-    ) -> impl WithOptions<WriteOptions, Output = (io::Result<usize>, FixedBuf<B>)>
+    ) -> impl crate::Request<Output = (io::Result<usize>, FixedBuf<B>)> + WithOptions<WriteOptions>
     where
         B: 'static,
     {
@@ -343,7 +343,7 @@ impl File {
         &self,
         bufs: Vec<B>,
         offset: u64,
-    ) -> impl WithOptions<ReadOptions, Output = (io::Result<usize>, Vec<B>)>
+    ) -> impl crate::Request<Output = (io::Result<usize>, Vec<B>)> + WithOptions<ReadOptions>
     where
         B: StableBufMut + 'static,
     {
@@ -367,7 +367,7 @@ impl File {
         &self,
         bufs: Vec<B>,
         offset: u64,
-    ) -> impl WithOptions<WriteOptions, Output = (io::Result<usize>, Vec<B>)>
+    ) -> impl crate::Request<Output = (io::Result<usize>, Vec<B>)> + WithOptions<WriteOptions>
     where
         B: StableBuf + 'static,
     {

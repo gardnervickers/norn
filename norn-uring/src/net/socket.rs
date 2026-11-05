@@ -6,8 +6,9 @@ use io_uring::opcode;
 use io_uring::squeue::Flags;
 use libc::{SOCK_CLOEXEC, SOCK_NONBLOCK};
 use socket2::{Domain, Protocol, SockAddr, SockAddrStorage, Type};
+use std::future::Future;
 use std::io;
-use std::mem::{ManuallyDrop, MaybeUninit};
+use std::mem::{self, ManuallyDrop, MaybeUninit};
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
@@ -17,7 +18,10 @@ use std::task::{ready, Context, Poll as TaskPoll};
 use crate::buf::{set_init_checked, StableBuf, StableBufMut};
 use crate::bufring::{BufRingBuf, BufRingBufBundle, RecvBufRing};
 use crate::fd::{NornFd, UringFd};
+use crate::net::options::{RecvOptions, SendOptions};
 use crate::operation::{CQEResult, Multishot, Op, OpTarget, Operation, OperationId, Singleshot};
+use crate::request::{AcceptsOptions, OptionsSealed};
+use crate::WithOptions;
 
 pub(crate) struct RingRecvCompletion<T> {
     pub(crate) result: io::Result<T>,
@@ -545,16 +549,6 @@ impl Socket {
         self.fd.submit(op)
     }
 
-    pub(crate) fn recv_ring_bundle_with_flags(
-        &self,
-        ring: &RecvBufRing,
-        flags: i32,
-    ) -> Op<RecvRingBundle> {
-        self.assert_bufring_driver(ring);
-        let op = RecvRingBundle::new(self.fd.lease(), ring.clone(), flags);
-        self.fd.submit(op)
-    }
-
     pub(crate) fn recv_ring_bundle_multi_with_flags(
         &self,
         ring: &RecvBufRing,
@@ -565,43 +559,31 @@ impl Socket {
         self.fd.submit(op)
     }
 
-    pub(crate) async fn recv_from<B>(&self, buf: B) -> (io::Result<(usize, SocketAddr)>, B)
+    pub(crate) fn recv_from<B>(&self, buf: B) -> RecvFromFuture<'_, B>
     where
         B: StableBufMut + 'static,
     {
-        let mut buf = buf;
-        if let Some(result) = self.try_recv_from(&mut buf, 0) {
-            return (result, buf);
+        RecvFromFuture {
+            state: TryFirst::Start {
+                socket: self,
+                buf,
+                flags: 0,
+            },
         }
-        let op = RecvFrom::new(self.fd.lease(), buf, 0);
-        self.fd.submit(op).await
     }
 
-    pub(crate) async fn send_to<B>(&self, buf: B, addr: SocketAddr) -> (io::Result<usize>, B)
+    pub(crate) fn send_to<B>(&self, buf: B, addr: SocketAddr) -> SendToFuture<'_, B>
     where
         B: StableBuf + 'static,
     {
-        if let Some(result) = self.try_send_to(&buf, Some(addr), 0) {
-            return (result, buf);
+        SendToFuture {
+            addr,
+            state: TryFirst::Start {
+                socket: self,
+                buf,
+                flags: 0,
+            },
         }
-        let op = SendTo::new(self.fd.lease(), buf, Some(addr), 0);
-        self.fd.submit(op).await
-    }
-
-    pub(crate) async fn recv_from_with_flags<B>(
-        &self,
-        buf: B,
-        flags: i32,
-    ) -> (io::Result<(usize, SocketAddr)>, B)
-    where
-        B: StableBufMut + 'static,
-    {
-        let mut buf = buf;
-        if let Some(result) = self.try_recv_from(&mut buf, flags) {
-            return (result, buf);
-        }
-        let op = RecvFrom::new(self.fd.lease(), buf, flags as u32);
-        self.fd.submit(op).await
     }
 
     pub(crate) fn recv<B>(&self, buf: B) -> Op<Recv<B>>
@@ -620,19 +602,11 @@ impl Socket {
         self.fd.submit(op)
     }
 
-    pub(crate) fn recv_with_flags<B>(&self, buf: B, flags: i32) -> Op<Recv<B>>
+    pub(crate) fn recv_tcp<B>(&self, buf: B) -> Op<Recv<B, true>>
     where
         B: StableBufMut + 'static,
     {
-        let op = Recv::new(self.fd.lease(), buf, flags);
-        self.fd.submit(op)
-    }
-
-    pub(crate) fn recv_tcp_with_flags<B>(&self, buf: B, flags: i32) -> Op<Recv<B, true>>
-    where
-        B: StableBufMut + 'static,
-    {
-        let op = Recv::new(self.fd.lease(), buf, flags);
+        let op = Recv::new(self.fd.lease(), buf, 0);
         self.fd.submit(op)
     }
 
@@ -882,6 +856,121 @@ impl Singleshot for OpenSocket {
 
     fn complete(self, completion: Self::Completion) -> Self::Output {
         completion.map(|fd| bind_owned_fd(fd, self.handle))
+    }
+}
+
+/// A datagram operation that first tries a nonblocking system call, and
+/// submits an `io_uring` operation only if that would block.
+enum TryFirst<'a, B: 'static, T: 'static> {
+    Start {
+        socket: &'a Socket,
+        buf: B,
+        flags: i32,
+    },
+    Submitted(Op<T>),
+    Done,
+}
+
+impl<B: 'static, T: 'static> TryFirst<'_, B, T> {
+    #[track_caller]
+    fn set_flags(&mut self, new_flags: i32) {
+        let TryFirst::Start { flags, .. } = self else {
+            panic!("request options must be set before the request is first polled");
+        };
+        *flags = new_flags;
+    }
+}
+
+/// [`Socket::recv_from`]: a nonblocking `recvfrom`, then `IORING_OP_RECVMSG`.
+pub(crate) struct RecvFromFuture<'a, B: 'static> {
+    state: TryFirst<'a, B, RecvFrom<B>>,
+}
+
+// `B` is moved, never pinned, and `Op` is `Unpin`.
+impl<B: 'static> Unpin for RecvFromFuture<'_, B> {}
+
+impl<B> Future for RecvFromFuture<'_, B>
+where
+    B: StableBufMut + 'static,
+{
+    type Output = (io::Result<(usize, SocketAddr)>, B);
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> TaskPoll<Self::Output> {
+        let state = &mut self.get_mut().state;
+        if let TryFirst::Start { .. } = state {
+            let TryFirst::Start {
+                socket,
+                mut buf,
+                flags,
+            } = mem::replace(state, TryFirst::Done)
+            else {
+                unreachable!()
+            };
+            if let Some(result) = socket.try_recv_from(&mut buf, flags) {
+                return TaskPoll::Ready((result, buf));
+            }
+            let op = RecvFrom::new(socket.fd.lease(), buf, flags as u32);
+            *state = TryFirst::Submitted(socket.fd.submit(op));
+        }
+        match state {
+            TryFirst::Submitted(op) => Pin::new(op).poll(cx),
+            _ => panic!("datagram receive polled after completion"),
+        }
+    }
+}
+
+impl<B: 'static> OptionsSealed for RecvFromFuture<'_, B> {}
+
+impl<B: StableBufMut + 'static> WithOptions<RecvOptions> for RecvFromFuture<'_, B> {
+    #[track_caller]
+    fn options(mut self, opts: RecvOptions) -> Self {
+        self.state.set_flags(opts.flags());
+        self
+    }
+}
+
+/// [`Socket::send_to`]: a nonblocking `sendto`, then `IORING_OP_SENDMSG`.
+pub(crate) struct SendToFuture<'a, B: 'static> {
+    addr: SocketAddr,
+    state: TryFirst<'a, B, SendTo<B>>,
+}
+
+// `B` is moved, never pinned, and `Op` is `Unpin`.
+impl<B: 'static> Unpin for SendToFuture<'_, B> {}
+
+impl<B> Future for SendToFuture<'_, B>
+where
+    B: StableBuf + 'static,
+{
+    type Output = (io::Result<usize>, B);
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> TaskPoll<Self::Output> {
+        let this = self.get_mut();
+        let state = &mut this.state;
+        if let TryFirst::Start { .. } = state {
+            let TryFirst::Start { socket, buf, flags } = mem::replace(state, TryFirst::Done) else {
+                unreachable!()
+            };
+            if let Some(result) = socket.try_send_to(&buf, Some(this.addr), flags) {
+                return TaskPoll::Ready((result, buf));
+            }
+            let op = SendTo::new(socket.fd.lease(), buf, Some(this.addr), flags as u32);
+            *state = TryFirst::Submitted(socket.fd.submit(op));
+        }
+        match state {
+            TryFirst::Submitted(op) => Pin::new(op).poll(cx),
+            _ => panic!("datagram send polled after completion"),
+        }
+    }
+}
+
+impl<B: 'static> OptionsSealed for SendToFuture<'_, B> {}
+
+impl<B: StableBuf + 'static> WithOptions<SendOptions> for SendToFuture<'_, B> {
+    #[track_caller]
+    fn options(mut self, opts: SendOptions) -> Self {
+        self.state.set_flags(opts.flags());
+        self
     }
 }
 
@@ -1962,6 +2051,30 @@ impl Singleshot for Shutdown {
         result.result.map(|_| ())
     }
 }
+impl<B, const TCP: bool> AcceptsOptions<RecvOptions> for Recv<B, TCP> {
+    fn set_options(&mut self, opts: RecvOptions) {
+        self.flags = opts.flags();
+    }
+}
+
+impl<B> AcceptsOptions<SendOptions> for Send<B> {
+    fn set_options(&mut self, opts: SendOptions) {
+        self.flags = opts.flags();
+    }
+}
+
+impl<B> AcceptsOptions<SendOptions> for SendZc<B> {
+    fn set_options(&mut self, opts: SendOptions) {
+        self.flags = opts.flags();
+    }
+}
+
+impl<B> AcceptsOptions<SendOptions> for SendMsgZc<B> {
+    fn set_options(&mut self, opts: SendOptions) {
+        self.flags = opts.flags();
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct Recv<B, const TCP: bool = false> {
     fd: NornFd,
@@ -2664,6 +2777,32 @@ mod tests {
         })
     }
 
+    /// The public API no longer passes flags to bundle receives, but the
+    /// stream's configuration-failure path must still release the socket.
+    #[test]
+    fn terminal_bundle_configuration_error_releases_socket_ownership() -> io::Result<()> {
+        let driver = crate::Driver::new(io_uring::IoUring::builder(), 8)?;
+        let mut executor = LocalExecutor::new(driver);
+
+        executor.block_on(async {
+            let ring = RecvBufRing::builder(16).buf_cnt(1).buf_len(128).build()?;
+            let socket =
+                Socket::bind("127.0.0.1:0".parse().unwrap(), Domain::IPV4, Type::DGRAM).await?;
+            let mut recv = Box::pin(socket.recv_ring_bundle_stream(&ring, libc::MSG_TRUNC));
+
+            let err = recv
+                .next()
+                .await
+                .expect("configuration failure must produce one stream item")
+                .unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+            socket.close().await?;
+            drop(recv);
+            Ok(())
+        })
+    }
+
     #[test]
     fn oversized_receive_completion_requires_msg_trunc() {
         let mut buf = Vec::with_capacity(1);
@@ -2731,7 +2870,6 @@ mod tests {
         drop(socket.recv_from_ring_multi(ring));
         drop(socket.recv_ring_multi(ring));
         drop(socket.recv_ring_bundle(ring));
-        drop(socket.recv_ring_bundle_with_flags(ring, 0));
         drop(socket.recv_ring_bundle_multi_with_flags(ring, 0));
         drop(socket.recv_ring_bundle_multi_with_flags(ring, 0));
     }
@@ -2760,7 +2898,7 @@ mod tests {
         assert_driver_mismatch(|| drop(socket.recv_ring_multi(&first_ring)));
         assert_driver_mismatch(|| drop(socket.recv_ring_bundle(&first_ring)));
         assert_driver_mismatch(|| {
-            drop(socket.recv_ring_bundle_with_flags(&first_ring, 0));
+            drop(socket.recv_ring_bundle(&first_ring));
         });
         assert_driver_mismatch(|| {
             drop(socket.recv_ring_bundle_multi_with_flags(&first_ring, 0));

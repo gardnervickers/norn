@@ -12,6 +12,7 @@ use crate::buf::{StableBuf, StableBufMut};
 use crate::bufring::{BufRingBuf, BufRingBufBundle, RecvBufRing};
 use crate::fd::UringFd;
 use crate::net::socket::{self, Event, SendZcResult};
+use crate::net::{RecvOptions, SendOptions};
 use crate::operation::Op;
 
 use super::socket::AcceptMulti;
@@ -504,34 +505,32 @@ impl TcpSocket {
     ///
     /// This takes ownership of the buffer, and returns future which resolves
     /// to a tuple of the original buffer and the number of bytes read.
+    ///
+    /// Set per-operation [`RecvOptions`] with [`WithOptions::options`]. A
+    /// receive with [`RecvOptions::trunc`] fails with
+    /// [`io::ErrorKind::InvalidInput`] and returns the buffer unchanged.
+    ///
+    /// [`WithOptions::options`]: crate::WithOptions::options
     pub fn recv<B: StableBufMut>(
         &self,
         buf: B,
-    ) -> impl crate::Request<Output = (io::Result<usize>, B)> {
-        self.socket.recv(buf)
-    }
-
-    /// Recv data into the given buffer with recv flags.
-    ///
-    /// Returns [`io::ErrorKind::InvalidInput`] with the buffer unchanged if
-    /// `flags` includes `MSG_TRUNC`. On TCP that flag discards input without
-    /// initializing the buffer, so it is rejected before submission.
-    pub fn recv_with_flags<B: StableBufMut>(
-        &self,
-        buf: B,
-        flags: i32,
-    ) -> impl crate::Request<Output = (io::Result<usize>, B)> {
-        self.socket.recv_tcp_with_flags(buf, flags)
+    ) -> impl crate::Request<Output = (io::Result<usize>, B)> + crate::WithOptions<RecvOptions>
+    {
+        self.socket.recv_tcp(buf)
     }
 
     /// Send data from the given buffer.
     ///
     /// This takes ownership of the buffer, and returns a future which resolves
     /// to a tuple of the original buffer and the number of bytes sent.
+    ///
+    /// Set per-operation [`SendOptions`] with
+    /// [`WithOptions::options`](crate::WithOptions::options).
     pub fn send<B: StableBuf>(
         &self,
         buf: B,
-    ) -> impl crate::Request<Output = (io::Result<usize>, B)> {
+    ) -> impl crate::Request<Output = (io::Result<usize>, B)> + crate::WithOptions<SendOptions>
+    {
         self.socket.send(buf)
     }
 
@@ -543,10 +542,14 @@ impl TcpSocket {
     ///
     /// This method does not fall back to regular send if zerocopy is unsupported.
     /// Callers should enable `SO_ZEROCOPY` with [`TcpSocket::set_zerocopy`] first.
+    ///
+    /// Set per-operation [`SendOptions`] with
+    /// [`WithOptions::options`](crate::WithOptions::options).
     pub fn send_zc<B: StableBuf>(
         &self,
         buf: B,
-    ) -> impl crate::Request<Output = (io::Result<SendZcResult>, B)> {
+    ) -> impl crate::Request<Output = (io::Result<SendZcResult>, B)> + crate::WithOptions<SendOptions>
+    {
         self.socket.send_zc(buf)
     }
 
@@ -558,10 +561,14 @@ impl TcpSocket {
     ///
     /// This method does not fall back to regular sendmsg if zerocopy is unsupported.
     /// Callers should enable `SO_ZEROCOPY` with [`TcpSocket::set_zerocopy`] first.
+    ///
+    /// Set per-operation [`SendOptions`] with
+    /// [`WithOptions::options`](crate::WithOptions::options).
     pub fn send_msg_zc<B: StableBuf>(
         &self,
         buf: B,
-    ) -> impl crate::Request<Output = (io::Result<SendZcResult>, B)> {
+    ) -> impl crate::Request<Output = (io::Result<SendZcResult>, B)> + crate::WithOptions<SendOptions>
+    {
         self.socket.send_msg_zc(buf)
     }
 
@@ -605,28 +612,6 @@ impl TcpSocket {
         self.socket.recv_ring_bundle(ring)
     }
 
-    /// Receive data using a single-shot recv bundle operation and a provided buffer ring.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the buffer ring was registered with another driver.
-    ///
-    /// # Errors
-    ///
-    /// The request resolves with [`io::ErrorKind::InvalidInput`] when `flags`
-    /// contains `MSG_TRUNC`, `MSG_PEEK` or `MSG_WAITALL`. `MSG_TRUNC` does not
-    /// identify the number of buffers selected by a bundle receive, a kernel
-    /// bundle retry peeks the start of the queue again under `MSG_PEEK`, and a
-    /// partial `MSG_WAITALL` retry can commit buffers that the completion does
-    /// not report.
-    pub fn recv_bundle_with_flags(
-        &self,
-        ring: &RecvBufRing,
-        flags: i32,
-    ) -> impl crate::Request<Output = io::Result<BufRingBufBundle>> {
-        self.socket.recv_ring_bundle_with_flags(ring, flags)
-    }
-
     /// Receive data using a multishot recv bundle operation and a provided buffer ring.
     ///
     /// # Panics
@@ -634,27 +619,6 @@ impl TcpSocket {
     /// Panics when the buffer ring was registered with another driver.
     pub fn recv_bundle_multi(&self, ring: &RecvBufRing) -> TcpRecvBundleMulti {
         TcpRecvBundleMulti::new(&self.socket, ring, 0)
-    }
-
-    /// Receive data using a multishot recv bundle operation and a provided buffer ring.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the buffer ring was registered with another driver.
-    ///
-    /// # Errors
-    ///
-    /// The stream yields [`io::ErrorKind::InvalidInput`] and terminates when
-    /// `flags` contains `MSG_TRUNC`, `MSG_PEEK`, or `MSG_WAITALL`. `MSG_TRUNC`
-    /// does not identify the number of selected buffers, a kernel bundle retry
-    /// peeks the start of the queue again, and multishot receives do not
-    /// support `MSG_WAITALL`.
-    pub fn recv_bundle_multi_with_flags(
-        &self,
-        ring: &RecvBufRing,
-        flags: i32,
-    ) -> TcpRecvBundleMulti {
-        TcpRecvBundleMulti::new(&self.socket, ring, flags)
     }
 
     /// Convert this socket into a stream.
