@@ -118,6 +118,6 @@ pub use fd::UringFd;
 pub use operation::{CQEResult, Multishot, Op, Operation, Singleshot};
 pub use request::{
     LinkedTimeoutControl, Map, Request, Then, ThenAux, Timeout, TimeoutControl, TimeoutOutcome,
-    TimeoutRemove, TimeoutUpdate, WithTimeout,
+    TimeoutRemove, TimeoutUpdate, WithOptions, WithTimeout,
 };
 pub use util::noop;

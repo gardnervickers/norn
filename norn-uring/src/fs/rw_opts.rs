@@ -12,13 +12,23 @@ const RWF_DONTCACHE: i32 = 0x0000_0080;
 
 /// Per-operation options for positional file reads.
 ///
-/// Pass these to [`File::read_at_with`], [`File::read_fixed_at_with`], or
-/// [`File::readv_at_with`]. The default options submit the same request as the
-/// corresponding method without options.
+/// Set them on a request from [`File::read_at`], [`File::read_fixed_at`], or
+/// [`File::readv_at`] with [`WithOptions::options`]. The default options
+/// submit the same request as not setting any.
 ///
-/// [`File::read_at_with`]: crate::fs::File::read_at_with
-/// [`File::read_fixed_at_with`]: crate::fs::File::read_fixed_at_with
-/// [`File::readv_at_with`]: crate::fs::File::readv_at_with
+/// ```no_run
+/// # async fn f(file: &norn_uring::fs::File) {
+/// use norn_uring::{fs::ReadOptions, WithOptions};
+///
+/// let cached_only = ReadOptions::new().nowait(true);
+/// let (res, buf) = file.read_at(vec![0; 4096], 0).options(cached_only).await;
+/// # }
+/// ```
+///
+/// [`File::read_at`]: crate::fs::File::read_at
+/// [`File::read_fixed_at`]: crate::fs::File::read_fixed_at
+/// [`File::readv_at`]: crate::fs::File::readv_at
+/// [`WithOptions::options`]: crate::WithOptions::options
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct ReadOptions {
     rw_flags: i32,
@@ -62,13 +72,24 @@ impl ReadOptions {
 
 /// Per-operation options for positional file writes.
 ///
-/// Pass these to [`File::write_at_with`], [`File::write_fixed_at_with`], or
-/// [`File::writev_at_with`]. The default options submit the same request as
-/// the corresponding method without options.
+/// Set them on a request from [`File::write_at`], [`File::write_fixed_at`],
+/// or [`File::writev_at`] with [`WithOptions::options`]. The default options
+/// submit the same request as not setting any. Options are `Copy` and can be
+/// built in a `const`:
 ///
-/// [`File::write_at_with`]: crate::fs::File::write_at_with
-/// [`File::write_fixed_at_with`]: crate::fs::File::write_fixed_at_with
-/// [`File::writev_at_with`]: crate::fs::File::writev_at_with
+/// ```no_run
+/// # async fn f(file: &norn_uring::fs::File) {
+/// use norn_uring::{fs::WriteOptions, WithOptions};
+///
+/// const DURABLE: WriteOptions = WriteOptions::new().dsync(true);
+/// let (res, buf) = file.write_at(b"record".to_vec(), 0).options(DURABLE).await;
+/// # }
+/// ```
+///
+/// [`File::write_at`]: crate::fs::File::write_at
+/// [`File::write_fixed_at`]: crate::fs::File::write_fixed_at
+/// [`File::writev_at`]: crate::fs::File::writev_at
+/// [`WithOptions::options`]: crate::WithOptions::options
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct WriteOptions {
     rw_flags: i32,
@@ -184,48 +205,26 @@ const fn set_flag(flags: i32, flag: i32, enabled: bool) -> i32 {
     }
 }
 
-/// Per-I/O SQE fields applied by file read and write operations.
-///
-/// `()` is the zero-sized default so methods without options keep their
-/// operation payload size.
-pub(crate) trait RwParams {
-    fn rw_flags(&self) -> i32;
-
-    fn write_stream(&self) -> u8;
-}
-
-impl RwParams for () {
-    #[inline]
-    fn rw_flags(&self) -> i32 {
-        0
-    }
-
-    #[inline]
-    fn write_stream(&self) -> u8 {
-        0
-    }
-}
-
-impl RwParams for ReadOptions {
-    #[inline]
-    fn rw_flags(&self) -> i32 {
+impl ReadOptions {
+    /// The `rw_flags` SQE field.
+    pub(crate) const fn rw_flags(&self) -> i32 {
         self.rw_flags
     }
 
-    #[inline]
-    fn write_stream(&self) -> u8 {
+    #[cfg(test)]
+    const fn write_stream(&self) -> u8 {
         0
     }
 }
 
-impl RwParams for WriteOptions {
-    #[inline]
-    fn rw_flags(&self) -> i32 {
+impl WriteOptions {
+    /// The `rw_flags` SQE field.
+    pub(crate) const fn rw_flags(&self) -> i32 {
         self.rw_flags
     }
 
-    #[inline]
-    fn write_stream(&self) -> u8 {
+    /// The `write_stream` SQE field; zero selects default placement.
+    pub(crate) const fn write_stream(&self) -> u8 {
         match self.stream {
             Some(stream) => stream.get(),
             None => 0,

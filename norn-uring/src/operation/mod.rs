@@ -481,6 +481,21 @@ where
         &self.reactor
     }
 
+    /// Change this request's operation before it is first polled.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the request has already been polled or linked: its entry
+    /// may already be on its way to the kernel.
+    #[track_caller]
+    pub(crate) fn modify_prepared(self, f: impl FnOnce(&mut T)) -> Self {
+        let State::Prepared { handle } = &self.state else {
+            panic!("request options must be set before the request is first polled");
+        };
+        f(&mut handle.data_mut().expect("prepared operation has data"));
+        self
+    }
+
     pub(crate) fn prepare_batch(
         mut self: Pin<&mut Self>,
         batch: &mut SmallVec<[ConfiguredEntry; 4]>,

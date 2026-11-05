@@ -34,6 +34,57 @@ mod private {
         fn finish_submit(self: Pin<&mut Self>);
         fn fail_submit(self: Pin<&mut Self>, err: &SubmitError);
     }
+
+    // Public solely so it can seal `WithOptions`.
+    #[allow(unnameable_types)]
+    pub trait AcceptsOptions<O> {
+        fn set_options(&mut self, opts: O);
+    }
+}
+
+pub(crate) use private::AcceptsOptions;
+
+/// A request that accepts per-operation options before it is submitted.
+///
+/// Each operation family has one options type, such as
+/// [`fs::ReadOptions`](crate::fs::ReadOptions) for positional file reads.
+/// Options apply to this request only. A request whose options are never set
+/// submits the same entry as one built with default options.
+///
+/// Set options before linking the request or adding a timeout, since those
+/// return a different request type:
+///
+/// ```no_run
+/// # async fn f(file: &norn_uring::fs::File) {
+/// use std::time::Duration;
+/// use norn_uring::{fs::WriteOptions, Request, WithOptions};
+///
+/// const DURABLE: WriteOptions = WriteOptions::new().dsync(true);
+/// let (res, buf) = file
+///     .write_at(b"record".to_vec(), 0)
+///     .options(DURABLE)
+///     .timeout(Duration::from_secs(1))
+///     .await;
+/// # }
+/// ```
+pub trait WithOptions<O>: Request {
+    /// Replace this request's options.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the request has already been polled.
+    #[must_use]
+    fn options(self, opts: O) -> Self;
+}
+
+impl<T, O> WithOptions<O> for Op<T>
+where
+    T: Singleshot + private::AcceptsOptions<O> + 'static,
+{
+    #[track_caller]
+    fn options(self, opts: O) -> Self {
+        self.modify_prepared(|op| op.set_options(opts))
+    }
 }
 
 /// A lazy request that can be linked with other requests before submission.

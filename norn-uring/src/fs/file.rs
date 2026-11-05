@@ -15,11 +15,12 @@ use crate::bufring::{BufRingBuf, RecvBufRing};
 use crate::fd::{NornFd, UringFd};
 use crate::fixedbuf::FixedBuf;
 use crate::fs::opts;
-use crate::fs::rw_opts::{ReadOptions, RwParams, WriteOptions};
+use crate::fs::rw_opts::{ReadOptions, WriteOptions};
 use crate::net::socket::{
     buffer_count, MultishotBacklog, Poll, RingReceive, RingRecvCompletion, RingRecvStream,
 };
 use crate::operation::{CQEResult, Multishot, Op, Operation, Singleshot};
+use crate::request::{AcceptsOptions, WithOptions};
 
 /// A reference to an open file on the filesystem.
 pub struct File {
@@ -211,6 +212,9 @@ impl File {
     ///
     /// The read will start at the provided offset.
     ///
+    /// Set per-operation [`ReadOptions`] for this read with
+    /// [`WithOptions::options`].
+    ///
     /// # Errors
     ///
     /// Fails with `EINVAL` ([`io::ErrorKind::InvalidInput`]) before
@@ -220,7 +224,7 @@ impl File {
         &self,
         buf: B,
         offset: u64,
-    ) -> impl crate::Request<Output = (io::Result<usize>, B)>
+    ) -> impl WithOptions<ReadOptions, Output = (io::Result<usize>, B)>
     where
         B: StableBufMut + 'static,
     {
@@ -232,6 +236,9 @@ impl File {
     ///
     /// The write will start at the provided offset.
     ///
+    /// Set per-operation [`WriteOptions`] for this write with
+    /// [`WithOptions::options`].
+    ///
     /// # Errors
     ///
     /// Fails with `EINVAL` ([`io::ErrorKind::InvalidInput`]) before
@@ -241,7 +248,7 @@ impl File {
         &self,
         buf: B,
         offset: u64,
-    ) -> impl crate::Request<Output = (io::Result<usize>, B)>
+    ) -> impl WithOptions<WriteOptions, Output = (io::Result<usize>, B)>
     where
         B: StableBuf + 'static,
     {
@@ -253,6 +260,9 @@ impl File {
     ///
     /// The read starts at `offset` and may fill the buffer's entire selected
     /// capacity. The operation returns ownership of the buffer with its result.
+    ///
+    /// Set per-operation [`ReadOptions`] for this read with
+    /// [`WithOptions::options`].
     ///
     /// # Errors
     ///
@@ -268,7 +278,7 @@ impl File {
         &self,
         buf: FixedBuf<B>,
         offset: u64,
-    ) -> impl crate::Request<Output = (io::Result<usize>, FixedBuf<B>)>
+    ) -> impl WithOptions<ReadOptions, Output = (io::Result<usize>, FixedBuf<B>)>
     where
         B: 'static,
     {
@@ -288,6 +298,9 @@ impl File {
     /// Short writes can be retried by calling [`FixedBuf::consume`] on the
     /// returned buffer and advancing `offset` by the completed byte count.
     ///
+    /// Set per-operation [`WriteOptions`] for this write with
+    /// [`WithOptions::options`].
+    ///
     /// # Errors
     ///
     /// Fails with `EINVAL` ([`io::ErrorKind::InvalidInput`]) before
@@ -302,7 +315,7 @@ impl File {
         &self,
         buf: FixedBuf<B>,
         offset: u64,
-    ) -> impl crate::Request<Output = (io::Result<usize>, FixedBuf<B>)>
+    ) -> impl WithOptions<WriteOptions, Output = (io::Result<usize>, FixedBuf<B>)>
     where
         B: 'static,
     {
@@ -318,155 +331,48 @@ impl File {
     ///
     /// The read starts at the provided offset and fills each buffer in order.
     ///
+    /// Set per-operation [`ReadOptions`] for this read with
+    /// [`WithOptions::options`].
+    ///
     /// # Errors
     ///
     /// Fails with `EINVAL` ([`io::ErrorKind::InvalidInput`]) before
     /// submission when `offset` exceeds `i64::MAX`; `io_uring` would otherwise
     /// treat `u64::MAX` as "use the file cursor". The buffers are still returned.
-    pub async fn readv_at<B>(&self, bufs: Vec<B>, offset: u64) -> (io::Result<usize>, Vec<B>)
+    pub fn readv_at<B>(
+        &self,
+        bufs: Vec<B>,
+        offset: u64,
+    ) -> impl WithOptions<ReadOptions, Output = (io::Result<usize>, Vec<B>)>
     where
         B: StableBufMut + 'static,
     {
         let read = ReadVectoredAt::new(self.fd.lease(), bufs, offset);
-        self.fd.submit(read).await
+        self.fd.submit(read)
     }
 
     /// Write bytes from a set of buffers to the file.
     ///
     /// The write starts at the provided offset and consumes each buffer in order.
     ///
+    /// Set per-operation [`WriteOptions`] for this write with
+    /// [`WithOptions::options`].
+    ///
     /// # Errors
     ///
     /// Fails with `EINVAL` ([`io::ErrorKind::InvalidInput`]) before
     /// submission when `offset` exceeds `i64::MAX`; `io_uring` would otherwise
     /// treat `u64::MAX` as "use the file cursor". The buffers are still returned.
-    pub async fn writev_at<B>(&self, bufs: Vec<B>, offset: u64) -> (io::Result<usize>, Vec<B>)
+    pub fn writev_at<B>(
+        &self,
+        bufs: Vec<B>,
+        offset: u64,
+    ) -> impl WithOptions<WriteOptions, Output = (io::Result<usize>, Vec<B>)>
     where
         B: StableBuf + 'static,
     {
         let write = WriteVectoredAt::new(self.fd.lease(), bufs, offset);
-        self.fd.submit(write).await
-    }
-
-    /// Read bytes into the specified buffer with per-operation options.
-    ///
-    /// This behaves like [`File::read_at`] with the flags in `opts` applied
-    /// to this read only.
-    pub fn read_at_with<B>(
-        &self,
-        buf: B,
-        offset: u64,
-        opts: ReadOptions,
-    ) -> impl crate::Request<Output = (io::Result<usize>, B)>
-    where
-        B: StableBufMut + 'static,
-    {
-        let read = ReadAt::with_options(self.fd.lease(), buf, offset, opts);
-        self.fd.submit(read)
-    }
-
-    /// Write the specified buffer with per-operation options.
-    ///
-    /// This behaves like [`File::write_at`] with the flags and write stream
-    /// in `opts` applied to this write only.
-    pub fn write_at_with<B>(
-        &self,
-        buf: B,
-        offset: u64,
-        opts: WriteOptions,
-    ) -> impl crate::Request<Output = (io::Result<usize>, B)>
-    where
-        B: StableBuf + 'static,
-    {
-        let write = WriteAt::with_options(self.fd.lease(), buf, offset, opts);
         self.fd.submit(write)
-    }
-
-    /// Read into a registered fixed buffer with per-operation options.
-    ///
-    /// This behaves like [`File::read_fixed_at`] with the flags in `opts`
-    /// applied to this read only.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the fixed buffer was registered with another driver.
-    #[track_caller]
-    pub fn read_fixed_at_with<B>(
-        &self,
-        buf: FixedBuf<B>,
-        offset: u64,
-        opts: ReadOptions,
-    ) -> impl crate::Request<Output = (io::Result<usize>, FixedBuf<B>)>
-    where
-        B: 'static,
-    {
-        assert!(
-            buf.same_driver(self.fd.handle()),
-            "fixed buffer and file must target the same driver"
-        );
-        let read = ReadFixedAt::with_options(self.fd.lease(), buf, offset, opts);
-        self.fd.submit(read)
-    }
-
-    /// Write a registered fixed buffer's logical payload with per-operation
-    /// options.
-    ///
-    /// This behaves like [`File::write_fixed_at`] with the flags and write
-    /// stream in `opts` applied to this write only.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the fixed buffer was registered with another driver.
-    #[track_caller]
-    pub fn write_fixed_at_with<B>(
-        &self,
-        buf: FixedBuf<B>,
-        offset: u64,
-        opts: WriteOptions,
-    ) -> impl crate::Request<Output = (io::Result<usize>, FixedBuf<B>)>
-    where
-        B: 'static,
-    {
-        assert!(
-            buf.same_driver(self.fd.handle()),
-            "fixed buffer and file must target the same driver"
-        );
-        let write = WriteFixedAt::with_options(self.fd.lease(), buf, offset, opts);
-        self.fd.submit(write)
-    }
-
-    /// Read bytes into a set of buffers with per-operation options.
-    ///
-    /// This behaves like [`File::readv_at`] with the flags in `opts` applied
-    /// to this read only.
-    pub async fn readv_at_with<B>(
-        &self,
-        bufs: Vec<B>,
-        offset: u64,
-        opts: ReadOptions,
-    ) -> (io::Result<usize>, Vec<B>)
-    where
-        B: StableBufMut + 'static,
-    {
-        let read = ReadVectoredAt::with_options(self.fd.lease(), bufs, offset, opts);
-        self.fd.submit(read).await
-    }
-
-    /// Write bytes from a set of buffers with per-operation options.
-    ///
-    /// This behaves like [`File::writev_at`] with the flags and write stream
-    /// in `opts` applied to this write only.
-    pub async fn writev_at_with<B>(
-        &self,
-        bufs: Vec<B>,
-        offset: u64,
-        opts: WriteOptions,
-    ) -> (io::Result<usize>, Vec<B>)
-    where
-        B: StableBuf + 'static,
-    {
-        let write = WriteVectoredAt::with_options(self.fd.lease(), bufs, offset, opts);
-        self.fd.submit(write).await
     }
 
     /// Sync the file and metadata to disk.
@@ -1026,12 +932,12 @@ impl RingReceive for ReadRingMulti {
 }
 
 #[derive(Debug)]
-struct ReadAt<B, O = ()> {
+struct ReadAt<B> {
     fd: NornFd,
     buf: B,
     offset: u64,
     submitted_len: usize,
-    opts: O,
+    opts: ReadOptions,
 }
 
 impl<B> ReadAt<B>
@@ -1039,15 +945,10 @@ where
     B: StableBufMut,
 {
     fn new(fd: NornFd, buf: B, offset: u64) -> Self {
-        Self::with_options(fd, buf, offset, ())
+        Self::with_options(fd, buf, offset, ReadOptions::new())
     }
-}
 
-impl<B, O> ReadAt<B, O>
-where
-    B: StableBufMut,
-{
-    fn with_options(fd: NornFd, buf: B, offset: u64, opts: O) -> Self {
+    fn with_options(fd: NornFd, buf: B, offset: u64, opts: ReadOptions) -> Self {
         let submitted_len = buf.bytes_remaining();
         Self {
             fd,
@@ -1059,12 +960,17 @@ where
     }
 }
 
+impl<B: StableBufMut + 'static> AcceptsOptions<ReadOptions> for ReadAt<B> {
+    fn set_options(&mut self, opts: ReadOptions) {
+        self.opts = opts;
+    }
+}
+
 // Safety: `NornFd` retains the descriptor and the owned `StableBufMut` keeps
 // the writable region stable and exclusive through the terminal CQE.
-unsafe impl<B, O> Operation for ReadAt<B, O>
+unsafe impl<B> Operation for ReadAt<B>
 where
     B: StableBufMut,
-    O: RwParams,
 {
     type Completion = CQEResult;
 
@@ -1083,10 +989,9 @@ where
     }
 }
 
-impl<B, O> Singleshot for ReadAt<B, O>
+impl<B> Singleshot for ReadAt<B>
 where
     B: StableBufMut,
-    O: RwParams,
 {
     type Output = (io::Result<usize>, B);
 
@@ -1107,21 +1012,19 @@ where
 }
 
 #[derive(Debug)]
-struct ReadFixedAt<B: 'static, O = ()> {
+struct ReadFixedAt<B: 'static> {
     fd: NornFd,
     buf: FixedBuf<B>,
     offset: u64,
-    opts: O,
+    opts: ReadOptions,
 }
 
 impl<B: 'static> ReadFixedAt<B> {
     fn new(fd: NornFd, buf: FixedBuf<B>, offset: u64) -> Self {
-        Self::with_options(fd, buf, offset, ())
+        Self::with_options(fd, buf, offset, ReadOptions::new())
     }
-}
 
-impl<B: 'static, O> ReadFixedAt<B, O> {
-    fn with_options(fd: NornFd, buf: FixedBuf<B>, offset: u64, opts: O) -> Self {
+    fn with_options(fd: NornFd, buf: FixedBuf<B>, offset: u64, opts: ReadOptions) -> Self {
         Self {
             fd,
             buf,
@@ -1131,9 +1034,15 @@ impl<B: 'static, O> ReadFixedAt<B, O> {
     }
 }
 
+impl<B: 'static> AcceptsOptions<ReadOptions> for ReadFixedAt<B> {
+    fn set_options(&mut self, opts: ReadOptions) {
+        self.opts = opts;
+    }
+}
+
 // Safety: `FixedBuf` owns the registered slot until the terminal CQE and the
 // same-driver check is performed before this operation is constructed.
-unsafe impl<B: 'static, O: RwParams> Operation for ReadFixedAt<B, O> {
+unsafe impl<B: 'static> Operation for ReadFixedAt<B> {
     type Completion = CQEResult;
 
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
@@ -1152,7 +1061,7 @@ unsafe impl<B: 'static, O: RwParams> Operation for ReadFixedAt<B, O> {
     }
 }
 
-impl<B: 'static, O: RwParams> Singleshot for ReadFixedAt<B, O> {
+impl<B: 'static> Singleshot for ReadFixedAt<B> {
     type Output = (io::Result<usize>, FixedBuf<B>);
 
     fn complete(mut self, result: CQEResult) -> Self::Output {
@@ -1169,21 +1078,19 @@ impl<B: 'static, O: RwParams> Singleshot for ReadFixedAt<B, O> {
     }
 }
 
-struct WriteAt<B, O = ()> {
+struct WriteAt<B> {
     fd: NornFd,
     buf: B,
     offset: u64,
-    opts: O,
+    opts: WriteOptions,
 }
 
 impl<B> WriteAt<B> {
     fn new(fd: NornFd, buf: B, offset: u64) -> Self {
-        Self::with_options(fd, buf, offset, ())
+        Self::with_options(fd, buf, offset, WriteOptions::new())
     }
-}
 
-impl<B, O> WriteAt<B, O> {
-    fn with_options(fd: NornFd, buf: B, offset: u64, opts: O) -> Self {
+    fn with_options(fd: NornFd, buf: B, offset: u64, opts: WriteOptions) -> Self {
         Self {
             fd,
             buf,
@@ -1193,12 +1100,17 @@ impl<B, O> WriteAt<B, O> {
     }
 }
 
+impl<B: StableBuf + 'static> AcceptsOptions<WriteOptions> for WriteAt<B> {
+    fn set_options(&mut self, opts: WriteOptions) {
+        self.opts = opts;
+    }
+}
+
 // Safety: `NornFd` retains the descriptor and the owned `StableBuf` keeps its
 // initialized bytes stable through every kernel read.
-unsafe impl<B, O> Operation for WriteAt<B, O>
+unsafe impl<B> Operation for WriteAt<B>
 where
     B: StableBuf,
-    O: RwParams,
 {
     type Completion = CQEResult;
 
@@ -1218,10 +1130,9 @@ where
     }
 }
 
-impl<B, O> Singleshot for WriteAt<B, O>
+impl<B> Singleshot for WriteAt<B>
 where
     B: StableBuf,
-    O: RwParams,
 {
     type Output = (io::Result<usize>, B);
 
@@ -1234,21 +1145,19 @@ where
 }
 
 #[derive(Debug)]
-struct WriteFixedAt<B: 'static, O = ()> {
+struct WriteFixedAt<B: 'static> {
     fd: NornFd,
     buf: FixedBuf<B>,
     offset: u64,
-    opts: O,
+    opts: WriteOptions,
 }
 
 impl<B: 'static> WriteFixedAt<B> {
     fn new(fd: NornFd, buf: FixedBuf<B>, offset: u64) -> Self {
-        Self::with_options(fd, buf, offset, ())
+        Self::with_options(fd, buf, offset, WriteOptions::new())
     }
-}
 
-impl<B: 'static, O> WriteFixedAt<B, O> {
-    fn with_options(fd: NornFd, buf: FixedBuf<B>, offset: u64, opts: O) -> Self {
+    fn with_options(fd: NornFd, buf: FixedBuf<B>, offset: u64, opts: WriteOptions) -> Self {
         Self {
             fd,
             buf,
@@ -1258,9 +1167,15 @@ impl<B: 'static, O> WriteFixedAt<B, O> {
     }
 }
 
+impl<B: 'static> AcceptsOptions<WriteOptions> for WriteFixedAt<B> {
+    fn set_options(&mut self, opts: WriteOptions) {
+        self.opts = opts;
+    }
+}
+
 // Safety: `FixedBuf` owns the initialized registered payload until the
 // terminal CQE and the same-driver check happens before construction.
-unsafe impl<B: 'static, O: RwParams> Operation for WriteFixedAt<B, O> {
+unsafe impl<B: 'static> Operation for WriteFixedAt<B> {
     type Completion = CQEResult;
 
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
@@ -1280,7 +1195,7 @@ unsafe impl<B: 'static, O: RwParams> Operation for WriteFixedAt<B, O> {
     }
 }
 
-impl<B: 'static, O: RwParams> Singleshot for WriteFixedAt<B, O> {
+impl<B: 'static> Singleshot for WriteFixedAt<B> {
     type Output = (io::Result<usize>, FixedBuf<B>);
 
     fn complete(self, result: CQEResult) -> Self::Output {
@@ -1291,22 +1206,20 @@ impl<B: 'static, O: RwParams> Singleshot for WriteFixedAt<B, O> {
     }
 }
 
-struct ReadVectoredAt<B, O = ()> {
+struct ReadVectoredAt<B> {
     fd: NornFd,
     bufs: Vec<B>,
     iovecs: Vec<libc::iovec>,
     offset: u64,
-    opts: O,
+    opts: ReadOptions,
 }
 
 impl<B> ReadVectoredAt<B> {
     fn new(fd: NornFd, bufs: Vec<B>, offset: u64) -> Self {
-        Self::with_options(fd, bufs, offset, ())
+        Self::with_options(fd, bufs, offset, ReadOptions::new())
     }
-}
 
-impl<B, O> ReadVectoredAt<B, O> {
-    fn with_options(fd: NornFd, bufs: Vec<B>, offset: u64, opts: O) -> Self {
+    fn with_options(fd: NornFd, bufs: Vec<B>, offset: u64, opts: ReadOptions) -> Self {
         Self {
             fd,
             bufs,
@@ -1317,12 +1230,17 @@ impl<B, O> ReadVectoredAt<B, O> {
     }
 }
 
+impl<B: StableBufMut + 'static> AcceptsOptions<ReadOptions> for ReadVectoredAt<B> {
+    fn set_options(&mut self, opts: ReadOptions) {
+        self.opts = opts;
+    }
+}
+
 // Safety: every owned `StableBufMut` remains live and exclusive, and the
 // operation-owned iovec array is built only after the operation is pinned.
-unsafe impl<B, O> Operation for ReadVectoredAt<B, O>
+unsafe impl<B> Operation for ReadVectoredAt<B>
 where
     B: StableBufMut,
-    O: RwParams,
 {
     type Completion = CQEResult;
 
@@ -1351,10 +1269,9 @@ where
     }
 }
 
-impl<B, O> Singleshot for ReadVectoredAt<B, O>
+impl<B> Singleshot for ReadVectoredAt<B>
 where
     B: StableBufMut,
-    O: RwParams,
 {
     type Output = (io::Result<usize>, Vec<B>);
 
@@ -1393,22 +1310,20 @@ where
     }
 }
 
-struct WriteVectoredAt<B, O = ()> {
+struct WriteVectoredAt<B> {
     fd: NornFd,
     bufs: Vec<B>,
     iovecs: Vec<libc::iovec>,
     offset: u64,
-    opts: O,
+    opts: WriteOptions,
 }
 
 impl<B> WriteVectoredAt<B> {
     fn new(fd: NornFd, bufs: Vec<B>, offset: u64) -> Self {
-        Self::with_options(fd, bufs, offset, ())
+        Self::with_options(fd, bufs, offset, WriteOptions::new())
     }
-}
 
-impl<B, O> WriteVectoredAt<B, O> {
-    fn with_options(fd: NornFd, bufs: Vec<B>, offset: u64, opts: O) -> Self {
+    fn with_options(fd: NornFd, bufs: Vec<B>, offset: u64, opts: WriteOptions) -> Self {
         Self {
             fd,
             bufs,
@@ -1419,12 +1334,17 @@ impl<B, O> WriteVectoredAt<B, O> {
     }
 }
 
+impl<B: StableBuf + 'static> AcceptsOptions<WriteOptions> for WriteVectoredAt<B> {
+    fn set_options(&mut self, opts: WriteOptions) {
+        self.opts = opts;
+    }
+}
+
 // Safety: every owned `StableBuf` remains live, and the operation-owned iovec
 // array is built only after the operation is pinned.
-unsafe impl<B, O> Operation for WriteVectoredAt<B, O>
+unsafe impl<B> Operation for WriteVectoredAt<B>
 where
     B: StableBuf,
-    O: RwParams,
 {
     type Completion = CQEResult;
 
@@ -1454,10 +1374,9 @@ where
     }
 }
 
-impl<B, O> Singleshot for WriteVectoredAt<B, O>
+impl<B> Singleshot for WriteVectoredAt<B>
 where
     B: StableBuf,
-    O: RwParams,
 {
     type Output = (io::Result<usize>, Vec<B>);
 
@@ -2021,10 +1940,11 @@ mod layout_tests {
 
     #[test]
     fn fixed_operation_payloads_stay_within_the_expected_size_class() {
-        assert_eq!(std::mem::size_of::<ReadAt<usize>>(), 32);
-        assert_eq!(std::mem::size_of::<WriteAt<usize>>(), 24);
-        assert_eq!(std::mem::size_of::<ReadFixedAt<[u8; 1]>>(), 48);
-        assert_eq!(std::mem::size_of::<WriteFixedAt<[u8; 1]>>(), 48);
+        // Each op carries its `ReadOptions` (4 bytes) or `WriteOptions` (8).
+        assert_eq!(std::mem::size_of::<ReadAt<usize>>(), 40);
+        assert_eq!(std::mem::size_of::<WriteAt<usize>>(), 32);
+        assert_eq!(std::mem::size_of::<ReadFixedAt<[u8; 1]>>(), 56);
+        assert_eq!(std::mem::size_of::<WriteFixedAt<[u8; 1]>>(), 56);
     }
 
     #[test]
