@@ -50,7 +50,7 @@ use norn_executor::park::{Park, ParkMode, Unpark};
 use norn_executor::{spawn, LocalExecutor};
 use norn_uring::buf::{StableBuf, StableBufMut};
 use norn_uring::bufring::RecvBufRing;
-use norn_uring::fixedbuf::FixedBufPool;
+use norn_uring::fixedbuf::FixedBufTable;
 use norn_uring::fs::File;
 use norn_uring::net::{TcpListener, TcpSocket, UdpSocket};
 use norn_uring::{Driver, DriverOptions, Handle, Request, TimeoutOutcome};
@@ -617,7 +617,7 @@ struct Ctx {
     errors: RefCell<Vec<String>>,
     stop: Cell<bool>,
     rings: Vec<RecvBufRing>,
-    pool: Option<Rc<FixedBufPool<Vec<u8>>>>,
+    pool: Option<Rc<FixedBufTable<Vec<u8>>>>,
     peer_stop: Arc<AtomicBool>,
     peers: RefCell<Vec<std::thread::JoinHandle<()>>>,
     tmpdir: PathBuf,
