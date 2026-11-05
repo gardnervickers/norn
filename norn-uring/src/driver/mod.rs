@@ -2447,6 +2447,114 @@ mod tests {
         assert_eq!(driver.shared.in_flight(), 0);
     }
 
+    struct Nop;
+
+    // Safety: a NOP references no memory and posts one terminal CQE.
+    unsafe impl Operation for Nop {
+        type Completion = CQEResult;
+
+        fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+            Ok(opcode::Nop::new().build())
+        }
+
+        unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+            result
+        }
+    }
+
+    impl Singleshot for Nop {
+        type Output = io::Result<u32>;
+
+        fn complete(self, completion: Self::Completion) -> Self::Output {
+            completion.into_result()
+        }
+    }
+
+    #[test]
+    fn overflow_queue_keeps_order_and_moves_linked_groups_whole() {
+        let mut driver = Driver::new(io_uring::IoUring::builder(), 2).unwrap();
+        let handle = driver.handle();
+        let waker = futures_test::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        // One slot is left, too few for the batch, and the NOP after the batch
+        // must queue behind it rather than take the slot.
+        let mut first = pin!(handle.submit(Nop));
+        let mut batch = pin!(handle.submit(Nop).then(handle.submit(Nop)));
+        let mut last = pin!(handle.submit(Nop));
+        assert!(first.as_mut().poll(&mut cx).is_pending());
+        assert!(batch.as_mut().poll(&mut cx).is_pending());
+        assert!(last.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(handle.queued_entries(), 3);
+        assert!(driver.needs_park());
+
+        // The first park submits `first`; only then does the batch fit.
+        driver.park(ParkMode::NoPark).unwrap();
+        assert_eq!(handle.queued_entries(), 3);
+        driver.park(ParkMode::NoPark).unwrap();
+        assert_eq!(handle.queued_entries(), 1, "the batch moved whole");
+        driver.park(ParkMode::NoPark).unwrap();
+        assert_eq!(handle.queued_entries(), 0);
+
+        let (mut first_done, mut batch_done, mut last_done) = (false, false, false);
+        for _ in 0..10 {
+            first_done = first_done || first.as_mut().poll(&mut cx).is_ready();
+            batch_done = batch_done || batch.as_mut().poll(&mut cx).is_ready();
+            last_done = last_done || last.as_mut().poll(&mut cx).is_ready();
+            if first_done && batch_done && last_done {
+                return;
+            }
+            driver.park(ParkMode::NoPark).unwrap();
+        }
+        panic!("queued operations did not complete");
+    }
+
+    #[test]
+    fn a_queued_operation_dropped_before_it_reaches_the_kernel_is_never_pushed() {
+        let mut driver = Driver::new(io_uring::IoUring::builder(), 1).unwrap();
+        let handle = driver.handle();
+        fill_sq(&driver);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut read = Box::pin(long_lived_read(&handle, &dropped));
+        assert!(read
+            .as_mut()
+            .poll(&mut Context::from_waker(&futures_test::task::noop_waker()))
+            .is_pending());
+        assert_eq!(handle.queued_entries(), 1);
+
+        // Cancelled where it waits: no cancellation is pushed, and the read
+        // completes without ever being counted in flight.
+        drop(read);
+        assert_eq!(driver.shared.in_flight(), 0);
+        assert!(park_until(&mut driver, 10, || dropped.load(Ordering::Acquire)));
+        assert_eq!(handle.queued_entries(), 0);
+        assert_eq!(driver.shared.in_flight(), 0);
+    }
+
+    #[test]
+    fn shutdown_fails_queued_operations_without_the_kernel() {
+        let mut driver = Driver::new(io_uring::IoUring::builder(), 1).unwrap();
+        let handle = driver.handle();
+        fill_sq(&driver);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut read = Box::pin(long_lived_read(&handle, &dropped));
+        let waker = futures_test::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(read.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(handle.queued_entries(), 1);
+
+        assert_eq!(
+            driver.shutdown_with_outcome(),
+            ShutdownOutcome::CleanDrained
+        );
+        let Poll::Ready(Err(err)) = read.as_mut().poll(&mut cx) else {
+            panic!("a queued read must fail with the shutdown error");
+        };
+        assert_eq!(err.to_string(), "reactor is shutting down");
+        drop(read);
+        assert!(dropped.load(Ordering::Acquire));
+    }
+
     #[test]
     fn iopoll_rings_are_rejected() {
         let mut builder = io_uring::IoUring::builder();
