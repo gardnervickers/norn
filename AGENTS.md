@@ -57,6 +57,7 @@ The project is intentionally not general-purpose today; APIs are still in flux i
 - `Sleep` futures resolve to `Result<(), norn_timer::Error>`; shutdown path returns shutdown errors.
 - Simulated clock is heavily used in tests/benchmarks.
 - Dropping the timer driver or calling `Park::shutdown` completes every outstanding sleeper with `Error::Shutdown`.
+- `Interval` ticks on a fixed schedule computed from deadlines (no drift). A tick is missed only when the next deadline has already passed at delivery; `MissedTickBehavior` (`Skip` default, `Burst`, `Delay`) decides the next deadline. After shutdown every tick returns `Error::Shutdown`.
 
 ### `norn-uring` model
 

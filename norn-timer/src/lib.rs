@@ -2,7 +2,8 @@
 //!
 //! [`Driver`] wraps another [`Park`] implementation, advances a hierarchical
 //! timer wheel when the executor parks, and limits the inner park duration to
-//! the next timer deadline. [`Handle`] creates [`Sleep`] futures. [`Clock`] can
+//! the next timer deadline. [`Handle`] creates [`Sleep`] futures and
+//! [`Interval`] tickers. [`Clock`] can
 //! track system time or manually advanced time for deterministic tests.
 //!
 //! # Example
@@ -43,12 +44,14 @@ use std::time::{Duration, Instant};
 pub use clock::Clock;
 pub use entry::Sleep;
 pub use error::Error;
+pub use interval::{Interval, MissedTickBehavior};
 use norn_executor::park::{Park, ParkMode};
 
 mod clock;
 mod context;
 mod entry;
 mod error;
+mod interval;
 mod level;
 #[cfg(test)]
 mod tests;
@@ -112,6 +115,31 @@ impl Handle {
     pub fn sleep_until(&self, deadline: Instant) -> Sleep {
         let deadline = self.wheels.clock().instant_to_tick(deadline);
         Sleep::new_at(self.wheels.clone(), deadline)
+    }
+
+    /// Create an [`Interval`] whose first tick completes immediately and whose
+    /// later ticks complete every `period`.
+    ///
+    /// Missed ticks are skipped by default; see [`MissedTickBehavior`].
+    ///
+    /// ### Panics
+    /// Panics if `period` is zero.
+    pub fn interval(&self, period: Duration) -> Interval {
+        Interval::new(self, self.wheels.clock().elapsed(), period)
+    }
+
+    /// Create an [`Interval`] whose first tick completes at `start` and whose
+    /// later ticks complete every `period` after it.
+    ///
+    /// A `start` that has already passed is handled like any late tick: the
+    /// first tick completes immediately, and the [`MissedTickBehavior`]
+    /// decides when the next one is due. A `start` before the clock origin is
+    /// treated as the clock origin.
+    ///
+    /// ### Panics
+    /// Panics if `period` is zero.
+    pub fn interval_at(&self, start: Instant, period: Duration) -> Interval {
+        Interval::new(self, self.wheels.clock().offset_of(start), period)
     }
 
     /// Get the clock used by the timer.

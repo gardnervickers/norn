@@ -45,6 +45,17 @@ impl Clock {
         }
     }
 
+    /// Return the offset of `t` from the clock origin, clamped at zero.
+    pub(crate) fn offset_of(&self, t: Instant) -> Duration {
+        t.checked_duration_since(self.start)
+            .unwrap_or(Duration::ZERO)
+    }
+
+    /// Convert an offset from the clock origin to the tick at which it is due.
+    pub(crate) fn offset_to_tick(&self, offset: Duration) -> u64 {
+        duration_to_deadline_tick(offset)
+    }
+
     /// Return the deadline after `duration` starting at the current time.
     ///
     /// This intentionally performs the arithmetic as a [`Duration`] before
@@ -99,7 +110,8 @@ impl Clock {
         }
     }
 
-    fn elapsed(&self) -> Duration {
+    /// Return the time elapsed since the clock origin.
+    pub(crate) fn elapsed(&self) -> Duration {
         match &self.time {
             TimeSource::System => Instant::now()
                 .checked_duration_since(self.start)
