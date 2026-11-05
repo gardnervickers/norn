@@ -24,7 +24,7 @@ use crate::registered_buffers::Registry as RegisteredBuffers;
 pub(crate) use crate::registered_buffers::{
     Generation as FixedBufGeneration, Release as FixedBufRelease,
     ReleaseError as FixedBufReleaseError, ReserveError as ReserveFixedBufError,
-    Retention as FixedBufRetention,
+    Retention as FixedBufRetention, UpdateError as FixedBufUpdateError,
 };
 use crate::util::notify::Notify;
 
@@ -504,6 +504,34 @@ impl FixedBufDriver {
             .unregister(&shared.ring, generation)
     }
 
+    pub(crate) fn is_running(&self) -> bool {
+        self.shared
+            .upgrade()
+            .is_some_and(|shared| shared.status() == Status::Running)
+    }
+
+    /// Replace one slot of this generation's fixed-buffer table.
+    ///
+    /// # Safety
+    ///
+    /// See [`RegisteredBuffers::update`].
+    pub(crate) unsafe fn update_slot(
+        &self,
+        generation: FixedBufGeneration,
+        index: u32,
+        iovec: &libc::iovec,
+    ) -> Result<(), FixedBufUpdateError> {
+        let Some(shared) = self.shared.upgrade() else {
+            return Err(FixedBufUpdateError::RingGone);
+        };
+        // Safety: forwarded to the caller.
+        unsafe {
+            shared
+                .registered_buffers
+                .update(&shared.ring, generation, index, iovec)
+        }
+    }
+
     pub(crate) fn retain(
         &self,
         generation: FixedBufGeneration,
@@ -652,6 +680,16 @@ impl Handle {
     #[cfg(test)]
     pub(crate) fn test_forget_fixed_buffers(&self) {
         self.shared.registered_buffers.test_forget();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_with_submitter<U>(&self, f: impl FnOnce(&Submitter<'_>) -> U) -> U {
+        self.shared.with_submitter(f)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_fail_next_fixed_buffer_update(&self, errno: i32) {
+        self.shared.registered_buffers.test_fail_next_update(errno);
     }
 
     #[cfg(test)]

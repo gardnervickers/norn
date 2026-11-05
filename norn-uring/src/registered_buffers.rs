@@ -39,6 +39,14 @@ pub(crate) enum ReleaseError {
     Io(io::Error),
 }
 
+#[derive(Debug)]
+pub(crate) enum UpdateError {
+    RingGone,
+    StateMismatch,
+    DriverBorrowed,
+    Io(io::Error),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Retention {
     Retained,
@@ -55,6 +63,8 @@ pub(crate) struct Registry {
     retained: RefCell<Vec<(Generation, Box<dyn Any>)>>,
     state: Cell<State>,
     generation: Cell<Generation>,
+    #[cfg(test)]
+    update_failures: RefCell<std::collections::VecDeque<i32>>,
 }
 
 impl Registry {
@@ -63,6 +73,8 @@ impl Registry {
             retained: RefCell::new(Vec::new()),
             state: Cell::new(State::Empty),
             generation: Cell::new(0),
+            #[cfg(test)]
+            update_failures: RefCell::new(std::collections::VecDeque::new()),
         }
     }
 
@@ -157,6 +169,47 @@ impl Registry {
         }
         self.mark_released();
         Ok(Release::Unregistered)
+    }
+
+    /// Replace one slot of the active table with `iovec`.
+    ///
+    /// The update covers exactly one slot. `io-uring` discards the count of
+    /// slots the kernel updated, and a single-slot update is the only shape
+    /// whose failure proves that the kernel table was left unchanged.
+    ///
+    /// # Safety
+    ///
+    /// `iovec` must be empty (null base and zero length) or describe a region
+    /// satisfying the `FixedBuffer` contract until this slot is successfully
+    /// updated again, the table is unregistered, or the ring is destroyed. The
+    /// caller must also prove that no submitted operation uses the slot.
+    pub(crate) unsafe fn update(
+        &self,
+        ring: &RefCell<IoUring>,
+        generation: Generation,
+        index: u32,
+        iovec: &libc::iovec,
+    ) -> Result<(), UpdateError> {
+        if self.state.get() != State::Registered(generation) {
+            return Err(UpdateError::StateMismatch);
+        }
+
+        #[cfg(test)]
+        if let Some(errno) = self.update_failures.borrow_mut().pop_front() {
+            return Err(UpdateError::Io(io::Error::from_raw_os_error(errno)));
+        }
+
+        loop {
+            let ring = ring.try_borrow().map_err(|_| UpdateError::DriverBorrowed)?;
+            // Safety: forwarded to the caller.
+            match unsafe {
+                ring.submitter()
+                    .register_buffers_update(index, std::slice::from_ref(iovec), None)
+            } {
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                result => return result.map_err(UpdateError::Io),
+            }
+        }
     }
 
     /// Retain storage which may still be referenced by the kernel.
@@ -254,6 +307,11 @@ impl Registry {
     #[cfg(test)]
     pub(crate) fn test_state(&self) -> State {
         self.state.get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_fail_next_update(&self, errno: i32) {
+        self.update_failures.borrow_mut().push_back(errno);
     }
 
     #[cfg(test)]

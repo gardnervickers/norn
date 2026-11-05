@@ -5,6 +5,10 @@
 //! one non-cloneable [`FixedBuf`] which fixed I/O
 //! operations consume and return.
 //!
+//! A [`FixedBufTable`] instead registers empty slots whose buffers can be
+//! installed, replaced, and removed individually while other slots stay in
+//! use. A driver holds at most one pool or table at a time.
+//!
 //! `Vec<u8>` and `BytesMut` expose only their initialized lengths. Resize them
 //! before registration; `Vec::with_capacity(N)` and
 //! `BytesMut::with_capacity(N)` expose empty regions and are rejected.
@@ -46,13 +50,16 @@ use std::cell::{Cell, UnsafeCell};
 use std::error::Error;
 use std::fmt;
 use std::io;
+use std::marker::PhantomData;
+use std::mem;
 use std::ops::{Deref, DerefMut, Range};
 use std::ptr::NonNull;
 use std::rc::Rc;
 
 use crate::buf::{StableBuf, StableBufMut};
 use crate::driver::{
-    FixedBufDriver, FixedBufGeneration, FixedBufRelease, FixedBufReleaseError, ReserveFixedBufError,
+    FixedBufDriver, FixedBufGeneration, FixedBufRelease, FixedBufReleaseError, FixedBufUpdateError,
+    ReserveFixedBufError,
 };
 use crate::Handle;
 
@@ -98,13 +105,30 @@ struct Inner<B: 'static> {
     free_head: Cell<Option<usize>>,
 }
 
-struct Storage<B> {
-    buffers: Box<[UnsafeCell<B>]>,
+enum Storage<B> {
+    /// Values registered together by a [`FixedBufPool`].
+    Dense(Box<[UnsafeCell<B>]>),
+    /// Separately allocated values installed in a [`FixedBufTable`].
+    Sparse(SparseStorage<B>),
 }
 
+struct SparseStorage<B> {
+    slots: Box<[Cell<Option<SlotValue<B>>>]>,
+    /// A replacement whose region was passed to a kernel update that has not
+    /// returned. It is only left here if that update unwinds.
+    staged: Cell<Option<SlotValue<B>>>,
+}
+
+/// One separately allocated table value.
+///
+/// The allocation is held as a raw pointer rather than a `Box`, so moving the
+/// owner never reasserts uniqueness over a region the kernel may write.
+struct SlotValue<B>(NonNull<UnsafeCell<B>>, PhantomData<B>);
+
 struct SlotMeta {
-    ptr: NonNull<u8>,
-    len: u32,
+    ptr: Cell<NonNull<u8>>,
+    /// Registered length; zero for a vacant table slot.
+    len: Cell<u32>,
     acquired: Cell<bool>,
     next_free: Cell<Option<usize>>,
 }
@@ -265,6 +289,12 @@ pub enum AcquireError {
     /// The requested table index is already acquired.
     #[error("fixed-buffer index {index} is already acquired")]
     InUse {
+        /// Requested index.
+        index: usize,
+    },
+    /// The requested [`FixedBufTable`] slot has no installed buffer.
+    #[error("fixed-buffer index {index} has no installed buffer")]
+    Vacant {
         /// Requested index.
         index: usize,
     },
@@ -486,13 +516,16 @@ impl Handle {
             .map(UnsafeCell::new)
             .collect::<Vec<_>>()
             .into_boxed_slice();
-        let mut storage = Box::new(Storage { buffers: cells });
-        let mut slots = Vec::with_capacity(storage.buffers.len());
-        let mut iovecs = Vec::with_capacity(storage.buffers.len());
-        let mut intervals = Vec::with_capacity(storage.buffers.len());
+        let buffer_count = cells.len();
+        let mut storage = Box::new(Storage::Dense(cells));
+        let mut slots = Vec::with_capacity(buffer_count);
+        let mut iovecs = Vec::with_capacity(buffer_count);
+        let mut intervals = Vec::with_capacity(buffer_count);
 
-        let buffer_count = storage.buffers.len();
-        for (index, cell) in storage.buffers.iter_mut().enumerate() {
+        let Storage::Dense(cells) = &mut *storage else {
+            unreachable!("dense registration created sparse storage");
+        };
+        for (index, cell) in cells.iter_mut().enumerate() {
             let selected = region(cell.get_mut());
             if selected.is_empty() {
                 return Err(RegisterError {
@@ -518,8 +551,8 @@ impl Handle {
                 .expect("FixedBuffer returned an address range which wraps usize");
             intervals.push((start, end, index));
             slots.push(SlotMeta {
-                ptr,
-                len: selected.len() as u32,
+                ptr: Cell::new(ptr),
+                len: Cell::new(selected.len() as u32),
                 acquired: Cell::new(false),
                 next_free: Cell::new((index + 1 < buffer_count).then_some(index + 1)),
             });
@@ -583,15 +616,7 @@ impl<B: 'static> FixedBufPool<B> {
     ///
     /// Returns [`AcquireError::Exhausted`] when every slot is acquired.
     pub fn try_acquire(&self) -> Result<FixedBuf<B>, AcquireError> {
-        let inner = Rc::clone(&self.inner);
-        let index = inner.free_head.get().ok_or(AcquireError::Exhausted)?;
-        let slot = &inner.slots[index];
-        inner.free_head.set(slot.next_free.get());
-        slot.next_free.set(None);
-        assert!(!slot.acquired.replace(true), "free-list slot was acquired");
-        let ptr = slot.ptr;
-        let len = slot.len;
-        Ok(FixedBuf::new(inner, index as u16, ptr, len))
+        self.inner.try_acquire()
     }
 
     /// Acquire a specific registered slot by kernel-table index.
@@ -604,42 +629,7 @@ impl<B: 'static> FixedBufPool<B> {
     /// Returns [`AcquireError::InvalidIndex`] for an unknown index or
     /// [`AcquireError::InUse`] when that slot is already acquired.
     pub fn try_acquire_at(&self, index: usize) -> Result<FixedBuf<B>, AcquireError> {
-        let Some(slot) = self.inner.slots.get(index) else {
-            return Err(AcquireError::InvalidIndex {
-                index,
-                len: self.inner.slots.len(),
-            });
-        };
-        if slot.acquired.get() {
-            return Err(AcquireError::InUse { index });
-        }
-
-        let inner = Rc::clone(&self.inner);
-        let next = slot.next_free.get();
-        if inner.free_head.get() == Some(index) {
-            inner.free_head.set(next);
-        } else {
-            let mut cursor = inner
-                .free_head
-                .get()
-                .expect("unacquired fixed-buffer slot missing from free list");
-            loop {
-                let cursor_slot = &inner.slots[cursor];
-                if cursor_slot.next_free.get() == Some(index) {
-                    cursor_slot.next_free.set(next);
-                    break;
-                }
-                cursor = cursor_slot
-                    .next_free
-                    .get()
-                    .expect("unacquired fixed-buffer slot missing from free list");
-            }
-        }
-        slot.next_free.set(None);
-        slot.acquired.set(true);
-        let ptr = slot.ptr;
-        let len = slot.len;
-        Ok(FixedBuf::new(inner, index as u16, ptr, len))
+        self.inner.try_acquire_at(index)
     }
 
     /// Unregister the table and recover the original buffers in input order.
@@ -690,6 +680,639 @@ impl<B: 'static> FixedBufPool<B> {
     /// Return whether this pool contains no slots.
     pub fn is_empty(&self) -> bool {
         self.inner.slots.is_empty()
+    }
+}
+
+/// A sparse table of separately replaceable fixed buffers.
+///
+/// Created by [`Handle::register_sparse_fixed_buffers`], a table reserves
+/// `len` kernel slots, all initially vacant. Buffers can then be installed,
+/// replaced, or removed one slot at a time, without unregistering the table
+/// or returning buffers held in other slots. Acquired slots yield the same
+/// [`FixedBuf`] leases as a [`FixedBufPool`].
+///
+/// A slot can be replaced or removed only while it is not acquired. Fixed I/O
+/// operations own their [`FixedBuf`] until the kernel's terminal completion,
+/// so no submitted operation can observe a slot change: the kernel resolves a
+/// slot when it issues an operation, which may be after submission.
+///
+/// Each value is allocated separately, and slot changes are synchronous
+/// `io_uring_register(2)` calls. Prefer [`FixedBufPool`] for a fixed set of
+/// buffers.
+///
+/// Like a pool, the table occupies the driver's single fixed-buffer table.
+/// Dropping it performs safe best-effort release; use
+/// [`FixedBufTable::unregister`] when release errors or ownership recovery
+/// matter.
+pub struct FixedBufTable<B: 'static> {
+    inner: Rc<Inner<B>>,
+}
+
+/// Why a [`FixedBufTable`] slot operation failed.
+#[derive(Debug)]
+pub enum SlotErrorKind {
+    /// The slot index does not exist.
+    InvalidIndex {
+        /// Requested index.
+        index: usize,
+        /// Number of table slots.
+        len: usize,
+    },
+    /// The slot already holds a buffer.
+    Occupied {
+        /// Requested index.
+        index: usize,
+    },
+    /// The slot holds no buffer.
+    Vacant {
+        /// Requested index.
+        index: usize,
+    },
+    /// The slot is acquired by a [`FixedBuf`], possibly owned by an operation.
+    InUse {
+        /// Requested index.
+        index: usize,
+    },
+    /// The new buffer exposed an empty region.
+    EmptyBuffer,
+    /// The new buffer's region cannot be represented by fixed I/O SQEs.
+    BufferTooLarge {
+        /// Length exposed by the buffer.
+        len: usize,
+        /// Maximum representable length.
+        max: usize,
+    },
+    /// The new buffer's region overlaps the buffer installed in another slot.
+    OverlappingBuffers {
+        /// Index of the overlapping installed slot.
+        other: usize,
+    },
+    /// The driver is no longer accepting registrations.
+    DriverStopped,
+    /// The driver was temporarily borrowed by another operation.
+    DriverBorrowed,
+    /// The driver's active table did not match this table's generation, or
+    /// an earlier slot update unwound. The table should be dropped.
+    StateMismatch,
+    /// The kernel could not reserve the required resources.
+    ResourceExhausted(io::Error),
+    /// Another operating-system error occurred.
+    Io(io::Error),
+}
+
+impl fmt::Display for SlotErrorKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidIndex { index, len } => write!(
+                f,
+                "fixed-buffer index {index} is out of bounds for a table of length {len}"
+            ),
+            Self::Occupied { index } => {
+                write!(f, "fixed-buffer slot {index} already holds a buffer")
+            }
+            Self::Vacant { index } => write!(f, "fixed-buffer slot {index} holds no buffer"),
+            Self::InUse { index } => write!(f, "fixed-buffer slot {index} is acquired"),
+            Self::EmptyBuffer => f.write_str("fixed buffer exposes an empty region"),
+            Self::BufferTooLarge { len, max } => write!(
+                f,
+                "fixed buffer is {len} bytes, exceeding the limit of {max}"
+            ),
+            Self::OverlappingBuffers { other } => write!(
+                f,
+                "fixed buffer overlaps the region installed in slot {other}"
+            ),
+            Self::DriverStopped => f.write_str("the driver is not running"),
+            Self::DriverBorrowed => {
+                f.write_str("the io_uring driver is currently borrowed; retry the slot update")
+            }
+            Self::StateMismatch => {
+                f.write_str("the driver's fixed-buffer table does not match this table")
+            }
+            Self::ResourceExhausted(err) => write!(
+                f,
+                "fixed-buffer resources are exhausted (check locked-memory limits): {err}"
+            ),
+            Self::Io(err) => write!(f, "fixed-buffer slot update failed: {err}"),
+        }
+    }
+}
+
+impl Error for SlotErrorKind {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::ResourceExhausted(err) | Self::Io(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+/// A failed install or replacement which returns the rejected buffer.
+pub struct SlotError<B> {
+    kind: SlotErrorKind,
+    buffer: B,
+}
+
+impl<B> SlotError<B> {
+    /// Return the reason the slot operation failed.
+    pub fn kind(&self) -> &SlotErrorKind {
+        &self.kind
+    }
+
+    /// Recover the buffer which was not installed.
+    pub fn into_buffer(self) -> B {
+        self.buffer
+    }
+
+    /// Split this error into its reason and rejected buffer.
+    pub fn into_parts(self) -> (SlotErrorKind, B) {
+        (self.kind, self.buffer)
+    }
+}
+
+impl<B> fmt::Debug for SlotError<B> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SlotError")
+            .field("kind", &self.kind)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<B> fmt::Display for SlotError<B> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.kind.fmt(f)
+    }
+}
+
+impl<B> Error for SlotError<B> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.kind.source()
+    }
+}
+
+/// A table unregistration failure which retains the intact table.
+pub struct UnregisterTableError<B: 'static> {
+    kind: UnregisterErrorKind,
+    table: FixedBufTable<B>,
+}
+
+impl<B: 'static> UnregisterTableError<B> {
+    /// Return the reason unregistration failed.
+    pub fn kind(&self) -> &UnregisterErrorKind {
+        &self.kind
+    }
+
+    /// Recover the intact table so unregistration can be retried.
+    pub fn into_table(self) -> FixedBufTable<B> {
+        self.table
+    }
+
+    /// Split this error into its reason and intact table.
+    pub fn into_parts(self) -> (UnregisterErrorKind, FixedBufTable<B>) {
+        (self.kind, self.table)
+    }
+}
+
+impl<B: 'static> fmt::Debug for UnregisterTableError<B> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UnregisterTableError")
+            .field("kind", &self.kind)
+            .field("table", &self.table)
+            .finish()
+    }
+}
+
+impl<B: 'static> fmt::Display for UnregisterTableError<B> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.kind.fmt(f)
+    }
+}
+
+impl<B: 'static> Error for UnregisterTableError<B> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.kind.source()
+    }
+}
+
+impl Handle {
+    /// Register an empty table of `len` replaceable fixed-buffer slots.
+    ///
+    /// Install buffers with [`FixedBufTable::install`]. Requires Linux 5.13.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegisterErrorKind::EmptyPool`] for `len == 0`,
+    /// [`RegisterErrorKind::TooManyBuffers`] above the kernel's 16384-slot
+    /// limit, and otherwise the same driver and kernel errors as
+    /// [`Handle::register_fixed_buffers`].
+    pub fn register_sparse_fixed_buffers<B: 'static>(
+        &self,
+        len: usize,
+    ) -> Result<FixedBufTable<B>, RegisterErrorKind> {
+        if len == 0 {
+            return Err(RegisterErrorKind::EmptyPool);
+        }
+        if len > MAX_FIXED_BUFFERS {
+            return Err(RegisterErrorKind::TooManyBuffers {
+                count: len,
+                max: MAX_FIXED_BUFFERS,
+            });
+        }
+
+        let reservation = self.reserve_fixed_buffers().map_err(map_reserve_error)?;
+        let slots = (0..len)
+            .map(|_| SlotMeta {
+                ptr: Cell::new(NonNull::dangling()),
+                len: Cell::new(0),
+                acquired: Cell::new(false),
+                next_free: Cell::new(None),
+            })
+            .collect();
+        let inner = Rc::new(Inner {
+            driver: self.fixed_buf_driver(),
+            generation: reservation.generation(),
+            registered: Cell::new(true),
+            storage: Some(Box::new(Storage::Sparse(SparseStorage::new(len)))),
+            slots,
+            free_head: Cell::new(None),
+        });
+
+        reservation.arm_kernel_call();
+        let register =
+            reservation.with_submitter(|submitter| submitter.register_buffers_sparse(len as u32));
+        if let Err(err) = register {
+            inner.registered.set(false);
+            reservation.kernel_call_failed();
+            return Err(map_register_io_error(err));
+        }
+        let _ = reservation.commit();
+
+        Ok(FixedBufTable { inner })
+    }
+}
+
+impl<B: 'static> FixedBufTable<B> {
+    /// Install `buffer` in a vacant slot.
+    ///
+    /// The region is projected once, after the value reaches its final
+    /// allocation. On failure the slot stays vacant and the buffer is
+    /// returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SlotError`] for an invalid or occupied slot, an invalid or
+    /// overlapping region, a stopped or borrowed driver, or a kernel failure.
+    pub fn install(&self, index: usize, buffer: B) -> Result<(), SlotError<B>>
+    where
+        B: FixedBuffer,
+    {
+        let inner = &*self.inner;
+        let storage = inner.sparse();
+        let Some(slot) = inner.slots.get(index) else {
+            return Err(SlotError {
+                kind: self.invalid_index(index),
+                buffer,
+            });
+        };
+        // The storage check also covers a value left behind by an install
+        // whose kernel update unwound.
+        if slot.len.get() != 0 || SparseStorage::is_occupied(&storage.slots[index]) {
+            return Err(SlotError {
+                kind: SlotErrorKind::Occupied { index },
+                buffer,
+            });
+        }
+        if !inner.driver.is_running() {
+            return Err(SlotError {
+                kind: SlotErrorKind::DriverStopped,
+                buffer,
+            });
+        }
+
+        let mut value = SlotValue::new(buffer);
+        let (ptr, len) = match self.project(index, &mut value) {
+            Ok(region) => region,
+            Err(kind) => {
+                return Err(SlotError {
+                    kind,
+                    buffer: value.into_inner(),
+                })
+            }
+        };
+
+        // Keep the value in table storage across the kernel call, so an
+        // unwind cannot free a region the kernel may already reference.
+        storage.slots[index].set(Some(value));
+        // Safety: `FixedBuffer` guarantees the region, which table storage
+        // owns until this slot is updated again or the table is released. The
+        // slot is vacant, so no operation uses it.
+        let result = unsafe {
+            inner
+                .driver
+                .update_slot(inner.generation, index as u32, &region_iovec(ptr, len))
+        };
+        match result {
+            Ok(()) => {
+                slot.ptr.set(ptr);
+                slot.len.set(len);
+                inner.push_free(index);
+                Ok(())
+            }
+            Err(err) => {
+                let value = storage.slots[index]
+                    .take()
+                    .expect("installing fixed-buffer value disappeared");
+                Err(SlotError {
+                    kind: map_update_error(err),
+                    buffer: value.into_inner(),
+                })
+            }
+        }
+    }
+
+    /// Replace the buffer in an installed, unacquired slot.
+    ///
+    /// The kernel switches the slot to the new region in one update, and the
+    /// previous buffer is returned. On failure the previous buffer stays
+    /// installed and the new buffer is returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SlotError`] for an invalid, vacant, or acquired slot, an
+    /// invalid or overlapping region, a stopped or borrowed driver, or a
+    /// kernel failure.
+    pub fn replace(&self, index: usize, buffer: B) -> Result<B, SlotError<B>>
+    where
+        B: FixedBuffer,
+    {
+        let inner = &*self.inner;
+        let storage = inner.sparse();
+        if let Err(kind) = self.check_releasable(index) {
+            return Err(SlotError { kind, buffer });
+        }
+        if !inner.driver.is_running() {
+            return Err(SlotError {
+                kind: SlotErrorKind::DriverStopped,
+                buffer,
+            });
+        }
+        if SparseStorage::is_occupied(&storage.staged) {
+            return Err(SlotError {
+                kind: SlotErrorKind::StateMismatch,
+                buffer,
+            });
+        }
+
+        let mut value = SlotValue::new(buffer);
+        let (ptr, len) = match self.project(index, &mut value) {
+            Ok(region) => region,
+            Err(kind) => {
+                return Err(SlotError {
+                    kind,
+                    buffer: value.into_inner(),
+                })
+            }
+        };
+
+        // Hold the slot out of circulation during the kernel call. If the call
+        // unwinds, the slot stays unavailable and both values stay owned by
+        // table storage until the table is released.
+        let slot = &inner.slots[index];
+        inner.unlink_free(index);
+        slot.acquired.set(true);
+        storage.staged.set(Some(value));
+        // Safety: as for `install`; the slot is held unacquirable, so no
+        // operation uses it.
+        let result = unsafe {
+            inner
+                .driver
+                .update_slot(inner.generation, index as u32, &region_iovec(ptr, len))
+        };
+        let value = storage
+            .staged
+            .take()
+            .expect("staged fixed-buffer value disappeared");
+        slot.acquired.set(false);
+        match result {
+            Ok(()) => {
+                let previous = storage.slots[index]
+                    .replace(Some(value))
+                    .expect("installed fixed-buffer slot has no value");
+                slot.ptr.set(ptr);
+                slot.len.set(len);
+                inner.push_free(index);
+                Ok(previous.into_inner())
+            }
+            Err(err) => {
+                inner.push_free(index);
+                Err(SlotError {
+                    kind: map_update_error(err),
+                    buffer: value.into_inner(),
+                })
+            }
+        }
+    }
+
+    /// Remove and return the buffer in an installed, unacquired slot.
+    ///
+    /// Removal is permitted after driver shutdown. Once the ring has been
+    /// destroyed, the buffer is returned without a kernel call.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SlotErrorKind`] for an invalid, vacant, or acquired slot, a
+    /// borrowed driver, or a kernel failure. The buffer stays installed.
+    pub fn remove(&self, index: usize) -> Result<B, SlotErrorKind> {
+        let inner = &*self.inner;
+        self.check_releasable(index)?;
+
+        let slot = &inner.slots[index];
+        inner.unlink_free(index);
+        slot.acquired.set(true);
+        let empty = libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 0,
+        };
+        // Safety: an empty update installs no region. The slot is held
+        // unacquirable, so no operation uses it.
+        let result = unsafe {
+            inner
+                .driver
+                .update_slot(inner.generation, index as u32, &empty)
+        };
+        slot.acquired.set(false);
+        match result {
+            Ok(()) | Err(FixedBufUpdateError::RingGone) => {
+                let value = inner.sparse().slots[index]
+                    .take()
+                    .expect("installed fixed-buffer slot has no value");
+                slot.len.set(0);
+                slot.ptr.set(NonNull::dangling());
+                Ok(value.into_inner())
+            }
+            Err(err) => {
+                inner.push_free(index);
+                Err(map_update_error(err))
+            }
+        }
+    }
+
+    /// Acquire any installed slot which is not currently acquired.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AcquireError::Exhausted`] when no such slot exists.
+    pub fn try_acquire(&self) -> Result<FixedBuf<B>, AcquireError> {
+        self.inner.try_acquire()
+    }
+
+    /// Acquire a specific installed slot by kernel-table index.
+    ///
+    /// This searches the free list and is O(table length).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AcquireError::InvalidIndex`] for an unknown index,
+    /// [`AcquireError::Vacant`] for a slot without a buffer, or
+    /// [`AcquireError::InUse`] when that slot is already acquired.
+    pub fn try_acquire_at(&self, index: usize) -> Result<FixedBuf<B>, AcquireError> {
+        self.inner.try_acquire_at(index)
+    }
+
+    /// Return whether a buffer is installed in `index`.
+    pub fn is_installed(&self, index: usize) -> bool {
+        self.inner
+            .slots
+            .get(index)
+            .is_some_and(|slot| slot.len.get() != 0)
+    }
+
+    /// Unregister the table and recover each slot's buffer by index.
+    ///
+    /// # Errors
+    ///
+    /// Fails under the same conditions as [`FixedBufPool::unregister`],
+    /// returning the intact table.
+    pub fn unregister(self) -> Result<Vec<Option<B>>, UnregisterTableError<B>> {
+        let inner = match Rc::try_unwrap(self.inner) {
+            Ok(inner) => inner,
+            Err(inner) => {
+                let acquired = Rc::strong_count(&inner).saturating_sub(1);
+                return Err(UnregisterTableError {
+                    kind: UnregisterErrorKind::Busy { acquired },
+                    table: Self { inner },
+                });
+            }
+        };
+
+        match inner.driver.unregister(inner.generation) {
+            Ok(FixedBufRelease::Unregistered | FixedBufRelease::RingGone) => {
+                inner.registered.set(false);
+                Ok(inner.into_slots())
+            }
+            Err(err) => Err(UnregisterTableError {
+                kind: map_release_error(err),
+                table: Self {
+                    inner: Rc::new(inner),
+                },
+            }),
+        }
+    }
+
+    /// Return the number of slots.
+    pub fn len(&self) -> usize {
+        self.inner.slots.len()
+    }
+
+    /// Return whether this table has no slots.
+    pub fn is_empty(&self) -> bool {
+        self.inner.slots.is_empty()
+    }
+
+    fn invalid_index(&self, index: usize) -> SlotErrorKind {
+        SlotErrorKind::InvalidIndex {
+            index,
+            len: self.inner.slots.len(),
+        }
+    }
+
+    /// Check that `index` holds an installed buffer that may leave the kernel table.
+    fn check_releasable(&self, index: usize) -> Result<(), SlotErrorKind> {
+        let Some(slot) = self.inner.slots.get(index) else {
+            return Err(self.invalid_index(index));
+        };
+        if slot.acquired.get() {
+            return Err(SlotErrorKind::InUse { index });
+        }
+        if slot.len.get() == 0 {
+            return Err(SlotErrorKind::Vacant { index });
+        }
+        Ok(())
+    }
+
+    /// Project and validate a value destined for `index`.
+    ///
+    /// Regions must not overlap a buffer installed in any other slot.
+    fn project(
+        &self,
+        index: usize,
+        value: &mut SlotValue<B>,
+    ) -> Result<(NonNull<u8>, u32), SlotErrorKind>
+    where
+        B: FixedBuffer,
+    {
+        let selected = value.project(FixedBuffer::fixed_region);
+        if selected.is_empty() {
+            return Err(SlotErrorKind::EmptyBuffer);
+        }
+        let len = u32::try_from(selected.len()).map_err(|_| SlotErrorKind::BufferTooLarge {
+            len: selected.len(),
+            max: u32::MAX as usize,
+        })?;
+        let ptr = fixed_region_ptr(selected);
+        let start = ptr.as_ptr() as usize;
+        let end = start
+            .checked_add(len as usize)
+            .expect("FixedBuffer returned an address range which wraps usize");
+        let overlapping = self.inner.slots.iter().enumerate().find(|(other, slot)| {
+            let other_start = slot.ptr.get().as_ptr() as usize;
+            let other_end = other_start + slot.len.get() as usize;
+            *other != index && slot.len.get() != 0 && start < other_end && other_start < end
+        });
+        if let Some((other, _)) = overlapping {
+            return Err(SlotErrorKind::OverlappingBuffers { other });
+        }
+        Ok((ptr, len))
+    }
+}
+
+impl<B: 'static> fmt::Debug for FixedBufTable<B> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let installed = (0..self.len())
+            .filter(|&index| self.is_installed(index))
+            .count();
+        f.debug_struct("FixedBufTable")
+            .field("len", &self.len())
+            .field("installed", &installed)
+            .finish()
+    }
+}
+
+fn region_iovec(ptr: NonNull<u8>, len: u32) -> libc::iovec {
+    libc::iovec {
+        iov_base: ptr.as_ptr().cast(),
+        iov_len: len as usize,
+    }
+}
+
+fn map_update_error(err: FixedBufUpdateError) -> SlotErrorKind {
+    match err {
+        FixedBufUpdateError::RingGone => SlotErrorKind::DriverStopped,
+        FixedBufUpdateError::StateMismatch => SlotErrorKind::StateMismatch,
+        FixedBufUpdateError::DriverBorrowed => SlotErrorKind::DriverBorrowed,
+        FixedBufUpdateError::Io(err) => match err.raw_os_error() {
+            Some(libc::ENOMEM | libc::EPERM) => SlotErrorKind::ResourceExhausted(err),
+            _ => SlotErrorKind::Io(err),
+        },
     }
 }
 
@@ -845,7 +1468,7 @@ impl<B: 'static> FixedBuf<B> {
     }
 
     fn registered_capacity(&self) -> usize {
-        self.inner.slots[self.index as usize].len as usize
+        self.inner.slots[self.index as usize].len.get() as usize
     }
 
     pub(crate) fn kernel_index(&self) -> u16 {
@@ -898,9 +1521,8 @@ impl<B: 'static> Drop for FixedBuf<B> {
         let index = self.index as usize;
         let slot = &self.inner.slots[index];
         debug_assert!(slot.acquired.get());
-        slot.next_free.set(self.inner.free_head.get());
         slot.acquired.set(false);
-        self.inner.free_head.set(Some(index));
+        self.inner.push_free(index);
     }
 }
 
@@ -982,11 +1604,78 @@ impl<B: 'static> fmt::Debug for FixedBuf<B> {
 
 impl<B: 'static> Storage<B> {
     fn into_buffers(self) -> Vec<B> {
-        let Self { buffers } = self;
+        let Self::Dense(buffers) = self else {
+            unreachable!("fixed-buffer pool has sparse storage");
+        };
         Vec::from(buffers)
             .into_iter()
             .map(UnsafeCell::into_inner)
             .collect()
+    }
+
+    fn into_slots(self) -> Vec<Option<B>> {
+        let Self::Sparse(storage) = self else {
+            unreachable!("fixed-buffer table has dense storage");
+        };
+        // A staged replacement exists only after an unwound kernel update. It
+        // is dropped here, once the table is no longer registered.
+        Vec::from(storage.slots)
+            .into_iter()
+            .map(|slot| slot.into_inner().map(SlotValue::into_inner))
+            .collect()
+    }
+}
+
+impl<B> SparseStorage<B> {
+    fn new(len: usize) -> Self {
+        Self {
+            slots: (0..len).map(|_| Cell::new(None)).collect(),
+            staged: Cell::new(None),
+        }
+    }
+
+    fn is_occupied(cell: &Cell<Option<SlotValue<B>>>) -> bool {
+        let value = cell.take();
+        let occupied = value.is_some();
+        cell.set(value);
+        occupied
+    }
+}
+
+impl<B> SlotValue<B> {
+    fn new(value: B) -> Self {
+        Self(
+            NonNull::from(Box::leak(Box::new(UnsafeCell::new(value)))),
+            PhantomData,
+        )
+    }
+
+    /// Project the value's fixed region.
+    ///
+    /// The region is derived from the raw allocation, so it stays valid while
+    /// this value is moved, until the allocation is accessed through another
+    /// path or freed.
+    fn project<F>(&mut self, region: F) -> &mut [u8]
+    where
+        F: for<'a> FnOnce(&'a mut B) -> &'a mut [u8],
+    {
+        // Safety: this value exclusively owns the live allocation.
+        region(unsafe { &mut *UnsafeCell::raw_get(self.0.as_ptr()) })
+    }
+
+    fn into_inner(self) -> B {
+        let ptr = self.0;
+        mem::forget(self);
+        // Safety: the pointer came from `Box::leak`, and ownership moves out
+        // of `self`, which is not dropped.
+        unsafe { Box::from_raw(ptr.as_ptr()) }.into_inner()
+    }
+}
+
+impl<B> Drop for SlotValue<B> {
+    fn drop(&mut self) {
+        // Safety: the pointer came from `Box::leak` and is released once.
+        drop(unsafe { Box::from_raw(self.0.as_ptr()) });
     }
 }
 
@@ -994,6 +1683,87 @@ impl<B: 'static> Inner<B> {
     fn into_buffers(mut self) -> Vec<B> {
         self.registered.set(false);
         (*self.storage.take().expect("fixed-buffer storage missing")).into_buffers()
+    }
+
+    fn into_slots(mut self) -> Vec<Option<B>> {
+        self.registered.set(false);
+        (*self.storage.take().expect("fixed-buffer storage missing")).into_slots()
+    }
+
+    fn sparse(&self) -> &SparseStorage<B> {
+        match self.storage.as_deref() {
+            Some(Storage::Sparse(storage)) => storage,
+            _ => unreachable!("fixed-buffer table is missing sparse storage"),
+        }
+    }
+
+    fn try_acquire(self: &Rc<Self>) -> Result<FixedBuf<B>, AcquireError> {
+        let index = self.free_head.get().ok_or(AcquireError::Exhausted)?;
+        let slot = &self.slots[index];
+        self.free_head.set(slot.next_free.get());
+        slot.next_free.set(None);
+        assert!(!slot.acquired.replace(true), "free-list slot was acquired");
+        Ok(FixedBuf::new(
+            Rc::clone(self),
+            index as u16,
+            slot.ptr.get(),
+            slot.len.get(),
+        ))
+    }
+
+    fn try_acquire_at(self: &Rc<Self>, index: usize) -> Result<FixedBuf<B>, AcquireError> {
+        let Some(slot) = self.slots.get(index) else {
+            return Err(AcquireError::InvalidIndex {
+                index,
+                len: self.slots.len(),
+            });
+        };
+        if slot.acquired.get() {
+            return Err(AcquireError::InUse { index });
+        }
+        if slot.len.get() == 0 {
+            return Err(AcquireError::Vacant { index });
+        }
+
+        self.unlink_free(index);
+        slot.acquired.set(true);
+        Ok(FixedBuf::new(
+            Rc::clone(self),
+            index as u16,
+            slot.ptr.get(),
+            slot.len.get(),
+        ))
+    }
+
+    fn push_free(&self, index: usize) {
+        self.slots[index].next_free.set(self.free_head.get());
+        self.free_head.set(Some(index));
+    }
+
+    /// Remove an installed, unacquired slot from the free list in O(len).
+    fn unlink_free(&self, index: usize) {
+        let slot = &self.slots[index];
+        let next = slot.next_free.get();
+        if self.free_head.get() == Some(index) {
+            self.free_head.set(next);
+        } else {
+            let mut cursor = self
+                .free_head
+                .get()
+                .expect("unacquired fixed-buffer slot missing from free list");
+            loop {
+                let cursor_slot = &self.slots[cursor];
+                if cursor_slot.next_free.get() == Some(index) {
+                    cursor_slot.next_free.set(next);
+                    break;
+                }
+                cursor = cursor_slot
+                    .next_free
+                    .get()
+                    .expect("unacquired fixed-buffer slot missing from free list");
+            }
+        }
+        slot.next_free.set(None);
     }
 }
 
@@ -1292,14 +2062,17 @@ mod tests {
         let drops = Rc::new(Cell::new(0));
         let reservation = handle.reserve_fixed_buffers().unwrap();
         let generation = reservation.generation();
-        let mut storage = Box::new(Storage {
-            buffers: vec![UnsafeCell::new(DropTracked {
+        let mut storage = Box::new(Storage::Dense(
+            vec![UnsafeCell::new(DropTracked {
                 bytes: [0; 8],
                 drops: Rc::clone(&drops),
             })]
             .into_boxed_slice(),
-        });
-        let selected = storage.buffers[0].get_mut().fixed_region();
+        ));
+        let Storage::Dense(cells) = &mut *storage else {
+            unreachable!();
+        };
+        let selected = cells[0].get_mut().fixed_region();
         let ptr = fixed_region_ptr(selected);
         let iovec = libc::iovec {
             iov_base: ptr.as_ptr().cast(),
@@ -1311,8 +2084,8 @@ mod tests {
             registered: Cell::new(true),
             storage: Some(storage),
             slots: vec![SlotMeta {
-                ptr,
-                len: iovec.iov_len as u32,
+                ptr: Cell::new(ptr),
+                len: Cell::new(iovec.iov_len as u32),
                 acquired: Cell::new(false),
                 next_free: Cell::new(None),
             }]
@@ -1358,6 +2131,329 @@ mod tests {
             .unregister()
             .map_err(|err| io::Error::other(err.to_string()))?;
         assert_eq!(buffers, vec![[0u8; 8]]);
+        Ok(())
+    }
+
+    fn tracked(drops: &Rc<Cell<usize>>) -> DropTracked {
+        DropTracked {
+            bytes: [0; 8],
+            drops: Rc::clone(drops),
+        }
+    }
+
+    #[test]
+    fn failed_sparse_registration_rolls_back_the_driver_reservation() -> io::Result<()> {
+        let driver = crate::Driver::new(io_uring::IoUring::builder(), 8)?;
+        let handle = driver.handle();
+        let mut foreign = Box::new([0u8; 8]);
+        let iovec = libc::iovec {
+            iov_base: foreign.as_mut_ptr().cast(),
+            iov_len: foreign.len(),
+        };
+        // Occupy the kernel table behind the registry's back.
+        // Safety: `foreign` outlives the explicit unregistration below.
+        handle.test_with_submitter(|submitter| unsafe { submitter.register_buffers(&[iovec]) })?;
+
+        let err = handle
+            .register_sparse_fixed_buffers::<Vec<u8>>(2)
+            .unwrap_err();
+        assert!(
+            matches!(&err, RegisterErrorKind::Io(err) if err.raw_os_error() == Some(libc::EBUSY))
+        );
+
+        handle.test_with_submitter(|submitter| submitter.unregister_buffers())?;
+        drop(foreign);
+        let table = handle
+            .register_sparse_fixed_buffers::<Vec<u8>>(2)
+            .map_err(io::Error::other)?;
+        table
+            .unregister()
+            .map_err(|err| io::Error::other(err.to_string()))?;
+        Ok(())
+    }
+
+    #[test]
+    fn sparse_registration_validates_length() -> io::Result<()> {
+        let driver = crate::Driver::new(io_uring::IoUring::builder(), 8)?;
+        let handle = driver.handle();
+        assert!(matches!(
+            handle.register_sparse_fixed_buffers::<Vec<u8>>(0),
+            Err(RegisterErrorKind::EmptyPool)
+        ));
+        assert!(matches!(
+            handle.register_sparse_fixed_buffers::<Vec<u8>>(MAX_FIXED_BUFFERS + 1),
+            Err(RegisterErrorKind::TooManyBuffers { .. })
+        ));
+        let table = handle
+            .register_sparse_fixed_buffers::<Vec<u8>>(MAX_FIXED_BUFFERS)
+            .map_err(io::Error::other)?;
+        assert_eq!(table.len(), MAX_FIXED_BUFFERS);
+        table
+            .unregister()
+            .map_err(|err| io::Error::other(err.to_string()))?;
+        Ok(())
+    }
+
+    #[test]
+    fn sparse_table_installs_replaces_and_removes_slots() -> io::Result<()> {
+        let driver = crate::Driver::new(io_uring::IoUring::builder(), 8)?;
+        let handle = driver.handle();
+        let table = handle
+            .register_sparse_fixed_buffers::<Vec<u8>>(3)
+            .map_err(io::Error::other)?;
+
+        assert_eq!(table.try_acquire().unwrap_err(), AcquireError::Exhausted);
+        assert_eq!(
+            table.try_acquire_at(1).unwrap_err(),
+            AcquireError::Vacant { index: 1 }
+        );
+        assert!(matches!(
+            table.remove(1),
+            Err(SlotErrorKind::Vacant { index: 1 })
+        ));
+        let err = table.install(3, vec![0; 8]).unwrap_err();
+        assert!(matches!(
+            err.kind(),
+            SlotErrorKind::InvalidIndex { index: 3, len: 3 }
+        ));
+        let err = table.install(1, Vec::new()).unwrap_err();
+        assert!(matches!(err.kind(), SlotErrorKind::EmptyBuffer));
+        assert!(!table.is_installed(1));
+
+        table.install(1, vec![1; 8]).map_err(io::Error::other)?;
+        assert!(table.is_installed(1));
+        let err = table.install(1, vec![9; 8]).unwrap_err();
+        assert!(matches!(err.kind(), SlotErrorKind::Occupied { index: 1 }));
+        assert_eq!(err.into_buffer(), vec![9; 8]);
+
+        let lease = table.try_acquire().unwrap();
+        assert_eq!(lease.index(), 1);
+        assert_eq!(lease.capacity(), 8);
+        assert_eq!(lease.as_full_slice(), &[1; 8]);
+        let err = table.replace(1, vec![2; 4]).unwrap_err();
+        assert!(matches!(err.kind(), SlotErrorKind::InUse { index: 1 }));
+        assert!(matches!(
+            table.remove(1),
+            Err(SlotErrorKind::InUse { index: 1 })
+        ));
+        drop(lease);
+
+        assert_eq!(
+            table.replace(1, vec![2; 4]).map_err(io::Error::other)?,
+            vec![1; 8]
+        );
+        let lease = table.try_acquire_at(1).unwrap();
+        assert_eq!(lease.as_full_slice(), &[2; 4]);
+        drop(lease);
+
+        table.install(0, vec![3; 16]).map_err(io::Error::other)?;
+        assert_eq!(table.remove(1).map_err(io::Error::other)?, vec![2; 4]);
+        assert!(!table.is_installed(1));
+        assert_eq!(table.try_acquire().unwrap().index(), 0);
+
+        let slots = table
+            .unregister()
+            .map_err(|err| io::Error::other(err.to_string()))?;
+        assert_eq!(slots, vec![Some(vec![3; 16]), None, None]);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_slot_updates_keep_the_previous_slot_state() -> io::Result<()> {
+        let driver = crate::Driver::new(io_uring::IoUring::builder(), 8)?;
+        let handle = driver.handle();
+        let table = handle
+            .register_sparse_fixed_buffers::<Vec<u8>>(2)
+            .map_err(io::Error::other)?;
+
+        handle.test_fail_next_fixed_buffer_update(libc::ENOMEM);
+        let err = table.install(0, vec![1; 8]).unwrap_err();
+        assert!(matches!(err.kind(), SlotErrorKind::ResourceExhausted(_)));
+        assert_eq!(err.into_buffer(), vec![1; 8]);
+        assert!(!table.is_installed(0));
+        assert_eq!(table.try_acquire().unwrap_err(), AcquireError::Exhausted);
+
+        table.install(0, vec![1; 8]).map_err(io::Error::other)?;
+        handle.test_fail_next_fixed_buffer_update(libc::EFAULT);
+        let err = table.replace(0, vec![2; 4]).unwrap_err();
+        assert!(matches!(err.kind(), SlotErrorKind::Io(_)));
+        assert_eq!(err.into_buffer(), vec![2; 4]);
+        let lease = table.try_acquire().unwrap();
+        assert_eq!(lease.as_full_slice(), &[1; 8]);
+        drop(lease);
+
+        handle.test_fail_next_fixed_buffer_update(libc::EFAULT);
+        assert!(matches!(table.remove(0), Err(SlotErrorKind::Io(_))));
+        assert_eq!(table.try_acquire_at(0).unwrap().capacity(), 8);
+
+        let slots = table
+            .unregister()
+            .map_err(|err| io::Error::other(err.to_string()))?;
+        assert_eq!(slots, vec![Some(vec![1; 8]), None]);
+        Ok(())
+    }
+
+    #[test]
+    fn sparse_table_rejects_regions_overlapping_another_slot() -> io::Result<()> {
+        struct SharedSlice(SharedRegion);
+
+        // Safety: the regions are stable and initialized while the test runs;
+        // the test intentionally overlaps them to verify rejection.
+        unsafe impl FixedBuffer for SharedSlice {
+            fn fixed_region(&mut self) -> &mut [u8] {
+                unsafe { project_shared_region(&mut self.0) }
+            }
+        }
+
+        let driver = crate::Driver::new(io_uring::IoUring::builder(), 8)?;
+        let table = driver
+            .handle()
+            .register_sparse_fixed_buffers::<SharedSlice>(2)
+            .map_err(io::Error::other)?;
+        let bytes = Rc::new(UnsafeCell::new([0u8; 32]));
+        let region = |range| {
+            SharedSlice(SharedRegion {
+                bytes: Rc::clone(&bytes),
+                range,
+            })
+        };
+
+        table
+            .install(0, region(0..16))
+            .map_err(|err| io::Error::other(err.to_string()))?;
+        let err = table.install(1, region(8..24)).unwrap_err();
+        assert!(matches!(
+            err.kind(),
+            SlotErrorKind::OverlappingBuffers { other: 0 }
+        ));
+        table
+            .install(1, region(16..32))
+            .map_err(|err| io::Error::other(err.to_string()))?;
+        // A replacement may reuse its own slot's region, but not another's.
+        table
+            .replace(0, region(0..16))
+            .map_err(|err| io::Error::other(err.to_string()))?;
+        let Err(err) = table.replace(0, region(12..20)) else {
+            panic!("overlapping replacement succeeded");
+        };
+        assert!(matches!(
+            err.kind(),
+            SlotErrorKind::OverlappingBuffers { other: 1 }
+        ));
+        table
+            .unregister()
+            .map_err(|err| io::Error::other(err.to_string()))?;
+        Ok(())
+    }
+
+    #[test]
+    fn sparse_table_and_dense_pool_share_the_single_driver_table() -> io::Result<()> {
+        let driver = crate::Driver::new(io_uring::IoUring::builder(), 8)?;
+        let handle = driver.handle();
+        let table = handle
+            .register_sparse_fixed_buffers::<Vec<u8>>(1)
+            .map_err(io::Error::other)?;
+        let err = handle.register_fixed_buffers(vec![[0u8; 8]]).unwrap_err();
+        assert!(matches!(err.kind(), RegisterErrorKind::AlreadyRegistered));
+
+        let busy = table.try_acquire().err();
+        assert_eq!(busy, Some(AcquireError::Exhausted));
+        table.install(0, vec![0; 8]).map_err(io::Error::other)?;
+        let lease = table.try_acquire().unwrap();
+        let (kind, table) = table.unregister().unwrap_err().into_parts();
+        assert!(matches!(kind, UnregisterErrorKind::Busy { acquired: 1 }));
+        drop(lease);
+        table
+            .unregister()
+            .map_err(|err| io::Error::other(err.to_string()))?;
+
+        let pool = handle
+            .register_fixed_buffers(vec![[0u8; 8]])
+            .map_err(io::Error::other)?;
+        assert!(matches!(
+            handle.register_sparse_fixed_buffers::<Vec<u8>>(1),
+            Err(RegisterErrorKind::AlreadyRegistered)
+        ));
+        pool.unregister()
+            .map_err(|err| io::Error::other(err.to_string()))?;
+        Ok(())
+    }
+
+    #[test]
+    fn dropped_table_retains_installed_storage_until_ring_destruction() -> io::Result<()> {
+        let driver = crate::Driver::new(io_uring::IoUring::builder(), 8)?;
+        let handle = driver.handle();
+        let drops = Rc::new(Cell::new(0));
+        let table = handle
+            .register_sparse_fixed_buffers::<DropTracked>(2)
+            .map_err(io::Error::other)?;
+        table
+            .install(1, tracked(&drops))
+            .map_err(|err| io::Error::other(err.to_string()))?;
+
+        handle.test_with_ring_borrowed_mut(|| drop(table));
+        assert_eq!(drops.get(), 0);
+        assert_eq!(handle.test_retained_fixed_buffers(), 1);
+
+        drop(handle);
+        drop(driver);
+        assert_eq!(drops.get(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn stopped_driver_rejects_installs_but_releases_slots() -> io::Result<()> {
+        let driver = crate::Driver::new(io_uring::IoUring::builder(), 8)?;
+        let handle = driver.handle();
+        let table = handle
+            .register_sparse_fixed_buffers::<Vec<u8>>(3)
+            .map_err(io::Error::other)?;
+        table.install(0, vec![1; 8]).map_err(io::Error::other)?;
+        table.install(1, vec![2; 8]).map_err(io::Error::other)?;
+
+        // Shut down with the handle keeping the ring alive.
+        drop(driver);
+        let err = table.install(2, vec![3; 8]).unwrap_err();
+        assert!(matches!(err.kind(), SlotErrorKind::DriverStopped));
+        let err = table.replace(0, vec![3; 8]).unwrap_err();
+        assert!(matches!(err.kind(), SlotErrorKind::DriverStopped));
+        assert_eq!(table.remove(0).map_err(io::Error::other)?, vec![1; 8]);
+
+        // Once the ring is destroyed, removal needs no kernel call.
+        drop(handle);
+        assert_eq!(table.remove(1).map_err(io::Error::other)?, vec![2; 8]);
+        let slots = table
+            .unregister()
+            .map_err(|err| io::Error::other(err.to_string()))?;
+        assert_eq!(slots, vec![None, None, None]);
+        Ok(())
+    }
+
+    #[test]
+    fn state_mismatch_rejects_slot_updates() -> io::Result<()> {
+        let driver = crate::Driver::new(io_uring::IoUring::builder(), 8)?;
+        let handle = driver.handle();
+        let drops = Rc::new(Cell::new(0));
+        let table = handle
+            .register_sparse_fixed_buffers::<DropTracked>(2)
+            .map_err(io::Error::other)?;
+        table
+            .install(0, tracked(&drops))
+            .map_err(|err| io::Error::other(err.to_string()))?;
+
+        handle.test_forget_fixed_buffers();
+        let err = table.install(1, tracked(&drops)).unwrap_err();
+        assert!(matches!(err.kind(), SlotErrorKind::StateMismatch));
+        drop(err);
+        assert_eq!(drops.get(), 1);
+        assert!(matches!(table.remove(0), Err(SlotErrorKind::StateMismatch)));
+
+        drop(table);
+        assert_eq!(drops.get(), 1);
+        assert_eq!(handle.test_retained_fixed_buffers(), 1);
+        drop(handle);
+        drop(driver);
+        assert_eq!(drops.get(), 2);
         Ok(())
     }
 }
