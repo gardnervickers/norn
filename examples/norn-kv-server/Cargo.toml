@@ -17,6 +17,11 @@ io-uring = "0.7"
 libc = "0.2.149"
 norn-uring = { path = "../../norn-uring" }
 
+[features]
+# Benchmark experiment: serve multishot connections through registered
+# (fixed) file slots instead of plain descriptors.
+fixed-files = []
+
 [[bin]]
 name = "norn-kv-server"
 path = "src/main.rs"

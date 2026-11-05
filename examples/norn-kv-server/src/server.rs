@@ -226,6 +226,8 @@ pub async fn serve(
         RecvMode::Exact => None,
         RecvMode::Multishot => Some(recv_ring(RECV_RING_BUFFERS)?),
     };
+    #[cfg(feature = "fixed-files")]
+    fixed_files::register(config.max_connections)?;
     let mut incoming = pin!(listener.incoming());
     while let Some(next) = incoming.next().await {
         let socket = match next {
@@ -271,6 +273,11 @@ async fn serve_connection_multishot(
 ) -> io::Result<()> {
     socket.set_nodelay(true).await?;
 
+    #[cfg(feature = "fixed-files")]
+    let fixed = fixed_files::insert(&socket).await?;
+    #[cfg(feature = "fixed-files")]
+    let mut incoming = Box::pin(fixed.recv_ring_multi(&recv_ring));
+    #[cfg(not(feature = "fixed-files"))]
     let mut incoming = Box::pin(socket.recv_ring_multi(&recv_ring));
     let mut pending = Vec::with_capacity(RECV_BUFFER_LEN);
     let mut response = Vec::with_capacity(RECV_BUFFER_LEN);
@@ -284,7 +291,14 @@ async fn serve_connection_multishot(
         // Send them before acting on a close or a fatal protocol error, so a
         // rejected or truncated frame does not discard earlier replies.
         if !response.is_empty() {
-            response = send_all(&socket, response).await?;
+            #[cfg(feature = "fixed-files")]
+            {
+                response = fixed_files::send_all(&fixed, response).await?;
+            }
+            #[cfg(not(feature = "fixed-files"))]
+            {
+                response = send_all(&socket, response).await?;
+            }
         }
         match outcome {
             Ok(BatchEnd::Open) => {}
@@ -575,6 +589,51 @@ async fn recv_exact(socket: &TcpSocket, mut buffer: RecvBuffer) -> io::Result<Op
         }
     }
     Ok(Some(buffer))
+}
+
+#[cfg(feature = "fixed-files")]
+mod fixed_files {
+    use std::cell::OnceCell;
+    use std::io;
+    use std::rc::Rc;
+
+    use norn_uring::buf::{BufCursor, StableBuf};
+    use norn_uring::fixedfile::{FixedFd, FixedFileTable};
+    use norn_uring::net::TcpSocket;
+
+    thread_local! {
+        static TABLE: OnceCell<Rc<FixedFileTable>> = const { OnceCell::new() };
+    }
+
+    /// Register this worker's file table, one slot per allowed connection.
+    pub(super) fn register(max_connections: usize) -> io::Result<()> {
+        let slots = u32::try_from(max_connections).unwrap_or(u32::MAX);
+        let table = norn_uring::Handle::current().register_fixed_files(slots)?;
+        TABLE.with(|cell| {
+            cell.set(Rc::new(table))
+                .map_err(|_| io::Error::other("file table already registered"))
+        })
+    }
+
+    /// Put an accepted socket into a slot of this worker's table.
+    pub(super) async fn insert(socket: &TcpSocket) -> io::Result<FixedFd> {
+        let table = TABLE.with(|cell| cell.get().cloned()).expect("file table registered");
+        table.insert(socket.as_uring_fd()).await
+    }
+
+    pub(super) async fn send_all(fixed: &FixedFd, buffer: Vec<u8>) -> io::Result<Vec<u8>> {
+        let mut cursor = BufCursor::new(buffer);
+        while cursor.bytes_init() != 0 {
+            let (result, returned) = fixed.send(cursor).await;
+            cursor = returned;
+            let sent = result?;
+            if sent == 0 {
+                return Err(io::Error::from(io::ErrorKind::WriteZero));
+            }
+            cursor.consume(sent);
+        }
+        Ok(cursor.into_inner())
+    }
 }
 
 async fn send_all(socket: &TcpSocket, buffer: Vec<u8>) -> io::Result<Vec<u8>> {
