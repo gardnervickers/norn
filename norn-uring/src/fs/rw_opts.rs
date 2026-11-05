@@ -107,8 +107,12 @@ impl WriteOptions {
     /// This sets `RWF_NOWAIT`. A write that would block completes with
     /// [`io::ErrorKind::WouldBlock`] and is not retried by the kernel. A write
     /// that can only partly complete without blocking may return fewer bytes
-    /// than requested. Files that do not support nonblocking writes fail with
-    /// `EOPNOTSUPP`.
+    /// than requested; `io_uring` still counts such a write as failed, so a
+    /// request linked after it with [`Request::then`](crate::Request::then) is
+    /// canceled. Files that do not support nonblocking writes fail with
+    /// `EOPNOTSUPP`. A buffered write to a filesystem that cannot attempt one
+    /// without blocking, such as ext4, fails with `WouldBlock` every time, so
+    /// retrying it does not help.
     ///
     /// [`io::ErrorKind::WouldBlock`]: std::io::ErrorKind::WouldBlock
     #[must_use]
