@@ -1404,9 +1404,9 @@ impl Shared {
     ///
     /// A group in which an operation was cancelled while it waited completes
     /// with `ECANCELED` without reaching the kernel. A group's members are
-    /// dropped together, and the kernel fails the rest of a cancelled chain
-    /// anyway. Once the driver stops accepting work, queued entries fail with
-    /// the shutdown error instead.
+    /// dropped together, so all of them were cancelled, including any behind
+    /// a hard link. Once the driver stops accepting work, queued entries fail
+    /// with the shutdown error instead.
     fn flush_overflow(&self) {
         loop {
             if self.overflow.borrow().is_empty() {
@@ -1436,7 +1436,7 @@ impl Shared {
                     for queued in overflow.drain(..len) {
                         queued.entry.mark_dequeued();
                         let flags = if queued.linked {
-                            Flags::IO_LINK
+                            queued.entry.link_flags()
                         } else {
                             Flags::empty()
                         };
@@ -1512,7 +1512,7 @@ impl Shared {
             let flags = if idx + 1 == len {
                 Flags::empty()
             } else {
-                Flags::IO_LINK
+                entry.link_flags()
             };
             raw_entries.push(entry.into_entry_with_flags(flags));
         }
@@ -3644,6 +3644,87 @@ mod tests {
             driver.park(ParkMode::NoPark).unwrap();
         }
         done()
+    }
+
+    /// A NOP that records whether it was synthetic and whether it succeeded.
+    struct RecordedNop(Rc<Cell<Option<(bool, bool)>>>);
+
+    // Safety: a NOP references no memory and posts one terminal CQE.
+    unsafe impl Operation for RecordedNop {
+        type Completion = ();
+
+        fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+            Ok(opcode::Nop::new().build())
+        }
+
+        unsafe fn reap(&mut self, result: CQEResult) {
+            self.0
+                .set(Some((result.is_synthetic(), result.result.is_ok())));
+        }
+    }
+
+    impl Singleshot for RecordedNop {
+        type Output = ();
+
+        fn complete(self, _: ()) {}
+    }
+
+    #[test]
+    fn dropping_a_submitted_then_always_chain_cancels_both_requests() {
+        let mut driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let handle = driver.handle();
+        let first = Arc::new(AtomicBool::new(false));
+        let second = Arc::new(AtomicBool::new(false));
+        let mut chain = Box::pin(
+            long_lived_read(&handle, &first).then_always(long_lived_read(&handle, &second)),
+        );
+        let waker = futures_test::task::noop_waker();
+        assert!(chain
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending());
+        driver.park(ParkMode::NoPark).unwrap();
+
+        // Cancelling the first read does not break the hard link, so the
+        // kernel issues the second read, which is cancelled once issued.
+        drop(chain);
+        assert!(
+            park_until(&mut driver, 20, || first.load(Ordering::Acquire)
+                && second.load(Ordering::Acquire)),
+            "both reads must end"
+        );
+    }
+
+    #[test]
+    fn dropping_a_queued_then_always_chain_cancels_both_requests() {
+        for always in [true, false] {
+            let mut driver = Driver::new(io_uring::IoUring::builder(), 2).unwrap();
+            let handle = driver.handle();
+            fill_sq(&driver);
+            let dropped = Arc::new(AtomicBool::new(false));
+            let outcome = Rc::new(Cell::new(None));
+            let read = long_lived_read(&handle, &dropped);
+            let nop = handle.submit(RecordedNop(Rc::clone(&outcome)));
+            let waker = futures_test::task::noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            if always {
+                let mut chain = pin!(read.then_always(nop));
+                assert!(chain.as_mut().poll(&mut cx).is_pending());
+                assert_eq!(handle.queued_entries(), 2);
+            } else {
+                let mut chain = pin!(read.then(nop));
+                assert!(chain.as_mut().poll(&mut cx).is_pending());
+                assert_eq!(handle.queued_entries(), 2);
+            }
+
+            // Both requests are cancelled where they wait, so neither reaches
+            // the kernel, whether the link is hard or soft.
+            assert!(park_until(&mut driver, 20, || dropped
+                .load(Ordering::Acquire)
+                && outcome.get().is_some()));
+            assert_eq!(outcome.get(), Some((true, false)), "always={always}");
+            assert_eq!(handle.queued_entries(), 0);
+        }
     }
 
     struct MultishotPoll {

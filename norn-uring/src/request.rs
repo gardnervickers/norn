@@ -54,6 +54,30 @@ pub trait Request: Future + Sized + private::Chainable {
         Then::new(self, next)
     }
 
+    /// Link another request that runs even if this one fails.
+    ///
+    /// The requests are linked with `IOSQE_IO_HARDLINK`: the kernel issues
+    /// `next` once this request completes, whatever its result, for example
+    /// to close a descriptor after a write. `next` also runs if this request
+    /// fails configuration. Both results are returned, as with
+    /// [`Request::then`].
+    ///
+    /// Dropping the returned request cancels both requests, as it does for
+    /// [`Request::then`]. Cancelling this request does not break a hard link,
+    /// so the kernel still issues `next`, and `next` is cancelled once it has
+    /// been issued. An operation that completes as soon as it is issued, such
+    /// as a close, can therefore still run.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `self` and `next` target different drivers.
+    fn then_always<R>(self, next: R) -> Then<Self, R>
+    where
+        R: Request,
+    {
+        Then::new_linked(self, next, true)
+    }
+
     /// Link another request but discard its output.
     ///
     /// Configuration failures short-circuit later linked operations in the same way as
@@ -98,21 +122,48 @@ pub trait Request: Future + Sized + private::Chainable {
 
 impl<T> Request for T where T: Future + Sized + private::Chainable {}
 
+/// Configure two linked requests into `batch`, and return whether requests
+/// linked after them may be submitted.
+///
+/// After a soft link, a configuration failure in `left` cancels `right`
+/// without the kernel. After a hard link, `right` is configured regardless and
+/// linked to whatever `left` configured.
+fn prepare_pair<A, B>(
+    mut left: Pin<&mut A>,
+    mut right: Pin<&mut B>,
+    hard: bool,
+    batch: &mut SmallVec<[ConfiguredEntry; 4]>,
+) -> bool
+where
+    A: Request,
+    B: Request,
+{
+    let left_configured = left.as_mut().prepare_batch(batch);
+    if hard {
+        if let Some(last) = batch.last() {
+            last.set_hard_link();
+        }
+        return right.as_mut().prepare_batch(batch);
+    }
+    if left_configured {
+        right.as_mut().prepare_batch(batch)
+    } else {
+        right.as_mut().cancel_unsubmitted();
+        false
+    }
+}
+
 /// Configure two linked requests and hand them to the driver as one batch.
 ///
 /// The driver pushes the batch whole, or queues it until the SQ has room, so
 /// both requests count as submitted once this returns.
-fn submit_pair<A, B>(mut left: Pin<&mut A>, mut right: Pin<&mut B>)
+fn submit_pair<A, B>(mut left: Pin<&mut A>, mut right: Pin<&mut B>, hard: bool)
 where
     A: Request,
     B: Request,
 {
     let mut batch = SmallVec::new();
-    if !left.as_mut().prepare_batch(&mut batch) {
-        right.as_mut().cancel_unsubmitted();
-    } else {
-        right.as_mut().prepare_batch(&mut batch);
-    }
+    prepare_pair(left.as_mut(), right.as_mut(), hard, &mut batch);
     let submitted = if batch.is_empty() {
         Ok(())
     } else {
@@ -140,6 +191,8 @@ pin_project_lite::pin_project! {
     {
         #[pin]
         state: ThenState<A, B>,
+        // Whether `right` is hard-linked behind `left` (`then_always`).
+        hard: bool,
     }
 }
 
@@ -179,6 +232,10 @@ where
     B: Request,
 {
     fn new(left: A, right: B) -> Self {
+        Self::new_linked(left, right, false)
+    }
+
+    fn new_linked(left: A, right: B, hard: bool) -> Self {
         assert!(
             left.reactor().same_driver(right.reactor()),
             "linked requests must target the same driver"
@@ -191,6 +248,7 @@ where
                 right_output: None,
                 submitted: false,
             },
+            hard,
         }
     }
 }
@@ -205,6 +263,7 @@ where
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         {
             let mut this = self.as_mut().project();
+            let hard = *this.hard;
             let ThenStateProj::Pending {
                 mut left,
                 mut right,
@@ -218,7 +277,7 @@ where
             if !*submitted {
                 ready!(left.as_mut().poll_ready_to_prepare(cx));
                 ready!(right.as_mut().poll_ready_to_prepare(cx));
-                submit_pair(left.as_mut(), right.as_mut());
+                submit_pair(left.as_mut(), right.as_mut(), hard);
                 *submitted = true;
             }
         }
@@ -344,7 +403,7 @@ where
             if !*submitted {
                 ready!(left.as_mut().poll_ready_to_prepare(cx));
                 ready!(right.as_mut().poll_ready_to_prepare(cx));
-                submit_pair(left.as_mut(), right.as_mut());
+                submit_pair(left.as_mut(), right.as_mut(), false);
                 *submitted = true;
             }
         }
@@ -486,12 +545,7 @@ where
         else {
             panic!("cannot prepare completed request");
         };
-        if !left.as_mut().prepare_batch(batch) {
-            right.as_mut().cancel_unsubmitted();
-            false
-        } else {
-            right.as_mut().prepare_batch(batch)
-        }
+        prepare_pair(left.as_mut(), right.as_mut(), *this.hard, batch)
     }
 
     fn cancel_unsubmitted(self: Pin<&mut Self>) {
@@ -577,12 +631,7 @@ where
         else {
             panic!("cannot prepare completed request");
         };
-        if !left.as_mut().prepare_batch(batch) {
-            right.as_mut().cancel_unsubmitted();
-            false
-        } else {
-            right.as_mut().prepare_batch(batch)
-        }
+        prepare_pair(left.as_mut(), right.as_mut(), false, batch)
     }
 
     fn cancel_unsubmitted(self: Pin<&mut Self>) {
@@ -745,6 +794,25 @@ mod tests {
             "first configure failed"
         );
         assert_canceled(&later);
+    }
+
+    #[test]
+    fn then_always_runs_next_after_a_configure_failure() {
+        let driver = crate::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let handle = driver.handle();
+        let mut ex = LocalExecutor::new(driver);
+
+        let ((failed, always), later) = ex.block_on(async {
+            handle
+                .submit(ConfigureFailed("first configure failed"))
+                .then_always(handle.submit(TaggedNop(2)))
+                .then(handle.submit(TaggedNop(3)))
+                .await
+        });
+
+        assert!(failed.is_err());
+        assert_eq!(always.unwrap(), 2, "a hard link runs after a failure");
+        assert_eq!(later.unwrap(), 3, "a soft link after it follows its result");
     }
 
     #[test]

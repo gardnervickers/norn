@@ -35,6 +35,40 @@ fn linked_file_write_then_read_observes_prior_write() -> Result<(), Box<dyn std:
 }
 
 #[test]
+fn then_always_runs_after_a_failed_file_write() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let dir = util::ThreadNameTestDir::new();
+        let path = dir.join("linked-always");
+        let mut opts = fs::OpenOptions::new();
+        opts.create(true).truncate(true).write(true);
+        let file = opts.open(&path).await?;
+        file.write_at(&b"hello"[..], 0).await.0?;
+        file.close().await?;
+
+        // A write to a read-only file fails. The hard-linked read runs anyway,
+        // while a soft-linked one is cancelled.
+        let file = fs::OpenOptions::new().read(true).open(&path).await?;
+        let ((write_res, _), (read_res, buf)) = file
+            .write_at(&b"x"[..], 0)
+            .then_always(file.read_at(vec![0; 5], 0))
+            .await;
+        assert!(write_res.is_err());
+        let n = read_res?;
+        assert_eq!(&buf[..n], b"hello");
+
+        let ((write_res, _), (read_res, _)) = file
+            .write_at(&b"x"[..], 0)
+            .then(file.read_at(vec![0; 5], 0))
+            .await;
+        assert!(write_res.is_err());
+        assert_eq!(read_res.unwrap_err().raw_os_error(), Some(libc::ECANCELED));
+
+        file.close().await?;
+        Ok(())
+    })
+}
+
+#[test]
 fn then_aux_preserves_primary_result_for_real_file_ops() -> Result<(), Box<dyn std::error::Error>> {
     util::with_test_env(|| async {
         let dir = util::ThreadNameTestDir::new();

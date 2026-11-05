@@ -160,6 +160,20 @@ impl ConfiguredEntry {
         Self { entry, handle }
     }
 
+    /// Make the link from this entry to the next one in its batch a hard link.
+    pub(crate) fn set_hard_link(&self) {
+        self.handle.header().set_hard_link();
+    }
+
+    /// The flags that link this entry to the next one in its batch.
+    pub(crate) fn link_flags(&self) -> Flags {
+        if self.handle.header().hard_link() {
+            Flags::IO_HARDLINK
+        } else {
+            Flags::IO_LINK
+        }
+    }
+
     /// Record that the driver queued this entry because the SQ was full.
     pub(crate) fn mark_queued(&self) {
         self.handle.header().set_queue_state(QueueState::Queued);
