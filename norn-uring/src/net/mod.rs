@@ -2,10 +2,12 @@
 //!
 //! Unless otherwise documented, functions and methods in this module require
 //! an active [`crate::Driver`] context.
+mod msg_opts;
 pub(crate) mod socket;
 mod tcp;
 mod udp;
 
+pub use msg_opts::RecvOptions;
 pub use socket::{Event, RecvMsgRingBuf, SendZcResult, SendZcUsage};
 pub use tcp::{
     TcpListener, TcpListenerOptions, TcpRecvBundleMulti, TcpRecvRingMulti, TcpSocket, TcpStream,

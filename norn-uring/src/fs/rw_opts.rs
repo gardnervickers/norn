@@ -12,11 +12,11 @@ const RWF_DONTCACHE: i32 = 0x0000_0080;
 
 /// Per-operation options for positional file reads.
 ///
-/// Pass these to [`File::read_at_with`], [`File::read_fixed_at_with`], or
+/// Pass these to [`File::read_at`] (through [`WithOptions`](crate::WithOptions)), [`File::read_fixed_at_with`], or
 /// [`File::readv_at_with`]. The default options submit the same request as the
 /// corresponding method without options.
 ///
-/// [`File::read_at_with`]: crate::fs::File::read_at_with
+/// [`File::read_at`]: crate::fs::File::read_at
 /// [`File::read_fixed_at_with`]: crate::fs::File::read_fixed_at_with
 /// [`File::readv_at_with`]: crate::fs::File::readv_at_with
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -62,11 +62,11 @@ impl ReadOptions {
 
 /// Per-operation options for positional file writes.
 ///
-/// Pass these to [`File::write_at_with`], [`File::write_fixed_at_with`], or
+/// Pass these to [`File::write_at`] (through [`WithOptions`](crate::WithOptions)), [`File::write_fixed_at_with`], or
 /// [`File::writev_at_with`]. The default options submit the same request as
 /// the corresponding method without options.
 ///
-/// [`File::write_at_with`]: crate::fs::File::write_at_with
+/// [`File::write_at`]: crate::fs::File::write_at
 /// [`File::write_fixed_at_with`]: crate::fs::File::write_fixed_at_with
 /// [`File::writev_at_with`]: crate::fs::File::writev_at_with
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]

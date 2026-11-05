@@ -507,7 +507,7 @@ impl TcpSocket {
     pub fn recv<B: StableBufMut>(
         &self,
         buf: B,
-    ) -> impl crate::Request<Output = (io::Result<usize>, B)> {
+    ) -> impl crate::WithOptions<crate::net::RecvOptions, Output = (io::Result<usize>, B)> {
         self.socket.recv(buf)
     }
 

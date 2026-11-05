@@ -34,6 +34,64 @@ mod private {
         fn finish_submit(self: Pin<&mut Self>);
         fn fail_submit(self: Pin<&mut Self>, err: &SubmitError);
     }
+
+    // Public solely so it can seal `WithOptions`.
+    #[allow(unnameable_types)]
+    pub trait AcceptsOptions<O>: Singleshot + Sized + 'static {
+        /// The operation once options are applied.
+        type Configured: Singleshot<Output = Self::Output> + 'static;
+
+        /// Build the configured operation from this one.
+        fn with_options(self, opts: O) -> Self::Configured;
+
+        /// Apply options to an unpolled request.
+        ///
+        /// The default moves the operation into a new allocation, so that an
+        /// operation without options can stay as small as before options
+        /// existed. Operations that always carry their options override this
+        /// to update them in place.
+        #[track_caller]
+        fn apply(op: Op<Self>, opts: O) -> Op<Self::Configured> {
+            let (data, handle) = op.into_prepared();
+            handle.submit(data.with_options(opts))
+        }
+    }
+}
+
+pub(crate) use private::AcceptsOptions;
+
+/// A request whose per-operation options can be set before it is submitted.
+///
+/// Each operation family has one options type, such as
+/// [`fs::ReadOptions`](crate::fs::ReadOptions) for positional file reads.
+/// Options apply only to this request. A request built without calling
+/// [`WithOptions::options`] submits the same entry as before options existed.
+///
+/// Options are set by value on the unsubmitted request, so they can only be set
+/// before linking it with [`Request::then`] or adding a
+/// [`Request::timeout`]: `file.write_at(buf, 0).options(DURABLE).timeout(d)`.
+pub trait WithOptions<O>: Request {
+    /// The request with options applied.
+    type Configured: Request<Output = Self::Output>;
+
+    /// Apply options to this request.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the request has already been polled.
+    fn options(self, opts: O) -> Self::Configured;
+}
+
+impl<T, O> WithOptions<O> for Op<T>
+where
+    T: private::AcceptsOptions<O>,
+{
+    type Configured = Op<T::Configured>;
+
+    #[track_caller]
+    fn options(self, opts: O) -> Self::Configured {
+        T::apply(self, opts)
+    }
 }
 
 /// A lazy request that can be linked with other requests before submission.

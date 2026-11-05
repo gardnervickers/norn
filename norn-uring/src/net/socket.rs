@@ -1962,6 +1962,23 @@ pub(crate) struct Recv<B, const TCP: bool = false> {
     submitted_len: usize,
 }
 
+// `Recv` always carries its flags, so options are updated in place.
+impl<B, const TCP: bool> crate::request::AcceptsOptions<crate::net::RecvOptions> for Recv<B, TCP>
+where
+    B: StableBufMut + 'static,
+{
+    type Configured = Self;
+
+    fn with_options(mut self, opts: crate::net::RecvOptions) -> Self {
+        self.flags = opts.flags;
+        self
+    }
+
+    fn apply(op: Op<Self>, opts: crate::net::RecvOptions) -> Op<Self> {
+        op.modify_prepared(|recv| recv.flags = opts.flags)
+    }
+}
+
 impl<B, const TCP: bool> Recv<B, TCP>
 where
     B: StableBufMut,

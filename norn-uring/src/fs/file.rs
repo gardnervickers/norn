@@ -13,6 +13,7 @@ use crate::fs::opts;
 use crate::fs::rw_opts::{ReadOptions, RwParams, WriteOptions};
 use crate::net::socket::Poll;
 use crate::operation::{CQEResult, Operation, Singleshot};
+use crate::request::{AcceptsOptions, WithOptions};
 
 /// A reference to an open file on the filesystem.
 pub struct File {
@@ -160,7 +161,7 @@ impl File {
         &self,
         buf: B,
         offset: u64,
-    ) -> impl crate::Request<Output = (io::Result<usize>, B)>
+    ) -> impl WithOptions<ReadOptions, Output = (io::Result<usize>, B)>
     where
         B: StableBufMut + 'static,
     {
@@ -181,7 +182,7 @@ impl File {
         &self,
         buf: B,
         offset: u64,
-    ) -> impl crate::Request<Output = (io::Result<usize>, B)>
+    ) -> impl WithOptions<WriteOptions, Output = (io::Result<usize>, B)>
     where
         B: StableBuf + 'static,
     {
@@ -286,40 +287,6 @@ impl File {
     {
         let write = WriteVectoredAt::new(self.fd.lease(), bufs, offset);
         self.fd.submit(write).await
-    }
-
-    /// Read bytes into the specified buffer with per-operation options.
-    ///
-    /// This behaves like [`File::read_at`] with the flags in `opts` applied
-    /// to this read only.
-    pub fn read_at_with<B>(
-        &self,
-        buf: B,
-        offset: u64,
-        opts: ReadOptions,
-    ) -> impl crate::Request<Output = (io::Result<usize>, B)>
-    where
-        B: StableBufMut + 'static,
-    {
-        let read = ReadAt::with_options(self.fd.lease(), buf, offset, opts);
-        self.fd.submit(read)
-    }
-
-    /// Write the specified buffer with per-operation options.
-    ///
-    /// This behaves like [`File::write_at`] with the flags and write stream
-    /// in `opts` applied to this write only.
-    pub fn write_at_with<B>(
-        &self,
-        buf: B,
-        offset: u64,
-        opts: WriteOptions,
-    ) -> impl crate::Request<Output = (io::Result<usize>, B)>
-    where
-        B: StableBuf + 'static,
-    {
-        let write = WriteAt::with_options(self.fd.lease(), buf, offset, opts);
-        self.fd.submit(write)
     }
 
     /// Read into a registered fixed buffer with per-operation options.
@@ -885,6 +852,27 @@ where
     }
 }
 
+impl<B: StableBufMut + 'static> AcceptsOptions<ReadOptions> for ReadAt<B> {
+    type Configured = ReadAt<B, ReadOptions>;
+
+    fn with_options(self, opts: ReadOptions) -> Self::Configured {
+        let Self {
+            fd,
+            buf,
+            offset,
+            submitted_len,
+            opts: (),
+        } = self;
+        ReadAt {
+            fd,
+            buf,
+            offset,
+            submitted_len,
+            opts,
+        }
+    }
+}
+
 impl<B, O> ReadAt<B, O>
 where
     B: StableBufMut,
@@ -1021,6 +1009,20 @@ struct WriteAt<B, O = ()> {
 impl<B> WriteAt<B> {
     fn new(fd: NornFd, buf: B, offset: u64) -> Self {
         Self::with_options(fd, buf, offset, ())
+    }
+}
+
+impl<B: StableBuf + 'static> AcceptsOptions<WriteOptions> for WriteAt<B> {
+    type Configured = WriteAt<B, WriteOptions>;
+
+    fn with_options(self, opts: WriteOptions) -> Self::Configured {
+        let Self {
+            fd,
+            buf,
+            offset,
+            opts: (),
+        } = self;
+        WriteAt::with_options(fd, buf, offset, opts)
     }
 }
 

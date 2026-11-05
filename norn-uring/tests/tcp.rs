@@ -13,10 +13,43 @@ use futures_util::StreamExt;
 use norn_executor::spawn;
 use norn_uring::buf::StableBuf;
 use norn_uring::bufring::RecvBufRing;
-use norn_uring::net::{SendZcUsage, TcpListener, TcpListenerOptions, TcpSocket};
+use norn_uring::net::{RecvOptions, SendZcUsage, TcpListener, TcpListenerOptions, TcpSocket};
+use norn_uring::{Request, WithOptions};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 mod util;
+
+#[test]
+fn recv_options_apply_to_one_receive() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let listener = TcpListener::bind("127.0.0.1:0".parse()?, 8).await?;
+        let mut peer = std::net::TcpStream::connect(listener.local_addr()?)?;
+        let (server, _) = listener.accept().await?;
+        use std::io::Write;
+        peer.write_all(b"hello")?;
+
+        let peek = RecvOptions::new().peek(true).wait_all(true);
+        let (result, buf) = server.recv(vec![0u8; 5]).options(peek).await;
+        assert_eq!(result?, 5);
+        assert_eq!(buf, b"hello");
+
+        // The peeked bytes are still queued for a receive without options.
+        let (result, buf) = server.recv(vec![0u8; 5]).await;
+        assert_eq!(result?, 5);
+        assert_eq!(buf, b"hello");
+
+        // Options compose with request combinators.
+        peer.write_all(b"world")?;
+        let (result, buf) = server
+            .recv(vec![0u8; 5])
+            .options(RecvOptions::new().wait_all(true))
+            .timeout(std::time::Duration::from_secs(5))
+            .await;
+        assert_eq!(result?, 5);
+        assert_eq!(buf, b"world");
+        Ok(())
+    })
+}
 
 #[test]
 fn msg_trunc_is_rejected_without_modifying_buffers_or_consuming_input(
