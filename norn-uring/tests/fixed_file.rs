@@ -5,6 +5,9 @@ use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
 use std::pin::pin;
 
+use futures_util::StreamExt;
+use norn_uring::bufring::RecvBufRing;
+
 use norn_uring::fs::{File, OpenOptions};
 use norn_uring::Handle;
 
@@ -143,6 +146,33 @@ fn send_and_recv_on_an_inserted_socket() -> Result<(), Box<dyn std::error::Error
         drop(fixed);
         let mut rest = Vec::new();
         assert_eq!(peer.read_to_end(&mut rest)?, 0);
+        Ok(())
+    })
+}
+
+#[test]
+fn multishot_ring_receive_on_an_inserted_socket() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async move {
+        let table = Handle::current().register_fixed_files(1)?;
+        let ring = RecvBufRing::builder(3).buf_cnt(4).buf_len(16).build()?;
+        let (local, mut peer) = UnixStream::pair()?;
+        let fixed = table.insert_fd(local.as_fd())?;
+        drop(local);
+
+        let mut received = pin!(fixed.recv_ring_multi(&ring));
+        let mut data = Vec::new();
+        for chunk in [&b"first "[..], b"second "] {
+            peer.write_all(chunk)?;
+            let buf = received.next().await.expect("received data")?;
+            data.extend_from_slice(&buf);
+        }
+        // An orderly shutdown ends the stream after any remaining data.
+        peer.write_all(b"last")?;
+        peer.shutdown(std::net::Shutdown::Write)?;
+        while let Some(buf) = received.next().await {
+            data.extend_from_slice(&buf?);
+        }
+        assert_eq!(data, b"first second last");
         Ok(())
     })
 }

@@ -1418,15 +1418,15 @@ impl Multishot for RecvFromRingMulti {
 }
 
 #[derive(Debug)]
-pub(crate) struct RecvRingMulti {
-    fd: NornFd,
+pub(crate) struct RecvRingMulti<F = NornFd> {
+    fd: F,
     ring: RecvBufRing,
     flags: i32,
     backlog: MultishotBacklog,
 }
 
-impl RecvRingMulti {
-    pub(crate) fn new(fd: NornFd, ring: RecvBufRing, flags: i32) -> Self {
+impl<F> RecvRingMulti<F> {
+    pub(crate) fn new(fd: F, ring: RecvBufRing, flags: i32) -> Self {
         Self {
             backlog: MultishotBacklog::new(ring.max_unconsumed_per_receive()),
             fd,
@@ -1436,18 +1436,18 @@ impl RecvRingMulti {
     }
 }
 
-// Safety: `NornFd` and `RecvBufRing` retain all referenced resources through the
+// Safety: `F` and `RecvBufRing` retain all referenced resources through the
 // multishot terminal CQE. Each selected buffer is held by an owned completion
 // until it is yielded or dropped.
-unsafe impl Operation for RecvRingMulti {
+unsafe impl<F: OpFd> Operation for RecvRingMulti<F> {
     type Completion = RingRecvCompletion<BufRingBuf>;
 
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         self.ring.ensure_accepting_receives()?;
-        let this = self;
-        Ok(opcode::RecvMulti::new(this.fd.fd(), this.ring.bgid())
-            .flags(this.flags)
-            .build())
+        let (bgid, flags) = (self.ring.bgid(), self.flags);
+        Ok(with_fd_target!(self.fd.target(), |fd| {
+            opcode::RecvMulti::new(fd, bgid).flags(flags).build()
+        }))
     }
 
     unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
@@ -1476,7 +1476,7 @@ unsafe impl Operation for RecvRingMulti {
     }
 }
 
-impl Multishot for RecvRingMulti {
+impl<F: OpFd> Multishot for RecvRingMulti<F> {
     type Item = RingRecvCompletion<BufRingBuf>;
 
     fn update(&mut self, completion: Self::Completion) -> Self::Item {

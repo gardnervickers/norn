@@ -63,18 +63,24 @@ use std::ops::Range;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
+use std::pin::Pin;
 use std::rc::Rc;
+use std::task::{ready, Context, Poll};
+
+use futures_core::Stream;
 
 use io_uring::types::{self, DestinationSlot, FsyncFlags};
 use io_uring::{opcode, IoUring};
 use log::warn;
 
 use crate::buf::{StableBuf, StableBufMut};
+use crate::bufring::{BufRingBuf, RecvBufRing};
 use crate::fd::{FdTarget, NornFd, OpFd, UringFd};
 use crate::fixedbuf::FixedBuf;
 use crate::fs::{self, OpenOptions};
+use crate::net::socket::{RecvRingMulti, RingReceive, RingRecvStream};
 use crate::net::{Recv, Send};
-use crate::operation::{CQEResult, Operation, Singleshot};
+use crate::operation::{CQEResult, Op, Operation, Singleshot};
 use crate::Handle;
 
 const LOG: &str = "norn_uring::fixedfile";
@@ -414,6 +420,25 @@ impl FixedFd {
         self.slot.handle().submit(send)
     }
 
+    /// Receive from a connected socket with a multishot receive into a
+    /// provided buffer ring.
+    ///
+    /// See [`FixedRecvRingMulti`].
+    ///
+    /// # Panics
+    ///
+    /// Panics when the buffer ring was registered with another driver.
+    #[track_caller]
+    pub fn recv_ring_multi(&self, ring: &RecvBufRing) -> FixedRecvRingMulti {
+        assert!(
+            ring.same_driver(self.slot.handle()),
+            "buffer ring and fixed file must target the same driver"
+        );
+        FixedRecvRingMulti {
+            inner: Some(RingRecvStream::new(self.slot.clone(), ring, 0)),
+        }
+    }
+
     /// Install this file into the process file table with `IORING_OP_FIXED_FD_INSTALL`.
     ///
     /// The returned descriptor is close-on-exec and refers to the same open
@@ -456,6 +481,62 @@ impl FixedFd {
             return self.slot.clear_now();
         }
         handle.submit(CloseFixed { slot: self.slot }).await
+    }
+}
+
+pin_project_lite::pin_project! {
+    /// A multishot receive into a provided buffer ring on a registered socket.
+    ///
+    /// Returned by [`FixedFd::recv_ring_multi`]. Like
+    /// [`TcpRecvRingMulti`](crate::net::TcpRecvRingMulti), it yields received
+    /// buffers in order, re-arms when the kernel ends the receive, pauses at the
+    /// ring's unconsumed limit without losing data, and ends at the peer's
+    /// orderly shutdown. Each receive retains the slot, so the file stays in
+    /// the table until the stream and its in-flight receive are gone.
+    pub struct FixedRecvRingMulti {
+        #[pin]
+        inner: Option<RingRecvStream<RecvRingMulti<Slot>>>,
+    }
+}
+
+impl std::fmt::Debug for FixedRecvRingMulti {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FixedRecvRingMulti")
+            .field("ended", &self.inner.is_none())
+            .finish()
+    }
+}
+
+impl Stream for FixedRecvRingMulti {
+    type Item = io::Result<BufRingBuf>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let mut this = self.project();
+        let Some(inner) = this.inner.as_mut().as_pin_mut() else {
+            return Poll::Ready(None);
+        };
+        match ready!(inner.poll_next(cx)) {
+            // An orderly shutdown completes with an empty buffer.
+            Some(Ok(buffer)) if buffer.capacity() == 0 => {
+                this.inner.set(None);
+                Poll::Ready(None)
+            }
+            item @ Some(_) => Poll::Ready(item),
+            None => {
+                this.inner.set(None);
+                Poll::Ready(None)
+            }
+        }
+    }
+}
+
+impl RingReceive for RecvRingMulti<Slot> {
+    type Buffer = BufRingBuf;
+    type Source = Slot;
+
+    fn receive(slot: &Slot, ring: &RecvBufRing, flags: i32) -> Op<Self> {
+        let op = RecvRingMulti::new(slot.clone(), ring.clone(), flags);
+        slot.handle().submit(op)
     }
 }
 
