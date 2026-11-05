@@ -1,13 +1,12 @@
 //! Owned fixed buffers registered with an io_uring driver.
 //!
-//! A [`FixedBufPool`] owns a dense immutable
-//! table of caller-provided buffers. Each registered slot can be acquired as
-//! one non-cloneable [`FixedBuf`] which fixed I/O
-//! operations consume and return.
-//!
-//! A [`FixedBufTable`] instead registers empty slots whose buffers can be
-//! installed, replaced, and removed individually while other slots stay in
-//! use. A driver holds at most one pool or table at a time.
+//! A [`FixedBufTable`] owns a table of caller-provided buffers registered
+//! with one driver. Each installed slot can be acquired as one non-cloneable
+//! [`FixedBuf`] which fixed I/O operations consume and return, and buffers can
+//! be installed, replaced, and removed one slot at a time while other slots
+//! stay in use. [`Handle::register_fixed_buffers`] registers a table with
+//! every slot installed; [`Handle::register_sparse_fixed_buffers`] registers
+//! one with every slot vacant. A driver holds at most one table at a time.
 //!
 //! `Vec<u8>` and `BytesMut` expose only their initialized lengths. Resize them
 //! before registration; `Vec::with_capacity(N)` and
@@ -17,8 +16,8 @@
 //! use norn_uring::{fs::File, Handle};
 //!
 //! # async fn example(file: &File) -> Result<(), Box<dyn std::error::Error>> {
-//! let pool = Handle::current().register_fixed_buffers(vec![vec![0u8; 4096]])?;
-//! let buf = pool.try_acquire()?;
+//! let table = Handle::current().register_fixed_buffers(vec![vec![0u8; 4096]])?;
+//! let buf = table.try_acquire()?;
 //!
 //! let (result, mut buf) = file.read_fixed_at(buf, 0).await;
 //! let read = result?;
@@ -38,7 +37,7 @@
 //! }
 //! drop(buf);
 //!
-//! let original = pool.unregister()?;
+//! let original = table.unregister()?;
 //! assert_eq!(original.len(), 1);
 //! # Ok(())
 //! # }
@@ -67,24 +66,9 @@ pub use crate::buf::FixedBuffer;
 
 const MAX_FIXED_BUFFERS: usize = 1 << 14;
 
-/// An owned dense table of buffers registered with one `io_uring` driver.
+/// Exclusive ownership of one slot in a [`FixedBufTable`].
 ///
-/// The pool is not cloneable. Borrow it to acquire multiple slots, and call
-/// [`FixedBufPool::unregister`] to recover the original buffers.
-///
-/// Local tasks can share acquisition through `Rc<FixedBufPool<_>>` and recover
-/// the pool with `Rc::try_unwrap` before unregistering. Alternatively, acquire
-/// buffers up front and move each [`FixedBuf`] into its task.
-///
-/// Dropping the pool performs safe best-effort release. Use explicit
-/// [`FixedBufPool::unregister`] when release errors or ownership recovery matter.
-pub struct FixedBufPool<B: 'static> {
-    inner: Rc<Inner<B>>,
-}
-
-/// Exclusive ownership of one slot in a [`FixedBufPool`].
-///
-/// This type is not cloneable. Dropping it returns its whole slot to the pool.
+/// This type is not cloneable. Dropping it returns its whole slot to the table.
 /// The underlying `B` remains inaccessible while registered; keep application
 /// metadata externally and associate it with [`FixedBuf::index`].
 pub struct FixedBuf<B: 'static> {
@@ -105,14 +89,8 @@ struct Inner<B: 'static> {
     free_head: Cell<Option<usize>>,
 }
 
-enum Storage<B> {
-    /// Values registered together by a [`FixedBufPool`].
-    Dense(Box<[UnsafeCell<B>]>),
-    /// Separately allocated values installed in a [`FixedBufTable`].
-    Sparse(SparseStorage<B>),
-}
-
-struct SparseStorage<B> {
+/// Separately allocated values installed in a [`FixedBufTable`]'s slots.
+struct Storage<B> {
     slots: Box<[Cell<Option<SlotValue<B>>>]>,
     /// A replacement whose region was passed to a kernel update that has not
     /// returned. It is only left here if that update unwinds.
@@ -141,8 +119,8 @@ fn fixed_region_ptr(region: &mut [u8]) -> NonNull<u8> {
 /// Why fixed-buffer registration failed.
 #[derive(Debug)]
 pub enum RegisterErrorKind {
-    /// No buffers were supplied.
-    EmptyPool,
+    /// No buffers were supplied, or a sparse table of zero slots was requested.
+    Empty,
     /// One buffer exposed an empty registered region.
     EmptyBuffer {
         /// Index of the empty buffer.
@@ -188,13 +166,13 @@ pub enum RegisterErrorKind {
 impl fmt::Display for RegisterErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::EmptyPool => f.write_str("fixed-buffer pool must not be empty"),
+            Self::Empty => f.write_str("a fixed-buffer table must have at least one slot"),
             Self::EmptyBuffer { index } => {
                 write!(f, "fixed buffer at index {index} exposes an empty region")
             }
             Self::TooManyBuffers { count, max } => write!(
                 f,
-                "fixed-buffer pool contains {count} buffers, exceeding the limit of {max}"
+                "fixed-buffer table has {count} slots, exceeding the limit of {max}"
             ),
             Self::BufferTooLarge { index, len, max } => write!(
                 f,
@@ -279,7 +257,7 @@ pub enum AcquireError {
     #[error("no fixed buffer is currently available")]
     Exhausted,
     /// The requested table index does not exist.
-    #[error("fixed-buffer index {index} is out of bounds for a pool of length {len}")]
+    #[error("fixed-buffer index {index} is out of bounds for a table of length {len}")]
     InvalidIndex {
         /// Requested index.
         index: usize,
@@ -344,12 +322,12 @@ impl LengthError {
 /// Why explicit fixed-buffer unregistration failed.
 #[derive(Debug)]
 pub enum UnregisterErrorKind {
-    /// One or more [`FixedBuf`] values still own pool slots.
+    /// One or more [`FixedBuf`] values still own table slots.
     Busy {
         /// Number of acquired slots, including buffers owned by operations.
         acquired: usize,
     },
-    /// The driver's active table did not match this pool's generation.
+    /// The driver's active table did not match this table's generation.
     StateMismatch,
     /// The driver was temporarily borrowed by another operation.
     DriverBorrowed,
@@ -364,7 +342,7 @@ impl fmt::Display for UnregisterErrorKind {
                 write!(f, "{acquired} fixed buffer(s) are still acquired")
             }
             Self::StateMismatch => {
-                f.write_str("the driver's fixed-buffer generation does not match this pool")
+                f.write_str("the driver's fixed-buffer generation does not match this table")
             }
             Self::DriverBorrowed => {
                 f.write_str("the io_uring driver is currently borrowed; retry unregistration")
@@ -383,54 +361,12 @@ impl Error for UnregisterErrorKind {
     }
 }
 
-/// An unregistration failure which retains the intact pool.
-pub struct UnregisterError<B: 'static> {
-    kind: UnregisterErrorKind,
-    pool: FixedBufPool<B>,
-}
-
-impl<B: 'static> UnregisterError<B> {
-    /// Return the reason unregistration failed.
-    pub fn kind(&self) -> &UnregisterErrorKind {
-        &self.kind
-    }
-
-    /// Recover the intact pool so unregistration can be retried.
-    pub fn into_pool(self) -> FixedBufPool<B> {
-        self.pool
-    }
-
-    /// Split this error into its reason and intact pool.
-    pub fn into_parts(self) -> (UnregisterErrorKind, FixedBufPool<B>) {
-        (self.kind, self.pool)
-    }
-}
-
-impl<B: 'static> fmt::Debug for UnregisterError<B> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("UnregisterError")
-            .field("kind", &self.kind)
-            .field("pool", &self.pool)
-            .finish()
-    }
-}
-
-impl<B: 'static> fmt::Display for UnregisterError<B> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.kind.fmt(f)
-    }
-}
-
-impl<B: 'static> Error for UnregisterError<B> {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        self.kind.source()
-    }
-}
-
 impl Handle {
-    /// Register a caller-owned dense table of fixed buffers with this driver.
+    /// Register a table of caller-owned fixed buffers with this driver, with
+    /// one installed slot per buffer, in input order.
     ///
-    /// On failure, the returned [`RegisterError`] retains every input buffer.
+    /// All buffers are registered in one `io_uring_register(2)` call. Slots
+    /// can later be replaced or removed through the returned table. On failure, the returned [`RegisterError`] retains every input buffer.
     /// `Vec<u8>` and `BytesMut` values must be resized to their intended
     /// registered lengths before this call; spare capacity is not registered.
     ///
@@ -441,7 +377,7 @@ impl Handle {
     pub fn register_fixed_buffers<B>(
         &self,
         buffers: Vec<B>,
-    ) -> Result<FixedBufPool<B>, RegisterError<B>>
+    ) -> Result<FixedBufTable<B>, RegisterError<B>>
     where
         B: FixedBuffer + 'static,
     {
@@ -464,7 +400,7 @@ impl Handle {
     /// # Safety
     ///
     /// Every returned slice must obey the complete [`FixedBuffer`] safety
-    /// contract until the returned pool is successfully unregistered or its
+    /// contract until the returned table is successfully unregistered or its
     /// `io_uring` is destroyed. Regions selected from different values must not
     /// overlap; registration also checks and rejects overlapping intervals.
     ///
@@ -472,19 +408,22 @@ impl Handle {
     ///
     /// Returns [`RegisterError`] under the same conditions as
     /// [`Handle::register_fixed_buffers`], retaining every input value. This
-    /// includes regions which overlap another selected region in the pool.
+    /// includes regions which overlap another selected region in the table.
+    ///
+    /// The projection applies only to the buffers registered here. Installing
+    /// or replacing a buffer later requires `B: FixedBuffer`.
     pub unsafe fn register_fixed_buffers_with<B, F>(
         &self,
         buffers: Vec<B>,
         mut region: F,
-    ) -> Result<FixedBufPool<B>, RegisterError<B>>
+    ) -> Result<FixedBufTable<B>, RegisterError<B>>
     where
         B: 'static,
         F: for<'a> FnMut(&'a mut B) -> &'a mut [u8],
     {
         if buffers.is_empty() {
             return Err(RegisterError {
-                kind: RegisterErrorKind::EmptyPool,
+                kind: RegisterErrorKind::Empty,
                 buffers,
             });
         }
@@ -511,54 +450,53 @@ impl Handle {
             }
         };
 
-        let cells = buffers
-            .into_iter()
-            .map(UnsafeCell::new)
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        let buffer_count = cells.len();
-        let mut storage = Box::new(Storage::Dense(cells));
+        let buffer_count = buffers.len();
+        let storage = Box::new(Storage::filled(buffers));
         let mut slots = Vec::with_capacity(buffer_count);
         let mut iovecs = Vec::with_capacity(buffer_count);
         let mut intervals = Vec::with_capacity(buffer_count);
 
-        let Storage::Dense(cells) = &mut *storage else {
-            unreachable!("dense registration created sparse storage");
-        };
-        for (index, cell) in cells.iter_mut().enumerate() {
-            let selected = region(cell.get_mut());
-            if selected.is_empty() {
+        for (index, cell) in storage.slots.iter().enumerate() {
+            let mut value = cell
+                .take()
+                .expect("filled fixed-buffer storage has a vacant slot");
+            // The region is derived from the value's own allocation, so it
+            // stays valid when the value goes back into its slot.
+            let selected = value.project(&mut region);
+            let selected_len = selected.len();
+            let ptr = (!selected.is_empty()).then(|| fixed_region_ptr(selected));
+            cell.set(Some(value));
+            let Some(ptr) = ptr else {
                 return Err(RegisterError {
                     kind: RegisterErrorKind::EmptyBuffer { index },
-                    buffers: (*storage).into_buffers(),
+                    buffers: (*storage).into_values(),
                 });
-            }
-            if selected.len() > u32::MAX as usize {
+            };
+            if selected_len > u32::MAX as usize {
                 return Err(RegisterError {
                     kind: RegisterErrorKind::BufferTooLarge {
                         index,
-                        len: selected.len(),
+                        len: selected_len,
                         max: u32::MAX as usize,
                     },
-                    buffers: (*storage).into_buffers(),
+                    buffers: (*storage).into_values(),
                 });
             }
 
-            let ptr = fixed_region_ptr(selected);
             let start = ptr.as_ptr() as usize;
             let end = start
-                .checked_add(selected.len())
+                .checked_add(selected_len)
                 .expect("FixedBuffer returned an address range which wraps usize");
             intervals.push((start, end, index));
             slots.push(SlotMeta {
                 ptr: Cell::new(ptr),
-                len: Cell::new(selected.len() as u32),
+                len: Cell::new(selected_len as u32),
                 acquired: Cell::new(false),
                 next_free: Cell::new((index + 1 < buffer_count).then_some(index + 1)),
             });
             iovecs.push(libc::iovec {
                 iov_base: ptr.as_ptr().cast(),
-                iov_len: selected.len(),
+                iov_len: selected_len,
             });
         }
 
@@ -568,7 +506,7 @@ impl Handle {
             let second = pair[0].2.max(pair[1].2);
             return Err(RegisterError {
                 kind: RegisterErrorKind::OverlappingBuffers { first, second },
-                buffers: (*storage).into_buffers(),
+                buffers: (*storage).into_values(),
             });
         }
 
@@ -599,111 +537,42 @@ impl Handle {
             let inner = unwrap_unregistered(inner);
             return Err(RegisterError {
                 kind: map_register_io_error(err),
-                buffers: inner.into_buffers(),
+                buffers: inner.into_values(),
             });
         }
 
         let _ = reservation.commit();
 
-        Ok(FixedBufPool { inner })
+        Ok(FixedBufTable { inner })
     }
 }
 
-impl<B: 'static> FixedBufPool<B> {
-    /// Acquire any currently free registered slot.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`AcquireError::Exhausted`] when every slot is acquired.
-    pub fn try_acquire(&self) -> Result<FixedBuf<B>, AcquireError> {
-        self.inner.try_acquire()
-    }
-
-    /// Acquire a specific registered slot by kernel-table index.
-    ///
-    /// This searches the free list and is O(pool length). Prefer
-    /// [`FixedBufPool::try_acquire`] on request hot paths.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`AcquireError::InvalidIndex`] for an unknown index or
-    /// [`AcquireError::InUse`] when that slot is already acquired.
-    pub fn try_acquire_at(&self, index: usize) -> Result<FixedBuf<B>, AcquireError> {
-        self.inner.try_acquire_at(index)
-    }
-
-    /// Unregister the table and recover the original buffers in input order.
-    ///
-    /// # Errors
-    ///
-    /// [`UnregisterErrorKind::Busy`] is retryable after dropping the reported
-    /// acquired buffers or operations. [`UnregisterErrorKind::DriverBorrowed`]
-    /// is transient and can be retried later. OS errors retain the intact pool
-    /// for caller-directed retry. A state mismatch is an invariant failure;
-    /// dropping the returned pool conservatively retains its storage until the
-    /// ring is destroyed.
-    pub fn unregister(self) -> Result<Vec<B>, UnregisterError<B>> {
-        let inner = match Rc::try_unwrap(self.inner) {
-            Ok(inner) => inner,
-            Err(inner) => {
-                let acquired = Rc::strong_count(&inner).saturating_sub(1);
-                return Err(UnregisterError {
-                    kind: UnregisterErrorKind::Busy { acquired },
-                    pool: Self { inner },
-                });
-            }
-        };
-        let inner = inner;
-
-        match inner.driver.unregister(inner.generation) {
-            Ok(FixedBufRelease::Unregistered | FixedBufRelease::RingGone) => {
-                inner.registered.set(false);
-                Ok(inner.into_buffers())
-            }
-            Err(err) => {
-                let kind = map_release_error(err);
-                Err(UnregisterError {
-                    kind,
-                    pool: Self {
-                        inner: Rc::new(inner),
-                    },
-                })
-            }
-        }
-    }
-
-    /// Return the number of registered slots.
-    pub fn len(&self) -> usize {
-        self.inner.slots.len()
-    }
-
-    /// Return whether this pool contains no slots.
-    pub fn is_empty(&self) -> bool {
-        self.inner.slots.is_empty()
-    }
-}
-
-/// A sparse table of separately replaceable fixed buffers.
+/// A table of fixed buffers registered with one `io_uring` driver.
 ///
-/// Created by [`Handle::register_sparse_fixed_buffers`], a table reserves
-/// `len` kernel slots, all initially vacant. Buffers can then be installed,
-/// replaced, or removed one slot at a time, without unregistering the table
-/// or returning buffers held in other slots. Acquired slots yield the same
-/// [`FixedBuf`] leases as a [`FixedBufPool`].
+/// [`Handle::register_fixed_buffers`] creates a table with one installed slot
+/// per buffer, and [`Handle::register_sparse_fixed_buffers`] creates one whose
+/// `len` slots are all vacant. Buffers can be installed, replaced, or removed
+/// one slot at a time, without unregistering the table or returning buffers
+/// held in other slots. Each installed slot can be acquired as one
+/// [`FixedBuf`].
+///
+/// The table is not cloneable. Local tasks can share acquisition through
+/// `Rc<FixedBufTable<_>>` and recover the table with `Rc::try_unwrap` before
+/// unregistering. Alternatively, acquire buffers up front and move each
+/// [`FixedBuf`] into its task.
 ///
 /// A slot can be replaced or removed only while it is not acquired. Fixed I/O
 /// operations own their [`FixedBuf`] until the kernel's terminal completion,
 /// so no submitted operation can observe a slot change: the kernel resolves a
 /// slot when it issues an operation, which may be after submission.
 ///
-/// Each value is allocated separately, and slot changes are synchronous
-/// `io_uring_register(2)` calls. Prefer [`FixedBufPool`] for a fixed set of
-/// buffers.
+/// Each value is allocated separately, so its region stays put while other
+/// slots change. Slot changes are synchronous `io_uring_register(2)` calls
+/// and require Linux 5.13.
 ///
-/// Like a pool, the table occupies the driver's single fixed-buffer table.
-/// Dropping it performs safe best-effort release; use
-/// [`FixedBufTable::unregister`] when release errors or ownership recovery
-/// matter.
+/// The table occupies the driver's single fixed-buffer table. Dropping it
+/// performs safe best-effort release; use [`FixedBufTable::unregister`] when
+/// release errors or ownership recovery matter.
 pub struct FixedBufTable<B: 'static> {
     inner: Rc<Inner<B>>,
 }
@@ -850,12 +719,12 @@ impl<B> Error for SlotError<B> {
 }
 
 /// A table unregistration failure which retains the intact table.
-pub struct UnregisterTableError<B: 'static> {
+pub struct UnregisterError<B: 'static> {
     kind: UnregisterErrorKind,
     table: FixedBufTable<B>,
 }
 
-impl<B: 'static> UnregisterTableError<B> {
+impl<B: 'static> UnregisterError<B> {
     /// Return the reason unregistration failed.
     pub fn kind(&self) -> &UnregisterErrorKind {
         &self.kind
@@ -872,22 +741,22 @@ impl<B: 'static> UnregisterTableError<B> {
     }
 }
 
-impl<B: 'static> fmt::Debug for UnregisterTableError<B> {
+impl<B: 'static> fmt::Debug for UnregisterError<B> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("UnregisterTableError")
+        f.debug_struct("UnregisterError")
             .field("kind", &self.kind)
             .field("table", &self.table)
             .finish()
     }
 }
 
-impl<B: 'static> fmt::Display for UnregisterTableError<B> {
+impl<B: 'static> fmt::Display for UnregisterError<B> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.kind.fmt(f)
     }
 }
 
-impl<B: 'static> Error for UnregisterTableError<B> {
+impl<B: 'static> Error for UnregisterError<B> {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         self.kind.source()
     }
@@ -900,7 +769,7 @@ impl Handle {
     ///
     /// # Errors
     ///
-    /// Returns [`RegisterErrorKind::EmptyPool`] for `len == 0`,
+    /// Returns [`RegisterErrorKind::Empty`] for `len == 0`,
     /// [`RegisterErrorKind::TooManyBuffers`] above the kernel's 16384-slot
     /// limit, and otherwise the same driver and kernel errors as
     /// [`Handle::register_fixed_buffers`].
@@ -909,7 +778,7 @@ impl Handle {
         len: usize,
     ) -> Result<FixedBufTable<B>, RegisterErrorKind> {
         if len == 0 {
-            return Err(RegisterErrorKind::EmptyPool);
+            return Err(RegisterErrorKind::Empty);
         }
         if len > MAX_FIXED_BUFFERS {
             return Err(RegisterErrorKind::TooManyBuffers {
@@ -931,7 +800,7 @@ impl Handle {
             driver: self.fixed_buf_driver(),
             generation: reservation.generation(),
             registered: Cell::new(true),
-            storage: Some(Box::new(Storage::Sparse(SparseStorage::new(len)))),
+            storage: Some(Box::new(Storage::new(len))),
             slots,
             free_head: Cell::new(None),
         });
@@ -966,7 +835,7 @@ impl<B: 'static> FixedBufTable<B> {
         B: FixedBuffer,
     {
         let inner = &*self.inner;
-        let storage = inner.sparse();
+        let storage = inner.storage();
         let Some(slot) = inner.slots.get(index) else {
             return Err(SlotError {
                 kind: self.invalid_index(index),
@@ -975,7 +844,7 @@ impl<B: 'static> FixedBufTable<B> {
         };
         // The storage check also covers a value left behind by an install
         // whose kernel update unwound.
-        if slot.len.get() != 0 || SparseStorage::is_occupied(&storage.slots[index]) {
+        if slot.len.get() != 0 || Storage::is_occupied(&storage.slots[index]) {
             return Err(SlotError {
                 kind: SlotErrorKind::Occupied { index },
                 buffer,
@@ -1045,7 +914,7 @@ impl<B: 'static> FixedBufTable<B> {
         B: FixedBuffer,
     {
         let inner = &*self.inner;
-        let storage = inner.sparse();
+        let storage = inner.storage();
         if let Err(kind) = self.check_releasable(index) {
             return Err(SlotError { kind, buffer });
         }
@@ -1055,7 +924,7 @@ impl<B: 'static> FixedBufTable<B> {
                 buffer,
             });
         }
-        if SparseStorage::is_occupied(&storage.staged) {
+        if Storage::is_occupied(&storage.staged) {
             return Err(SlotError {
                 kind: SlotErrorKind::StateMismatch,
                 buffer,
@@ -1142,7 +1011,7 @@ impl<B: 'static> FixedBufTable<B> {
         slot.acquired.set(false);
         match result {
             Ok(()) | Err(FixedBufUpdateError::RingGone) => {
-                let value = inner.sparse().slots[index]
+                let value = inner.storage().slots[index]
                     .take()
                     .expect("installed fixed-buffer slot has no value");
                 slot.len.set(0);
@@ -1190,14 +1059,18 @@ impl<B: 'static> FixedBufTable<B> {
     ///
     /// # Errors
     ///
-    /// Fails under the same conditions as [`FixedBufPool::unregister`],
-    /// returning the intact table.
-    pub fn unregister(self) -> Result<Vec<Option<B>>, UnregisterTableError<B>> {
+    /// [`UnregisterErrorKind::Busy`] is retryable after dropping the reported
+    /// acquired buffers or operations. [`UnregisterErrorKind::DriverBorrowed`]
+    /// is transient and can be retried later. OS errors retain the intact
+    /// table for caller-directed retry. A state mismatch is an invariant
+    /// failure; dropping the returned table conservatively retains its storage
+    /// until the ring is destroyed.
+    pub fn unregister(self) -> Result<Vec<Option<B>>, UnregisterError<B>> {
         let inner = match Rc::try_unwrap(self.inner) {
             Ok(inner) => inner,
             Err(inner) => {
                 let acquired = Rc::strong_count(&inner).saturating_sub(1);
-                return Err(UnregisterTableError {
+                return Err(UnregisterError {
                     kind: UnregisterErrorKind::Busy { acquired },
                     table: Self { inner },
                 });
@@ -1209,7 +1082,7 @@ impl<B: 'static> FixedBufTable<B> {
                 inner.registered.set(false);
                 Ok(inner.into_slots())
             }
-            Err(err) => Err(UnregisterTableError {
+            Err(err) => Err(UnregisterError {
                 kind: map_release_error(err),
                 table: Self {
                     inner: Rc::new(inner),
@@ -1435,7 +1308,7 @@ impl<B: 'static> FixedBuf<B> {
 
     /// Return the logical payload.
     pub fn as_slice(&self) -> &[u8] {
-        // Safety: the pool retains the initialized registered storage and this
+        // Safety: the table retains the initialized registered storage and this
         // exclusive FixedBuf owns the whole slot.
         unsafe { std::slice::from_raw_parts(self.view_ptr(), self.len as usize) }
     }
@@ -1552,7 +1425,7 @@ impl<B: 'static> AsMut<[u8]> for FixedBuf<B> {
     }
 }
 
-// Safety: the pool keeps the registered region stable and initialized, while
+// Safety: the table keeps the registered region stable and initialized, while
 // this non-cloneable value owns its whole slot.
 unsafe impl<B: 'static> StableBuf for FixedBuf<B> {
     fn stable_ptr(&self) -> *const u8 {
@@ -1564,7 +1437,7 @@ unsafe impl<B: 'static> StableBuf for FixedBuf<B> {
     }
 }
 
-// Safety: the pool keeps the selected region stable and this non-cloneable
+// Safety: the table keeps the selected region stable and this non-cloneable
 // value provides exclusive access to its whole slot.
 unsafe impl<B: 'static> StableBufMut for FixedBuf<B> {
     fn stable_ptr_mut(&mut self) -> *mut u8 {
@@ -1584,14 +1457,6 @@ unsafe impl<B: 'static> StableBufMut for FixedBuf<B> {
     }
 }
 
-impl<B: 'static> fmt::Debug for FixedBufPool<B> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("FixedBufPool")
-            .field("len", &self.len())
-            .finish()
-    }
-}
-
 impl<B: 'static> fmt::Debug for FixedBuf<B> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FixedBuf")
@@ -1602,36 +1467,41 @@ impl<B: 'static> fmt::Debug for FixedBuf<B> {
     }
 }
 
-impl<B: 'static> Storage<B> {
-    fn into_buffers(self) -> Vec<B> {
-        let Self::Dense(buffers) = self else {
-            unreachable!("fixed-buffer pool has sparse storage");
-        };
-        Vec::from(buffers)
-            .into_iter()
-            .map(UnsafeCell::into_inner)
-            .collect()
-    }
-
-    fn into_slots(self) -> Vec<Option<B>> {
-        let Self::Sparse(storage) = self else {
-            unreachable!("fixed-buffer table has dense storage");
-        };
-        // A staged replacement exists only after an unwound kernel update. It
-        // is dropped here, once the table is no longer registered.
-        Vec::from(storage.slots)
-            .into_iter()
-            .map(|slot| slot.into_inner().map(SlotValue::into_inner))
-            .collect()
-    }
-}
-
-impl<B> SparseStorage<B> {
+impl<B> Storage<B> {
     fn new(len: usize) -> Self {
         Self {
             slots: (0..len).map(|_| Cell::new(None)).collect(),
             staged: Cell::new(None),
         }
+    }
+
+    /// Storage with one installed value per slot, in order.
+    fn filled(values: Vec<B>) -> Self {
+        Self {
+            slots: values
+                .into_iter()
+                .map(|value| Cell::new(Some(SlotValue::new(value))))
+                .collect(),
+            staged: Cell::new(None),
+        }
+    }
+
+    fn into_slots(self) -> Vec<Option<B>> {
+        // A staged replacement exists only after an unwound kernel update. It
+        // is dropped here, once the table is no longer registered.
+        Vec::from(self.slots)
+            .into_iter()
+            .map(|slot| slot.into_inner().map(SlotValue::into_inner))
+            .collect()
+    }
+
+    /// Recover the values of storage created by [`Storage::filled`] whose
+    /// registration never became active.
+    fn into_values(self) -> Vec<B> {
+        self.into_slots()
+            .into_iter()
+            .map(|value| value.expect("filled fixed-buffer storage lost a value"))
+            .collect()
     }
 
     fn is_occupied(cell: &Cell<Option<SlotValue<B>>>) -> bool {
@@ -1680,9 +1550,9 @@ impl<B> Drop for SlotValue<B> {
 }
 
 impl<B: 'static> Inner<B> {
-    fn into_buffers(mut self) -> Vec<B> {
+    fn into_values(mut self) -> Vec<B> {
         self.registered.set(false);
-        (*self.storage.take().expect("fixed-buffer storage missing")).into_buffers()
+        (*self.storage.take().expect("fixed-buffer storage missing")).into_values()
     }
 
     fn into_slots(mut self) -> Vec<Option<B>> {
@@ -1690,11 +1560,10 @@ impl<B: 'static> Inner<B> {
         (*self.storage.take().expect("fixed-buffer storage missing")).into_slots()
     }
 
-    fn sparse(&self) -> &SparseStorage<B> {
-        match self.storage.as_deref() {
-            Some(Storage::Sparse(storage)) => storage,
-            _ => unreachable!("fixed-buffer table is missing sparse storage"),
-        }
+    fn storage(&self) -> &Storage<B> {
+        self.storage
+            .as_deref()
+            .expect("fixed-buffer table storage missing")
     }
 
     fn try_acquire(self: &Rc<Self>) -> Result<FixedBuf<B>, AcquireError> {
@@ -1798,7 +1667,7 @@ impl<B: 'static> Drop for Inner<B> {
 fn unwrap_unregistered<B: 'static>(inner: Rc<Inner<B>>) -> Inner<B> {
     match Rc::try_unwrap(inner) {
         Ok(inner) => inner,
-        Err(_) => unreachable!("unpublished fixed-buffer pool was shared"),
+        Err(_) => unreachable!("unpublished fixed-buffer table was shared"),
     }
 }
 
@@ -2062,22 +1931,18 @@ mod tests {
         let drops = Rc::new(Cell::new(0));
         let reservation = handle.reserve_fixed_buffers().unwrap();
         let generation = reservation.generation();
-        let mut storage = Box::new(Storage::Dense(
-            vec![UnsafeCell::new(DropTracked {
-                bytes: [0; 8],
-                drops: Rc::clone(&drops),
-            })]
-            .into_boxed_slice(),
-        ));
-        let Storage::Dense(cells) = &mut *storage else {
-            unreachable!();
-        };
-        let selected = cells[0].get_mut().fixed_region();
+        let storage = Box::new(Storage::filled(vec![DropTracked {
+            bytes: [0; 8],
+            drops: Rc::clone(&drops),
+        }]));
+        let mut value = storage.slots[0].take().unwrap();
+        let selected = value.project(FixedBuffer::fixed_region);
         let ptr = fixed_region_ptr(selected);
         let iovec = libc::iovec {
             iov_base: ptr.as_ptr().cast(),
             iov_len: selected.len(),
         };
+        storage.slots[0].set(Some(value));
         let inner = Rc::new(Inner {
             driver: handle.fixed_buf_driver(),
             generation,
@@ -2115,7 +1980,7 @@ mod tests {
     }
 
     #[test]
-    fn pool_recovers_after_driver_destruction_with_an_outstanding_lease() -> io::Result<()> {
+    fn table_recovers_after_driver_destruction_with_an_outstanding_lease() -> io::Result<()> {
         let driver = crate::Driver::new(io_uring::IoUring::builder(), 8)?;
         let handle = driver.handle();
         let pool = handle
@@ -2130,7 +1995,7 @@ mod tests {
         let buffers = pool
             .unregister()
             .map_err(|err| io::Error::other(err.to_string()))?;
-        assert_eq!(buffers, vec![[0u8; 8]]);
+        assert_eq!(buffers, vec![Some([0u8; 8])]);
         Ok(())
     }
 
@@ -2178,7 +2043,7 @@ mod tests {
         let handle = driver.handle();
         assert!(matches!(
             handle.register_sparse_fixed_buffers::<Vec<u8>>(0),
-            Err(RegisterErrorKind::EmptyPool)
+            Err(RegisterErrorKind::Empty)
         ));
         assert!(matches!(
             handle.register_sparse_fixed_buffers::<Vec<u8>>(MAX_FIXED_BUFFERS + 1),
