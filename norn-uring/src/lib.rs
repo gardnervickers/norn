@@ -54,6 +54,7 @@
 //! - [`bufring`]: registered `io_uring` buffer-ring support.
 //! - [`fixedbuf`]: caller-owned buffers registered for fixed I/O.
 //! - [`fs`]: asynchronous filesystem operations.
+//! - [`futex`]: process-private futex waits and wakes.
 //! - [`net`]: asynchronous TCP and UDP networking.
 //! - [`uring_cmd`]: the low-level device-command extension contract.
 //!
@@ -103,6 +104,8 @@ pub mod bufring;
 pub mod fixedbuf;
 /// Asynchronous filesystem operations.
 pub mod fs;
+/// Process-private futex waits and wakes.
+pub mod futex;
 /// Asynchronous TCP and UDP networking.
 pub mod net;
 /// Device-specific commands submitted through `IORING_OP_URING_CMD`.
