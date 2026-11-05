@@ -6,6 +6,7 @@
 mod dir;
 mod file;
 mod opts;
+mod rw_opts;
 
 use std::io;
 
@@ -17,6 +18,7 @@ pub use dir::{
 };
 pub use file::{pipe, File, PipeReader, PipeWriter};
 pub use opts::OpenOptions;
+pub use rw_opts::{ReadOptions, WriteOptions, WriteStream};
 
 fn complete_get_xattr<B>(buf: &mut B, submitted_len: u32, result: u32) -> io::Result<usize>
 where
