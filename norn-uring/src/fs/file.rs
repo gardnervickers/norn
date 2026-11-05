@@ -7,7 +7,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 use crate::buf::{set_init_checked, StableBuf, StableBufMut};
-use crate::fd::{NornFd, UringFd};
+use crate::fd::{with_fd_target, NornFd, OpFd, UringFd};
 use crate::fixedbuf::FixedBuf;
 use crate::fs::opts;
 use crate::net::socket::Poll;
@@ -746,18 +746,18 @@ fn u64_to_off_t(len: u64, what: &'static str) -> io::Result<libc::off_t> {
 }
 
 #[derive(Debug)]
-struct ReadAt<B> {
-    fd: NornFd,
+pub(crate) struct ReadAt<B, F = NornFd> {
+    fd: F,
     buf: B,
     offset: u64,
     submitted_len: usize,
 }
 
-impl<B> ReadAt<B>
+impl<B, F> ReadAt<B, F>
 where
     B: StableBufMut,
 {
-    fn new(fd: NornFd, buf: B, offset: u64) -> Self {
+    pub(crate) fn new(fd: F, buf: B, offset: u64) -> Self {
         let submitted_len = buf.bytes_remaining();
         Self {
             fd,
@@ -768,11 +768,12 @@ where
     }
 }
 
-// Safety: `NornFd` retains the descriptor and the owned `StableBufMut` keeps
-// the writable region stable and exclusive through the terminal CQE.
-unsafe impl<B> Operation for ReadAt<B>
+// Safety: `F` retains the descriptor and the owned `StableBufMut` keeps the
+// writable region stable and exclusive through the terminal CQE.
+unsafe impl<B, F> Operation for ReadAt<B, F>
 where
     B: StableBufMut,
+    F: OpFd,
 {
     type Completion = CQEResult;
 
@@ -780,9 +781,9 @@ where
         let offset = checked_file_offset(self.offset)?;
         let len = usize_to_u32(self.submitted_len, "read buffer length")?;
         let buf = self.buf.stable_ptr_mut();
-        Ok(opcode::Read::new(self.fd.fd(), buf, len)
-            .offset(offset)
-            .build())
+        Ok(with_fd_target!(self.fd.target(), |fd| {
+            opcode::Read::new(fd, buf, len).offset(offset).build()
+        }))
     }
 
     unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
@@ -790,9 +791,10 @@ where
     }
 }
 
-impl<B> Singleshot for ReadAt<B>
+impl<B, F> Singleshot for ReadAt<B, F>
 where
     B: StableBufMut,
+    F: OpFd,
 {
     type Output = (io::Result<usize>, B);
 
@@ -813,21 +815,22 @@ where
 }
 
 #[derive(Debug)]
-struct ReadFixedAt<B: 'static> {
-    fd: NornFd,
+pub(crate) struct ReadFixedAt<B: 'static, F = NornFd> {
+    fd: F,
     buf: FixedBuf<B>,
     offset: u64,
 }
 
-impl<B: 'static> ReadFixedAt<B> {
-    fn new(fd: NornFd, buf: FixedBuf<B>, offset: u64) -> Self {
+impl<B: 'static, F> ReadFixedAt<B, F> {
+    pub(crate) fn new(fd: F, buf: FixedBuf<B>, offset: u64) -> Self {
         Self { fd, buf, offset }
     }
 }
 
-// Safety: `FixedBuf` owns the registered slot until the terminal CQE and the
-// same-driver check is performed before this operation is constructed.
-unsafe impl<B: 'static> Operation for ReadFixedAt<B> {
+// Safety: `F` retains the descriptor, `FixedBuf` owns the registered slot
+// until the terminal CQE, and the same-driver check is performed before this
+// operation is constructed.
+unsafe impl<B: 'static, F: OpFd> Operation for ReadFixedAt<B, F> {
     type Completion = CQEResult;
 
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
@@ -835,9 +838,11 @@ unsafe impl<B: 'static> Operation for ReadFixedAt<B> {
         let ptr = self.buf.fixed_ptr_mut();
         let len = self.buf.read_capacity_u32();
         let index = self.buf.kernel_index();
-        Ok(opcode::ReadFixed::new(self.fd.fd(), ptr, len, index)
-            .offset(offset)
-            .build())
+        Ok(with_fd_target!(self.fd.target(), |fd| {
+            opcode::ReadFixed::new(fd, ptr, len, index)
+                .offset(offset)
+                .build()
+        }))
     }
 
     unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
@@ -845,7 +850,7 @@ unsafe impl<B: 'static> Operation for ReadFixedAt<B> {
     }
 }
 
-impl<B: 'static> Singleshot for ReadFixedAt<B> {
+impl<B: 'static, F: OpFd> Singleshot for ReadFixedAt<B, F> {
     type Output = (io::Result<usize>, FixedBuf<B>);
 
     fn complete(mut self, result: CQEResult) -> Self::Output {
@@ -862,23 +867,24 @@ impl<B: 'static> Singleshot for ReadFixedAt<B> {
     }
 }
 
-struct WriteAt<B> {
-    fd: NornFd,
+pub(crate) struct WriteAt<B, F = NornFd> {
+    fd: F,
     buf: B,
     offset: u64,
 }
 
-impl<B> WriteAt<B> {
-    fn new(fd: NornFd, buf: B, offset: u64) -> Self {
+impl<B, F> WriteAt<B, F> {
+    pub(crate) fn new(fd: F, buf: B, offset: u64) -> Self {
         Self { fd, buf, offset }
     }
 }
 
-// Safety: `NornFd` retains the descriptor and the owned `StableBuf` keeps its
+// Safety: `F` retains the descriptor and the owned `StableBuf` keeps its
 // initialized bytes stable through every kernel read.
-unsafe impl<B> Operation for WriteAt<B>
+unsafe impl<B, F> Operation for WriteAt<B, F>
 where
     B: StableBuf,
+    F: OpFd,
 {
     type Completion = CQEResult;
 
@@ -886,9 +892,9 @@ where
         let offset = checked_file_offset(self.offset)?;
         let len = usize_to_u32(self.buf.bytes_init(), "write buffer length")?;
         let buf = self.buf.stable_ptr();
-        Ok(opcode::Write::new(self.fd.fd(), buf, len)
-            .offset(offset)
-            .build())
+        Ok(with_fd_target!(self.fd.target(), |fd| {
+            opcode::Write::new(fd, buf, len).offset(offset).build()
+        }))
     }
 
     unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
@@ -896,9 +902,10 @@ where
     }
 }
 
-impl<B> Singleshot for WriteAt<B>
+impl<B, F> Singleshot for WriteAt<B, F>
 where
     B: StableBuf,
+    F: OpFd,
 {
     type Output = (io::Result<usize>, B);
 
@@ -911,21 +918,22 @@ where
 }
 
 #[derive(Debug)]
-struct WriteFixedAt<B: 'static> {
-    fd: NornFd,
+pub(crate) struct WriteFixedAt<B: 'static, F = NornFd> {
+    fd: F,
     buf: FixedBuf<B>,
     offset: u64,
 }
 
-impl<B: 'static> WriteFixedAt<B> {
-    fn new(fd: NornFd, buf: FixedBuf<B>, offset: u64) -> Self {
+impl<B: 'static, F> WriteFixedAt<B, F> {
+    pub(crate) fn new(fd: F, buf: FixedBuf<B>, offset: u64) -> Self {
         Self { fd, buf, offset }
     }
 }
 
-// Safety: `FixedBuf` owns the initialized registered payload until the
-// terminal CQE and the same-driver check happens before construction.
-unsafe impl<B: 'static> Operation for WriteFixedAt<B> {
+// Safety: `F` retains the descriptor, `FixedBuf` owns the initialized
+// registered payload until the terminal CQE, and the same-driver check happens
+// before construction.
+unsafe impl<B: 'static, F: OpFd> Operation for WriteFixedAt<B, F> {
     type Completion = CQEResult;
 
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
@@ -933,9 +941,11 @@ unsafe impl<B: 'static> Operation for WriteFixedAt<B> {
         let ptr = self.buf.fixed_ptr();
         let len = self.buf.write_len_u32();
         let index = self.buf.kernel_index();
-        Ok(opcode::WriteFixed::new(self.fd.fd(), ptr, len, index)
-            .offset(offset)
-            .build())
+        Ok(with_fd_target!(self.fd.target(), |fd| {
+            opcode::WriteFixed::new(fd, ptr, len, index)
+                .offset(offset)
+                .build()
+        }))
     }
 
     unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
@@ -943,7 +953,7 @@ unsafe impl<B: 'static> Operation for WriteFixedAt<B> {
     }
 }
 
-impl<B: 'static> Singleshot for WriteFixedAt<B> {
+impl<B: 'static, F: OpFd> Singleshot for WriteFixedAt<B, F> {
     type Output = (io::Result<usize>, FixedBuf<B>);
 
     fn complete(self, result: CQEResult) -> Self::Output {
@@ -1274,23 +1284,26 @@ where
     }
 }
 
-struct Sync {
-    fd: NornFd,
+pub(crate) struct Sync<F = NornFd> {
+    fd: F,
     flags: FsyncFlags,
 }
 
-impl Sync {
-    fn new(fd: NornFd, flags: FsyncFlags) -> Self {
+impl<F> Sync<F> {
+    pub(crate) fn new(fd: F, flags: FsyncFlags) -> Self {
         Self { fd, flags }
     }
 }
 
-// Safety: `NornFd` retains the descriptor; the SQE references no memory.
-unsafe impl Operation for Sync {
+// Safety: `F` retains the descriptor; the SQE references no memory.
+unsafe impl<F: OpFd> Operation for Sync<F> {
     type Completion = CQEResult;
 
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
-        Ok(opcode::Fsync::new(self.fd.fd()).flags(self.flags).build())
+        let flags = self.flags;
+        Ok(with_fd_target!(self.fd.target(), |fd| {
+            opcode::Fsync::new(fd).flags(flags).build()
+        }))
     }
 
     unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
@@ -1298,7 +1311,7 @@ unsafe impl Operation for Sync {
     }
 }
 
-impl Singleshot for Sync {
+impl<F: OpFd> Singleshot for Sync<F> {
     type Output = io::Result<()>;
 
     fn complete(self, result: CQEResult) -> Self::Output {

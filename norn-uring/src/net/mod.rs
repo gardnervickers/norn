@@ -7,6 +7,7 @@ mod tcp;
 mod udp;
 
 pub use socket::{Event, RecvMsgRingBuf, SendZcResult, SendZcUsage};
+pub(crate) use socket::{Recv, Send};
 pub use tcp::{
     TcpListener, TcpListenerOptions, TcpRecvBundleMulti, TcpRecvRingMulti, TcpSocket, TcpStream,
     TcpStreamReader, TcpStreamWriter,

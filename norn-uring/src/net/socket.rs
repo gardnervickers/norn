@@ -16,7 +16,7 @@ use std::task::{ready, Context, Poll as TaskPoll};
 
 use crate::buf::{set_init_checked, StableBuf, StableBufMut};
 use crate::bufring::{BufRingBuf, BufRingBufBundle, RecvBufRing};
-use crate::fd::{NornFd, UringFd};
+use crate::fd::{with_fd_target, NornFd, OpFd, UringFd};
 use crate::operation::{CQEResult, Multishot, Op, OpTarget, Operation, OperationId, Singleshot};
 
 pub(crate) struct RingRecvCompletion<T> {
@@ -1955,18 +1955,18 @@ impl Singleshot for Shutdown {
     }
 }
 #[derive(Debug)]
-pub(crate) struct Recv<B, const TCP: bool = false> {
-    fd: NornFd,
+pub(crate) struct Recv<B, const TCP: bool = false, F = NornFd> {
+    fd: F,
     buf: B,
     flags: i32,
     submitted_len: usize,
 }
 
-impl<B, const TCP: bool> Recv<B, TCP>
+impl<B, const TCP: bool, F> Recv<B, TCP, F>
 where
     B: StableBufMut,
 {
-    pub(crate) fn new(fd: NornFd, buf: B, flags: i32) -> Self {
+    pub(crate) fn new(fd: F, buf: B, flags: i32) -> Self {
         let submitted_len = buf.bytes_remaining();
         Self {
             fd,
@@ -1977,11 +1977,12 @@ where
     }
 }
 
-// Safety: `NornFd` retains the socket and the owned `StableBufMut` keeps the
+// Safety: `F` retains the socket and the owned `StableBufMut` keeps the
 // writable region stable and exclusive through completion.
-unsafe impl<B, const TCP: bool> Operation for Recv<B, TCP>
+unsafe impl<B, const TCP: bool, F> Operation for Recv<B, TCP, F>
 where
     B: StableBufMut,
+    F: OpFd,
 {
     type Completion = CQEResult;
 
@@ -1994,9 +1995,10 @@ where
         }
         let len = checked_scalar_len(self.submitted_len, "receive buffer length")?;
         let ptr = self.buf.stable_ptr_mut();
-        Ok(opcode::Recv::new(self.fd.fd(), ptr, len)
-            .flags(self.flags)
-            .build())
+        let flags = self.flags;
+        Ok(with_fd_target!(self.fd.target(), |fd| {
+            opcode::Recv::new(fd, ptr, len).flags(flags).build()
+        }))
     }
 
     unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
@@ -2004,9 +2006,10 @@ where
     }
 }
 
-impl<B, const TCP: bool> Singleshot for Recv<B, TCP>
+impl<B, const TCP: bool, F> Singleshot for Recv<B, TCP, F>
 where
     B: StableBufMut,
+    F: OpFd,
 {
     type Output = (io::Result<usize>, B);
 
@@ -2027,35 +2030,37 @@ where
 }
 
 #[derive(Debug)]
-pub(crate) struct Send<B> {
-    fd: NornFd,
+pub(crate) struct Send<B, F = NornFd> {
+    fd: F,
     buf: B,
     flags: i32,
 }
 
-impl<B> Send<B>
+impl<B, F> Send<B, F>
 where
     B: StableBuf,
 {
-    pub(crate) fn new(fd: NornFd, buf: B, flags: i32) -> Self {
+    pub(crate) fn new(fd: F, buf: B, flags: i32) -> Self {
         Self { fd, buf, flags }
     }
 }
 
-// Safety: `NornFd` retains the socket and the owned `StableBuf` keeps its
+// Safety: `F` retains the socket and the owned `StableBuf` keeps its
 // initialized bytes stable through every kernel read.
-unsafe impl<B> Operation for Send<B>
+unsafe impl<B, F> Operation for Send<B, F>
 where
     B: StableBuf,
+    F: OpFd,
 {
     type Completion = CQEResult;
 
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let len = checked_scalar_len(self.buf.bytes_init(), "send buffer length")?;
         let ptr = self.buf.stable_ptr();
-        Ok(opcode::Send::new(self.fd.fd(), ptr, len)
-            .flags(self.flags)
-            .build())
+        let flags = self.flags;
+        Ok(with_fd_target!(self.fd.target(), |fd| {
+            opcode::Send::new(fd, ptr, len).flags(flags).build()
+        }))
     }
 
     unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
@@ -2063,9 +2068,10 @@ where
     }
 }
 
-impl<B> Singleshot for Send<B>
+impl<B, F> Singleshot for Send<B, F>
 where
     B: StableBuf,
+    F: OpFd,
 {
     type Output = (io::Result<usize>, B);
 

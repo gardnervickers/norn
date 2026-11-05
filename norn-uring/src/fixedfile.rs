@@ -43,18 +43,27 @@
 //!
 //! # Kernel requirements
 //!
-//! Sparse table registration requires Linux 5.19. Kernels without it report
-//! an OS error from [`Handle::register_fixed_files`].
+//! Sparse table registration requires Linux 5.19. [`FixedFd::install`]
+//! requires Linux 6.8. Kernels without a feature report an OS error from
+//! the corresponding call or request.
 
 use std::cell::{Cell, RefCell};
+use std::ffi::CString;
 use std::io;
-use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 use std::rc::Rc;
 
-use io_uring::types;
+use io_uring::types::{self, DestinationSlot, FsyncFlags};
 use io_uring::{opcode, IoUring};
 use log::warn;
 
+use crate::buf::{StableBuf, StableBufMut};
+use crate::fd::{FdTarget, NornFd, OpFd, UringFd};
+use crate::fixedbuf::FixedBuf;
+use crate::fs::{self, OpenOptions};
+use crate::net::{Recv, Send};
 use crate::operation::{CQEResult, Operation, Singleshot};
 use crate::Handle;
 
@@ -127,6 +136,30 @@ impl FixedFileTable {
         self.table.available()
     }
 
+    /// Install a process descriptor into a free slot with `IORING_OP_FILES_UPDATE`.
+    ///
+    /// The table takes its own reference to the open file. `fd` remains open
+    /// and independently owned; closing it after this request completes does
+    /// not affect the returned [`FixedFd`]. The request retains `fd` until its
+    /// terminal completion, so [`UringFd::close`] reports
+    /// [`io::ErrorKind::WouldBlock`] meanwhile.
+    ///
+    /// A slot is reserved when the request is first polled, and returned to
+    /// the table if the request fails or is dropped before completing.
+    ///
+    /// The request resolves to an error with raw OS error `ENFILE` when the
+    /// table has no free slot, and with [`io::ErrorKind::BrokenPipe`] when it
+    /// is created after the driver stops.
+    pub fn insert(&self, fd: &UringFd) -> impl crate::Request<Output = io::Result<FixedFd>> {
+        let insert = Insert {
+            table: Rc::clone(&self.table),
+            source: fd.lease(),
+            fds: [-1],
+            slot: None,
+        };
+        self.table.handle.submit(insert)
+    }
+
     /// Synchronously install a borrowed process descriptor into a free slot.
     ///
     /// This uses `IORING_REGISTER_FILES_UPDATE` and is useful for descriptors
@@ -149,6 +182,26 @@ impl FixedFileTable {
         }
         slot.inner.occupied.set(true);
         Ok(FixedFd { slot })
+    }
+
+    /// Open a file directly into a free slot.
+    ///
+    /// The file never occupies a process descriptor. Use
+    /// [`FixedFd::install`] when a process descriptor is needed later.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid option combination or path,
+    /// [`io::ErrorKind::BrokenPipe`] when called after the driver stops, raw
+    /// OS error `ENFILE` when the table has no free slot, or the kernel's
+    /// error when the file cannot be opened.
+    pub async fn open<P: AsRef<Path>>(
+        &self,
+        path: P,
+        options: &OpenOptions,
+    ) -> io::Result<FixedFd> {
+        let open = OpenDirect::new(path.as_ref(), options, Rc::clone(&self.table))?;
+        self.table.handle.submit(open).await
     }
 }
 
@@ -180,6 +233,129 @@ impl FixedFd {
     /// to the same driver and own this `FixedFd` until its terminal completion.
     pub fn index(&self) -> u32 {
         self.slot.index()
+    }
+
+    /// Read bytes from the file into `buf`, starting at `offset`.
+    ///
+    /// The offset is ignored for streams such as pipes and sockets.
+    pub fn read_at<B>(
+        &self,
+        buf: B,
+        offset: u64,
+    ) -> impl crate::Request<Output = (io::Result<usize>, B)>
+    where
+        B: StableBufMut + 'static,
+    {
+        let read = fs::ReadAt::new(self.slot.clone(), buf, offset);
+        self.slot.handle().submit(read)
+    }
+
+    /// Write `buf` to the file, starting at `offset`.
+    ///
+    /// The offset is ignored for streams such as pipes and sockets.
+    pub fn write_at<B>(
+        &self,
+        buf: B,
+        offset: u64,
+    ) -> impl crate::Request<Output = (io::Result<usize>, B)>
+    where
+        B: StableBuf + 'static,
+    {
+        let write = fs::WriteAt::new(self.slot.clone(), buf, offset);
+        self.slot.handle().submit(write)
+    }
+
+    /// Read bytes into a registered fixed buffer, starting at `offset`.
+    ///
+    /// This behaves like [`fs::File::read_fixed_at`].
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixed buffer was registered with another driver.
+    #[track_caller]
+    pub fn read_fixed_at<B>(
+        &self,
+        buf: FixedBuf<B>,
+        offset: u64,
+    ) -> impl crate::Request<Output = (io::Result<usize>, FixedBuf<B>)>
+    where
+        B: 'static,
+    {
+        assert!(
+            buf.same_driver(self.slot.handle()),
+            "fixed buffer and fixed file must target the same driver"
+        );
+        let read = fs::ReadFixedAt::new(self.slot.clone(), buf, offset);
+        self.slot.handle().submit(read)
+    }
+
+    /// Write a registered fixed buffer's logical payload, starting at `offset`.
+    ///
+    /// This behaves like [`fs::File::write_fixed_at`].
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixed buffer was registered with another driver.
+    #[track_caller]
+    pub fn write_fixed_at<B>(
+        &self,
+        buf: FixedBuf<B>,
+        offset: u64,
+    ) -> impl crate::Request<Output = (io::Result<usize>, FixedBuf<B>)>
+    where
+        B: 'static,
+    {
+        assert!(
+            buf.same_driver(self.slot.handle()),
+            "fixed buffer and fixed file must target the same driver"
+        );
+        let write = fs::WriteFixedAt::new(self.slot.clone(), buf, offset);
+        self.slot.handle().submit(write)
+    }
+
+    /// Sync the file and its metadata to disk.
+    pub fn sync(&self) -> impl crate::Request<Output = io::Result<()>> {
+        let sync = fs::Sync::new(self.slot.clone(), FsyncFlags::empty());
+        self.slot.handle().submit(sync)
+    }
+
+    /// Sync only the file's data to disk.
+    pub fn datasync(&self) -> impl crate::Request<Output = io::Result<()>> {
+        let sync = fs::Sync::new(self.slot.clone(), FsyncFlags::DATASYNC);
+        self.slot.handle().submit(sync)
+    }
+
+    /// Receive bytes from a connected socket into `buf`.
+    pub fn recv<B>(&self, buf: B) -> impl crate::Request<Output = (io::Result<usize>, B)>
+    where
+        B: StableBufMut + 'static,
+    {
+        let recv = Recv::<B, false, Slot>::new(self.slot.clone(), buf, 0);
+        self.slot.handle().submit(recv)
+    }
+
+    /// Send `buf` on a connected socket.
+    pub fn send<B>(&self, buf: B) -> impl crate::Request<Output = (io::Result<usize>, B)>
+    where
+        B: StableBuf + 'static,
+    {
+        let send = Send::new(self.slot.clone(), buf, 0);
+        self.slot.handle().submit(send)
+    }
+
+    /// Install this file into the process file table with `IORING_OP_FIXED_FD_INSTALL`.
+    ///
+    /// The returned descriptor is close-on-exec and refers to the same open
+    /// file; this `FixedFd` remains valid and independently owned. Use it for
+    /// APIs that require a process descriptor, for example with
+    /// [`fs::File::from_uring_fd`].
+    ///
+    /// Requires Linux 6.8. Older kernels complete with `EINVAL`.
+    pub fn install(&self) -> impl crate::Request<Output = io::Result<UringFd>> {
+        let install = Install {
+            slot: self.slot.clone(),
+        };
+        self.slot.handle().submit(install)
     }
 
     /// Remove the file from its slot with an asynchronous fixed-file close.
@@ -238,6 +414,16 @@ impl Slot {
 
     fn handle(&self) -> &Handle {
         &self.inner.table.handle
+    }
+}
+
+// Safety: the index is returned to the allocator only after the last `Slot`
+// clone drops and its kernel entry is cleared, and `FixedFd` submits every
+// operation to the driver that owns the table.
+unsafe impl OpFd for Slot {
+    #[inline]
+    fn target(&self) -> FdTarget {
+        FdTarget::Fixed(types::Fixed(self.inner.index))
     }
 }
 
@@ -361,6 +547,157 @@ fn push_or_leak(list: &RefCell<Vec<u32>>, index: u32) {
 
 fn not_installed() -> io::Error {
     io::Error::other("io_uring did not install the descriptor")
+}
+
+fn reserve_with(table: &Rc<Table>, slot: &mut Option<Slot>) -> io::Result<u32> {
+    debug_assert!(slot.is_none(), "fixed-file operation configured twice");
+    let reserved = table.reserve()?;
+    let index = reserved.index();
+    *slot = Some(reserved);
+    Ok(index)
+}
+
+/// Install a retained process descriptor with `IORING_OP_FILES_UPDATE`.
+struct Insert {
+    table: Rc<Table>,
+    /// Keeps the descriptor number open until the terminal CQE.
+    source: NornFd,
+    /// The update array read by the kernel.
+    fds: [RawFd; 1],
+    slot: Option<Slot>,
+}
+
+// Safety: `fds` lives inline in the stably placed operation, `source` keeps
+// the copied descriptor number open, and `slot` reserves an empty index
+// through the terminal CQE. `reap` converts a successful update into an owned
+// `FixedFd`; on failure the kernel leaves the empty index unchanged.
+unsafe impl Operation for Insert {
+    type Completion = io::Result<FixedFd>;
+
+    fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+        let index = reserve_with(&self.table, &mut self.slot)?;
+        self.fds[0] = self.source.fd().0;
+        // `register_fixed_files` bounds every index by `i32::MAX`.
+        Ok(opcode::FilesUpdate::new(self.fds.as_ptr(), 1)
+            .offset(index as i32)
+            .build())
+    }
+
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+        let slot = self.slot.take();
+        let installed = result.into_result()?;
+        let slot = slot.ok_or_else(not_installed)?;
+        if installed != 1 {
+            return Err(not_installed());
+        }
+        slot.inner.occupied.set(true);
+        Ok(FixedFd { slot })
+    }
+}
+
+impl Singleshot for Insert {
+    type Output = io::Result<FixedFd>;
+
+    fn complete(self, completion: Self::Completion) -> Self::Output {
+        completion
+    }
+}
+
+/// Open a path directly into a reserved slot.
+struct OpenDirect {
+    path: CString,
+    how: types::OpenHow,
+    table: Rc<Table>,
+    slot: Option<Slot>,
+}
+
+impl OpenDirect {
+    fn new(path: &Path, options: &OpenOptions, table: Rc<Table>) -> io::Result<Self> {
+        let path = CString::new(path.as_os_str().as_bytes())?;
+        let creation_mode = options.get_creation_mode()?;
+        // A direct descriptor has no close-on-exec state, and the kernel
+        // rejects `O_CLOEXEC` when a destination slot is supplied.
+        let flags = options.get_access_mode()? | creation_mode;
+        let mut how = types::OpenHow::new().flags(flags as u64);
+        if creation_mode & libc::O_CREAT != 0 {
+            how = how.mode(u64::from(options.mode));
+        }
+        Ok(Self {
+            path,
+            how,
+            table,
+            slot: None,
+        })
+    }
+}
+
+// Safety: `path` and `how` are owned by the stably placed operation, and
+// `slot` reserves an empty index through the terminal CQE. The kernel installs
+// a file only on success, which `reap` converts into an owned `FixedFd`.
+unsafe impl Operation for OpenDirect {
+    type Completion = io::Result<FixedFd>;
+
+    fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+        let index = reserve_with(&self.table, &mut self.slot)?;
+        let destination = DestinationSlot::try_from_slot_target(index).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "fixed-file index out of range")
+        })?;
+        Ok(
+            opcode::OpenAt2::new(types::Fd(libc::AT_FDCWD), self.path.as_ptr(), &self.how)
+                .file_index(Some(destination))
+                .build(),
+        )
+    }
+
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+        let slot = self.slot.take();
+        result.into_result()?;
+        let slot = slot.ok_or_else(not_installed)?;
+        slot.inner.occupied.set(true);
+        Ok(FixedFd { slot })
+    }
+}
+
+impl Singleshot for OpenDirect {
+    type Output = io::Result<FixedFd>;
+
+    fn complete(self, completion: Self::Completion) -> Self::Output {
+        completion
+    }
+}
+
+/// Create a process descriptor for a fixed file.
+struct Install {
+    slot: Slot,
+}
+
+// Safety: `slot` retains the source entry through the terminal CQE, and a
+// successful CQE is converted into an owned descriptor before it is queued.
+unsafe impl Operation for Install {
+    type Completion = io::Result<OwnedFd>;
+
+    fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+        // Flags 0 makes the new descriptor close-on-exec.
+        Ok(opcode::FixedFdInstall::new(types::Fixed(self.slot.index()), 0).build())
+    }
+
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+        let fd = result.into_result()?;
+        // Safety: a successful install CQE transfers ownership of a new descriptor.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
+    }
+}
+
+impl Singleshot for Install {
+    type Output = io::Result<UringFd>;
+
+    fn complete(self, completion: Self::Completion) -> Self::Output {
+        let fd = completion?;
+        Ok(UringFd::from_fd_on(
+            fd.into_raw_fd(),
+            self.slot.handle().clone(),
+        ))
+    }
 }
 
 /// Remove a fixed file with `IORING_OP_CLOSE`.
@@ -497,7 +834,10 @@ fn retry_interrupted<T>(mut f: impl FnMut() -> io::Result<T>) -> io::Result<T> {
 
 #[cfg(test)]
 mod tests {
-    use std::os::fd::{AsFd, FromRawFd, OwnedFd};
+    use std::future::Future;
+    use std::os::fd::AsFd;
+    use std::pin::pin;
+    use std::task::{Context, Poll, Waker};
 
     use super::*;
     use crate::Driver;
@@ -512,6 +852,10 @@ mod tests {
         assert_eq!(rc, 0);
         // Safety: `pipe2` returned two new descriptors owned by this test.
         unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
+    }
+
+    fn poll_once<F: Future>(future: F) -> Poll<F::Output> {
+        pin!(future).poll(&mut Context::from_waker(Waker::noop()))
     }
 
     /// Returns true once every writer of the pipe is closed.
@@ -644,14 +988,31 @@ mod tests {
 
     #[test]
     fn stopped_driver_rejects_insertions_but_releases_slots() {
+        // Another driver owns the async insert's source so the source can
+        // still be closed through a running ring when the test ends.
+        let other = driver();
         let driver = driver();
         let handle = driver.handle();
         let table = handle.register_fixed_files(2).unwrap();
         let (reader, writer) = pipe();
         let fixed = table.insert_fd(writer.as_fd()).unwrap();
+        let (_, source) = pipe();
+        let source = UringFd::from_fd_on(source.into_raw_fd(), other.handle());
 
         drop(driver);
         let err = table.insert_fd(writer.as_fd()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(table.available(), 1);
+
+        let Poll::Ready(Err(err)) = poll_once(table.insert(&source)) else {
+            panic!("insert after shutdown must fail immediately");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+        let mut options = OpenOptions::new();
+        options.read(true);
+        let Poll::Ready(Err(err)) = poll_once(table.open("/dev/null", &options)) else {
+            panic!("open after shutdown must fail immediately");
+        };
         assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
         assert_eq!(table.available(), 1);
 
@@ -661,7 +1022,7 @@ mod tests {
         drop(fixed);
         assert!(reader_sees_eof(&reader));
         assert_eq!(table.available(), 2);
-        drop(table);
+        drop((table, source, other));
     }
 
     #[test]

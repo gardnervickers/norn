@@ -99,6 +99,51 @@ impl UringFd {
     }
 }
 
+/// The descriptor namespace an operation targets.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum FdTarget {
+    /// A descriptor in the process file table.
+    Fd(types::Fd),
+    /// A slot in the ring's registered file table.
+    Fixed(types::Fixed),
+}
+
+/// A retained descriptor that built-in operations can target.
+///
+/// # Safety
+///
+/// While a value lives, the descriptor or fixed-file slot returned by
+/// [`OpFd::target`] must keep referring to the same open file. Operations
+/// retain the value through their terminal CQE, so an implementation must not
+/// close, clear, or reuse the target before it is dropped. A
+/// [`FdTarget::Fixed`] index is meaningful only to the ring that owns its
+/// table, so callers must submit such operations to that driver.
+pub(crate) unsafe trait OpFd {
+    fn target(&self) -> FdTarget;
+}
+
+/// Build an SQE for either descriptor namespace.
+///
+/// The body is type-checked once for `types::Fd` and once for `types::Fixed`,
+/// so an opcode that cannot target registered files fails to compile.
+macro_rules! with_fd_target {
+    ($target:expr, |$fd:ident| $body:expr) => {
+        match $target {
+            $crate::fd::FdTarget::Fd($fd) => $body,
+            $crate::fd::FdTarget::Fixed($fd) => $body,
+        }
+    };
+}
+pub(crate) use with_fd_target;
+
+// Safety: `NornFd` closes its descriptor only after the last clone drops.
+unsafe impl OpFd for NornFd {
+    #[inline]
+    fn target(&self) -> FdTarget {
+        FdTarget::Fd(self.fd())
+    }
+}
+
 /// [`NornFd`] is a reference counted file descriptor.
 #[derive(Clone, Debug)]
 pub(crate) struct NornFd {

@@ -16,6 +16,7 @@ pub use dir::{
     symlink,
 };
 pub use file::{pipe, File, PipeReader, PipeWriter};
+pub(crate) use file::{ReadAt, ReadFixedAt, Sync, WriteAt, WriteFixedAt};
 pub use opts::OpenOptions;
 
 fn complete_get_xattr<B>(buf: &mut B, submitted_len: u32, result: u32) -> io::Result<usize>
