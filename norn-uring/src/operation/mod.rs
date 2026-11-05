@@ -567,6 +567,41 @@ where
     }
 }
 
+impl<T> Op<T>
+where
+    T: Multishot + 'static,
+{
+    /// Take the next already-reaped item without submitting the operation or
+    /// registering a waker.
+    ///
+    /// Returns `Pending` when nothing is queued, including before the
+    /// operation has been submitted, and `Ready(None)` once the terminal
+    /// completion has been consumed.
+    pub(crate) fn poll_queued(self: Pin<&mut Self>) -> Poll<Option<T::Item>> {
+        let this = self.project();
+        let State::Submitted { inner } = this.state else {
+            return Poll::Pending;
+        };
+        if let Some(result) = inner.try_next() {
+            return Poll::Ready(Some(result));
+        }
+        if inner.inner.is_complete() {
+            return Poll::Ready(None);
+        }
+        Poll::Pending
+    }
+
+    /// Whether [`Op::poll_queued`] would return `Ready`: an item is queued or
+    /// the terminal completion has arrived.
+    #[inline]
+    pub(crate) fn has_queued(&self) -> bool {
+        let State::Submitted { inner } = &self.state else {
+            return false;
+        };
+        inner.inner.is_complete() || !inner.inner.raw().state().borrow().completions.is_empty()
+    }
+}
+
 /// A typed reference to an operation in progress.
 pub(crate) struct TypedHandle<T> {
     inner: RawOpRef,

@@ -181,7 +181,9 @@ where
 /// `self` has been placed in its final storage. The guarantees below apply while
 /// the registration attempt may pass the region to the kernel. If registration
 /// becomes active, they continue until the registration is successfully released
-/// or the owning ring is destroyed:
+/// or the owning ring is destroyed. For a value installed in a
+/// [`FixedBufTable`](crate::fixedbuf::FixedBufTable) slot, successfully
+/// replacing or removing that slot also releases the registration:
 ///
 /// - the region's address and length do not change;
 /// - every byte remains allocated, initialized, and writable;
@@ -197,7 +199,7 @@ where
 /// before the value is moved or returned to the caller. Moving the value is
 /// permitted before `fixed_region` is called, after a failed attempt returns,
 /// and after an active registration is released. Registration additionally
-/// verifies that regions returned by different values in one pool are pairwise
+/// verifies that regions returned by different values in one table are pairwise
 /// disjoint.
 pub unsafe trait FixedBuffer {
     /// Return the exact initialized region to register.

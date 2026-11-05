@@ -5,13 +5,20 @@ use std::io;
 use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
+use std::pin::Pin;
+use std::task::{ready, Context, Poll as TaskPoll};
+
+use futures_core::Stream;
 
 use crate::buf::{set_init_checked, StableBuf, StableBufMut};
+use crate::bufring::{BufRingBuf, RecvBufRing};
 use crate::fd::{NornFd, UringFd};
 use crate::fixedbuf::FixedBuf;
 use crate::fs::opts;
-use crate::net::socket::Poll;
-use crate::operation::{CQEResult, Operation, Singleshot};
+use crate::net::socket::{
+    buffer_count, MultishotBacklog, Poll, RingReceive, RingRecvCompletion, RingRecvStream,
+};
+use crate::operation::{CQEResult, Multishot, Op, Operation, Singleshot};
 
 /// A reference to an open file on the filesystem.
 pub struct File {
@@ -26,6 +33,59 @@ pub struct PipeReader {
 /// The write end of a pipe.
 pub struct PipeWriter {
     fd: UringFd,
+}
+
+pin_project_lite::pin_project! {
+    /// A stream of buffers filled by a multishot pipe read.
+    ///
+    /// The stream ends when every writer has closed the pipe.
+    ///
+    /// Buffer exhaustion is absorbed as backpressure: reading waits for a
+    /// buffer return and re-arms without yielding ENOBUFS or discarding queued
+    /// data. Drop held buffers to allow progress. Ring quarantine yields a
+    /// terminal error; driver shutdown ends a stream waiting for buffers. Other
+    /// read errors remain terminal.
+    ///
+    /// The kernel keeps the read armed while the stream is not polled, and the
+    /// stream holds each filled buffer until a later `poll_next` yields it.
+    /// [`Builder::max_unconsumed_per_receive`](crate::bufring::Builder::max_unconsumed_per_receive)
+    /// bounds the buffers a stream holds: at the bound it pauses reading,
+    /// without losing data, until it is polled again.
+    pub struct PipeReadRingMulti {
+        #[pin]
+        inner: Option<RingRecvStream<ReadRingMulti>>,
+    }
+}
+
+impl std::fmt::Debug for PipeReadRingMulti {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PipeReadRingMulti")
+            .field("done", &self.inner.is_none())
+            .finish()
+    }
+}
+
+impl Stream for PipeReadRingMulti {
+    type Item = io::Result<BufRingBuf>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> TaskPoll<Option<Self::Item>> {
+        let mut this = self.project();
+        let Some(inner) = this.inner.as_mut().as_pin_mut() else {
+            return TaskPoll::Ready(None);
+        };
+        match ready!(inner.poll_next(cx)) {
+            // A zero-byte read selects no buffer and reports end of file.
+            Some(Ok(buffer)) if buffer.capacity() == 0 => {
+                this.inner.set(None);
+                TaskPoll::Ready(None)
+            }
+            item @ Some(_) => TaskPoll::Ready(item),
+            None => {
+                this.inner.set(None);
+                TaskPoll::Ready(None)
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for File {
@@ -541,6 +601,30 @@ impl PipeReader {
         .await
     }
 
+    /// Read data using a multishot read operation and a provided buffer ring.
+    ///
+    /// Each item owns one selected ring buffer containing the bytes from one
+    /// read. Reads are sequential: one multishot read is armed at a time, and a
+    /// terminated read is replaced only after its terminal completion has been
+    /// consumed. Requires Linux 6.7 or newer.
+    ///
+    /// The kernel requires a pollable descriptor. Wrapping a regular file with
+    /// [`PipeReader::from_uring_fd`] yields a terminal `EBADFD` error.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the buffer ring was registered with another driver.
+    #[track_caller]
+    pub fn read_ring_multi(&self, ring: &RecvBufRing) -> PipeReadRingMulti {
+        assert!(
+            ring.same_driver(self.fd.handle()),
+            "buffer ring and pipe must target the same driver"
+        );
+        PipeReadRingMulti {
+            inner: Some(RingRecvStream::new(self.fd.clone_internal(), ring, 0)),
+        }
+    }
+
     /// Duplicate bytes from this pipe into another pipe without consuming them.
     ///
     /// Waits while this pipe is empty and still has a writer, or while `dst`
@@ -743,6 +827,80 @@ fn u64_to_off_t(len: u64, what: &'static str) -> io::Result<libc::off_t> {
             format!("{what} exceeds off_t::MAX"),
         )
     })
+}
+
+pub(crate) struct ReadRingMulti {
+    fd: NornFd,
+    ring: RecvBufRing,
+    backlog: MultishotBacklog,
+}
+
+// Safety: `NornFd` and `RecvBufRing` retain the descriptor and registered
+// group through the multishot terminal CQE. The SQE references no other
+// memory, and each selected buffer is held by an owned completion until it is
+// yielded or dropped.
+unsafe impl Operation for ReadRingMulti {
+    type Completion = RingRecvCompletion<BufRingBuf>;
+
+    fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+        self.ring.ensure_accepting_receives()?;
+        // The kernel requires a zero length so each read uses the whole
+        // selected buffer. Offset -1 reads from the current position.
+        Ok(opcode::ReadMulti::new(self.fd.fd(), 0, self.ring.bgid())
+            .offset(u64::MAX)
+            .build())
+    }
+
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+        let id = result.operation_id();
+        let (result, flags) = result.into_parts();
+        let result = result.map_err(|error| self.ring.release_failed(error, flags));
+        let result = result.and_then(|n| {
+            if n == 0 && io_uring::cqueue::buffer_select(flags).is_none() {
+                Ok(BufRingBuf::empty(self.ring.clone()))
+            } else {
+                self.ring.get_buf(n, flags)
+            }
+        });
+        let terminal = !io_uring::cqueue::more(flags);
+        // Safety: `id` came from the completion being reaped.
+        unsafe {
+            self.backlog.reaped(id, buffer_count(&result), |target| {
+                self.ring.pause_receive(target)
+            })
+        };
+        RingRecvCompletion {
+            paused: self.backlog.is_pause(terminal, &result),
+            result,
+            terminal,
+        }
+    }
+}
+
+impl Multishot for ReadRingMulti {
+    type Item = RingRecvCompletion<BufRingBuf>;
+
+    fn update(&mut self, completion: Self::Completion) -> Self::Item {
+        self.backlog.yielded(buffer_count(&completion.result));
+        completion
+    }
+
+    fn complete(self, completion: Self::Completion) -> Option<Self::Item> {
+        Some(completion)
+    }
+}
+
+impl RingReceive for ReadRingMulti {
+    type Buffer = BufRingBuf;
+    type Source = UringFd;
+
+    fn receive(fd: &UringFd, ring: &RecvBufRing, _flags: i32) -> Op<Self> {
+        fd.submit(ReadRingMulti {
+            backlog: MultishotBacklog::new(ring.max_unconsumed_per_receive()),
+            fd: fd.lease(),
+            ring: ring.clone(),
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -1704,5 +1862,57 @@ mod layout_tests {
 
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
         assert!(bufs[0].is_empty());
+    }
+}
+
+#[cfg(test)]
+mod read_ring_multi_tests {
+    use std::num::NonZeroUsize;
+    use std::pin::pin;
+
+    use futures_util::StreamExt;
+
+    use super::*;
+
+    fn write(writer: &PipeWriter, bytes: &[u8]) {
+        // Safety: the writer's descriptor stays open for the call.
+        let n = unsafe { libc::write(writer.fd.fd().0, bytes.as_ptr().cast(), bytes.len()) };
+        assert_eq!(n, bytes.len() as isize);
+    }
+
+    /// A multishot pipe read pauses at its ring's limit, leaving later data
+    /// in the pipe, and resumes in order once the consumer takes its buffer.
+    #[test]
+    fn multishot_pipe_read_pauses_at_the_ring_limit_without_losing_data() {
+        let driver = crate::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let mut ex = norn_executor::LocalExecutor::new(driver);
+        ex.block_on(async {
+            let ring = RecvBufRing::builder(44)
+                .buf_cnt(4)
+                .buf_len(8)
+                .max_unconsumed_per_receive(NonZeroUsize::new(1).unwrap())
+                .build()
+                .unwrap();
+            let (reader, writer) = pipe().unwrap();
+            let mut stream = pin!(reader.read_ring_multi(&ring));
+            assert!(futures_util::poll!(stream.next()).is_pending());
+
+            write(&writer, b"first");
+            for _ in 0..4 {
+                crate::noop().await.unwrap();
+            }
+            assert_eq!(
+                ring.test_pauses(),
+                1,
+                "one unconsumed buffer pauses the read"
+            );
+            write(&writer, b"second");
+            for _ in 0..4 {
+                crate::noop().await.unwrap();
+            }
+
+            assert_eq!(&stream.next().await.unwrap().unwrap()[..], b"first");
+            assert_eq!(&stream.next().await.unwrap().unwrap()[..], b"second");
+        });
     }
 }
