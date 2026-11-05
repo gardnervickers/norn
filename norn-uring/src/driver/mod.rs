@@ -643,6 +643,30 @@ impl Handle {
         })
     }
 
+    /// Run a synchronous ring-wide registration call.
+    ///
+    /// Fails with [`io::ErrorKind::WouldBlock`] instead of panicking when the
+    /// ring is already mutably borrowed by the driver.
+    pub(crate) fn try_with_submitter<U>(
+        &self,
+        f: impl FnOnce(&Submitter<'_>) -> io::Result<U>,
+    ) -> io::Result<U> {
+        self.try_with_ring(|ring| f(&ring.submitter()))
+    }
+
+    pub(crate) fn try_with_ring<U>(
+        &self,
+        f: impl FnOnce(&IoUring) -> io::Result<U>,
+    ) -> io::Result<U> {
+        let ring = self.shared.ring.try_borrow().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "io_uring is already borrowed by the driver",
+            )
+        })?;
+        f(&ring)
+    }
+
     pub(crate) fn fixed_buf_driver(&self) -> FixedBufDriver {
         FixedBufDriver {
             shared: Rc::downgrade(&self.shared),
