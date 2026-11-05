@@ -12,11 +12,12 @@ use std::io;
 use std::os::fd::RawFd;
 use std::rc::Rc;
 
+use io_uring::types::CancelBuilder;
 use io_uring::{opcode, types};
 use log::warn;
 
 use crate::driver::CloseFdError;
-use crate::operation::{Op, Operation, Singleshot};
+use crate::operation::{CQEResult, Op, Operation, Singleshot};
 use crate::Handle;
 
 /// A driver-bound file descriptor used by `io_uring` operations.
@@ -96,6 +97,39 @@ impl UringFd {
     /// descriptor.
     pub async fn close(self) -> io::Result<()> {
         self.inner.close().await
+    }
+
+    /// Ask the kernel to cancel every in-flight request on this descriptor.
+    ///
+    /// The request resolves to the number of matching requests the kernel
+    /// found. Each canceled request then completes through its own future or
+    /// stream, typically with `ECANCELED`, and releases its descriptor lease
+    /// when consumed or dropped. This lets one task interrupt operations owned
+    /// by other tasks, for example so that [`UringFd::close`] can succeed or a
+    /// multishot stream ends after yielding the completions already posted.
+    ///
+    /// Cancellation matches requests that reach the kernel before this one,
+    /// including requests already queued in the submission queue. Prepared
+    /// requests that have not been polled, requests still waiting for
+    /// submission-queue space, and requests submitted afterwards are not
+    /// matched.
+    /// Streams that transparently re-arm, such as
+    /// [`TcpListener::incoming`](crate::net::TcpListener::incoming), may submit
+    /// a new request after observing the cancellation.
+    ///
+    /// The kernel matches requests by open file description, so in-flight
+    /// requests on duplicates of this descriptor submitted to the same driver
+    /// are also canceled. A request already executing in a kernel worker may
+    /// be counted but finish normally. Requests on other drivers are not
+    /// affected.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request cannot be submitted, or `EINVAL` on
+    /// kernels older than Linux 5.19, which lack descriptor-based
+    /// cancellation.
+    pub fn cancel_pending(&self) -> impl crate::Request<Output = io::Result<usize>> {
+        self.submit(CancelFd { fd: self.lease() })
     }
 }
 
@@ -330,6 +364,42 @@ impl Singleshot for CloseFd {
     }
 }
 
+struct CancelFd {
+    // The lease keeps the descriptor number bound to the same open file
+    // description until the kernel has resolved it for this request.
+    fd: NornFd,
+}
+
+// Safety: the SQE references no memory and names its target only by a
+// descriptor that `fd` retains through the terminal CQE. Cancellation does not
+// enable multishot completions.
+unsafe impl Operation for CancelFd {
+    type Completion = CQEResult;
+
+    fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+        let criteria = CancelBuilder::fd(self.fd.fd()).all();
+        Ok(opcode::AsyncCancel2::new(criteria).build())
+    }
+
+    unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+        result
+    }
+}
+
+impl Singleshot for CancelFd {
+    type Output = io::Result<usize>;
+
+    fn complete(self, completion: Self::Completion) -> Self::Output {
+        match completion.into_result() {
+            Ok(count) => Ok(count as usize),
+            // Linux reports a count with `IORING_ASYNC_CANCEL_ALL`; treat a
+            // no-match result from any kernel the same way.
+            Err(err) if err.raw_os_error() == Some(libc::ENOENT) => Ok(0),
+            Err(err) => Err(err),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,6 +411,54 @@ mod tests {
 
     fn assert_open(fd: RawFd) {
         assert_ne!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+    }
+
+    #[test]
+    fn cancel_configures_descriptor_wide_async_cancel() {
+        // `IORING_ASYNC_CANCEL_ALL | IORING_ASYNC_CANCEL_FD` from
+        // `include/uapi/linux/io_uring.h`.
+        const CANCEL_ALL_FD: u32 = 1 | 2;
+        let [read_end, write_end] = pipe();
+        let mut cancel = CancelFd {
+            fd: NornFd::from_fd(read_end),
+        };
+
+        let entry = cancel.configure().unwrap();
+
+        assert_eq!(entry.get_opcode(), opcode::AsyncCancel2::CODE.into());
+        let bytes: [u8; 64] = unsafe { std::mem::transmute_copy(&entry) };
+        assert_eq!(
+            i32::from_ne_bytes(bytes[4..8].try_into().unwrap()),
+            read_end
+        );
+        assert_eq!(u64::from_ne_bytes(bytes[16..24].try_into().unwrap()), 0);
+        assert_eq!(
+            u32::from_ne_bytes(bytes[28..32].try_into().unwrap()),
+            CANCEL_ALL_FD
+        );
+        drop(cancel);
+        unsafe { libc::close(write_end) };
+    }
+
+    #[test]
+    fn cancel_completion_reports_matched_request_count() {
+        let complete = |result| {
+            let [read_end, write_end] = pipe();
+            let cancel = CancelFd {
+                fd: NornFd::from_fd(read_end),
+            };
+            let output = cancel.complete(CQEResult::new(result, 0));
+            unsafe { libc::close(write_end) };
+            output
+        };
+
+        assert_eq!(complete(Ok(3)).unwrap(), 3);
+        assert_eq!(
+            complete(Err(io::Error::from_raw_os_error(libc::ENOENT))).unwrap(),
+            0
+        );
+        let err = complete(Err(io::Error::from_raw_os_error(libc::EINVAL))).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EINVAL));
     }
 
     #[test]
