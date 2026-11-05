@@ -104,6 +104,8 @@ pub mod bufring;
 pub mod epoll;
 /// Owned caller-provided buffers registered for fixed I/O.
 pub mod fixedbuf;
+/// A managed table of registered file descriptors.
+pub mod fixedfile;
 /// Asynchronous filesystem operations.
 pub mod fs;
 /// Asynchronous TCP and UDP networking.
