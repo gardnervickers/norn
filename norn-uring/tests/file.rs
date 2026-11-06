@@ -4,10 +4,11 @@ use bytes::{Bytes, BytesMut};
 use futures_core::Future;
 use futures_util::future::poll_fn;
 use norn_uring::fixedbuf::{AcquireError, FixedBuffer, RegisterErrorKind, UnregisterErrorKind};
-use norn_uring::fs;
+use norn_uring::{fs, Request, WithOptions};
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
 use std::task::Poll;
+use std::time::Duration;
 
 mod util;
 
@@ -498,6 +499,171 @@ fn readv_writev() -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(bufs[0], b"hello wo");
         assert_eq!(bufs[1], b"rld");
 
+        Ok(())
+    })
+}
+
+#[test]
+fn read_write_options_round_trip() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let dir = util::ThreadNameTestDir::new();
+        let path = dir.join("rw-options");
+        let mut opts = fs::OpenOptions::new();
+        opts.create(true).truncate(true).write(true).read(true);
+        let file = opts.open(&path).await?;
+
+        let dsync = fs::WriteOptions::new().dsync(true);
+        let (res, _) = file.write_at(&b"hello "[..], 0).options(dsync).await;
+        assert_eq!(res?, 6);
+
+        let sync = fs::WriteOptions::new().sync(true);
+        let bufs = vec![
+            Bytes::from_static(b"vectored "),
+            Bytes::from_static(b"and "),
+        ];
+        let (res, _) = file.writev_at(bufs, 6).options(sync).await;
+        assert_eq!(res?, 13);
+
+        // Regular files ignore write streams, so a placement hint never
+        // changes the bytes written.
+        let table = norn_uring::Handle::current().register_fixed_buffers(vec![[0u8; 16]])?;
+        let mut buffer = table.try_acquire()?;
+        buffer.set_payload(b"fixed")?;
+        let stream = fs::WriteOptions::new()
+            .dsync(true)
+            .stream(fs::WriteStream::new(1));
+        let (res, mut buffer) = file.write_fixed_at(buffer, 19).options(stream).await;
+        assert_eq!(res?, 5);
+        assert_eq!(std::fs::read(&path)?, b"hello vectored and fixed");
+
+        let read_opts = fs::ReadOptions::new();
+        let (res, buf) = file.read_at(vec![0u8; 5], 0).options(read_opts).await;
+        assert_eq!(res?, 5);
+        assert_eq!(buf, b"hello");
+
+        let bufs = vec![vec![0u8; 9], vec![0u8; 4]];
+        let (res, bufs) = file.readv_at(bufs, 6).options(read_opts).await;
+        assert_eq!(res?, 13);
+        assert_eq!(bufs[0], b"vectored ");
+        assert_eq!(bufs[1], b"and ");
+
+        buffer.clear();
+        let (res, buffer) = file.read_fixed_at(buffer, 19).options(read_opts).await;
+        assert_eq!(res?, 5);
+        assert_eq!(buffer.as_slice(), b"fixed");
+        drop(buffer);
+        assert_eq!(table.unregister()?.len(), 1);
+
+        file.close().await?;
+        Ok(())
+    })
+}
+
+#[test]
+#[should_panic(expected = "request options must be set before the request is first polled")]
+fn options_on_a_polled_request_panic() {
+    util::with_test_env(|| async {
+        let (reader, _writer) = fs::pipe()?;
+        let reader = fs::File::from_uring_fd(reader.into_uring_fd());
+        let mut read = reader.read_at(vec![0u8; 4], 0);
+        assert!(
+            poll_fn(|cx| Poll::Ready(std::pin::Pin::new(&mut read).poll(cx).is_pending())).await
+        );
+        drop(read.options(fs::ReadOptions::new().nowait(true)));
+        Ok(())
+    })
+    .unwrap();
+}
+
+/// `RWF_NOWAIT` fails a read that would wait instead of waiting for data.
+/// Without the flag, io_uring waits for the empty pipe to become readable.
+#[test]
+fn nowait_read_of_an_empty_pipe_fails_instead_of_waiting() -> Result<(), Box<dyn std::error::Error>>
+{
+    util::with_test_env(|| async {
+        let (reader, writer) = fs::pipe()?;
+        let reader = fs::File::from_uring_fd(reader.into_uring_fd());
+        let writer = fs::File::from_uring_fd(writer.into_uring_fd());
+        let nowait = fs::ReadOptions::new().nowait(true);
+
+        // The timeout only keeps a read that ignored the flag from hanging the
+        // test; it cancels such a read, which then fails with `ECANCELED`.
+        let (res, buf) = reader
+            .read_at(vec![7u8; 4], 0)
+            .options(nowait)
+            .timeout(Duration::from_secs(5))
+            .await;
+        assert_eq!(res.unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(buf, [7u8; 4]);
+
+        let mut read = std::pin::pin!(reader.read_at(vec![0u8; 4], 0));
+        assert!(poll_fn(|cx| Poll::Ready(read.as_mut().poll(cx).is_pending())).await);
+        writer.write_at(&b"data"[..], 0).await.0?;
+        let (res, buf) = read.await;
+        assert_eq!(res?, 4);
+        assert_eq!(buf, b"data");
+
+        // With data waiting in the pipe, the flag does not fail the read.
+        writer.write_at(&b"more"[..], 0).await.0?;
+        let (res, buf) = reader.read_at(vec![0u8; 4], 0).options(nowait).await;
+        assert_eq!(res?, 4);
+        assert_eq!(buf, b"more");
+
+        reader.close().await?;
+        writer.close().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn unsupported_rw_flags_fail_without_losing_buffers() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        // `/dev/null` does not support uncached buffered I/O. Kernels before
+        // 6.14 reject the unknown flag with the same error, so this observes
+        // that the flag reaches the kernel on every supported version.
+        let mut opts = fs::OpenOptions::new();
+        opts.read(true).write(true);
+        let file = opts.open("/dev/null").await?;
+
+        let read_opts = fs::ReadOptions::new().dontcache(true);
+        let (res, buf) = file.read_at(vec![1u8; 4], 0).options(read_opts).await;
+        assert_eq!(res.unwrap_err().raw_os_error(), Some(libc::EOPNOTSUPP));
+        assert_eq!(buf, [1u8; 4]);
+
+        let bufs = vec![vec![1u8; 2]];
+        let (res, bufs) = file.readv_at(bufs, 0).options(read_opts).await;
+        assert_eq!(res.unwrap_err().raw_os_error(), Some(libc::EOPNOTSUPP));
+        assert_eq!(bufs, [vec![1u8; 2]]);
+
+        let write_opts = fs::WriteOptions::new().dontcache(true);
+        let (res, buf) = file.write_at(vec![2u8; 4], 0).options(write_opts).await;
+        assert_eq!(res.unwrap_err().raw_os_error(), Some(libc::EOPNOTSUPP));
+        assert_eq!(buf, [2u8; 4]);
+
+        let bufs = vec![vec![3u8; 2]];
+        let (res, bufs) = file.writev_at(bufs, 0).options(write_opts).await;
+        assert_eq!(res.unwrap_err().raw_os_error(), Some(libc::EOPNOTSUPP));
+        assert_eq!(bufs, [vec![3u8; 2]]);
+
+        let table = norn_uring::Handle::current().register_fixed_buffers(vec![[4u8; 4]])?;
+        let mut buffer = table.try_acquire()?;
+        buffer.set_payload(&[4u8; 4])?;
+        let (res, buffer) = file.write_fixed_at(buffer, 0).options(write_opts).await;
+        assert_eq!(res.unwrap_err().raw_os_error(), Some(libc::EOPNOTSUPP));
+        let (res, buffer) = file.read_fixed_at(buffer, 0).options(read_opts).await;
+        assert_eq!(res.unwrap_err().raw_os_error(), Some(libc::EOPNOTSUPP));
+        assert_eq!(buffer.as_slice(), [4u8; 4]);
+        drop(buffer);
+        assert_eq!(table.unregister()?.len(), 1);
+
+        // Default options submit the plain request, which `/dev/null` accepts.
+        let (res, _) = file
+            .write_at(vec![5u8; 4], 0)
+            .options(fs::WriteOptions::new())
+            .await;
+        assert_eq!(res?, 4);
+
+        file.close().await?;
         Ok(())
     })
 }

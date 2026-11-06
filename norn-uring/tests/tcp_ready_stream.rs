@@ -16,7 +16,7 @@ use std::task::Poll;
 use norn_uring::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-const TCP_LOG_TARGET: &str = "norn_uring::net::tcp";
+const TCP_LOG_TARGET: &str = "norn_uring::net::ready";
 
 thread_local! {
     static COUNTS: RefCell<HashMap<String, usize>> = RefCell::new(HashMap::new());

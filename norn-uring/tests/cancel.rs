@@ -167,3 +167,49 @@ fn cancel_pending_skips_link_successors_not_yet_issued() -> Result<(), Box<dyn s
         Ok(())
     })
 }
+
+/// Canceling a request does not fail the request hard-linked after it: the
+/// kernel issues that one instead, so the cancellation has to be repeated.
+#[test]
+fn repeated_cancel_pending_reaches_hard_linked_requests() -> Result<(), Box<dyn std::error::Error>>
+{
+    util::with_test_env(|| async {
+        let socket = std::rc::Rc::new(UdpSocket::bind("127.0.0.1:0".parse()?).await?);
+        let readable = libc::POLLIN as u32;
+        let done = std::rc::Rc::new(std::cell::Cell::new(false));
+        let chain = {
+            let (socket, done) = (std::rc::Rc::clone(&socket), std::rc::Rc::clone(&done));
+            norn_executor::spawn(async move {
+                let results = socket
+                    .poll_readiness(readable)
+                    .then_always(socket.poll_readiness(readable))
+                    .await;
+                done.set(true);
+                results
+            })
+        };
+        let settle = || async {
+            for _ in 0..4 {
+                norn_uring::noop().await?;
+            }
+            Ok::<_, io::Error>(())
+        };
+        settle().await?;
+
+        assert_eq!(socket.as_uring_fd().cancel_pending().await?, 1);
+        settle().await?;
+        assert!(
+            !done.get(),
+            "the hard-linked poll was issued and still waits"
+        );
+
+        assert_eq!(socket.as_uring_fd().cancel_pending().await?, 1);
+        settle().await?;
+        assert!(done.get());
+        let (first, second) = chain.await.unwrap();
+        assert_canceled(first);
+        assert_canceled(second);
+        assert_eq!(socket.as_uring_fd().cancel_pending().await?, 0);
+        Ok(())
+    })
+}

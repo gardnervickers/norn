@@ -38,8 +38,11 @@ impl Command16 {
 
     /// Select a registered fixed buffer by index.
     ///
-    /// The command implementation must retain the corresponding registration
-    /// through the terminal completion.
+    /// The command implementation must hold the
+    /// [`FixedBuf`](crate::fixedbuf::FixedBuf) acquired for that index through
+    /// the terminal completion. Keeping the table registered is not enough: a
+    /// slot from which no buffer is acquired can be replaced or removed, which
+    /// hands its buffer back to the caller while the command may still use it.
     pub const fn with_fixed_buffer(mut self, index: u16) -> Self {
         self.fixed_buffer = Some(index);
         self
