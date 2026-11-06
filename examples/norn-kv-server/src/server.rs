@@ -15,7 +15,7 @@ use norn_uring::net::{TcpListener, TcpSocket};
 
 use crate::codec::{decode_body, DecodeStatus, FrameDecoder, ResponseEncoder};
 use crate::handler::{ConnectionAction, MemoryHandler};
-use crate::protocol::{EncodeError, RequestHeader, HEADER_LEN};
+use crate::protocol::{RequestHeader, HEADER_LEN};
 
 const RECV_RING_BUFFERS: u16 = 8_192;
 const RECV_BUFFER_LEN: usize = 8 * 1024;
@@ -457,7 +457,7 @@ fn process_available_frames(
 
         let action = handler
             .handle(frame, &mut ResponseEncoder::new(response))
-            .map_err(encode_error)?;
+            .map_err(io::Error::from)?;
         consumed += frame_len;
         *commands += 1;
 
@@ -551,7 +551,7 @@ async fn serve_exact_frames(
                 decode_body(header, body_buf.filled_slice()),
                 &mut ResponseEncoder::new(&mut response),
             )
-            .map_err(encode_error)?;
+            .map_err(io::Error::from)?;
 
         if !response.is_empty() {
             response = send_all(socket, response).await?;
@@ -592,10 +592,6 @@ async fn send_all(socket: &TcpSocket, buffer: Vec<u8>) -> io::Result<Vec<u8>> {
 }
 
 fn invalid_data(error: impl std::error::Error + Send + Sync + 'static) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, error)
-}
-
-fn encode_error(error: EncodeError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error)
 }
 
