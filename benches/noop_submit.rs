@@ -3,7 +3,6 @@
 use std::borrow::Cow;
 use std::cmp;
 use std::future::Future;
-use std::io;
 use std::task::{Context, Poll};
 
 use bencher::{Bencher, TestDesc, TestDescAndFn, TestFn};
@@ -92,33 +91,10 @@ async fn drop_terminal_noops(n: usize) {
         assert!(matches!(noop.as_mut().poll(&mut cx), Poll::Pending));
     }
 
-    norn_uring::Handle::current().submit(DrainNop).await;
+    // NOPs complete in submission order, so once this later NOP's CQE is
+    // reaped every earlier terminal CQE has been reaped too.
+    noop().await.unwrap();
     drop(noops);
-}
-
-#[derive(Debug)]
-struct DrainNop;
-
-unsafe impl norn_uring::Operation for DrainNop {
-    type Completion = norn_uring::CQEResult;
-
-    fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
-        Ok(io_uring::opcode::Nop::new()
-            .build()
-            .flags(io_uring::squeue::Flags::IO_DRAIN))
-    }
-
-    unsafe fn reap(&mut self, result: norn_uring::CQEResult) -> Self::Completion {
-        result
-    }
-}
-
-impl norn_uring::Singleshot for DrainNop {
-    type Output = ();
-
-    fn complete(self, result: norn_uring::CQEResult) -> Self::Output {
-        result.into_result().unwrap();
-    }
 }
 
 impl NoopBackpressureBench {
