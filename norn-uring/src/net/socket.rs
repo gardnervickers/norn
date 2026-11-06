@@ -2042,9 +2042,10 @@ impl<K: AddrKind> Singleshot for Accept<K> {
 /// cancellation. Until then the kernel's multishot accept takes every
 /// connection it can: the whole queue in one issue (at submit, or in a
 /// poll-triggered task-work run), and each later arrival in its own pass. The
-/// listen backlog does not bound this; an arm ends only when the completion
-/// queue cannot take another entry. A re-arm after a pause can take the same
-/// again.
+/// listen backlog does not bound this. An arm ends when the completion queue
+/// cannot take another entry, on kernels that end it then (an older one may
+/// let the completions overflow instead), or when descriptors run out. A
+/// re-arm after a pause can take the same again.
 pub(crate) struct AcceptMulti {
     fd: NornFd,
     // The driver the accept is submitted to, which queues its pause.

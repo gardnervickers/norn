@@ -318,11 +318,15 @@ impl TcpListener {
     /// every connection it can until then. The stream holds the limit plus
     /// every connection accepted before the pause takes effect: the whole
     /// queue at arm time, and every arrival until the driver next reaps and
-    /// submits the cancellation, which lasts as long as the executor runs
-    /// without parking. The listen backlog does not bound this (it may never
-    /// hold more than one connection), and the kernel ends an arm only when
-    /// the completion queue is full (at about its size in descriptors) or
-    /// descriptors run out (`EMFILE`/`ENFILE`, yielded as an error). Each
+    /// submits the cancellation. That window is about one executor turn, as
+    /// each turn parks without waiting, which reaps and submits, but it
+    /// grows if a task blocks the thread or the executor does not reach the
+    /// driver. The listen backlog does not bound this (it may never hold
+    /// more than one connection). Beyond that, an arm ends when descriptors
+    /// run out (`EMFILE`/`ENFILE`, yielded as an error), or when the
+    /// completion queue is full, at about its size in descriptors; the
+    /// latter depends on the kernel, and an older one may let the
+    /// completions overflow instead of ending the arm. Each
     /// re-arm after a pause can take the same again. A caller that needs a
     /// hard bound on descriptors should use [`accept`](Self::accept), which
     /// takes one connection per request.
@@ -349,11 +353,12 @@ impl TcpListener {
     /// accept takes every connection it can until then. The stream holds
     /// `limit` plus every connection accepted before the pause takes effect:
     /// the whole queue at arm time, and every arrival until the driver next
-    /// reaps and submits the cancellation, which lasts as long as the
-    /// executor runs without parking. The listen backlog does not bound this,
-    /// and the kernel ends an arm only when the completion queue is full (at
-    /// about its size in descriptors) or descriptors run out. For a hard
-    /// bound, use
+    /// reaps and submits the cancellation, a window of about one executor
+    /// turn, longer if a task blocks the thread or the executor does not
+    /// reach the driver. The listen backlog does not bound this. An arm ends
+    /// when descriptors run out, or when the completion queue is full (at
+    /// about its size in descriptors), which depends on the kernel: an older
+    /// one may let the completions overflow instead. For a hard bound, use
     /// [`accept`](Self::accept). Otherwise it behaves like
     /// [`incoming`](Self::incoming).
     pub fn incoming_with_limit(

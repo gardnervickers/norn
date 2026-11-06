@@ -330,15 +330,20 @@ fn incoming_limit_holds_the_queue_at_arm_time_then_pauses() -> Result<(), Box<dy
 /// The listen backlog does not bound what `incoming()` holds either. Armed on
 /// an empty queue with a listen backlog of 1, connections that arrive while
 /// the executor does not reach the driver are each accepted in their own
-/// kernel pass, so the queue never holds more than one. The accept ends only
-/// when the completion queue is full, at about its size in descriptors. The
-/// connects run on the executor thread, so nothing here depends on scheduling.
+/// kernel pass, so the queue never holds more than one, yet the stream holds
+/// them all. A small ring keeps this to a dozen descriptors, so the test also
+/// runs under a low `ulimit -n`. Every connect must succeed: with a backlog of
+/// 1, a connect the kernel did not accept promptly would time out, which
+/// fails the test rather than being skipped. The connects run on the executor
+/// thread, so nothing here depends on scheduling.
 #[test]
 fn incoming_limit_is_not_bounded_by_the_listen_backlog() -> Result<(), Box<dyn std::error::Error>> {
     const LIMIT: usize = 2;
-    const SQ_ENTRIES: u32 = 256;
-    // The default completion queue holds twice the submission queue.
+    const SQ_ENTRIES: u32 = 8;
+    // The default completion queue holds twice the submission queue. The
+    // clients stay below it so that no accept completion is lost.
     const CQ_ENTRIES: usize = 2 * SQ_ENTRIES as usize;
+    const CLIENTS: usize = CQ_ENTRIES - 4;
     let driver = norn_uring::Driver::new(io_uring::IoUring::builder(), SQ_ENTRIES)?;
     let mut executor = norn_executor::LocalExecutor::new(driver);
     executor.block_on(async {
@@ -349,14 +354,12 @@ fn incoming_limit_is_not_bounded_by_the_listen_backlog() -> Result<(), Box<dyn s
         // The accept is armed on an empty queue.
         norn_uring::noop().await?;
 
-        // Connections beyond the completion queue time out in the backlog.
         let mut clients = Vec::new();
-        for _ in 0..CQ_ENTRIES + 16 {
-            if let Ok(client) =
-                std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(50))
-            {
-                clients.push(client);
-            }
+        for i in 0..CLIENTS {
+            let client =
+                std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(5))
+                    .map_err(|err| format!("connect {i} of {CLIENTS} failed: {err}"))?;
+            clients.push(client);
         }
         for _ in 0..8 {
             norn_uring::noop().await?;
@@ -367,13 +370,10 @@ fn incoming_limit_is_not_bounded_by_the_listen_backlog() -> Result<(), Box<dyn s
             next.expect("accept stream ended")?;
             held += 1;
         }
-        assert!(
-            held > LIMIT + 1,
-            "held {held} connections, bounded by the limit {LIMIT} and a listen backlog of 1"
-        );
-        assert!(
-            held <= CQ_ENTRIES + 1,
-            "held {held} connections, above the completion queue size {CQ_ENTRIES} plus one"
+        assert_eq!(
+            held, CLIENTS,
+            "held {held} of {CLIENTS} connections, bounded by the limit {LIMIT} \
+             and a listen backlog of 1"
         );
         Ok::<_, Box<dyn std::error::Error>>(())
     })
