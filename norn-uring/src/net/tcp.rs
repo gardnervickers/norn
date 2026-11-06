@@ -319,9 +319,9 @@ impl TcpListener {
     /// every connection accepted before the pause takes effect: the whole
     /// queue at arm time, and every arrival until the driver next reaps and
     /// submits the cancellation. That window is about one executor turn, as
-    /// each turn parks without waiting, which reaps and submits, but it
-    /// grows if a task blocks the thread or the executor does not reach the
-    /// driver. The listen backlog does not bound this (it may never hold
+    /// every turn ends in a park, which reaps and submits before any wait,
+    /// but it grows if a task blocks the thread or the executor does not
+    /// reach the driver. The listen backlog does not bound this (it may never hold
     /// more than one connection). Beyond that, an arm ends when descriptors
     /// run out (`EMFILE`/`ENFILE`, yielded as an error), or when the
     /// completion queue is full, at about its size in descriptors; the
