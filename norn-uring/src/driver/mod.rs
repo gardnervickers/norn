@@ -48,6 +48,12 @@ const DEFAULT_COMPLETION_DRAIN_BUDGET: NonZeroUsize = NonZeroUsize::new(32).unwr
 /// entering one unbounded syscall when a request cannot be cancelled.
 const SHUTDOWN_CANCEL_TIMEOUT: Duration = Duration::from_millis(100);
 
+/// Longest wait-only enter after an allocation failure. Queued entries
+/// (possibly the unparker's eventfd read) never reached the kernel, and a
+/// remote wake cannot end the wait while its read is among them, so the wait is
+/// bounded to keep wake latency low.
+const ALLOCATION_FAILURE_WAIT_CAP: Duration = Duration::from_millis(10);
+
 /// Options controlling normal [`Driver`] operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DriverOptions {
@@ -97,6 +103,14 @@ pub struct Driver {
     /// CQEs copied out of the kernel ring but not dispatched because a wake
     /// callback unwound. This is empty on the normal path.
     deferred_cqes: RefCell<VecDeque<cqueue::Entry>>,
+    /// Whether the last [`Driver::submit`] turned a waiting park into a
+    /// non-waiting one because [`Driver::prepare_park`] consumed a pending
+    /// remote wake. A park downgraded because the eventfd read could not be
+    /// queued does not set this: it has no woken work to run.
+    park_skipped: Cell<bool>,
+    /// Set by [`Driver::prepare_park`] when it consumed a pending remote wake,
+    /// and taken by [`Driver::submit`].
+    consumed_wake: Cell<bool>,
 }
 
 /// Tracks one batch copied from the kernel CQ.
@@ -270,6 +284,7 @@ struct ShutdownTest {
     drain_attempts: Cell<usize>,
     submit_failures: RefCell<std::collections::VecDeque<i32>>,
     submit_limits: RefCell<std::collections::VecDeque<(usize, usize)>>,
+    wait_only_failures: RefCell<std::collections::VecDeque<i32>>,
 }
 
 pub(crate) struct FixedBufReservation {
@@ -983,6 +998,8 @@ impl Driver {
             }),
             unparker: Arc::new(unpark::Unparker::new()?),
             unparker_buf: mem::ManuallyDrop::new(UnparkerBuffer::new()),
+            park_skipped: Cell::new(false),
+            consumed_wake: Cell::new(false),
             deferred_cqes: RefCell::new(VecDeque::new()),
         })
     }
@@ -1027,6 +1044,7 @@ impl Driver {
         }
         let action = self.unparker.park();
         if action == unpark::ParkAction::Notified {
+            self.consumed_wake.set(true);
             return false;
         }
         if action == unpark::ParkAction::Arm {
@@ -1060,6 +1078,8 @@ impl Driver {
     /// Returns the number of entries which were submitted.
     fn submit(&self, mut mode: ParkMode) -> io::Result<usize> {
         let waiting = matches!(mode, ParkMode::Timeout(_) | ParkMode::NextCompletion);
+        self.park_skipped.set(false);
+        self.consumed_wake.set(false);
         if waiting && self.shared.has_sq_demand() {
             // Work waiting for SQ space needs capacity, not a completion. Blocking
             // for a CQE could strand it behind long-lived operations, so submit,
@@ -1080,7 +1100,10 @@ impl Driver {
         }
         // If we're going to park, then prepare the unparker.
         if waiting && !self.prepare_park() {
-            // Preparing the unparker failed, don't park!
+            // Preparing the unparker failed, don't park! Only a consumed wake
+            // means woken work is waiting; if the eventfd read could not be
+            // queued the park may still sleep after an allocation failure.
+            self.park_skipped.set(self.consumed_wake.replace(false));
             mode = ParkMode::NoPark;
         }
         trace!(target: LOG, "submit.mode {:?}", mode);
@@ -1270,6 +1293,11 @@ impl Driver {
                     trace!(target: LOG, "park.drained {}", drained);
                     let ebusy = err.raw_os_error() == Some(libc::EBUSY);
                     if (remaining.is_some() || !ebusy) && (drained == 0 || remaining == Some(0)) {
+                        if drained == 0 && !ebusy && self.wait_after_allocation_failure(mode)? {
+                            // The wait ended on a completion; reap it now so
+                            // the caller wakes whatever it completed.
+                            self.drain_normal(&mut remaining);
+                        }
                         // Yield to runnable work. The next park call will retry
                         // any submission that remains queued. Allocation
                         // failures yield here too rather than spin on enter.
@@ -1280,6 +1308,45 @@ impl Driver {
                 Err(err) => return Err(err),
             }
         }
+    }
+}
+
+impl Driver {
+    /// Honor a waiting park whose enter failed with `EAGAIN` or `ENOMEM`.
+    ///
+    /// The failure means the kernel could not allocate request memory for the
+    /// queued submissions. Returning at once would turn every idle wait into a
+    /// busy loop for as long as allocation keeps failing, so wait for a
+    /// completion without submitting anything: a wait-only enter allocates
+    /// nothing. Returns whether the wait ran and ended without an error.
+    ///
+    /// The wait is bounded by [`ALLOCATION_FAILURE_WAIT_CAP`] (or the park's
+    /// timeout if shorter). The unparker's eventfd read may be among the
+    /// entries the failed enter never submitted, and then a remote wake cannot
+    /// end the wait; the bound keeps wake latency low while still sleeping
+    /// instead of spinning.
+    ///
+    /// The wait is skipped when the park was already downgraded because it
+    /// consumed a pending remote wake, or when a remote wake is pending: the
+    /// caller must run its woken work instead of sleeping. A full SQ or work
+    /// queued for SQ space does not skip it: the wait-only enter needs no SQ
+    /// space and the park would otherwise spin.
+    fn wait_after_allocation_failure(&self, mode: ParkMode) -> io::Result<bool> {
+        if !matches!(mode, ParkMode::Timeout(_) | ParkMode::NextCompletion)
+            || self.park_skipped.get()
+            || self.unparker.is_woken()
+        {
+            return Ok(false);
+        }
+        let mode = match mode {
+            ParkMode::Timeout(duration) => {
+                ParkMode::Timeout(duration.min(ALLOCATION_FAILURE_WAIT_CAP))
+            }
+            _ => ParkMode::Timeout(ALLOCATION_FAILURE_WAIT_CAP),
+        };
+        trace!(target: LOG, "park.wait_only {:?}", mode);
+        self.shared.wait_only(mode)?;
+        Ok(true)
     }
 }
 
@@ -1931,6 +1998,67 @@ impl Shared {
         }
     }
 
+    /// Wait for a completion without submitting anything.
+    ///
+    /// This is `io_uring_enter` with `to_submit = 0` and `min_complete = 1`, so
+    /// unlike [`Shared::submit`] it needs no request allocation. A timed wait
+    /// that expires, a signal, and a transient failure all end the wait
+    /// without an error; the caller re-checks its deadlines and parks again.
+    fn wait_only(&self, mode: ParkMode) -> io::Result<()> {
+        let flags = io_uring::EnterFlags::GETEVENTS | io_uring::EnterFlags::EXT_ARG;
+        #[cfg(test)]
+        if let Some(errno) = self
+            .shutdown_test
+            .wait_only_failures
+            .borrow_mut()
+            .pop_front()
+        {
+            tests::run_wait_only_hook();
+            return self.wait_only_failed(io::Error::from_raw_os_error(errno));
+        }
+        let ring = self.ring.borrow_mut();
+        let result = match mode {
+            ParkMode::Timeout(duration) => {
+                let ts = crate::util::timespec(duration);
+                let args = SubmitArgs::new().timespec(&ts);
+                // Safety: `SubmitArgs` is the `io_uring_getevents_arg` the
+                // kernel expects with `EXT_ARG`, and `ts` outlives the call.
+                unsafe { ring.submitter().enter(0, 1, flags.bits(), Some(&args)) }
+            }
+            _ => {
+                let args = SubmitArgs::new();
+                // Safety: as above, with no timeout or signal mask.
+                unsafe { ring.submitter().enter(0, 1, flags.bits(), Some(&args)) }
+            }
+        };
+        match result {
+            Ok(_) => Ok(()),
+            Err(err)
+                if matches!(err.raw_os_error(), Some(libc::ETIME | libc::EINTR))
+                    || Self::is_transient_submit_error(&err) =>
+            {
+                trace!(target: LOG, "park.wait_only {err}");
+                Ok(())
+            }
+            Err(err) => {
+                drop(ring);
+                self.wait_only_failed(err)
+            }
+        }
+    }
+
+    /// Fail a park whose wait-only enter returned `err`. Like
+    /// [`Shared::submit`], this reports `EBADR` or a non-zero dropped counter
+    /// as the lost-completions error and records the error as the driver's
+    /// health error.
+    fn wait_only_failed(&self, err: io::Error) -> io::Result<()> {
+        let err = self.lost_completions_error(err);
+        if Self::should_record_submit_error(&err) {
+            self.record_submit_error(&err);
+        }
+        Err(err)
+    }
+
     /// Fail if the kernel has dropped completions.
     ///
     /// The kernel drops a CQE when it cannot allocate an overflow entry, and
@@ -2483,7 +2611,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc};
     use std::task::{Context, Poll, Wake, Waker};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use smallvec::SmallVec;
 
@@ -3834,8 +3962,22 @@ mod tests {
             crate::test_util::assert_pipe_reader_closed(write_end);
             unsafe { libc::close(write_end) };
 
-            // Remote wakeups still re-arm once the transient failure passes.
+            // The park above submitted the close; reap its CQE now. Left in
+            // the CQ, it would end the timed park below at once, and the
+            // remote wake would never be needed.
+            driver.park(ParkMode::NoPark).unwrap();
+            {
+                let mut ring = driver.shared.ring.borrow_mut();
+                let mut cq = ring.completion();
+                cq.sync();
+                assert!(cq.is_empty(), "errno {errno}: a CQE is left in the CQ");
+            }
+
+            // The eventfd read queued by the first (failed) park reached the
+            // kernel in the `NoPark` park above, so a remote wake ends this
+            // park. Time it from before the wake thread starts.
             let unparker = Arc::clone(&driver.unparker);
+            let start = Instant::now();
             let remote = std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_millis(50));
                 unparker.wake();
@@ -3843,9 +3985,247 @@ mod tests {
             driver
                 .park(ParkMode::NextCompletion)
                 .expect("remote unpark should end the park");
+            let waited = start.elapsed();
             remote.join().unwrap();
             assert_eq!(driver.shared.status(), Status::Running);
+            assert!(
+                waited >= Duration::from_millis(40),
+                "errno {errno}: the park returned after {waited:?}, before the remote wake"
+            );
         }
+    }
+
+    /// Runs `parks` failing `NextCompletion` parks and returns how long they took.
+    fn failing_waiting_parks(driver: &mut Driver, errno: i32, parks: usize) -> Duration {
+        for _ in 0..parks {
+            driver.shared.fail_next_submit(errno);
+        }
+        let start = Instant::now();
+        for _ in 0..parks {
+            driver.park(ParkMode::NextCompletion).unwrap();
+        }
+        start.elapsed()
+    }
+
+    /// On `EAGAIN`/`ENOMEM` with nothing to reap, a waiting park used to return
+    /// at once, so a persistent allocation failure turned every idle wait into
+    /// a busy loop. Each park must still wait (up to the cap), so `PARKS` of
+    /// them take at least about `PARKS` caps instead of microseconds.
+    const PARKS: usize = 50;
+    const MIN_ELAPSED: Duration = Duration::from_millis(400);
+
+    #[test]
+    fn allocation_failure_does_not_turn_waiting_parks_into_a_spin() {
+        for errno in [libc::EAGAIN, libc::ENOMEM] {
+            let mut driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+            let handle = driver.handle();
+            let mut timer = pin!(handle.timeout(Duration::from_secs(30)));
+            let waker = futures_test::task::noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            assert!(timer.as_mut().poll(&mut cx).is_pending());
+            driver.park(ParkMode::NoPark).unwrap();
+
+            let elapsed = failing_waiting_parks(&mut driver, errno, PARKS);
+            assert!(
+                elapsed >= MIN_ELAPSED,
+                "errno {errno}: {PARKS} NextCompletion parks with a timer in flight returned \
+                 in {elapsed:?}: nothing waited"
+            );
+        }
+    }
+
+    /// The most common idle case: the only in-flight entry is the driver's own
+    /// eventfd read, which the failed enter never submitted.
+    #[test]
+    fn allocation_failure_does_not_spin_an_idle_driver() {
+        for errno in [libc::EAGAIN, libc::ENOMEM] {
+            let mut driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+            let elapsed = failing_waiting_parks(&mut driver, errno, PARKS);
+            assert!(
+                elapsed >= MIN_ELAPSED,
+                "errno {errno}: {PARKS} idle NextCompletion parks returned in {elapsed:?}"
+            );
+        }
+    }
+
+    /// Once the last timer has fired nothing but the eventfd read is in
+    /// flight; the parks after it must not spin either.
+    #[test]
+    fn allocation_failure_does_not_spin_after_the_last_timer_fires() {
+        let mut driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let handle = driver.handle();
+        let mut timer = pin!(handle.timeout(Duration::from_millis(20)));
+        let waker = futures_test::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(timer.as_mut().poll(&mut cx).is_pending());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while timer.as_mut().poll(&mut cx).is_pending() {
+            assert!(Instant::now() < deadline, "timer never fired");
+            driver.park(ParkMode::NextCompletion).unwrap();
+        }
+        let elapsed = failing_waiting_parks(&mut driver, libc::ENOMEM, PARKS);
+        assert!(
+            elapsed >= MIN_ELAPSED,
+            "{PARKS} parks after the timer fired returned in {elapsed:?}"
+        );
+    }
+
+    /// The wait is bounded by the cap even for a long or untimed park (a remote
+    /// wake cannot end it while the eventfd read is unsubmitted), and by the
+    /// park's own timeout when that is shorter.
+    #[test]
+    fn allocation_failure_wait_is_bounded_by_the_cap_and_the_park_timeout() {
+        let mut driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let handle = driver.handle();
+        let mut timer = pin!(handle.timeout(Duration::from_secs(30)));
+        let waker = futures_test::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(timer.as_mut().poll(&mut cx).is_pending());
+        driver.park(ParkMode::NoPark).unwrap();
+
+        for mode in [
+            ParkMode::NextCompletion,
+            ParkMode::Timeout(Duration::from_secs(30)),
+        ] {
+            driver.shared.fail_next_submit(libc::ENOMEM);
+            let start = Instant::now();
+            driver.park(mode).unwrap();
+            let waited = start.elapsed();
+            assert!(
+                waited >= Duration::from_millis(8) && waited < Duration::from_secs(1),
+                "{mode:?} waited {waited:?}, not about the 10 ms cap"
+            );
+        }
+
+        driver.shared.fail_next_submit(libc::ENOMEM);
+        let start = Instant::now();
+        driver
+            .park(ParkMode::Timeout(Duration::from_millis(2)))
+            .unwrap();
+        let waited = start.elapsed();
+        assert!(
+            waited >= Duration::from_millis(1) && waited < Duration::from_millis(100),
+            "a 2 ms timed park waited {waited:?}"
+        );
+    }
+
+    /// A remote wake during the capped wait, with the eventfd read still
+    /// unsubmitted, cannot end the wait but the cap does, well before the
+    /// outstanding timer.
+    #[test]
+    fn allocation_failure_wait_returns_within_the_cap_despite_a_remote_wake() {
+        let mut driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let handle = driver.handle();
+        let mut timer = pin!(handle.timeout(Duration::from_secs(5)));
+        let waker = futures_test::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(timer.as_mut().poll(&mut cx).is_pending());
+        driver.park(ParkMode::NoPark).unwrap();
+
+        // The failed enter leaves the freshly queued eventfd read unsubmitted.
+        driver.shared.fail_next_submit(libc::ENOMEM);
+        let start = Instant::now();
+        let unparker = Arc::clone(&driver.unparker);
+        let remote = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(5));
+            unparker.wake();
+        });
+        driver.park(ParkMode::NextCompletion).unwrap();
+        let waited = start.elapsed();
+        remote.join().unwrap();
+        assert!(
+            waited >= Duration::from_millis(5) && waited < Duration::from_secs(1),
+            "the park waited {waited:?}; the cap should have ended it"
+        );
+
+        // The pending wake is then observed by the next park.
+        driver.park(ParkMode::NextCompletion).unwrap();
+    }
+
+    /// A park whose `prepare_park` consumed a pending remote wake runs as
+    /// `NoPark`; if its enter then fails transiently it must return at once so
+    /// the woken work runs, not wait for a completion.
+    #[test]
+    fn allocation_failure_after_a_consumed_remote_wake_returns_at_once() {
+        for queued_op in [false, true] {
+            let mut driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+            let handle = driver.handle();
+            let waker = futures_test::task::noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            let mut first = pin!(handle.timeout(Duration::from_secs(5)));
+            assert!(first.as_mut().poll(&mut cx).is_pending());
+            driver.park(ParkMode::NoPark).unwrap();
+            let mut second = pin!(handle.timeout(Duration::from_secs(5)));
+            if queued_op {
+                // Leave an entry queued in the SQ.
+                assert!(second.as_mut().poll(&mut cx).is_pending());
+            }
+            Arc::clone(&driver.unparker).wake();
+            driver.shared.fail_next_submit(libc::ENOMEM);
+            let start = Instant::now();
+            driver.park(ParkMode::NextCompletion).unwrap();
+            let waited = start.elapsed();
+            assert!(
+                waited < Duration::from_millis(100),
+                "queued_op={queued_op}: the park waited {waited:?} after consuming a remote wake"
+            );
+        }
+    }
+
+    /// The SQ is full, so the eventfd read cannot be queued and the park runs
+    /// as `NoPark`. No wake was consumed, so the park must still wait out the
+    /// allocation failure instead of spinning.
+    #[test]
+    fn allocation_failure_does_not_spin_with_a_full_sq() {
+        let mut driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let handle = driver.handle();
+        let waker = futures_test::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut timers: Vec<_> = (0..8)
+            .map(|_| Box::pin(handle.timeout(Duration::from_secs(30))))
+            .collect();
+        for timer in &mut timers {
+            assert!(timer.as_mut().poll(&mut cx).is_pending());
+        }
+        assert_eq!(driver.shared.pending_submissions(), 8);
+        assert!(!driver.shared.has_sq_demand());
+        assert_failing_parks_sleep(&mut driver);
+    }
+
+    /// Work is queued for SQ space (the overflow queue); the wait-only enter
+    /// needs no SQ space, so the park must still wait.
+    #[test]
+    fn allocation_failure_does_not_spin_with_overflow_demand() {
+        let mut driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let handle = driver.handle();
+        let waker = futures_test::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut timers: Vec<_> = (0..12)
+            .map(|_| Box::pin(handle.timeout(Duration::from_secs(30))))
+            .collect();
+        for timer in &mut timers {
+            assert!(timer.as_mut().poll(&mut cx).is_pending());
+        }
+        assert!(driver.shared.has_sq_demand());
+        assert_failing_parks_sleep(&mut driver);
+    }
+
+    /// `PARKS` waiting parks that each hit an allocation failure must take
+    /// about one cap each, not return at once.
+    fn assert_failing_parks_sleep(driver: &mut Driver) {
+        const PARKS: usize = 50;
+        for _ in 0..PARKS {
+            driver.shared.fail_next_submit(libc::ENOMEM);
+        }
+        let start = Instant::now();
+        for _ in 0..PARKS {
+            driver.park(ParkMode::NextCompletion).unwrap();
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(400),
+            "{PARKS} parks returned in {elapsed:?}: the driver is spinning"
+        );
     }
 
     #[test]
@@ -4475,9 +4855,9 @@ mod tests {
         assert_eq!(captured_error_logs("dropped by the kernel"), 1);
     }
 
-    /// Bump the kernel's dropped-CQE counter through a second shared mapping
-    /// of the CQ ring, as a real drop would.
-    fn bump_kernel_dropped_counter(driver: &Driver, by: u32) {
+    /// Map the kernel's dropped-CQE counter through a second shared mapping of
+    /// the CQ ring. Returns the mapping and its length for `munmap`.
+    fn map_dropped_counter(driver: &Driver) -> (*mut libc::c_void, usize) {
         let ring = driver.shared.ring.borrow();
         let fd = ring.as_raw_fd();
         // io_uring_params: 10 u32, sq_off (40 bytes), cq_off; overflow is cq_off+16.
@@ -4495,11 +4875,16 @@ mod tests {
             )
         };
         assert_ne!(map, libc::MAP_FAILED, "{}", io::Error::last_os_error());
+        (map, off)
+    }
+
+    /// Bump the kernel's dropped-CQE counter, as a real drop would.
+    fn bump_kernel_dropped_counter(driver: &Driver, by: u32) {
+        let (map, off) = map_dropped_counter(driver);
         let counter =
             unsafe { &*((map as *mut u8).add(off) as *const std::sync::atomic::AtomicU32) };
         counter.fetch_add(by, Ordering::SeqCst);
-        unsafe { libc::munmap(map, len) };
-        drop(ring);
+        unsafe { libc::munmap(map, (off + 4).next_multiple_of(4096)) };
         assert!(driver.shared.ring.borrow_mut().completion().overflow() >= by);
     }
 
@@ -4638,6 +5023,71 @@ mod tests {
             .lost_completions_error(io::Error::from_raw_os_error(libc::EIO));
         assert_eq!(later.raw_os_error(), Some(libc::EIO));
         assert_eq!(captured_error_logs("io_uring_enter.ebadr"), 1);
+    }
+
+    thread_local! {
+        static WAIT_ONLY_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+
+    /// Run the hook a test installed for the injected wait-only failure.
+    pub(super) fn run_wait_only_hook() {
+        if let Some(hook) = WAIT_ONLY_HOOK.with(|hook| hook.borrow_mut().take()) {
+            hook();
+        }
+    }
+
+    #[test]
+    fn ebadr_from_wait_only_reports_the_lost_completions() {
+        capture_error_logs();
+        let mut driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let handle = driver.handle();
+        // Something to wait for, so the wait-only path is taken.
+        let mut timer = pin!(handle.timeout(Duration::from_secs(30)));
+        let waker = futures_test::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(timer.as_mut().poll(&mut cx).is_pending());
+
+        // Memory pressure: the submitting enter fails with EAGAIN, a CQE is
+        // dropped meanwhile, and the wait-only enter reports EBADR.
+        let (map, off) = map_dropped_counter(&driver);
+        let map_len = (off + 4).next_multiple_of(4096);
+        driver.shared.fail_next_submit(libc::EAGAIN);
+        driver
+            .shared
+            .shutdown_test
+            .wait_only_failures
+            .borrow_mut()
+            .push_back(libc::EBADR);
+        WAIT_ONLY_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let counter =
+                    unsafe { &*((map as *mut u8).add(off) as *const std::sync::atomic::AtomicU32) };
+                counter.fetch_add(1, Ordering::SeqCst);
+            }));
+        });
+        let err = driver
+            .park(ParkMode::NextCompletion)
+            .expect_err("EBADR from the wait-only enter is fatal");
+        assert!(err.to_string().contains("dropped by the kernel"), "{err}");
+        assert!(err.to_string().contains("setup_cqsize"), "{err}");
+        assert!(driver.shared.accounting_broken.get());
+        assert_eq!(
+            handle.health_error().unwrap().to_string(),
+            err.to_string(),
+            "the health error is the descriptive one"
+        );
+        assert_eq!(captured_error_logs("io_uring_enter.ebadr"), 1);
+
+        // The failure is sticky.
+        for mode in [ParkMode::NoPark, ParkMode::NextCompletion] {
+            let again = driver.park(mode).expect_err("later parks keep failing");
+            assert!(
+                again.to_string().contains("dropped by the kernel"),
+                "{again}"
+            );
+        }
+        assert_eq!(captured_error_logs("io_uring_enter.ebadr"), 1);
+        unsafe { libc::munmap(map, map_len) };
     }
 
     #[test]
