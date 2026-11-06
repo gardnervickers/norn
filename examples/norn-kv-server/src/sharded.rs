@@ -28,7 +28,7 @@ use norn_channel::DriverBuilder;
 use norn_executor::{spawn, LocalExecutor};
 use norn_uring::buf::{BufCursor, StableBuf};
 use norn_uring::bufring::{BufRingBuf, RecvBufRing};
-use norn_uring::net::{TcpListener, TcpListenerOptions, TcpSocket};
+use norn_uring::net::{ReuseportCpuMap, TcpListener, TcpListenerOptions, TcpSocket};
 use smallvec::SmallVec;
 
 use crate::codec::{DecodeStatus, DecodedFrame, FrameDecoder, ResponseEncoder};
@@ -64,6 +64,15 @@ pub struct ShardedServerConfig {
     pub workers: usize,
     /// Optional one-to-one worker CPU assignment.
     pub worker_cpus: Vec<usize>,
+    /// How the reuse-port group places new connections on workers.
+    ///
+    /// Anything but [`ConnectionSteering::Hash`] requires `worker_cpus`.
+    pub steering: ConnectionSteering,
+    /// Count, per worker, whether accepted connections arrived on its CPU.
+    ///
+    /// Requires `worker_cpus`. Read the counts with
+    /// [`ShardedServer::rx_locality`].
+    pub rx_locality_stats: bool,
     /// Command execution backend constructed independently on every worker.
     pub handler: HandlerConfig,
     /// Limits inherited from the single-worker networking server.
@@ -88,6 +97,8 @@ impl Default for ShardedServerConfig {
             ring_entries: 256,
             workers: 2,
             worker_cpus: Vec::new(),
+            steering: ConnectionSteering::Hash,
+            rx_locality_stats: false,
             handler: HandlerConfig::Memory,
             server: ServerConfig::default(),
             pair_capacity: DEFAULT_PAIR_CAPACITY,
@@ -122,6 +133,13 @@ impl ShardedServerConfig {
                 "--worker-cpus must contain exactly one CPU per worker",
             ));
         }
+        if self.worker_cpus.is_empty()
+            && (self.steering != ConnectionSteering::Hash || self.rx_locality_stats)
+        {
+            return Err(invalid_input(
+                "connection steering and RX locality stats require --worker-cpus",
+            ));
+        }
         let mut distinct = HashSet::with_capacity(self.worker_cpus.len());
         for &cpu in &self.worker_cpus {
             if cpu >= libc::CPU_SETSIZE as usize {
@@ -139,6 +157,136 @@ impl ShardedServerConfig {
     }
 }
 
+/// How a sharded server's reuse-port group places new connections.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ConnectionSteering {
+    /// The kernel's default: a hash of the connection's addresses.
+    #[default]
+    Hash,
+    /// Route connections whose SYN was processed on a worker's CPU to that
+    /// worker. Other CPUs fall back to hash placement.
+    Cpu,
+    /// Like [`Self::Cpu`], and also route each worker CPU's SMT siblings to
+    /// it, so receive processing on a sibling stays on the worker's core.
+    Core,
+}
+
+impl ConnectionSteering {
+    /// Build the CPU map for workers pinned to `worker_cpus`, in slot order.
+    fn map(self, worker_cpus: &[usize]) -> io::Result<Option<ReuseportCpuMap>> {
+        if self == Self::Hash {
+            return Ok(None);
+        }
+        let mut map = ReuseportCpuMap::new();
+        if self == Self::Core {
+            for (slot, &cpu) in worker_cpus.iter().enumerate() {
+                for sibling in core_siblings(cpu)? {
+                    map.route(sibling, slot)?;
+                }
+            }
+        }
+        // Exact routes last, so a worker CPU that is another worker's SMT
+        // sibling stays with its own worker.
+        for (slot, &cpu) in worker_cpus.iter().enumerate() {
+            map.route(cpu, slot)?;
+        }
+        Ok(Some(map))
+    }
+}
+
+/// Return `cpu` and its SMT siblings.
+fn core_siblings(cpu: usize) -> io::Result<Vec<usize>> {
+    let path = format!("/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list");
+    let list = std::fs::read_to_string(&path)
+        .map_err(|error| io::Error::new(error.kind(), format!("read {path}: {error}")))?;
+    parse_cpu_list(list.trim()).ok_or_else(|| invalid_input(format!("unparsable {path}")))
+}
+
+/// Parse a kernel CPU list such as `0-3,8,10-11`.
+fn parse_cpu_list(list: &str) -> Option<Vec<usize>> {
+    let mut cpus = Vec::new();
+    for part in list.split(',') {
+        let (start, end): (usize, usize) = match part.split_once('-') {
+            Some((start, end)) => (start.parse().ok()?, end.parse().ok()?),
+            None => {
+                let cpu = part.parse().ok()?;
+                (cpu, cpu)
+            }
+        };
+        cpus.extend(start..=end);
+    }
+    Some(cpus)
+}
+
+/// Per-worker counts of where accepted connections were received.
+///
+/// A connection's receive CPU is read from `SO_INCOMING_CPU` when it is
+/// accepted, which is the CPU that completed its handshake.
+#[derive(Debug)]
+pub struct RxLocality {
+    workers: Vec<RxCounts>,
+}
+
+#[derive(Debug, Default)]
+struct RxCounts {
+    same_cpu: AtomicU64,
+    same_core: AtomicU64,
+    other: AtomicU64,
+}
+
+/// One worker's [`RxLocality`] counts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RxLocalityCounts {
+    /// Received on the worker's own CPU.
+    pub same_cpu: u64,
+    /// Received on an SMT sibling of the worker's CPU.
+    pub same_core: u64,
+    /// Received on another core, or on an unknown CPU.
+    pub other: u64,
+}
+
+impl RxLocality {
+    /// Return every worker's counts, in worker order.
+    pub fn snapshot(&self) -> Vec<RxLocalityCounts> {
+        self.workers
+            .iter()
+            .map(|counts| RxLocalityCounts {
+                same_cpu: counts.same_cpu.load(Ordering::Relaxed),
+                same_core: counts.same_core.load(Ordering::Relaxed),
+                other: counts.other.load(Ordering::Relaxed),
+            })
+            .collect()
+    }
+}
+
+/// One worker's view of [`RxLocality`].
+struct RxProbe {
+    locality: Arc<RxLocality>,
+    worker: usize,
+    cpu: usize,
+    core: Vec<usize>,
+}
+
+impl RxProbe {
+    fn record(&self, socket: &TcpSocket) {
+        let counts = &self.locality.workers[self.worker];
+        let counter = match socket.incoming_cpu() {
+            Ok(Some(cpu)) if cpu == self.cpu => &counts.same_cpu,
+            Ok(Some(cpu)) if self.core.contains(&cpu) => &counts.same_core,
+            _ => &counts.other,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Steering state handed to one worker.
+#[derive(Default)]
+struct WorkerSteering {
+    /// Attached by the first worker once its listener has bound.
+    attach: Option<ReuseportCpuMap>,
+    rx: Option<RxProbe>,
+}
+
 /// A running fixed group of sharded networking workers.
 ///
 /// Dropping this handle requests cooperative shutdown but does not wait for
@@ -151,6 +299,7 @@ pub struct ShardedServer {
     stopping: Arc<AtomicBool>,
     workers: Vec<WorkerThread>,
     exits: std_mpsc::Receiver<WorkerExit>,
+    rx_locality: Option<Arc<RxLocality>>,
 }
 
 #[derive(Debug)]
@@ -177,6 +326,30 @@ impl ShardedServer {
     /// creation failure, driver creation failure, or listener bind failure.
     pub fn start(config: ShardedServerConfig) -> io::Result<Self> {
         config.validate()?;
+        let mut steering_map = config.steering.map(&config.worker_cpus)?;
+        let rx_locality = config.rx_locality_stats.then(|| {
+            Arc::new(RxLocality {
+                workers: (0..config.workers).map(|_| RxCounts::default()).collect(),
+            })
+        });
+        let mut steering_for = |index: usize| -> io::Result<WorkerSteering> {
+            let rx = match &rx_locality {
+                Some(locality) => {
+                    let cpu = config.worker_cpus[index];
+                    Some(RxProbe {
+                        locality: Arc::clone(locality),
+                        worker: index,
+                        cpu,
+                        core: core_siblings(cpu)?,
+                    })
+                }
+                None => None,
+            };
+            Ok(WorkerSteering {
+                attach: steering_map.take(),
+                rx,
+            })
+        };
         let (worker_channels, controls) = build_topology(config.workers, config.pair_capacity);
         let active = Arc::new(AtomicUsize::new(0));
         let next_connection = Arc::new(AtomicU64::new(0));
@@ -190,6 +363,7 @@ impl ShardedServer {
             config.listen,
             channels.next().unwrap(),
             &config,
+            steering_for(0)?,
             Arc::clone(&active),
             Arc::clone(&next_connection),
             Arc::clone(&stopping),
@@ -206,11 +380,19 @@ impl ShardedServer {
 
         for (index, worker_channels) in channels.enumerate() {
             let index = index + 1;
+            let steering = match steering_for(index) {
+                Ok(steering) => steering,
+                Err(error) => {
+                    stop_and_join(&stopping, &controls, workers);
+                    return Err(error);
+                }
+            };
             match spawn_worker(
                 index,
                 address,
                 worker_channels,
                 &config,
+                steering,
                 Arc::clone(&active),
                 Arc::clone(&next_connection),
                 Arc::clone(&stopping),
@@ -247,7 +429,13 @@ impl ShardedServer {
             stopping,
             workers,
             exits: exit_rx,
+            rx_locality,
         })
+    }
+
+    /// Return the RX locality counters, when they were enabled.
+    pub fn rx_locality(&self) -> Option<Arc<RxLocality>> {
+        self.rx_locality.clone()
     }
 
     /// Return the concrete address shared by every worker listener.
@@ -364,6 +552,7 @@ fn spawn_worker(
     listen: SocketAddr,
     channels: WorkerChannels,
     config: &ShardedServerConfig,
+    steering: WorkerSteering,
     active: Arc<AtomicUsize>,
     next_connection: Arc<AtomicU64>,
     stopping: Arc<AtomicBool>,
@@ -396,6 +585,7 @@ fn spawn_worker(
                     server,
                     cpu,
                     channels,
+                    steering,
                     active,
                     next_connection,
                     stopping,
@@ -432,6 +622,7 @@ fn run_worker(
     server: ServerConfig,
     cpu: Option<usize>,
     channels: WorkerChannels,
+    steering: WorkerSteering,
     active: Arc<AtomicUsize>,
     next_connection: Arc<AtomicU64>,
     stopping: Arc<AtomicBool>,
@@ -484,6 +675,7 @@ fn run_worker(
         control_rx,
         fatal_tx,
         fatal_rx,
+        steering,
         active,
         next_connection,
         stopping,
@@ -507,6 +699,7 @@ async fn worker_main(
     mut control_rx: norn_channel::mpsc::Receiver<Control>,
     fatal_tx: Sender<String>,
     fatal_rx: norn_channel::mpsc::Receiver<String>,
+    steering: WorkerSteering,
     active: Arc<AtomicUsize>,
     next_connection: Arc<AtomicU64>,
     stopping: Arc<AtomicBool>,
@@ -521,6 +714,13 @@ async fn worker_main(
                     format!("bind worker {index} listener at {listen}: {error}"),
                 )
             })?;
+    if let Some(map) = &steering.attach {
+        // Steering only affects locality, so keep serving with hash
+        // placement if this kernel or socket rejects the program.
+        if let Err(error) = listener.attach_reuseport_cpu_map(map) {
+            eprintln!("connection steering disabled: {error}");
+        }
+    }
     let address = listener.local_addr()?;
     let recv_ring = crate::server::recv_ring(RECV_RING_BUFFERS)?;
     startup.ready(address);
@@ -599,6 +799,7 @@ async fn worker_main(
         server,
         control_rx,
         fatal_rx,
+        steering.rx,
         active,
         next_connection,
     )
@@ -764,6 +965,7 @@ async fn serve_worker(
     config: ServerConfig,
     mut control: norn_channel::mpsc::Receiver<Control>,
     mut fatal: norn_channel::mpsc::Receiver<String>,
+    rx: Option<RxProbe>,
     active: Arc<AtomicUsize>,
     next_connection: Arc<AtomicU64>,
 ) -> io::Result<()> {
@@ -798,6 +1000,9 @@ async fn serve_worker(
                         continue;
                     }
                 };
+                if let Some(rx) = &rx {
+                    rx.record(&socket);
+                }
                 let admitted = active.try_update(
                     Ordering::AcqRel,
                     Ordering::Acquire,
@@ -3183,5 +3388,126 @@ mod tests {
         let buffer = router.take_buffer();
         assert!(buffer.is_empty());
         assert!(buffer.capacity() >= 3);
+    }
+
+    #[test]
+    fn kernel_cpu_lists_parse_ranges_and_singletons() {
+        assert_eq!(parse_cpu_list("8,24"), Some(vec![8, 24]));
+        assert_eq!(parse_cpu_list("0-2,7"), Some(vec![0, 1, 2, 7]));
+        assert_eq!(parse_cpu_list("3"), Some(vec![3]));
+        assert_eq!(parse_cpu_list("1-x"), None);
+        assert_eq!(parse_cpu_list(""), None);
+    }
+
+    #[test]
+    fn steering_and_rx_stats_require_pinned_workers() {
+        for config in [
+            ShardedServerConfig {
+                steering: ConnectionSteering::Cpu,
+                ..ShardedServerConfig::default()
+            },
+            ShardedServerConfig {
+                rx_locality_stats: true,
+                ..ShardedServerConfig::default()
+            },
+        ] {
+            assert!(config.validate().is_err());
+        }
+        assert_eq!(ConnectionSteering::Hash.map(&[0, 1]).unwrap(), None);
+    }
+
+    #[test]
+    fn core_steering_routes_siblings_but_keeps_each_worker_cpu_exact() -> io::Result<()> {
+        let cpus = allowed_cpus();
+        let Ok(siblings) = core_siblings(cpus[0]) else {
+            return Ok(());
+        };
+        // Pin worker 1 to a sibling of worker 0 when the host has SMT, so
+        // the exact route must win over worker 0's sibling route.
+        let second = siblings
+            .iter()
+            .copied()
+            .find(|&cpu| cpu != cpus[0] && cpus.contains(&cpu))
+            .or_else(|| cpus.get(1).copied());
+        let Some(second) = second else {
+            return Ok(());
+        };
+        let workers = [cpus[0], second];
+        let map = ConnectionSteering::Core.map(&workers)?.unwrap();
+        assert_eq!(map.slot(workers[0]), Some(0));
+        assert_eq!(map.slot(workers[1]), Some(1));
+        for sibling in siblings {
+            if !workers.contains(&sibling) {
+                assert_eq!(map.slot(sibling), Some(0));
+            }
+        }
+        let map = ConnectionSteering::Cpu.map(&workers)?.unwrap();
+        assert_eq!(map.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn steered_connections_are_accepted_by_the_worker_on_their_syn_cpu() -> io::Result<()> {
+        let cpus = allowed_cpus();
+        if cpus.len() < 2 {
+            return Ok(());
+        }
+        let worker_cpus = vec![cpus[0], cpus[1]];
+        let server = ShardedServer::start(ShardedServerConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            worker_cpus: worker_cpus.clone(),
+            steering: ConnectionSteering::Cpu,
+            rx_locality_stats: true,
+            ..ShardedServerConfig::default()
+        })?;
+        let address = server.local_addr();
+        let locality = server.rx_locality().unwrap();
+
+        // On loopback the SYN is processed on the connecting thread's CPU.
+        let clients = thread::spawn(move || -> io::Result<Vec<TcpStream>> {
+            pin_current_thread(worker_cpus[1])?;
+            (0..8).map(|_| TcpStream::connect(address)).collect()
+        })
+        .join()
+        .unwrap()?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let counts = loop {
+            let counts = locality.snapshot();
+            let accepted: u64 = counts
+                .iter()
+                .map(|c| c.same_cpu + c.same_core + c.other)
+                .sum();
+            if accepted == 8 || std::time::Instant::now() > deadline {
+                break counts;
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        drop(clients);
+        server.shutdown()?;
+        assert_eq!(counts[0], RxLocalityCounts::default());
+        assert_eq!(
+            counts[1],
+            RxLocalityCounts {
+                same_cpu: 8,
+                ..RxLocalityCounts::default()
+            }
+        );
+        Ok(())
+    }
+
+    fn allowed_cpus() -> Vec<usize> {
+        // SAFETY: the set is zero-initialized and pid zero names this thread.
+        let set = unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            assert_eq!(
+                libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set),
+                0
+            );
+            set
+        };
+        (0..libc::CPU_SETSIZE as usize)
+            // SAFETY: every index is below CPU_SETSIZE.
+            .filter(|&cpu| unsafe { libc::CPU_ISSET(cpu, &set) })
+            .collect()
     }
 }

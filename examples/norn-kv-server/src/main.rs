@@ -6,7 +6,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use norn_executor::LocalExecutor;
     use norn_kv_server::handler::HandlerConfig;
     use norn_kv_server::server::{serve, RecvMode, ServerConfig};
-    use norn_kv_server::sharded::{pin_current_thread, ShardedServer, ShardedServerConfig};
+    use norn_kv_server::sharded::{
+        pin_current_thread, ConnectionSteering, ShardedServer, ShardedServerConfig,
+    };
     use norn_uring::net::TcpListener;
 
     #[derive(Debug)]
@@ -16,6 +18,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ring_entries: u32,
         workers: usize,
         worker_cpus: Vec<usize>,
+        steering: ConnectionSteering,
+        rx_locality_stats: bool,
         pair_capacity: usize,
         handler: HandlerConfig,
         server: ServerConfig,
@@ -26,12 +30,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!(
             "Usage: norn-kv-server [--listen ADDR] [--backlog N] [--ring-entries N] \
              [--workers N] [--worker-cpus LIST] \
+             [--steer-connections hash|cpu|core] [--rx-locality-stats] \
              [--pair-capacity N] \
              [--fixed-response-bytes N] \
              [--max-body N] [--max-connections N] [--recv-mode exact|multishot] \
              [--max-batch-commands N] [--max-batch-response-bytes N]\n\
              --pair-capacity defaults to {pair_capacity} credited in-flight exchanges per \
-             directed worker pair in sharded mode"
+             directed worker pair in sharded mode\n\
+             --steer-connections routes each connection to the worker pinned to the \
+             CPU (cpu) or core (core) that processed its SYN; --rx-locality-stats \
+             prints, once a second, where accepted connections were received"
         );
     }
 
@@ -47,6 +55,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ring_entries: 256,
             workers: 1,
             worker_cpus: Vec::new(),
+            steering: ConnectionSteering::Hash,
+            rx_locality_stats: false,
             pair_capacity: ShardedServerConfig::default().pair_capacity,
             handler: HandlerConfig::Memory,
             server: ServerConfig::default(),
@@ -58,6 +68,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 usage();
                 std::process::exit(0);
             }
+            if arg == "--rx-locality-stats" {
+                config.rx_locality_stats = true;
+                continue;
+            }
             let (name, raw) = if let Some(raw) = value(&arg, "--listen") {
                 ("--listen", raw.to_owned())
             } else if let Some(raw) = value(&arg, "--backlog") {
@@ -68,6 +82,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ("--workers", raw.to_owned())
             } else if let Some(raw) = value(&arg, "--worker-cpus") {
                 ("--worker-cpus", raw.to_owned())
+            } else if let Some(raw) = value(&arg, "--steer-connections") {
+                ("--steer-connections", raw.to_owned())
             } else if let Some(raw) = value(&arg, "--pair-capacity") {
                 ("--pair-capacity", raw.to_owned())
             } else if let Some(raw) = value(&arg, "--fixed-response-bytes") {
@@ -89,6 +105,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     | "--ring-entries"
                     | "--workers"
                     | "--worker-cpus"
+                    | "--steer-connections"
                     | "--pair-capacity"
                     | "--fixed-response-bytes"
                     | "--max-body"
@@ -103,6 +120,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "--ring-entries" => "--ring-entries",
                     "--workers" => "--workers",
                     "--worker-cpus" => "--worker-cpus",
+                    "--steer-connections" => "--steer-connections",
                     "--pair-capacity" => "--pair-capacity",
                     "--fixed-response-bytes" => "--fixed-response-bytes",
                     "--max-body" => "--max-body",
@@ -139,6 +157,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "--ring-entries" => config.ring_entries = parse_number(name, &raw)?,
                 "--workers" => config.workers = parse_number(name, &raw)?,
                 "--worker-cpus" => config.worker_cpus = parse_cpu_list(&raw)?,
+                "--steer-connections" => {
+                    config.steering = match raw.as_str() {
+                        "hash" => ConnectionSteering::Hash,
+                        "cpu" => ConnectionSteering::Cpu,
+                        "core" => ConnectionSteering::Core,
+                        _ => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                format!("invalid --steer-connections value '{raw}'"),
+                            ));
+                        }
+                    }
+                }
                 "--pair-capacity" => config.pair_capacity = parse_number(name, &raw)?,
                 "--fixed-response-bytes" => {
                     config.handler = HandlerConfig::FixedResponse {
@@ -193,6 +224,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "--worker-cpus must contain exactly one CPU per worker",
             ));
         }
+        if config.workers == 1
+            && (config.steering != ConnectionSteering::Hash || config.rx_locality_stats)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--steer-connections and --rx-locality-stats require --workers > 1",
+            ));
+        }
         Ok(config)
     }
 
@@ -231,11 +270,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ring_entries: config.ring_entries,
             workers: config.workers,
             worker_cpus: config.worker_cpus,
+            steering: config.steering,
+            rx_locality_stats: config.rx_locality_stats,
             pair_capacity: config.pair_capacity,
             handler: config.handler,
             server: config.server,
         })?;
         println!("listening on {}", server.local_addr());
+        if let Some(locality) = server.rx_locality() {
+            // The benchmark stops the server with a signal, so report
+            // cumulative counts as they change rather than at exit.
+            std::thread::spawn(move || {
+                let mut last = Vec::new();
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    let counts = locality.snapshot();
+                    if counts != last {
+                        let workers: Vec<_> = counts
+                            .iter()
+                            .map(|c| format!("{}/{}/{}", c.same_cpu, c.same_core, c.other))
+                            .collect();
+                        eprintln!(
+                            "rx-locality same-cpu/same-core/other by worker: {}",
+                            workers.join(" ")
+                        );
+                        last = counts;
+                    }
+                }
+            });
+        }
         return server.wait().map_err(Into::into);
     }
     if let Some(&cpu) = config.worker_cpus.first() {
