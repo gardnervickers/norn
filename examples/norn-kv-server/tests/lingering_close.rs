@@ -166,22 +166,18 @@ fn check_sharded(ending: Ending) {
 fn single_worker(recv_mode: RecvMode) -> SocketAddr {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let driver = norn_uring::Driver::new(io_uring::IoUring::builder(), 256).unwrap();
+        let config = ServerConfig {
+            recv_mode,
+            ..ServerConfig::default()
+        };
+        let driver = norn_kv_server::server::driver(256, &config).unwrap();
         let mut executor = norn_executor::LocalExecutor::new(driver);
         executor
             .block_on(async move {
                 let listener =
                     norn_uring::net::TcpListener::bind("127.0.0.1:0".parse().unwrap(), 64).await?;
                 tx.send(listener.local_addr()?).unwrap();
-                norn_kv_server::server::serve(
-                    listener,
-                    HandlerConfig::Memory.build(),
-                    ServerConfig {
-                        recv_mode,
-                        ..ServerConfig::default()
-                    },
-                )
-                .await
+                norn_kv_server::server::serve(listener, HandlerConfig::Memory.build(), config).await
             })
             .unwrap();
     });

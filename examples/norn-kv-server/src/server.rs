@@ -195,29 +195,50 @@ impl ServerConfig {
     }
 }
 
+/// Completions one connection can have pending at once: its receive (a
+/// multishot receive's final completion, or an exact receive), a send, the
+/// lingering-close timeout, and a cancellation from a pause or a drop.
+const CQES_PER_CONNECTION: u64 = 4;
+
 /// Create a worker's `io_uring` driver with `ring_entries` submission queue
-/// entries and a completion queue that also has room for every buffer of
-/// the receive ring.
+/// entries and a completion queue (CQ) with room for everything `config`
+/// lets the worker have pending.
 ///
-/// A multishot receive posts one completion per ring buffer it fills, and
-/// keeps filling while the worker is busy, so with the default CQ (twice the
-/// SQ) a burst overflows it. The kernel may drop an overflowed completion
-/// when it cannot allocate the overflow entry, and the driver then fails.
+/// The kernel posts completions while the worker is busy, and a park reaps
+/// them only later. The CQ needs room for every buffer of the multishot
+/// receive ring (one completion per buffer filled), for
+/// [`CQES_PER_CONNECTION`] per connection up to `config.max_connections`,
+/// and for `ring_entries` more as slack for the accept, timers, closes and
+/// the driver's eventfd read. Without that, completions overflow the CQ (a
+/// full CQ also ends multishot receives), and the kernel may drop an
+/// overflowed completion when it cannot allocate the overflow entry, which
+/// fails the driver.
+///
+/// The kernel rounds the CQ up to a power of two, and clamps it at its
+/// limit (65536 entries) rather than failing.
 ///
 /// # Errors
 ///
 /// Returns an error when the kernel cannot create the ring.
-pub fn driver(ring_entries: u32, recv_mode: RecvMode) -> io::Result<norn_uring::Driver> {
-    let recv_buffers = match recv_mode {
-        RecvMode::Exact => 0,
-        RecvMode::Multishot => u32::from(RECV_RING_BUFFERS),
-    };
+pub fn driver(ring_entries: u32, config: &ServerConfig) -> io::Result<norn_uring::Driver> {
     let mut builder = io_uring::IoUring::builder();
-    // Clamp rather than reject sizes above the kernel's limits.
     builder
         .setup_clamp()
-        .setup_cqsize(ring_entries.saturating_add(recv_buffers));
+        .setup_cqsize(cq_entries(ring_entries, config));
     norn_uring::Driver::new(builder, ring_entries)
+}
+
+/// The CQ size [`driver`] requests; see there.
+fn cq_entries(ring_entries: u32, config: &ServerConfig) -> u32 {
+    let recv_buffers = match config.recv_mode {
+        RecvMode::Exact => 0,
+        RecvMode::Multishot => u64::from(RECV_RING_BUFFERS),
+    };
+    let connections = (config.max_connections as u64).saturating_mul(CQES_PER_CONNECTION);
+    let total = u64::from(ring_entries)
+        .saturating_add(recv_buffers)
+        .saturating_add(connections);
+    u32::try_from(total).unwrap_or(u32::MAX)
 }
 
 /// Build the provided-buffer ring that every multishot connection on a worker
@@ -699,10 +720,39 @@ mod tests {
         Status, OP_GET, OP_NOOP, OP_QUIT, OP_SET, REQUEST_MAGIC, RESPONSE_MAGIC,
     };
 
+    /// Block the worker, without reaping, until `peer` finishes, and fail as
+    /// soon as a completion overflows the CQ or the kernel drops one. A
+    /// dropped completion can strand the peer (a multishot receive that
+    /// ended without telling anyone stops draining its socket), so this does
+    /// not wait for the peer once one is seen.
+    fn assert_no_cq_overflow_while_busy<T>(peer: &std::thread::JoinHandle<T>, what: &str) {
+        use std::time::{Duration, Instant};
+
+        let handle = norn_uring::Handle::current();
+        let check = || {
+            assert!(
+                !handle.cq_overflow_pending() && handle.cqes_dropped() == 0,
+                "{what} overflowed the {}-entry CQ ({} completions dropped)",
+                handle.cq_entries(),
+                handle.cqes_dropped(),
+            );
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !peer.is_finished() {
+            check();
+            assert!(Instant::now() < deadline, "the peer did not finish sending");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Let the kernel complete receives for the last data it accepted.
+        std::thread::sleep(Duration::from_millis(500));
+        check();
+    }
+
     /// A multishot receive keeps filling ring buffers while the worker is
     /// busy, posting a completion for each. The worker's completion queue
-    /// must hold all of them: completions that overflow it can be dropped by
-    /// the kernel, after which the driver fails with `EBADR`.
+    /// must hold all of them: when it is full the kernel ends the receive and
+    /// overflows its final completion, which the kernel can drop, after which
+    /// the driver fails with `EBADR`.
     #[test]
     fn multishot_burst_fits_in_the_completion_queue() {
         use std::io::Write;
@@ -718,7 +768,7 @@ mod tests {
         const BURST: usize = BURST_BUFFERS * RECV_BUFFER_LEN;
 
         // The server's default `--ring-entries`.
-        let driver = driver(256, RecvMode::Multishot).unwrap();
+        let driver = driver(256, &ServerConfig::default()).unwrap();
         let mut executor = LocalExecutor::new(driver);
         executor.block_on(async {
             let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap(), 8)
@@ -729,9 +779,12 @@ mod tests {
             let (start_tx, start_rx) = mpsc::channel::<()>();
             let peer = thread::spawn(move || {
                 let mut stream = TcpStream::connect(address).unwrap();
-                start_rx.recv().unwrap();
-                stream.write_all(&vec![7_u8; BURST]).unwrap();
                 stream
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                start_rx.recv().unwrap();
+                let sent = stream.write_all(&vec![7_u8; BURST]);
+                (stream, sent)
             });
             let (socket, _) = listener.accept().await.unwrap();
             let mut incoming = pin!(socket.recv_ring_multi(&ring));
@@ -749,17 +802,15 @@ mod tests {
             })
             .await;
 
-            // Keep the worker busy, without reaping, while the burst arrives.
-            // The kernel completes the receive from task work meanwhile.
+            // The kernel completes the receive from task work while the
+            // worker is busy.
             start_tx.send(()).unwrap();
-            let peer_stream = peer.join().unwrap();
-            thread::sleep(Duration::from_millis(500));
-            let handle = norn_uring::Handle::current();
-            assert!(
-                !handle.cq_overflow_pending(),
-                "a {BURST_BUFFERS}-buffer multishot burst overflowed the {}-entry CQ",
-                handle.cq_entries(),
+            assert_no_cq_overflow_while_busy(
+                &peer,
+                &format!("a {BURST_BUFFERS}-buffer multishot burst"),
             );
+            let (peer_stream, sent) = peer.join().unwrap();
+            sent.unwrap();
 
             let mut received = 0;
             let mut buffers = 0;
@@ -772,6 +823,110 @@ mod tests {
             assert!(buffers >= BURST_BUFFERS);
             drop(peer_stream);
         });
+    }
+
+    /// Every exact-mode connection has a receive in flight, so the CQ needs
+    /// room for one completion per connection, not only for the SQ.
+    #[test]
+    fn exact_mode_many_connections_fit_in_the_completion_queue() {
+        use std::io::Write;
+        use std::net::TcpStream;
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        use norn_executor::LocalExecutor;
+
+        // More than the default 512-entry CQ of the default 256-entry SQ.
+        const CONNECTIONS: usize = 768;
+        raise_open_file_limit(4 * CONNECTIONS as u64);
+
+        let config = ServerConfig {
+            recv_mode: RecvMode::Exact,
+            ..ServerConfig::default()
+        };
+        let driver = driver(256, &config).unwrap();
+        let mut executor = LocalExecutor::new(driver);
+        executor.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap(), 1024)
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            let (start_tx, start_rx) = mpsc::channel::<()>();
+            let peer = thread::spawn(move || {
+                let mut streams: Vec<_> = (0..CONNECTIONS)
+                    .map(|_| TcpStream::connect(address).unwrap())
+                    .collect();
+                start_rx.recv().unwrap();
+                for stream in &mut streams {
+                    stream.write_all(&[1]).unwrap();
+                }
+                streams
+            });
+            let mut tasks = Vec::new();
+            for _ in 0..CONNECTIONS {
+                let (socket, _) = listener.accept().await.unwrap();
+                tasks.push(norn_executor::spawn(async move {
+                    let (result, _) = socket.recv(Vec::with_capacity(64)).await;
+                    result.unwrap()
+                }));
+            }
+            // Let parks submit every receive.
+            for _ in 0..8 {
+                norn_uring::Handle::current()
+                    .timeout(Duration::from_millis(5))
+                    .await
+                    .ok();
+            }
+            start_tx.send(()).unwrap();
+            assert_no_cq_overflow_while_busy(&peer, &format!("{CONNECTIONS} exact receives"));
+            let streams = peer.join().unwrap();
+            for task in tasks {
+                assert_eq!(task.await.unwrap(), 1);
+            }
+            drop(streams);
+        });
+    }
+
+    /// Raise the soft open-file limit to at least `wanted`, as far as the hard
+    /// limit allows.
+    fn raise_open_file_limit(wanted: u64) {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `limit` is a valid rlimit for getrlimit to fill.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        if limit.rlim_cur < wanted as libc::rlim_t {
+            limit.rlim_cur = limit.rlim_max.min(wanted as libc::rlim_t);
+            // SAFETY: `limit` is a valid rlimit.
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) };
+        }
+    }
+
+    #[test]
+    fn cq_covers_the_receive_ring_and_every_connection() {
+        let multishot = ServerConfig::default();
+        assert_eq!(
+            cq_entries(256, &multishot),
+            256 + u32::from(RECV_RING_BUFFERS) + 4 * 4_096
+        );
+        let exact = ServerConfig {
+            recv_mode: RecvMode::Exact,
+            max_connections: 10,
+            ..ServerConfig::default()
+        };
+        assert_eq!(cq_entries(256, &exact), 256 + 40);
+        let huge = ServerConfig {
+            max_connections: usize::MAX,
+            ..ServerConfig::default()
+        };
+        assert_eq!(cq_entries(256, &huge), u32::MAX);
+        // The kernel clamps rather than rejects an oversized CQ.
+        drop(driver(256, &huge).unwrap());
     }
 
     #[test]

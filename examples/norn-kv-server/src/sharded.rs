@@ -445,7 +445,7 @@ fn run_worker(
         })?;
     }
 
-    let uring = crate::server::driver(ring_entries, RecvMode::Multishot).map_err(|error| {
+    let uring = crate::server::driver(ring_entries, &server).map_err(|error| {
         io::Error::new(
             error.kind(),
             format!("create worker {index} io_uring driver: {error}"),
