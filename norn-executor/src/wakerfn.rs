@@ -130,6 +130,9 @@ where
     }
 
     /// Attempt to poll the inner future, returning the result if ready.
+    // Inlined into both copies of the executor loop (timed and untimed
+    // polls); as a call it costs every tick about 30 instructions.
+    #[inline(always)]
     pub(crate) fn try_poll(&mut self) -> Option<F::Output> {
         let generation = self.poll_root.generation.load(Ordering::Acquire);
         if generation == self.observed_generation {

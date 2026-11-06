@@ -17,6 +17,29 @@ pub(crate) struct RingCounters {
     pub(crate) enter_retries: Counter,
     pub(crate) unparks: Counter,
     pub(crate) status: Gauge,
+    pub(crate) waiting: Gauge,
+}
+
+/// Flags a ring as waiting in `io_uring_enter` until dropped.
+///
+/// It sets a flag instead of timing the wait: two clock reads cost about 250
+/// instructions per waiting enter, 14% of a tick in a probe where every op
+/// parks. Readers estimate idle time by sampling the flag.
+pub(crate) struct Waiting<'a>(&'a RingCounters);
+
+impl<'a> Waiting<'a> {
+    #[inline(always)]
+    pub(crate) fn start(counters: &'a RingCounters) -> Self {
+        counters.waiting.set(1);
+        Self(counters)
+    }
+}
+
+impl Drop for Waiting<'_> {
+    #[inline(always)]
+    fn drop(&mut self) {
+        self.0.waiting.set(0);
+    }
 }
 
 /// A read-only view of one ring's counters.
@@ -55,6 +78,7 @@ impl RingMetrics {
             cqes_dropped: c.cqes_dropped.get(),
             enter_retries: c.enter_retries.get(),
             unparks: c.unparks.get(),
+            waiting: c.waiting.get() != 0,
             status: match c.status.get() {
                 0 => RingStatus::Running,
                 1 => RingStatus::Closing,
@@ -123,6 +147,15 @@ pub struct RingSnapshot {
     /// Wakeups from another thread that reached a parked, running ring.
     /// Shutdown's own wakeup is not counted.
     pub unparks: u64,
+    /// Whether the driver's thread was inside a waiting `io_uring_enter` when
+    /// read: idle, waiting for a completion, a timeout or a wakeup.
+    ///
+    /// The executor's `running` flag is also false during the work a park
+    /// does before it waits, such as reaping completions; this flag is set
+    /// only for the wait itself. The fraction of samples that find it set
+    /// estimates how idle the thread is: sampling every millisecond for ten
+    /// seconds gives the idle fraction to within about one percent.
+    pub waiting: bool,
     /// The driver's lifecycle stage.
     pub status: RingStatus,
 }
@@ -195,6 +228,11 @@ impl Visit for RingSnapshot {
             "norn_uring_unparks_total",
             "Cross-thread wakeups that reached a parked ring.",
             self.unparks,
+        ));
+        f(gauge(
+            "norn_uring_waiting",
+            "1 while the driver's thread waits in io_uring_enter.",
+            u64::from(self.waiting),
         ));
         f(gauge(
             "norn_uring_status",

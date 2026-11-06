@@ -134,3 +134,30 @@ fn polls_of_an_unwinding_tick_are_counted() {
     assert_eq!(snapshot.polls, 1, "{snapshot:?}");
     assert!(!snapshot.running, "{snapshot:?}");
 }
+
+/// Poll timing is off until enabled, then buckets every task poll.
+#[test]
+fn poll_timing_buckets_each_poll() {
+    let mut executor = LocalExecutor::new(SpinPark);
+    assert!(executor.poll_time_metrics().is_none());
+    assert_eq!(executor.metric_sources().len(), 1);
+
+    executor.enable_poll_timing();
+    let times = executor.poll_time_metrics().unwrap();
+    executor.block_on(async {
+        norn_executor::spawn(async {}).await.unwrap();
+        norn_executor::spawn(async {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        })
+        .await
+        .unwrap();
+    });
+    let snapshot = times.snapshot();
+    assert_eq!(snapshot.count(), 2, "{snapshot:?}");
+    assert_eq!(snapshot.up_to_10ms, 1, "{snapshot:?}");
+    assert!(snapshot.max_ns >= 2_000_000, "{snapshot:?}");
+    assert!(snapshot.total_ns >= snapshot.max_ns, "{snapshot:?}");
+    let sources = executor.metric_sources();
+    assert_eq!(sources.len(), 2);
+    assert!(sources.get::<norn_executor::PollTimeMetrics>().is_some());
+}

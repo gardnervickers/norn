@@ -1962,14 +1962,14 @@ impl Shared {
         let sqpoll = ring.params().is_setup_sqpoll();
         let submitted = match mode {
             ParkMode::Timeout(duration) => {
-                self.publish_waiting(counters);
                 let ts = crate::util::timespec(duration);
                 let args = SubmitArgs::new().timespec(&ts);
+                let _waiting = self.start_waiting(counters);
                 ring.submitter().submit_with_args(1, &args)?
             }
             ParkMode::NextCompletion => {
-                self.publish_waiting(counters);
                 let args = SubmitArgs::new();
+                let _waiting = self.start_waiting(counters);
                 ring.submitter().submit_with_args(1, &args)?
             }
             ParkMode::NoPark => {
@@ -2005,13 +2005,15 @@ impl Shared {
         Ok(submitted)
     }
 
-    /// Count a waiting enter, and publish the in-flight count it waits with,
-    /// which includes the wakeup read armed for this park.
+    /// Count a waiting enter, publish the in-flight count it waits with
+    /// (which includes the wakeup read armed for this park), and flag the ring
+    /// as waiting until the returned guard drops.
     #[inline]
-    fn publish_waiting(&self, counters: &metrics::RingCounters) {
+    fn start_waiting<'a>(&self, counters: &'a metrics::RingCounters) -> metrics::Waiting<'a> {
         counters.enters.incr();
         counters.waiting_enters.incr();
         counters.in_flight.set(self.in_flight.get() as u64);
+        metrics::Waiting::start(counters)
     }
 
     /// Submit all entries in the submission queue.
@@ -2091,7 +2093,7 @@ impl Shared {
             return self.wait_only_failed(io::Error::from_raw_os_error(errno));
         }
         let ring = self.ring.borrow_mut();
-        self.publish_waiting(&self.counters);
+        let waiting = self.start_waiting(&self.counters);
         let result = match mode {
             ParkMode::Timeout(duration) => {
                 let ts = crate::util::timespec(duration);
@@ -2106,6 +2108,7 @@ impl Shared {
                 unsafe { ring.submitter().enter(0, 1, flags.bits(), Some(&args)) }
             }
         };
+        drop(waiting);
         match result {
             Ok(_) => Ok(()),
             Err(err)

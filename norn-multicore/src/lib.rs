@@ -535,6 +535,7 @@ enum WorkerExit {
 
 struct Bootstrap {
     id: WorkerId,
+    poll_timing: bool,
     driver: DriverBuilder,
     shutdown: channel::DetachedReceiver<()>,
     control: Arc<GroupControl>,
@@ -558,6 +559,7 @@ pub struct Builder {
     control: Arc<GroupControl>,
     thread_name_prefix: String,
     stack_size: Option<usize>,
+    poll_timing: bool,
 }
 
 impl fmt::Debug for Builder {
@@ -566,6 +568,7 @@ impl fmt::Debug for Builder {
             .field("workers", &self.workers.len())
             .field("thread_name_prefix", &self.thread_name_prefix)
             .field("stack_size", &self.stack_size)
+            .field("poll_timing", &self.poll_timing)
             .finish()
     }
 }
@@ -607,6 +610,7 @@ impl Builder {
             control,
             thread_name_prefix: "norn-worker".to_owned(),
             stack_size: None,
+            poll_timing: false,
         }
     }
 
@@ -664,6 +668,14 @@ impl Builder {
         )
     }
 
+    /// Time every task poll on every worker, as
+    /// [`LocalExecutor::enable_poll_timing`] does. Off by default, because it
+    /// reads the clock twice per poll.
+    pub fn enable_poll_timing(&mut self) -> &mut Self {
+        self.poll_timing = true;
+        self
+    }
+
     /// Configure one worker with a custom fallible [`Park`] factory.
     ///
     /// The factory and `main` closure are moved to the destination thread. The
@@ -694,6 +706,7 @@ impl Builder {
         slot.task = Some(Box::new(move |bootstrap| {
             let Bootstrap {
                 id,
+                poll_timing,
                 driver,
                 shutdown,
                 control,
@@ -719,6 +732,9 @@ impl Builder {
             let shutdown_state =
                 Rc::new(ShutdownState::new(Arc::clone(&control.workers[id.index()])));
             let mut executor = LocalExecutor::new(driver);
+            if poll_timing {
+                executor.enable_poll_timing();
+            }
             let metrics = executor.metric_sources();
             let _ = control.metrics[id.index()].set(metrics.clone());
             startup_reported.store(true, Ordering::Release);
@@ -800,6 +816,7 @@ impl Builder {
             let control_for_panic = Arc::clone(&self.control);
             let bootstrap = Bootstrap {
                 id,
+                poll_timing: self.poll_timing,
                 driver,
                 shutdown,
                 control,

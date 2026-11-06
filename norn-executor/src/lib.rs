@@ -53,7 +53,7 @@ mod metrics;
 pub mod park;
 mod wakerfn;
 
-pub use metrics::{ExecutorMetrics, ExecutorSnapshot};
+pub use metrics::{ExecutorMetrics, ExecutorSnapshot, PollTimeMetrics, PollTimeSnapshot};
 
 /// A single-threaded executor for driving [`Future`]s to completion.
 ///
@@ -75,6 +75,7 @@ pub struct LocalExecutor<P: park::Park> {
     config: Config,
     root_notifier: Option<wakerfn::RootNotifier<P::Unparker>>,
     counters: Arc<Padded<metrics::ExecutorCounters>>,
+    poll_times: Option<Arc<Padded<metrics::PollTimeCounters>>>,
 }
 
 /// Configuration for [`LocalExecutor`] scheduling.
@@ -124,6 +125,7 @@ impl<P: park::Park> LocalExecutor<P> {
             config,
             root_notifier,
             counters: Arc::default(),
+            poll_times: None,
         }
     }
 
@@ -154,8 +156,32 @@ impl<P: park::Park> LocalExecutor<P> {
     pub fn metric_sources(&self) -> norn_metrics::Sources {
         let mut sources = norn_metrics::Sources::new();
         sources.push(self.metrics());
+        if let Some(poll_times) = self.poll_time_metrics() {
+            sources.push(poll_times);
+        }
         self.park.metric_sources(&mut sources);
         sources
+    }
+
+    /// Time every task poll from the next `block_on` on, into five duration
+    /// buckets plus a total and a maximum.
+    ///
+    /// Off by default: timing reads the clock twice per poll, which costs
+    /// about 250 instructions and doubles the cost of a trivial poll. The
+    /// choice is made once per `block_on`, so with timing off the poll loop is
+    /// unchanged. Calling this again has no effect. Sources taken earlier from
+    /// [`LocalExecutor::metric_sources`] do not include poll times; take them
+    /// after enabling.
+    pub fn enable_poll_timing(&mut self) {
+        self.poll_times.get_or_insert_with(Arc::default);
+    }
+
+    /// A view of the poll durations, once
+    /// [`LocalExecutor::enable_poll_timing`] has been called.
+    pub fn poll_time_metrics(&self) -> Option<PollTimeMetrics> {
+        self.poll_times
+            .as_ref()
+            .map(|times| PollTimeMetrics(Arc::clone(times)))
     }
 
     /// Blocks the current thread until the provided [`Future`] has completed.
@@ -199,6 +225,19 @@ impl<P: park::Park> LocalExecutor<P> {
     where
         F: Future,
     {
+        // Choose once, not per tick or poll, whether to time polls.
+        match self.poll_times.clone() {
+            None => self.drive(fut, Untimed),
+            Some(times) => self.drive(fut, Timed(times)),
+        }
+    }
+
+    #[inline(always)]
+    fn drive<F, R>(&mut self, fut: F, runner: R) -> Result<F::Output, std::io::Error>
+    where
+        F: Future,
+        R: RunTask,
+    {
         let _g = self.enter();
         let fut = pin!(fut);
         let notifier = match self.root_notifier.take() {
@@ -227,7 +266,7 @@ impl<P: park::Park> LocalExecutor<P> {
             while let Some(next) = self.taskqueue.next() {
                 // Counted before running, so a run that unwinds counts too.
                 tick.polled += 1;
-                next.run();
+                runner.run(next);
                 if tick.polled == budget {
                     has_remaining_tasks = self.taskqueue.runnable() > 0;
                     break;
@@ -261,6 +300,31 @@ impl<P: park::Park> LocalExecutor<P> {
         let g1 = self.park.enter();
         let g2 = context::Context::enter(self.handle());
         (g1, g2)
+    }
+}
+
+/// How the poll loop runs one task: plainly, or timed.
+trait RunTask {
+    fn run(&self, task: norn_task::Runnable);
+}
+
+struct Untimed;
+
+impl RunTask for Untimed {
+    #[inline(always)]
+    fn run(&self, task: norn_task::Runnable) {
+        task.run();
+    }
+}
+
+struct Timed(Arc<Padded<metrics::PollTimeCounters>>);
+
+impl RunTask for Timed {
+    #[inline(always)]
+    fn run(&self, task: norn_task::Runnable) {
+        let start = std::time::Instant::now();
+        task.run();
+        self.0.record(start.elapsed());
     }
 }
 

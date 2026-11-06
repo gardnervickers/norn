@@ -30,6 +30,7 @@ fn counts_submissions_completions_and_lifecycle() {
     drop(executor);
     let snapshot = metrics.snapshot();
     assert_eq!(snapshot.status, RingStatus::Shutdown);
+    assert!(!snapshot.waiting, "{snapshot:?}");
     // Every entry the driver pushed has been reaped.
     assert_eq!(snapshot.in_flight, 0, "{snapshot:?}");
     assert_eq!(snapshot.sqes_submitted, snapshot.cqes, "{snapshot:?}");
@@ -111,6 +112,7 @@ fn counters_are_readable_while_the_ring_waits() {
     assert!(during.waiting_enters >= 1, "{during:?}");
     // The timeout and the wakeup read armed for this park.
     assert_eq!(during.in_flight, 2, "{during:?}");
+    assert!(during.waiting, "{during:?}");
 }
 
 /// The ring and the timer wheel above it each add their view to the

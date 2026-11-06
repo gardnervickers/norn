@@ -116,3 +116,26 @@ fn group_collects_every_layer_of_every_worker() {
         assert!(names.contains(&"test_label"));
     }
 }
+
+#[test]
+fn poll_timing_reaches_every_worker() {
+    let mut builder = RuntimeGroup::builder(2);
+    builder.enable_poll_timing();
+    for index in 0..2 {
+        builder
+            .worker(WorkerId::new(index), |_| async {
+                norn_executor::spawn(async {}).await.unwrap();
+            })
+            .unwrap();
+    }
+    let group = builder.start().unwrap();
+    let metrics = group.metrics();
+    group.join().unwrap();
+    for (_, sources) in &metrics {
+        let times = sources
+            .get::<norn_executor::PollTimeMetrics>()
+            .unwrap()
+            .snapshot();
+        assert!(times.count() >= 1, "{times:?}");
+    }
+}

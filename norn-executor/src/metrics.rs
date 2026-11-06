@@ -164,3 +164,142 @@ impl Visit for ExecutorSnapshot {
         self.tasks.visit(f);
     }
 }
+
+/// Poll durations recorded when poll timing is enabled.
+#[derive(Debug, Default)]
+pub(crate) struct PollTimeCounters {
+    buckets: [Counter; 5],
+    total_ns: Counter,
+    max_ns: norn_metrics::Gauge,
+}
+
+/// The upper bounds of the first four poll-time buckets, in nanoseconds; the
+/// fifth holds every longer poll.
+const POLL_TIME_BOUNDS_NS: [u64; 4] = [10_000, 100_000, 1_000_000, 10_000_000];
+
+impl PollTimeCounters {
+    /// Record one poll. Owner thread only.
+    #[inline]
+    pub(crate) fn record(&self, elapsed: std::time::Duration) {
+        let ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        let bucket = POLL_TIME_BOUNDS_NS
+            .iter()
+            .position(|&bound| ns <= bound)
+            .unwrap_or(POLL_TIME_BOUNDS_NS.len());
+        self.buckets[bucket].incr();
+        self.total_ns.add(ns);
+        if ns > self.max_ns.get() {
+            self.max_ns.set(ns);
+        }
+    }
+}
+
+/// A read-only view of an executor's poll durations, present once
+/// [`LocalExecutor::enable_poll_timing`](crate::LocalExecutor::enable_poll_timing)
+/// has been called.
+#[derive(Clone)]
+pub struct PollTimeMetrics(pub(crate) Arc<Padded<PollTimeCounters>>);
+
+impl std::fmt::Debug for PollTimeMetrics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.snapshot().fmt(f)
+    }
+}
+
+impl Visit for PollTimeMetrics {
+    fn visit(&self, f: &mut dyn FnMut(Metric)) {
+        self.snapshot().visit(f);
+    }
+}
+
+impl PollTimeMetrics {
+    /// Read the current values.
+    pub fn snapshot(&self) -> PollTimeSnapshot {
+        let c = &self.0;
+        PollTimeSnapshot {
+            up_to_10us: c.buckets[0].get(),
+            up_to_100us: c.buckets[1].get(),
+            up_to_1ms: c.buckets[2].get(),
+            up_to_10ms: c.buckets[3].get(),
+            over_10ms: c.buckets[4].get(),
+            total_ns: c.total_ns.get(),
+            max_ns: c.max_ns.get(),
+        }
+    }
+}
+
+/// Poll durations read from a [`PollTimeMetrics`].
+///
+/// The five buckets do not overlap; together they count every timed poll.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PollTimeSnapshot {
+    /// Polls that took at most 10 µs.
+    pub up_to_10us: u64,
+    /// Polls that took more than 10 µs and at most 100 µs.
+    pub up_to_100us: u64,
+    /// Polls that took more than 100 µs and at most 1 ms.
+    pub up_to_1ms: u64,
+    /// Polls that took more than 1 ms and at most 10 ms.
+    pub up_to_10ms: u64,
+    /// Polls that took more than 10 ms.
+    pub over_10ms: u64,
+    /// Total time spent in timed polls, in nanoseconds.
+    pub total_ns: u64,
+    /// The longest timed poll, in nanoseconds.
+    pub max_ns: u64,
+}
+
+impl PollTimeSnapshot {
+    /// The number of timed polls.
+    pub fn count(&self) -> u64 {
+        self.up_to_10us + self.up_to_100us + self.up_to_1ms + self.up_to_10ms + self.over_10ms
+    }
+}
+
+impl Visit for PollTimeSnapshot {
+    fn visit(&self, f: &mut dyn FnMut(Metric)) {
+        let counter = |name, help, value| Metric {
+            name,
+            help,
+            kind: Kind::Counter,
+            value,
+        };
+        f(counter(
+            "norn_executor_poll_time_le_10us_total",
+            "Timed polls that took at most 10 us.",
+            self.up_to_10us,
+        ));
+        f(counter(
+            "norn_executor_poll_time_le_100us_total",
+            "Timed polls that took more than 10 us and at most 100 us.",
+            self.up_to_100us,
+        ));
+        f(counter(
+            "norn_executor_poll_time_le_1ms_total",
+            "Timed polls that took more than 100 us and at most 1 ms.",
+            self.up_to_1ms,
+        ));
+        f(counter(
+            "norn_executor_poll_time_le_10ms_total",
+            "Timed polls that took more than 1 ms and at most 10 ms.",
+            self.up_to_10ms,
+        ));
+        f(counter(
+            "norn_executor_poll_time_gt_10ms_total",
+            "Timed polls that took more than 10 ms.",
+            self.over_10ms,
+        ));
+        f(counter(
+            "norn_executor_poll_time_nanoseconds_total",
+            "Time spent in timed polls.",
+            self.total_ns,
+        ));
+        f(Metric {
+            name: "norn_executor_poll_time_max_nanoseconds",
+            help: "The longest timed poll.",
+            kind: Kind::Gauge,
+            value: self.max_ns,
+        });
+    }
+}
