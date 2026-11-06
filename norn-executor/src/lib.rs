@@ -53,6 +53,16 @@ mod wakerfn;
 /// A single-threaded executor for driving [`Future`]s to completion.
 ///
 /// [`LocalExecutor`] can be driven by calling [`LocalExecutor::block_on`].
+///
+/// # Panics on drop
+///
+/// Dropping a [`LocalExecutor`] cancels its remaining tasks and then shuts down
+/// the [`park::Park`] layer. If waking a task's `JoinHandle` waker panics while
+/// the tasks are cancelled, every task is still finished and
+/// [`park::Park::shutdown`] still runs, and the first such panic is then
+/// propagated out of `drop`. A drop that happens while the thread is already
+/// panicking aborts the process, as for any panic in a destructor during
+/// unwinding.
 pub struct LocalExecutor<P: park::Park> {
     /// Task queue contains tasks which are ready to be executed.
     taskqueue: norn_task::TaskQueue,
@@ -282,8 +292,16 @@ impl<P: park::Park> Drop for LocalExecutor<P> {
             self.park.enter_for_shutdown(),
             context::Context::enter_for_shutdown(self.handle()),
         );
-        self.taskqueue.shutdown();
+        // `TaskQueue::shutdown` finishes every task and then re-raises the
+        // first join-waker panic. Still shut the park down while the context
+        // guard is alive, then resume the panic.
+        let tasks = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.taskqueue.shutdown();
+        }));
         self.park.shutdown();
+        if let Err(payload) = tasks {
+            std::panic::resume_unwind(payload);
+        }
     }
 }
 

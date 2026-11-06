@@ -12,7 +12,8 @@ use futures_util::future::poll_fn;
 use futures_util::task::AtomicWaker;
 use futures_util::StreamExt;
 use norn_uring::bufring::{BufRingBufBundle, RecvBufRing};
-use norn_uring::net::{SendZcUsage, UdpSocket};
+use norn_uring::net::{RecvOptions, SendOptions, SendZcUsage, UdpSocket};
+use norn_uring::WithOptions;
 
 mod util;
 
@@ -257,20 +258,67 @@ fn connected_send_recv_msg_zc() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
-fn recv_msg() -> Result<(), Box<dyn std::error::Error>> {
+fn recv_from_options_apply_with_and_without_waiting() -> Result<(), Box<dyn std::error::Error>> {
     util::with_test_env(|| async {
         let s1 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
         let s2 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let peek = RecvOptions::new().peek(true);
 
-        let (res, sent) = s1
-            .send_to(Bytes::from_static(b"hello"), s2.local_addr()?)
+        // A datagram is already queued, so the nonblocking `recvfrom` serves it.
+        s1.send_to(Bytes::from_static(b"ready"), s2.local_addr()?)
+            .await
+            .0?;
+        let (res, buf) = s2
+            .recv_from(BytesMut::with_capacity(16))
+            .options(peek)
             .await;
-        assert_eq!(res?, sent.len());
+        assert_eq!(res?, (5, s1.local_addr()?));
+        assert_eq!(&buf[..], b"ready");
+        let (res, buf) = s2.recv_from(BytesMut::with_capacity(16)).await;
+        assert_eq!(res?.0, 5);
+        assert_eq!(&buf[..], b"ready");
 
-        let (res, buf) = s2.recv_msg(BytesMut::with_capacity(16), 0).await;
-        let (n, addr) = res?;
-        assert_eq!(addr, s1.local_addr()?);
-        assert_eq!(&buf[..n], b"hello");
+        // Nothing is queued yet, so the receive goes through `io_uring`.
+        let mut recv = pin!(s2.recv_from(BytesMut::with_capacity(16)).options(peek));
+        assert!(poll_fn(|cx| Poll::Ready(recv.as_mut().poll(cx).is_pending())).await);
+        s1.send_to(Bytes::from_static(b"later"), s2.local_addr()?)
+            .await
+            .0?;
+        let (res, buf) = recv.await;
+        assert_eq!(res?.0, 5);
+        assert_eq!(&buf[..], b"later");
+        let (res, buf) = s2.recv_from(BytesMut::with_capacity(16)).await;
+        assert_eq!(res?.0, 5);
+        assert_eq!(&buf[..], b"later");
+
+        Ok(())
+    })
+}
+
+#[test]
+fn send_with_more_joins_one_datagram() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let s1 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let s2 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let more = SendOptions::new().more(true);
+
+        s1.send_to(Bytes::from_static(b"hel"), s2.local_addr()?)
+            .options(more)
+            .await
+            .0?;
+        s1.send_to(Bytes::from_static(b"lo"), s2.local_addr()?)
+            .await
+            .0?;
+        let (res, buf) = s2.recv_from(BytesMut::with_capacity(16)).await;
+        assert_eq!(res?.0, 5);
+        assert_eq!(&buf[..], b"hello");
+
+        s1.connect(s2.local_addr()?).await?;
+        s1.send(Bytes::from_static(b"wor")).options(more).await.0?;
+        s1.send(Bytes::from_static(b"ld")).await.0?;
+        let (res, buf) = s2.recv_from(BytesMut::with_capacity(16)).await;
+        assert_eq!(res?.0, 5);
+        assert_eq!(&buf[..], b"world");
 
         Ok(())
     })
@@ -290,7 +338,10 @@ fn msg_trunc_direct_recv_from_caps_vec_initialization() -> Result<(), Box<dyn st
         let buf = Vec::with_capacity(1);
         let submitted_len = buf.capacity();
         assert!(submitted_len < TRUNC_PAYLOAD.len());
-        let (res, buf) = receiver.recv_from_with_flags(buf, libc::MSG_TRUNC).await;
+        let (res, buf) = receiver
+            .recv_from(buf)
+            .options(RecvOptions::new().trunc(true))
+            .await;
         let (reported_len, addr) = res?;
 
         assert_eq!(reported_len, TRUNC_PAYLOAD.len());
@@ -311,7 +362,9 @@ fn msg_trunc_uring_recv_from_caps_bytes_mut_initialization(
         let buf = BytesMut::with_capacity(1);
         let submitted_len = buf.capacity();
         assert!(submitted_len < TRUNC_PAYLOAD.len());
-        let mut recv = pin!(receiver.recv_from_with_flags(buf, libc::MSG_TRUNC));
+        let mut recv = pin!(receiver
+            .recv_from(buf)
+            .options(RecvOptions::new().trunc(true)));
         poll_fn(|cx| {
             assert!(recv.as_mut().poll(cx).is_pending());
             Poll::Ready(())
@@ -345,7 +398,10 @@ fn msg_trunc_connected_recv_caps_vec_and_bytes_mut_initialization(
         sender.send(Bytes::from_static(TRUNC_PAYLOAD)).await.0?;
         let vec_buf = Vec::with_capacity(1);
         let vec_submitted_len = vec_buf.capacity();
-        let (res, vec_buf) = receiver.recv_with_flags(vec_buf, libc::MSG_TRUNC).await;
+        let (res, vec_buf) = receiver
+            .recv(vec_buf)
+            .options(RecvOptions::new().trunc(true))
+            .await;
         assert_eq!(res?, TRUNC_PAYLOAD.len());
         assert_eq!(vec_buf.len(), vec_submitted_len);
         assert_eq!(&vec_buf[..], &TRUNC_PAYLOAD[..vec_submitted_len]);
@@ -353,7 +409,10 @@ fn msg_trunc_connected_recv_caps_vec_and_bytes_mut_initialization(
         sender.send(Bytes::from_static(TRUNC_PAYLOAD)).await.0?;
         let bytes_buf = BytesMut::with_capacity(1);
         let bytes_submitted_len = bytes_buf.capacity();
-        let (res, bytes_buf) = receiver.recv_with_flags(bytes_buf, libc::MSG_TRUNC).await;
+        let (res, bytes_buf) = receiver
+            .recv(bytes_buf)
+            .options(RecvOptions::new().trunc(true))
+            .await;
         assert_eq!(res?, TRUNC_PAYLOAD.len());
         assert_eq!(bytes_buf.len(), bytes_submitted_len);
         assert_eq!(&bytes_buf[..], &TRUNC_PAYLOAD[..bytes_submitted_len]);
@@ -793,64 +852,6 @@ fn connected_recv_bundle_multi_preserves_empty_datagrams() -> Result<(), Box<dyn
     })
 }
 
-#[test]
-fn bundle_receive_rejects_invalid_flags_without_consuming_a_ring_buffer(
-) -> Result<(), Box<dyn std::error::Error>> {
-    util::with_test_env(|| async {
-        let ring = RecvBufRing::builder(13).buf_cnt(1).buf_len(128).build()?;
-        let s1 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
-        let s2 = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
-        s1.connect(s2.local_addr()?).await?;
-        s2.connect(s1.local_addr()?).await?;
-
-        let err = s2
-            .recv_bundle_with_flags(&ring, libc::MSG_TRUNC)
-            .await
-            .unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-
-        for flags in [libc::MSG_TRUNC, libc::MSG_PEEK, libc::MSG_WAITALL] {
-            let mut recv = pin!(s2.recv_bundle_multi_with_flags(&ring, flags));
-            let err = recv
-                .next()
-                .await
-                .expect("configuration failure must produce one stream item")
-                .unwrap_err();
-            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-            assert!(recv.next().await.is_none());
-        }
-
-        let payload = Bytes::from_static(b"ring-still-usable");
-        s1.send(payload.clone()).await.0?;
-        let (buf, peer) = s2.recv_from_ring(&ring).await?;
-        assert_eq!(peer, s1.local_addr()?);
-        assert_eq!(&buf[..], payload.as_ref());
-
-        Ok(())
-    })
-}
-
-#[test]
-fn terminal_bundle_configuration_error_releases_socket_ownership(
-) -> Result<(), Box<dyn std::error::Error>> {
-    util::with_test_env(|| async {
-        let ring = RecvBufRing::builder(16).buf_cnt(1).buf_len(128).build()?;
-        let socket = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
-        let mut recv = Box::pin(socket.recv_bundle_multi_with_flags(&ring, libc::MSG_TRUNC));
-
-        let err = recv
-            .next()
-            .await
-            .expect("configuration failure must produce one stream item")
-            .unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-
-        socket.close().await?;
-        drop(recv);
-        Ok(())
-    })
-}
-
 struct UdpEchoServer {
     socket: UdpSocket,
 }
@@ -1041,4 +1042,19 @@ fn readiness_stream_survives_a_full_completion_queue() -> Result<(), Box<dyn std
         }
         Ok::<_, Box<dyn std::error::Error>>(())
     })
+}
+
+#[test]
+#[should_panic(expected = "request options must be set before the request is first polled")]
+fn options_on_a_polled_recv_from_panic() {
+    util::with_test_env(|| async {
+        let socket = UdpSocket::bind("127.0.0.1:0".parse()?).await?;
+        let mut recv = socket.recv_from(vec![0u8; 4]);
+        assert!(
+            poll_fn(|cx| Poll::Ready(std::pin::Pin::new(&mut recv).poll(cx).is_pending())).await
+        );
+        drop(recv.options(RecvOptions::new().peek(true)));
+        Ok(())
+    })
+    .unwrap();
 }
