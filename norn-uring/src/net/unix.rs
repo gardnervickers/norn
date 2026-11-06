@@ -330,8 +330,9 @@ impl UnixSocket {
     /// bytes read means the peer shut down its write half.
     ///
     /// Set per-operation [`RecvOptions`] with [`WithOptions::options`]. As on
-    /// TCP, a receive with [`RecvOptions::trunc`] fails with
-    /// [`io::ErrorKind::InvalidInput`] and returns the buffer unchanged.
+    /// TCP, a receive with [`RecvOptions::trunc`], or with
+    /// [`RecvOptions::peek`] together with [`RecvOptions::wait_all`], fails
+    /// with [`io::ErrorKind::InvalidInput`] and returns the buffer unchanged.
     pub fn recv<B: StableBufMut>(
         &self,
         buf: B,

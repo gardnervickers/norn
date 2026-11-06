@@ -29,8 +29,8 @@ impl RecvOptions {
 
     /// Configure whether the receive leaves the data queued.
     ///
-    /// This sets `MSG_PEEK`. A later receive returns the same data. TCP
-    /// receives reject it together with [`RecvOptions::wait_all`] with
+    /// This sets `MSG_PEEK`. A later receive returns the same data. TCP and
+    /// Unix stream receives reject it together with [`RecvOptions::wait_all`] with
     /// [`io::ErrorKind::InvalidInput`]: `io_uring` retries a partial wait-all
     /// receive, and each peeking retry would copy the start of the queue
     /// again.

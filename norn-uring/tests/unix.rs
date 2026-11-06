@@ -146,21 +146,34 @@ fn stream_receive_options_apply_to_one_request() -> Result<(), Box<dyn std::erro
         a.send(&b"hel"[..]).await.0?;
         a.send(&b"lo"[..]).await.0?;
 
-        let peek = RecvOptions::new().peek(true).wait_all(true);
+        let peek = RecvOptions::new().peek(true);
         let (res, buf) = b.recv(vec![0u8; 5]).options(peek).await;
         assert_eq!(res?, 5);
         assert_eq!(buf, b"hello");
 
-        // A stream receive rejects `trunc` and returns the buffer untouched.
-        let trunc = RecvOptions::new().trunc(true);
-        let (res, buf) = b.recv(vec![7u8; 5]).options(trunc).await;
-        assert_eq!(res.unwrap_err().kind(), io::ErrorKind::InvalidInput);
-        assert_eq!(buf, [7; 5]);
+        // A stream receive rejects `trunc`, and `peek` with `wait_all`, and
+        // returns the buffer untouched.
+        let rejected = [
+            RecvOptions::new().trunc(true),
+            RecvOptions::new().peek(true).wait_all(true),
+        ];
+        for opts in rejected {
+            let (res, buf) = b.recv(vec![7u8; 5]).options(opts).await;
+            assert_eq!(res.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(buf, [7; 5]);
+        }
 
-        // The peeked bytes are still queued.
-        let (res, buf) = b.recv(vec![0u8; 5]).await;
-        assert_eq!(res?, 5);
-        assert_eq!(buf, b"hello");
+        // `wait_all` alone waits for the whole buffer.
+        let waiter = spawn(async move {
+            let (res, buf) = b
+                .recv(vec![0u8; 8])
+                .options(RecvOptions::new().wait_all(true))
+                .await;
+            res.map(|n| buf[..n].to_vec())
+        });
+        norn_uring::noop().await?;
+        a.send(&b"!!!"[..]).await.0?;
+        assert_eq!(waiter.await??, b"hello!!!");
         Ok(())
     })
 }
