@@ -28,7 +28,8 @@
 //! `STRESS_NO_REMOTE_UNPARK`, `STRESS_SHUTDOWN` (graceful|abortsome|abrupt),
 //! `STRESS_NO_LEFTOVERS` (never drop resources after the driver; by default
 //! half of the seeds do), `STRESS_ACTOR_MASK` (bitmask of actors to run),
-//! `STRESS_VERBOSE`.
+//! `STRESS_SETTLE_MS` (settle time before the probe and pool checks),
+//! `STRESS_TRACE_SEND`, `STRESS_VERBOSE`.
 #![cfg(target_os = "linux")]
 
 use std::cell::{Cell, RefCell};
@@ -488,7 +489,7 @@ impl Config {
             cq_entries = Some(4096);
         }
         let flags = rng.below(6);
-        let (coop_taskrun, single_issuer, mut defer_taskrun, taskrun_flag) = match flags {
+        let (mut coop_taskrun, single_issuer, mut defer_taskrun, mut taskrun_flag) = match flags {
             0 => (false, false, false, false),
             1 => (true, false, false, false),
             2 => (true, true, true, false),
@@ -504,6 +505,11 @@ impl Config {
         } else {
             None
         };
+        if sqpoll.is_some() {
+            // The kernel rejects SQPOLL combined with these task-run flags.
+            coop_taskrun = false;
+            taskrun_flag = false;
+        }
         let drain_budget = match rng.below(4) {
             0 => None,
             1 => Some(1),
@@ -624,6 +630,16 @@ struct Ctx {
     verbose: bool,
 }
 
+impl Drop for Ctx {
+    fn drop(&mut self) {
+        // An undrained peer thread would be detached with its sockets open.
+        debug_assert!(
+            std::thread::panicking() || self.peers.borrow().is_empty(),
+            "peer threads left in Ctx"
+        );
+    }
+}
+
 fn env_error(e: &io::Error) -> bool {
     matches!(
         e.raw_os_error(),
@@ -632,6 +648,10 @@ fn env_error(e: &io::Error) -> bool {
 }
 
 static ENV_ISSUES: AtomicUsize = AtomicUsize::new(0);
+/// Seeds skipped because the kernel refused their ring configuration.
+static UNSUPPORTED_CONFIGS: AtomicUsize = AtomicUsize::new(0);
+/// Seeds that finished with at least one environment issue.
+static ENV_SEEDS: AtomicUsize = AtomicUsize::new(0);
 
 impl Ctx {
     /// Host resource exhaustion (ephemeral ports, conntrack) is not a runtime
@@ -1663,18 +1683,35 @@ async fn tcp_echo_actor(ctx: Rc<Ctx>, mut rng: Rng, id: usize) {
             Err(e) => return ctx.fail(format!("tcp actor {id}: bind {e}")),
         };
         let addr = listener.local_addr().unwrap();
-        ctx.spawn_peer(move || {
-            if let Ok(s) = std::net::TcpStream::connect(addr) {
-                tcp_peer(s, behaviour, stop);
-            }
+        // The peer reports a failed connect: without it nothing would ever
+        // be accepted, and the accept below would wait forever.
+        let peer_error: Arc<Mutex<Option<io::Error>>> = Arc::new(Mutex::new(None));
+        let peer_error_out = Arc::clone(&peer_error);
+        ctx.spawn_peer(move || match std::net::TcpStream::connect(addr) {
+            Ok(s) => tcp_peer(s, behaviour, stop),
+            Err(e) => *peer_error_out.lock().unwrap() = Some(e),
         });
-        let accepted = if rng.chance(0.5) {
-            listener.accept().await.map(|(s, _)| s)
-        } else {
-            let mut incoming = Box::pin(listener.incoming());
-            match incoming.next().await {
-                Some(r) => r,
-                None => Err(io::Error::other("incoming ended")),
+        let accept = async {
+            if rng.chance(0.5) {
+                listener.accept().await.map(|(s, _)| s)
+            } else {
+                let mut incoming = Box::pin(listener.incoming());
+                match incoming.next().await {
+                    Some(r) => r,
+                    None => Err(io::Error::other("incoming ended")),
+                }
+            }
+        };
+        let accepted = match race(Box::pin(accept), sleep(Duration::from_secs(5))).await {
+            Either::Left(r) => r,
+            Either::Right(_) => {
+                return match peer_error.lock().unwrap().take() {
+                    Some(e) if env_error(&e) => {
+                        ctx.env(format!("tcp actor {id}: peer connect {e}"))
+                    }
+                    Some(e) => ctx.fail(format!("tcp actor {id}: peer connect {e}")),
+                    None => ctx.fail(format!("tcp actor {id}: accept timed out")),
+                };
             }
         };
         let close_listener = rng.chance(0.5);
@@ -2253,6 +2290,28 @@ async fn udp_actor(ctx: Rc<Ctx>, mut rng: Rng, id: usize) {
 // Post-run buffer-ring probe
 // ---------------------------------------------------------------------------
 
+/// The kernel's receive-drop counter for the UDP socket bound to `port` in this
+/// network namespace (the `drops` column of `/proc/net/udp`), or 0 if unknown.
+fn udp_drops(port: u16) -> u64 {
+    let Ok(table) = std::fs::read_to_string("/proc/net/udp") else {
+        return 0;
+    };
+    let suffix = format!(":{port:04X}");
+    table
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            let local = fields.get(1)?;
+            if local.ends_with(&suffix) {
+                fields.last()?.parse::<u64>().ok()
+            } else {
+                None
+            }
+        })
+        .sum()
+}
+
 /// Proves the ring holds exactly `buf_cnt` distinct selectable buffers and is
 /// not quarantined.
 async fn probe_ring(ctx: &Ctx, ring: &RecvBufRing) {
@@ -2260,7 +2319,7 @@ async fn probe_ring(ctx: &Ctx, ring: &RecvBufRing) {
     let rx = match UdpSocket::bind("127.0.0.1:0".parse().unwrap()).await {
         Ok(s) => s,
         Err(e) if env_error(&e) => return ctx.env(format!("probe: bind {e}")),
-        Err(e) => return ctx.env(format!("probe: bind {e}")),
+        Err(e) => return ctx.fail(format!("probe: bind {e}")),
     };
     let tx = match std::net::UdpSocket::bind("127.0.0.1:0") {
         Ok(tx) => tx,
@@ -2285,9 +2344,12 @@ async fn probe_ring(ctx: &Ctx, ring: &RecvBufRing) {
                 }
                 held.push(buf);
             }
-            Err(e) if ENV_ISSUES.load(Ordering::SeqCst) > 0 => {
+            // Only a datagram the kernel itself dropped (full receive queue,
+            // memory pressure) explains missing buffers; an unrelated
+            // environment issue elsewhere in the seed does not.
+            Err(e) if udp_drops(addr.port()) > 0 => {
                 return ctx.env(format!(
-                    "probe: {i} of {cnt} (datagrams may have been dropped): {e}"
+                    "probe: {i} of {cnt} (kernel dropped datagrams): {e}"
                 ));
             }
             Err(e) => {
@@ -2355,16 +2417,22 @@ fn start_watchdog(hang_secs: u64) {
         let started = SEED_STARTED_MS.load(Ordering::SeqCst);
         if now_ms().saturating_sub(started) > hang_secs * 1000 {
             let phase = PHASES[PHASE.load(Ordering::SeqCst)];
-            eprintln!(
-                "STRESS HANG seed={seed} phase={phase} after {hang_secs}s\nconfig: {:?}",
+            // Write to the real stderr: this thread inherits libtest's output
+            // capture, which `abort` would throw away.
+            use std::io::Write;
+            let mut err = std::io::stderr().lock();
+            let _ = writeln!(
+                err,
+                "STRESS HANG seed={seed} phase={phase} after {hang_secs}s (replay: STRESS_SEED={seed} STRESS_REPEAT=20)\nconfig: {:?}",
                 Config::generate(seed)
             );
             for w in WARNINGS.lock().unwrap().iter() {
-                eprintln!("  warning: {w}");
+                let _ = writeln!(err, "  warning: {w}");
             }
             for (i, st) in STATUS.lock().unwrap().iter().enumerate() {
-                eprintln!("  actor {i}: {st}");
+                let _ = writeln!(err, "  actor {i}: {st}");
             }
+            let _ = err.flush();
             std::process::abort();
         }
     });
@@ -2384,7 +2452,6 @@ fn run_seed(seed: u64, verbose: bool) -> Result<(), Vec<String>> {
     let live_before = LIVE_BUFS.load(Ordering::SeqCst);
     let fds_before = fd_count();
     let tmpdir = std::env::temp_dir().join(format!("norn-stress-{}-{seed}", std::process::id()));
-    let _ = std::fs::create_dir_all(&tmpdir);
 
     let options = DriverOptions {
         completion_drain_budget: cfg.drain_budget.and_then(NonZeroUsize::new),
@@ -2392,12 +2459,16 @@ fn run_seed(seed: u64, verbose: bool) -> Result<(), Vec<String>> {
     let driver = match Driver::new_with_options(cfg.builder(), cfg.sq_entries, options) {
         Ok(d) => d,
         Err(e) => {
+            UNSUPPORTED_CONFIGS.fetch_add(1, Ordering::SeqCst);
             if verbose {
                 eprintln!("seed {seed}: unsupported ring config: {e}");
             }
             return Ok(());
         }
     };
+    // Created only once the seed really runs, so skipped seeds leave nothing
+    // behind in the temp dir.
+    let _ = std::fs::create_dir_all(&tmpdir);
     let unparker = driver.unparker();
     let unpark_stop = Arc::new(AtomicBool::new(false));
     let unpark_thread = if cfg.remote_unpark {
@@ -2433,7 +2504,7 @@ fn run_seed(seed: u64, verbose: bool) -> Result<(), Vec<String>> {
     let errors_cell: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
     let peers_cell: Rc<RefCell<Vec<std::thread::JoinHandle<()>>>> =
         Rc::new(RefCell::new(Vec::new()));
-    let leftovers = if true {
+    let leftovers = {
         let cfg = cfg.clone();
         let peer_stop = Arc::clone(&peer_stop);
         let errors_out = Rc::clone(&errors_cell);
@@ -2553,17 +2624,11 @@ fn run_seed(seed: u64, verbose: bool) -> Result<(), Vec<String>> {
                     }
                 }
             }
-            errors_out
-                .borrow_mut()
-                .extend(ctx.errors.borrow_mut().drain(..));
-            peers_out
-                .borrow_mut()
-                .extend(ctx.peers.borrow_mut().drain(..));
             // Resources that outlive the executor and driver: a held
             // provided buffer, its ring, sockets and a fixed-buffer pool.
             let mut leftovers: Vec<Box<dyn std::any::Any>> = Vec::new();
-            // Off by default: these currently leak descriptors (see
-            // `stress_regressions.rs`) and would mask other failures.
+            // On by default (STRESS_NO_LEFTOVERS turns them off): they cover
+            // descriptors dropped after the driver shut down.
             if !env_flag("STRESS_NO_LEFTOVERS") && rng.chance(0.5) {
                 let ring = ctx.rings[0].clone();
                 if let Ok(rx) = UdpSocket::bind("127.0.0.1:0".parse().unwrap()).await {
@@ -2575,7 +2640,7 @@ fn run_seed(seed: u64, verbose: bool) -> Result<(), Vec<String>> {
                     {
                         leftovers.push(Box::new(buf));
                     }
-                    // An in-flight receive that only teardown completes.
+                    // A pending POLLPRI readiness poll that only teardown completes.
                     let pending = Box::pin(rx.poll_readiness(libc::POLLPRI as u32));
                     let mut pending = Some(pending);
                     std::future::poll_fn(|cx| {
@@ -2599,11 +2664,19 @@ fn run_seed(seed: u64, verbose: bool) -> Result<(), Vec<String>> {
                     leftovers.swap(i, j);
                 }
             }
+            // Hand over errors and peer threads only now: in Abrupt mode the
+            // actors keep running (and spawn peers) while the leftovers above
+            // await, and a peer left in `ctx` would be detached with its
+            // sockets still open, skewing the descriptor check.
+            errors_out
+                .borrow_mut()
+                .extend(ctx.errors.borrow_mut().drain(..));
+            peers_out
+                .borrow_mut()
+                .extend(ctx.peers.borrow_mut().drain(..));
             leftovers
             // `handles` (Abrupt) and `ctx` drop here or with the executor.
         })
-    } else {
-        Vec::new()
     };
     PHASE.store(2, Ordering::SeqCst);
     drop(ex);
@@ -2635,11 +2708,19 @@ fn run_seed(seed: u64, verbose: bool) -> Result<(), Vec<String>> {
         ));
     }
     for w in WARNINGS.lock().unwrap().iter() {
-        if w.contains("quarantin")
-            || w.contains("accounting")
-            || w.contains("invalid_user_data")
-            || w.contains("failed")
-        {
+        // Runtime warnings that signal broken accounting rather than a
+        // stressed-but-correct run (transient retries are not listed).
+        const FATAL_WARNINGS: [&str; 8] = [
+            "quarantin",
+            "accounting",
+            "invalid_user_data",
+            "failed",
+            "untrusted",
+            "drain_barrier",
+            "generation_mismatch",
+            "state_mismatch",
+        ];
+        if FATAL_WARNINGS.iter().any(|term| w.contains(term)) {
             errors.push(format!("runtime warning: {w}"));
         }
     }
@@ -2647,6 +2728,7 @@ fn run_seed(seed: u64, verbose: bool) -> Result<(), Vec<String>> {
     CURRENT_SEED.store(u64::MAX, Ordering::SeqCst);
     let env = ENV_ISSUES.load(Ordering::SeqCst);
     if env > 0 {
+        ENV_SEEDS.fetch_add(1, Ordering::SeqCst);
         eprintln!("STRESS ENV seed={seed} issues={env}");
         if !errors.is_empty() {
             errors.push(format!("note: {env} host resource errors in this run"));
@@ -2712,8 +2794,10 @@ fn stress_lifecycle() {
         }
     }
     eprintln!(
-        "STRESS SUMMARY ran={ran} failed={} elapsed={:?} failures={failures:?}",
+        "STRESS SUMMARY ran={ran} failed={} env_seeds={} unsupported_configs={} elapsed={:?} failures={failures:?}",
         failures.len(),
+        ENV_SEEDS.load(Ordering::SeqCst),
+        UNSUPPORTED_CONFIGS.load(Ordering::SeqCst),
         began.elapsed()
     );
     assert!(failures.is_empty(), "failing seeds: {failures:?}");
