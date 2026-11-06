@@ -179,7 +179,8 @@ mod tests {
     /// writer's exact total.
     #[test]
     fn concurrent_reader_sees_monotonic_exact_counts() {
-        const N: u64 = 1_000_000;
+        // Miri runs this about 10,000 times slower.
+        const N: u64 = if cfg!(miri) { 1_000 } else { 1_000_000 };
         let block = Arc::new(Padded(Counter::new()));
         let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let reader = {
