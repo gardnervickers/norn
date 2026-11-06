@@ -2312,6 +2312,26 @@ fn udp_drops(port: u16) -> u64 {
         .sum()
 }
 
+/// How long a probe waits for a datagram that was already sent to loopback.
+/// A delivered datagram arrives at once, so expiry means it was lost.
+const PROBE_RECV_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// `recv_from_ring` that gives up with `TimedOut` instead of blocking forever
+/// on a datagram the kernel dropped, which would otherwise show up as a
+/// watchdog hang rather than as the `udp_drops` environment case.
+async fn probe_recv(
+    rx: &UdpSocket,
+    ring: &RecvBufRing,
+) -> io::Result<(norn_uring::bufring::BufRingBuf, std::net::SocketAddr)> {
+    match race(rx.recv_from_ring(ring), sleep(PROBE_RECV_TIMEOUT)).await {
+        Either::Left(result) => result,
+        Either::Right(()) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("no datagram within {PROBE_RECV_TIMEOUT:?}"),
+        )),
+    }
+}
+
 /// Proves the ring holds exactly `buf_cnt` distinct selectable buffers and is
 /// not quarantined.
 async fn probe_ring(ctx: &Ctx, ring: &RecvBufRing) {
@@ -2334,7 +2354,7 @@ async fn probe_ring(ctx: &Ctx, ring: &RecvBufRing) {
     let mut held = Vec::new();
     let mut ptrs = HashSet::new();
     for i in 0..cnt {
-        match rx.recv_from_ring(ring).await {
+        match probe_recv(&rx, ring).await {
             Ok((buf, _)) => {
                 if buf[..] != (i as u32).to_le_bytes() {
                     ctx.fail(format!("probe: datagram {i} payload {:?}", &buf[..]));
@@ -2360,8 +2380,11 @@ async fn probe_ring(ctx: &Ctx, ring: &RecvBufRing) {
             }
         }
     }
-    match rx.recv_from_ring(ring).await {
+    match probe_recv(&rx, ring).await {
         Err(e) if e.raw_os_error() == Some(libc::ENOBUFS) => {}
+        Err(e) if e.kind() == io::ErrorKind::TimedOut && udp_drops(addr.port()) > 0 => {
+            return ctx.env(format!("probe: extra datagram lost to a kernel drop: {e}"));
+        }
         Ok((buf, _)) => ctx.fail(format!(
             "probe: ring yielded more than {cnt} buffers (extra {:?}, {ring:?})",
             &buf[..]
@@ -2369,8 +2392,11 @@ async fn probe_ring(ctx: &Ctx, ring: &RecvBufRing) {
         Err(e) => ctx.fail(format!("probe: expected ENOBUFS, got {e}")),
     }
     drop(held);
-    match rx.recv_from_ring(ring).await {
+    match probe_recv(&rx, ring).await {
         Ok((buf, _)) if buf[..] == (cnt as u32).to_le_bytes() => {}
+        Err(e) if e.kind() == io::ErrorKind::TimedOut && udp_drops(addr.port()) > 0 => {
+            ctx.env(format!("probe: final datagram lost to a kernel drop: {e}"))
+        }
         Ok((buf, _)) => ctx.fail(format!("probe: final payload {:?}", &buf[..])),
         Err(e) => ctx.fail(format!("probe: ring unusable after returns: {e}")),
     }
@@ -2793,11 +2819,15 @@ fn stress_lifecycle() {
             failures.push(seed);
         }
     }
+    let unsupported = UNSUPPORTED_CONFIGS.load(Ordering::SeqCst);
+    let executed = ran.saturating_sub(unsupported as u64);
     eprintln!(
-        "STRESS SUMMARY ran={ran} failed={} env_seeds={} unsupported_configs={} elapsed={:?} failures={failures:?}",
+        "STRESS SUMMARY ran={ran} failed={} env_seeds={} unsupported_configs={unsupported} \
+         (of ran, {unsupported} seeds skipped because the kernel refused their ring config; \
+         they count as passes, so {executed} seeds actually ran) elapsed={:?} \
+         failures={failures:?}",
         failures.len(),
         ENV_SEEDS.load(Ordering::SeqCst),
-        UNSUPPORTED_CONFIGS.load(Ordering::SeqCst),
         began.elapsed()
     );
     assert!(failures.is_empty(), "failing seeds: {failures:?}");
