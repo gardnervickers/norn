@@ -148,7 +148,9 @@ pub struct RingSnapshot {
     /// Shutdown's own wakeup is not counted.
     pub unparks: u64,
     /// Whether the driver's thread was inside a waiting `io_uring_enter` when
-    /// read: idle, waiting for a completion, a timeout or a wakeup.
+    /// read: idle, waiting for a completion, a timeout or a wakeup. Waiting
+    /// for room in an SQPOLL ring's submission queue is not idle and is not
+    /// flagged.
     ///
     /// The executor's `running` flag is also false during the work a park
     /// does before it waits, such as reaping completions; this flag is set

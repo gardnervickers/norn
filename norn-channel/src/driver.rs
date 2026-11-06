@@ -59,8 +59,9 @@ impl Registry {
         self.receivers.borrow_mut().remove(&id);
     }
 
-    /// Wake every ready receiver, returning how many were woken.
-    fn wake_ready(&self) -> usize {
+    /// Wake every ready receiver; `count` hears how many before any waker
+    /// runs, so a panicking waker cannot hide them.
+    fn wake_ready(&self, count: impl FnOnce(usize)) {
         let mut wakers = self.wake_storage.take();
         wakers.extend(
             self.receivers
@@ -68,9 +69,8 @@ impl Registry {
                 .values()
                 .filter_map(|receiver| receiver.take_ready_waker()),
         );
-        let woken = wakers.len();
+        count(wakers.len());
         self.wake_all(wakers);
-        woken
     }
 
     fn shutdown(&self) {
@@ -332,11 +332,11 @@ where
         ChannelMetrics(Arc::clone(&self.counters))
     }
 
-    /// Wake the receivers of messages that other threads sent, and count it.
+    /// Wake the receivers of pending messages, and count it.
     fn deliver_remote(&self) {
-        self.counters.remote_wakeups.incr();
-        let woken = self.registry.wake_ready();
-        self.counters.receivers_woken.add(woken as u64);
+        self.counters.deliveries.incr();
+        self.registry
+            .wake_ready(|woken| self.counters.receivers_woken.add(woken as u64));
     }
 
     /// Return the sendable endpoint used to construct channels for this driver.

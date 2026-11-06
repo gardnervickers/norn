@@ -241,12 +241,13 @@ struct GroupControl {
     /// Each worker's metric sources, set on its thread before it reports
     /// startup.
     metrics: Vec<OnceLock<norn_metrics::Sources>>,
-    /// Each worker's thread, for stack capture, set before it reports startup.
+    /// Each worker's pthread and kernel thread ids, for stack capture, set
+    /// before it reports startup.
     #[cfg_attr(
         not(all(feature = "stall-stacks", target_os = "linux")),
         allow(dead_code)
     )]
-    threads: Vec<OnceLock<u64>>,
+    threads: Vec<OnceLock<(u64, i64)>>,
 }
 
 impl GroupControl {
@@ -704,9 +705,12 @@ impl Builder {
     ///
     /// The watchdog samples each worker's executor metrics about four times
     /// per threshold and costs the workers nothing. A run between one and two
-    /// thresholds long may be missed; any longer run is reported. A panic in
-    /// `on_stall` is caught. With the `stall-stacks` feature on Linux, each
-    /// report also carries the stuck thread's stack: see [`Stall::stack`].
+    /// thresholds long may be missed; any longer run is reported, except one
+    /// that starts and ends while a previous `on_stall` call or stack capture
+    /// is still running, since sampling waits for them. A panic in `on_stall`
+    /// is caught. With the `stall-stacks` feature on Linux, each report also
+    /// carries the stuck thread's stack, captured with a signal: see
+    /// [`Stall::stack`] for what that signal does to the stuck thread.
     pub fn stall_watchdog<F>(&mut self, threshold: std::time::Duration, on_stall: F) -> &mut Self
     where
         F: Fn(&Stall) + Send + 'static,
@@ -931,7 +935,7 @@ impl Builder {
         Ok(RuntimeGroup {
             control: self.control,
             workers: threads,
-            _watchdog: watchdog,
+            watchdog,
         })
     }
 }
@@ -990,7 +994,7 @@ pub struct RuntimeGroup {
     control: Arc<GroupControl>,
     workers: Vec<WorkerThread>,
     // Dropped after the workers are joined, so it watches until then.
-    _watchdog: Option<watchdog::Watchdog>,
+    watchdog: Option<watchdog::Watchdog>,
 }
 
 impl fmt::Debug for RuntimeGroup {
@@ -1119,8 +1123,12 @@ impl Drop for RuntimeGroup {
         if thread::panicking() {
             // Joining here could turn the owner's panic into a hang behind a
             // worker that ignores shutdown. Shutdown was requested above;
-            // dropping the handles detaches the threads.
+            // dropping the handles detaches the threads. The watchdog could be
+            // inside a capture or a callback, so it is detached too.
             drop(others);
+            if let Some(watchdog) = self.watchdog.take() {
+                watchdog.detach();
+            }
         } else {
             join_worker_threads(others);
         }

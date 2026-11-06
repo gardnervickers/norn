@@ -175,10 +175,7 @@ fn channel_deliveries_are_counted() {
         .get::<norn_channel::ChannelMetrics>()
         .unwrap()
         .snapshot();
-    assert!(channel.remote_wakeups >= 1, "{channel:?}");
+    assert!(channel.deliveries >= 1, "{channel:?}");
     assert!(channel.receivers_woken >= 1, "{channel:?}");
-    assert!(
-        channel.receivers_woken <= channel.remote_wakeups,
-        "{channel:?}"
-    );
+    assert!(channel.receivers_woken <= channel.deliveries, "{channel:?}");
 }

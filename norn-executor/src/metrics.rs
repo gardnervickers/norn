@@ -230,7 +230,8 @@ impl PollTimeMetrics {
 
 /// Poll durations read from a [`PollTimeMetrics`].
 ///
-/// The five buckets do not overlap; together they count every timed poll.
+/// The five buckets do not overlap; together they count every timed poll,
+/// including one that unwinds. The root future's polls are not timed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct PollTimeSnapshot {

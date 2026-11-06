@@ -7,7 +7,8 @@
 //! unwinder, which the watchdog loads before the first capture; it is not
 //! guaranteed async-signal-safe, and could deadlock a worker that is stuck
 //! inside the unwinder or the dynamic loader itself. A capture that does not
-//! finish within a second is abandoned and no further captures are tried.
+//! finish within a second is abandoned; later captures resume once its
+//! handler finishes.
 
 use crate::{GroupControl, WorkerId};
 
@@ -15,7 +16,7 @@ use crate::{GroupControl, WorkerId};
 mod imp {
     use std::cell::UnsafeCell;
     use std::ffi::c_void;
-    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicUsize, Ordering};
     use std::sync::{Mutex, Once};
     use std::time::{Duration, Instant};
 
@@ -29,6 +30,9 @@ mod imp {
 
     static STATE: AtomicU8 = AtomicU8::new(IDLE);
     static LEN: AtomicUsize = AtomicUsize::new(0);
+    /// The kernel thread id the pending request targets. A late or stray
+    /// signal on any other thread captures nothing.
+    static TARGET: AtomicI64 = AtomicI64::new(0);
     static INSTALL: Once = Once::new();
     static INSTALLED: AtomicBool = AtomicBool::new(false);
     /// Serializes captures across every group's watchdog in the process.
@@ -47,14 +51,23 @@ mod imp {
         libc::SIGRTMIN() + 3
     }
 
+    fn gettid() -> i64 {
+        // Safety: gettid has no preconditions and is async-signal-safe.
+        unsafe { libc::syscall(libc::SYS_gettid) }
+    }
+
     extern "C" fn on_signal(_: libc::c_int, _: *mut libc::siginfo_t, _: *mut c_void) {
-        // Only a capture the watchdog requested; a late signal writes nothing.
-        if STATE
-            .compare_exchange(REQUESTED, CAPTURING, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
+        // Only the requested thread captures: a signal queued for an earlier,
+        // withdrawn request, or sent by someone else, writes nothing.
+        if gettid() != TARGET.load(Ordering::Acquire)
+            || STATE
+                .compare_exchange(REQUESTED, CAPTURING, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
         {
             return;
         }
+        // Safety: errno is thread-local; restore what the interrupted code saw.
+        let errno = unsafe { *libc::__errno_location() };
         let mut len = 0;
         // Safety: this handler is the only writer (see `Frames`), and the
         // callback neither allocates nor panics.
@@ -68,6 +81,20 @@ mod imp {
         }
         LEN.store(len, Ordering::Relaxed);
         STATE.store(DONE, Ordering::Release);
+        // Safety: as above.
+        unsafe { *libc::__errno_location() = errno };
+    }
+
+    /// Whether the signal is still handled by `on_signal`. An application
+    /// that later took the signal over, or reset it so that it terminates the
+    /// process, must not receive a capture request.
+    fn still_installed() -> bool {
+        // Safety: a sigaction query into a zeroed struct.
+        unsafe {
+            let mut current: libc::sigaction = std::mem::zeroed();
+            libc::sigaction(signal(), std::ptr::null(), &mut current) == 0
+                && current.sa_sigaction == on_signal as *const () as usize
+        }
     }
 
     /// Install the handler once, unless the application already owns the
@@ -100,23 +127,30 @@ mod imp {
     pub(crate) fn register_worker(control: &GroupControl, worker: WorkerId) {
         // Safety: pthread_self has no preconditions.
         let thread = unsafe { libc::pthread_self() };
-        let _ = control.threads[worker.index()].set(thread as u64);
+        let _ = control.threads[worker.index()].set((thread as u64, gettid()));
     }
 
     pub(crate) fn capture(control: &GroupControl, worker: WorkerId) -> Option<Vec<String>> {
-        let thread = *control.threads.get(worker.index())?.get()? as libc::pthread_t;
+        let (thread, tid) = *control.threads.get(worker.index())?.get()?;
         if !install() {
             return None;
         }
         let _one_at_a_time = CAPTURE.lock().unwrap_or_else(|poison| poison.into_inner());
-        // A capture abandoned in CAPTURING stops all later ones.
+        // A handler that finished after its capture was abandoned left DONE;
+        // one still running (or deadlocked) leaves CAPTURING, and this
+        // capture gives up.
+        let _ = STATE.compare_exchange(DONE, IDLE, Ordering::AcqRel, Ordering::Relaxed);
+        if !still_installed() {
+            return None;
+        }
+        TARGET.store(tid, Ordering::Release);
         STATE
             .compare_exchange(IDLE, REQUESTED, Ordering::AcqRel, Ordering::Relaxed)
             .ok()?;
         // Safety: the thread is a worker of this group, registered on itself.
-        // A worker that has exited may have a reused id, so the handler checks
-        // the request state rather than trusting the target.
-        if unsafe { libc::pthread_kill(thread, signal()) } != 0 {
+        // If it has exited and its id was reused, the handler's thread id
+        // check keeps the other thread from capturing.
+        if unsafe { libc::pthread_kill(thread as libc::pthread_t, signal()) } != 0 {
             STATE.store(IDLE, Ordering::Release);
             return None;
         }

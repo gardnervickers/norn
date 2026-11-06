@@ -164,10 +164,11 @@ impl<P: park::Park> LocalExecutor<P> {
     }
 
     /// Time every task poll from the next `block_on` on, into five duration
-    /// buckets plus a total and a maximum.
+    /// buckets plus a total and a maximum. Polls of the root future passed to
+    /// `block_on` are not timed.
     ///
     /// Off by default: timing reads the clock twice per poll, which costs
-    /// about 250 instructions and doubles the cost of a trivial poll. The
+    /// about 250 instructions and 40 ns, several times a trivial poll. The
     /// choice is made once per `block_on`, so with timing off the poll loop is
     /// unchanged. Calling this again has no effect. Sources taken earlier from
     /// [`LocalExecutor::metric_sources`] do not include poll times; take them
@@ -322,9 +323,17 @@ struct Timed(Arc<Padded<metrics::PollTimeCounters>>);
 impl RunTask for Timed {
     #[inline(always)]
     fn run(&self, task: norn_task::Runnable) {
-        let start = std::time::Instant::now();
+        /// Records the poll when dropped, so a poll that unwinds counts too.
+        struct Timer<'a>(&'a metrics::PollTimeCounters, std::time::Instant);
+
+        impl Drop for Timer<'_> {
+            fn drop(&mut self) {
+                self.0.record(self.1.elapsed());
+            }
+        }
+
+        let _timer = Timer(&self.0, std::time::Instant::now());
         task.run();
-        self.0.record(start.elapsed());
     }
 }
 

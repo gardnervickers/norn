@@ -238,3 +238,27 @@ fn drop_runs_task_destructors_but_not_park_shutdown() {
     );
     assert!(!metrics.snapshot().running);
 }
+
+/// A timed poll that unwinds (its join waker panics) is still timed.
+#[test]
+fn an_unwinding_timed_poll_is_timed() {
+    let mut executor = LocalExecutor::new(SpinPark);
+    executor.enable_poll_timing();
+    let metrics = executor.metrics();
+    let times = executor.poll_time_metrics().unwrap();
+    let mut join = executor.handle().spawn(async {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    });
+    let waker = Waker::from(Arc::new(PanicOnWake));
+    assert!(Pin::new(&mut join)
+        .poll(&mut Context::from_waker(&waker))
+        .is_pending());
+    drop(waker);
+    let ran = panic::catch_unwind(AssertUnwindSafe(|| {
+        executor.block_on(std::future::pending::<()>())
+    }));
+    assert!(ran.is_err());
+    let snapshot = times.snapshot();
+    assert_eq!(snapshot.count(), metrics.snapshot().polls, "{snapshot:?}");
+    assert!(snapshot.max_ns >= 20_000_000, "{snapshot:?}");
+}

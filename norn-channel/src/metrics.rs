@@ -5,7 +5,7 @@ use norn_metrics::{Counter, Kind, Metric, Padded, Visit};
 /// Counters written by one channel [`Driver`](crate::Driver)'s thread.
 #[derive(Debug, Default)]
 pub(crate) struct ChannelCounters {
-    pub(crate) remote_wakeups: Counter,
+    pub(crate) deliveries: Counter,
     pub(crate) receivers_woken: Counter,
 }
 
@@ -32,7 +32,7 @@ impl ChannelMetrics {
     /// Read the current counts.
     pub fn snapshot(&self) -> ChannelSnapshot {
         ChannelSnapshot {
-            remote_wakeups: self.0.remote_wakeups.get(),
+            deliveries: self.0.deliveries.get(),
             receivers_woken: self.0.receivers_woken.get(),
         }
     }
@@ -42,23 +42,22 @@ impl ChannelMetrics {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ChannelSnapshot {
-    /// Times the driver found that another thread had sent to one of its
-    /// channels since it last looked, and woke the ready receivers.
-    ///
-    /// Sends that arrive together share one wakeup, so this counts deliveries,
-    /// not messages.
-    pub remote_wakeups: u64,
-    /// Receiver wakers those wakeups invoked.
+    /// Times a park found the driver's pending flag set and woke the ready
+    /// receivers. A send from any thread sets the flag, and so do a sender's
+    /// drop and a receiver's attach; sends that arrive together share one
+    /// delivery, so this counts deliveries, not messages.
+    pub deliveries: u64,
+    /// Receiver wakers those deliveries invoked.
     pub receivers_woken: u64,
 }
 
 impl Visit for ChannelSnapshot {
     fn visit(&self, f: &mut dyn FnMut(Metric)) {
         f(Metric {
-            name: "norn_channel_remote_wakeups_total",
-            help: "Deliveries of messages sent from other threads.",
+            name: "norn_channel_deliveries_total",
+            help: "Parks that delivered pending channel messages to receivers.",
             kind: Kind::Counter,
-            value: self.remote_wakeups,
+            value: self.deliveries,
         });
         f(Metric {
             name: "norn_channel_receivers_woken_total",

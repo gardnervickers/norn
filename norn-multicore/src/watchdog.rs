@@ -29,6 +29,15 @@ pub struct Stall {
     /// The worker thread's stack when it was reported, innermost frame first,
     /// one symbolized frame per entry. Present only with the `stall-stacks`
     /// feature on Linux, when the capture succeeded.
+    ///
+    /// Capturing interrupts the stuck thread with signal `SIGRTMIN + 3`, for
+    /// which the watchdog installs a process-wide handler unless the
+    /// application already handles that signal. A system call the kernel
+    /// does not restart after a signal, such as a read with a timeout,
+    /// `poll`, `epoll_wait`, `connect` or `io_uring_enter`, returns `EINTR`
+    /// on the stuck thread. Unwinding inside the handler uses the system
+    /// unwinder, which is not guaranteed async-signal-safe, so a thread stuck
+    /// inside the unwinder or the dynamic loader itself could deadlock.
     pub stack: Option<Vec<String>>,
 }
 
@@ -62,12 +71,24 @@ impl Watchdog {
     }
 }
 
+impl Watchdog {
+    /// Stop the thread without waiting for it, as a group dropped during a
+    /// panic must not block behind a capture or a callback.
+    pub(crate) fn detach(mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            thread.thread().unpark();
+        }
+    }
+}
+
 impl Drop for Watchdog {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
         if let Some(thread) = self.thread.take() {
             thread.thread().unpark();
-            // A panicking callback ended the thread early; nothing to report.
+            // Callback panics are caught, so this fails only if a panic
+            // payload's destructor panicked; nothing is left to report.
             let _ = thread.join();
         }
     }
@@ -106,9 +127,11 @@ fn watch(config: &WatchdogConfig, control: &GroupControl, stop: &AtomicBool) {
         if stop.load(Ordering::Acquire) {
             return;
         }
-        let now = Instant::now();
         for ((worker, metrics), watch) in workers.iter().zip(&mut watches) {
             let executor = metrics.snapshot();
+            // Taken per worker: a slow capture or callback for one worker
+            // delays the samples of the next.
+            let now = Instant::now();
             // The activity word changes whenever the executor starts or stops
             // running, so the same value in two samples, while running, means
             // it ran without parking ever since the first of them.
