@@ -24,7 +24,8 @@ pub enum MissedTickBehavior {
     /// The ticks due at 20 and 30 ms complete without waiting, and the next
     /// tick is due at 40 ms. The total tick count over a long run matches
     /// `elapsed / period`, at the cost of a burst of back-to-back ticks after
-    /// a stall.
+    /// a stall. Catch-up ticks complete without yielding, so a loop that
+    /// awaits them keeps the thread until it has caught up.
     Burst,
     /// Restart the schedule one period after the late tick was delivered.
     ///
@@ -58,7 +59,14 @@ pub enum MissedTickBehavior {
 ///
 /// The schedule is computed from tick deadlines, not from when [`Interval::tick`]
 /// is called, so time spent handling a tick does not delay the next one.
+///
+/// Deadlines resolve to whole milliseconds. A period under 1 ms cannot be
+/// delivered on time, so its ticks count as missed; under
+/// [`MissedTickBehavior::Skip`] it delivers at most about one tick per
+/// millisecond. Deadlines saturate at `u64::MAX` milliseconds after the clock
+/// origin; a clock past that point makes every tick due immediately.
 #[derive(Debug)]
+#[must_use = "intervals do nothing unless you call `tick` or `poll_tick`"]
 pub struct Interval {
     sleep: Pin<Box<Sleep>>,
     /// Offset from the clock origin of the tick the sleep is waiting for.
@@ -84,7 +92,9 @@ impl Interval {
     /// # Errors
     ///
     /// Returns [`crate::Error::Shutdown`] if the timer driver shuts down
-    /// before the tick. Every later tick then fails the same way.
+    /// before the tick is due. Every later tick then fails the same way. A
+    /// tick that was already due when the driver shut down still completes
+    /// with `Ok(())`.
     ///
     /// # Cancel safety
     ///

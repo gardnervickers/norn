@@ -100,6 +100,28 @@ fn first_tick_is_immediate_and_later_ticks_follow_the_period() {
 }
 
 #[test]
+fn immediate_ticks_do_not_wait_for_the_next_millisecond() {
+    let h = Harness::new();
+    h.clock.advance(Duration::from_micros(500));
+    let mut interval = h.handle.interval(ms(10));
+    assert_eq!(ready_ticks(&mut interval), 1, "first tick at 0.5 ms");
+
+    h.clock.advance(Duration::from_micros(2_900));
+    interval.reset_immediately();
+    assert_eq!(ready_ticks(&mut interval), 1, "reset_immediately at 3.4 ms");
+
+    let mut at_now = h.handle.interval_at(h.clock.now(), ms(10));
+    assert_eq!(ready_ticks(&mut at_now), 1, "interval_at(now) at 3.4 ms");
+}
+
+#[test]
+fn system_clock_first_tick_is_immediate() {
+    let driver = Driver::new(NoopPark, Clock::system());
+    let mut interval = driver.handle().interval(ms(10));
+    assert_eq!(ready_ticks(&mut interval), 1);
+}
+
+#[test]
 fn fractional_periods_do_not_drift() {
     let mut h = Harness::new();
     let mut interval = h.handle.interval(Duration::from_micros(1_500));
