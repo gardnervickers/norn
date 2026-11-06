@@ -1213,7 +1213,11 @@ impl Driver {
         }
         if user_data == Self::UNPARKER_WAKE_TOKEN {
             trace!(target: LOG, "unparker.token");
-            self.shared.counters.unparks.incr();
+            // Shutdown wakes its own ring to stop it; only count wakeups that
+            // arrive while running.
+            if self.shared.status() == Status::Running {
+                self.shared.counters.unparks.incr();
+            }
             self.shared.complete_in_flight();
             self.unparker.reset();
             return;
@@ -1952,17 +1956,19 @@ impl Shared {
 
         let mut ring = self.ring.borrow_mut();
         let counters = &*self.counters;
-        Ok(match mode {
+        // Under SQPOLL the kernel thread consumes entries without any enter
+        // reporting them, and an enter returns the count it was asked to
+        // submit, so only rings without SQPOLL count submissions.
+        let sqpoll = ring.params().is_setup_sqpoll();
+        let submitted = match mode {
             ParkMode::Timeout(duration) => {
-                counters.enters.incr();
-                counters.waiting_enters.incr();
+                self.publish_waiting(counters);
                 let ts = crate::util::timespec(duration);
                 let args = SubmitArgs::new().timespec(&ts);
                 ring.submitter().submit_with_args(1, &args)?
             }
             ParkMode::NextCompletion => {
-                counters.enters.incr();
-                counters.waiting_enters.incr();
+                self.publish_waiting(counters);
                 let args = SubmitArgs::new();
                 ring.submitter().submit_with_args(1, &args)?
             }
@@ -1976,15 +1982,36 @@ impl Shared {
                 // syscall.
                 let kernel_pending = sq.cq_overflow() || sq.taskrun();
                 let empty = sq.is_empty();
+                // With SQPOLL, `Submitter::submit` skips the system call while
+                // the kernel thread is awake and nothing else needs one.
+                let enters = !sqpoll || kernel_pending || {
+                    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+                    sq.need_wakeup()
+                };
                 drop(sq);
                 if kernel_pending || !empty {
-                    counters.enters.incr();
+                    if enters {
+                        counters.enters.incr();
+                    }
                     ring.submitter().submit()?
                 } else {
                     0
                 }
             }
-        })
+        };
+        if !sqpoll {
+            counters.sqes_submitted.add(submitted as u64);
+        }
+        Ok(submitted)
+    }
+
+    /// Count a waiting enter, and publish the in-flight count it waits with,
+    /// which includes the wakeup read armed for this park.
+    #[inline]
+    fn publish_waiting(&self, counters: &metrics::RingCounters) {
+        counters.enters.incr();
+        counters.waiting_enters.incr();
+        counters.in_flight.set(self.in_flight.get() as u64);
     }
 
     /// Submit all entries in the submission queue.
@@ -1997,10 +2024,7 @@ impl Shared {
         let mut ebusy_retries = 0usize;
         loop {
             match self.submit_once(mode) {
-                Ok(submitted) => {
-                    self.counters.sqes_submitted.add(submitted as u64);
-                    return Ok(submitted);
-                }
+                Ok(submitted) => return Ok(submitted),
                 Err(err)
                     if matches!(mode, ParkMode::Timeout(_))
                         && err.raw_os_error() == Some(libc::ETIME) =>
@@ -2019,6 +2043,7 @@ impl Shared {
                     // timed park may return early; the caller re-checks its
                     // deadlines and parks again with the remaining time.
                     trace!(target: LOG, "submit.eintr timed park returns early");
+                    self.counters.enter_retries.incr();
                     return Ok(0);
                 }
                 Err(err) if err.raw_os_error() == Some(libc::EINTR) => {
@@ -2066,8 +2091,7 @@ impl Shared {
             return self.wait_only_failed(io::Error::from_raw_os_error(errno));
         }
         let ring = self.ring.borrow_mut();
-        self.counters.enters.incr();
-        self.counters.waiting_enters.incr();
+        self.publish_waiting(&self.counters);
         let result = match mode {
             ParkMode::Timeout(duration) => {
                 let ts = crate::util::timespec(duration);
@@ -2089,6 +2113,9 @@ impl Shared {
                     || Self::is_transient_submit_error(&err) =>
             {
                 trace!(target: LOG, "park.wait_only {err}");
+                if err.raw_os_error() != Some(libc::ETIME) {
+                    self.counters.enter_retries.incr();
+                }
                 Ok(())
             }
             Err(err) => {
@@ -2268,6 +2295,7 @@ impl Shared {
             return Ok(());
         }
         let ring = self.ring.borrow_mut();
+        self.counters.enters.incr();
         match ring.submitter().squeue_wait() {
             Ok(_) => Ok(()),
             Err(err) if err.raw_os_error() == Some(libc::EINTR) => Ok(()),
@@ -2441,6 +2469,7 @@ impl Shared {
     fn run_task_work(&self) -> bool {
         const IORING_ENTER_GETEVENTS: u32 = 1;
         let mut ring = self.ring.borrow_mut();
+        self.counters.enters.incr();
         // Safety: the enter submits nothing, waits for nothing and passes no
         // argument; with GETEVENTS it only runs task work and flushes the CQ.
         let entered = unsafe {

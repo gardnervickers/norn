@@ -83,21 +83,27 @@ pub enum RingStatus {
 ///
 /// `in_flight` and `cqes_dropped` are published when the driver parks, so
 /// while its thread is busy they can trail by one executor tick; `sq_backlog`
-/// changes with the backlog.
+/// changes with the backlog. Counts that a submit adds, such as
+/// `sqes_submitted`, appear when its enter returns.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct RingSnapshot {
-    /// `io_uring_enter` calls.
+    /// `io_uring_enter` system calls the driver made.
     pub enters: u64,
     /// Enters that waited for a completion or a timeout.
     pub waiting_enters: u64,
-    /// Submission entries the kernel consumed.
+    /// Submission entries the kernel consumed, added when each enter returns.
+    ///
+    /// Stays zero on `IORING_SETUP_SQPOLL` rings, whose kernel thread consumes
+    /// entries without any enter reporting them.
     pub sqes_submitted: u64,
     /// Completion entries reaped from the ring, including the driver's own.
     pub cqes: u64,
     /// Entries pushed to the submission queue whose final completion has not
     /// been reaped, including the driver's own (its wakeup read,
-    /// cancellations and closes).
+    /// cancellations and closes). Published after each park reaps
+    /// completions and again just before it waits, so it is current while
+    /// the driver's thread is blocked.
     pub in_flight: u64,
     /// Entries waiting in the driver's queue for room in the submission queue.
     pub sq_backlog: u64,
@@ -114,7 +120,8 @@ pub struct RingSnapshot {
     /// `io_uring_enter` calls that failed with a transient error (`EINTR`,
     /// `EBUSY`, `EAGAIN` or `ENOMEM`) and were retried or deferred.
     pub enter_retries: u64,
-    /// Wakeups from another thread that reached a parked ring.
+    /// Wakeups from another thread that reached a parked, running ring.
+    /// Shutdown's own wakeup is not counted.
     pub unparks: u64,
     /// The driver's lifecycle stage.
     pub status: RingStatus,

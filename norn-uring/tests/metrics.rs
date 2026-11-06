@@ -1,7 +1,7 @@
 #![cfg(target_os = "linux")]
 
-//! Ring counters are exact, readable from other threads, and survive the
-//! driver.
+//! Ring counters account for every submission and completion, are readable
+//! from other threads, and survive the driver.
 
 use std::time::Duration;
 
@@ -57,7 +57,7 @@ fn counts_submission_backlog() {
 /// overflows a two-entry CQ while the runtime thread is busy.
 #[test]
 fn counts_completion_queue_overflow() {
-    let metrics = std::thread::spawn(|| {
+    let snapshot = std::thread::spawn(|| {
         let driver = Driver::new(io_uring::IoUring::builder(), 1).unwrap();
         let metrics = driver.metrics();
         let unparker = driver.unparker();
@@ -79,11 +79,11 @@ fn counts_completion_queue_overflow() {
                 assert_eq!(timer.await.unwrap().unwrap(), TimeoutOutcome::Expired);
             }
         });
-        metrics
+        // Read before the driver drops: shutdown wakes its own ring.
+        metrics.snapshot()
     })
     .join()
     .unwrap();
-    let snapshot = metrics.snapshot();
     assert!(snapshot.cq_overflows >= 1, "{snapshot:?}");
     assert_eq!(snapshot.cqes_dropped, 0, "{snapshot:?}");
     assert!(snapshot.unparks >= 1, "{snapshot:?}");
@@ -109,8 +109,8 @@ fn counters_are_readable_while_the_ring_waits() {
     });
     let during = reader.join().unwrap();
     assert!(during.waiting_enters >= 1, "{during:?}");
-    // The timeout operation was in flight when the ring parked.
-    assert!(during.in_flight >= 1, "{during:?}");
+    // The timeout and the wakeup read armed for this park.
+    assert_eq!(during.in_flight, 2, "{during:?}");
 }
 
 /// The ring and the timer wheel above it each add their view to the
@@ -143,4 +143,42 @@ fn park_stack_adds_ring_and_timer_sources() {
     // Executor first, then the timer, then the ring it wraps.
     assert!(position("norn_executor_polls_total") < position("norn_timer_fired_total"));
     assert!(position("norn_timer_fired_total") < position("norn_uring_cqes_total"));
+}
+
+/// Without another thread, the only wakeup is shutdown's own, which is not
+/// counted.
+#[test]
+fn unparks_skip_shutdowns_own_wakeup() {
+    let driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+    let metrics = driver.metrics();
+    let handle = driver.handle();
+    let mut executor = LocalExecutor::new(driver);
+    executor.block_on(async move {
+        handle.timeout(Duration::from_millis(10)).await.unwrap();
+    });
+    drop(executor);
+    assert_eq!(metrics.snapshot().unparks, 0);
+}
+
+/// An SQPOLL ring's kernel thread consumes entries without any enter
+/// reporting them, so submissions are not counted, and enters count only
+/// system calls.
+#[test]
+fn sqpoll_rings_do_not_count_submissions() {
+    let mut builder = io_uring::IoUring::builder();
+    builder.setup_sqpoll(1000);
+    let driver = Driver::new(builder, 32).unwrap();
+    let metrics = driver.metrics();
+    let mut executor = LocalExecutor::new(driver);
+    executor.block_on(async {
+        for _ in 0..2000 {
+            norn_uring::noop().await.unwrap();
+        }
+    });
+    drop(executor);
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.sqes_submitted, 0, "{snapshot:?}");
+    assert!(snapshot.cqes >= 2000, "{snapshot:?}");
+    // Most noops complete without a system call while the thread polls.
+    assert!(snapshot.enters < 2000, "{snapshot:?}");
 }

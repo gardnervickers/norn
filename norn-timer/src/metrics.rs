@@ -89,6 +89,12 @@ impl Visit for TimerSnapshot {
             value: self.cancelled,
         });
         f(Metric {
+            name: "norn_timer_shut_down_total",
+            help: "Sleeps completed with an error by driver shutdown.",
+            kind: Kind::Counter,
+            value: self.shut_down,
+        });
+        f(Metric {
             name: "norn_timer_pending",
             help: "Sleeps waiting in the timer wheel.",
             kind: Kind::Gauge,
