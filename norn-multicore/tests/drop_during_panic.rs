@@ -6,35 +6,53 @@
 //! worker and wait for it to finish before returning. Miri rejects a test
 //! that leaves a thread running when the test process ends.
 
+use std::cell::RefCell;
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use norn_multicore::{Builder, WorkerId};
 
-/// Wait until the worker that held a clone of `alive` has dropped its future,
-/// then give the rest of its thread teardown time to finish.
+thread_local! {
+    static ON_EXIT: RefCell<Option<NotifyOnDrop>> = const { RefCell::new(None) };
+}
+
+/// Sends when dropped. Stored in a thread-local, so that is when the thread
+/// exits.
+struct NotifyOnDrop(mpsc::Sender<()>);
+
+impl Drop for NotifyOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
+    }
+}
+
+/// Make the current thread send on `exited` as it exits. Call it on a worker.
+fn notify_on_thread_exit(exited: mpsc::Sender<()>) {
+    ON_EXIT.with(|slot| *slot.borrow_mut() = Some(NotifyOnDrop(exited)));
+}
+
+/// Wait until the worker thread that called [`notify_on_thread_exit`] is
+/// exiting.
 ///
-/// A detached worker has no join handle to wait on. Dropping the future is
-/// the last thing the test can observe, and the thread exits right after it.
-/// Sleeping lets that remainder run: under Miri the only runnable thread is
-/// the worker, so it runs to completion before the sleep returns.
-fn wait_for_worker_exit(alive: Arc<()>) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Arc::strong_count(&alive) > 1 {
-        assert!(Instant::now() < deadline, "worker never finished");
+/// A detached worker has no join handle to wait on. Thread-local destructors
+/// are the last user code a thread runs, so the signal arrives as the worker
+/// finishes. The yields let the thread's remaining teardown run before the
+/// test returns, because Miri rejects a test that leaves a thread running.
+fn wait_for_worker_exit(exited: &mpsc::Receiver<()>) {
+    exited
+        .recv_timeout(Duration::from_secs(10))
+        .expect("worker never exited");
+    for _ in 0..16 {
         thread::yield_now();
     }
-    thread::sleep(Duration::from_millis(100));
 }
 
 #[test]
 fn owner_panic_with_live_group_propagates() {
     let (done_tx, done_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel::<()>();
-    let alive = Arc::new(());
-    let worker_alive = Arc::clone(&alive);
+    let (exited_tx, exited_rx) = mpsc::channel();
 
     let owner = thread::spawn(move || {
         let result = std::panic::catch_unwind(|| {
@@ -43,7 +61,7 @@ fn owner_panic_with_live_group_propagates() {
                 .worker(WorkerId::new(0), move |_| async move {
                     // Ignore shutdown on purpose. Only the test's release
                     // signal lets this worker return.
-                    let _alive = worker_alive;
+                    notify_on_thread_exit(exited_tx);
                     let _ = release_rx.recv();
                 })
                 .unwrap();
@@ -58,7 +76,7 @@ fn owner_panic_with_live_group_propagates() {
     // blocked joining it) fails the test instead of also leaking a thread.
     release_tx.send(()).unwrap();
     owner.join().unwrap();
-    wait_for_worker_exit(alive);
+    wait_for_worker_exit(&exited_rx);
     assert_eq!(
         propagated,
         Ok(true),
@@ -69,14 +87,13 @@ fn owner_panic_with_live_group_propagates() {
 #[test]
 fn owner_panic_still_requests_shutdown_of_detached_workers() {
     let (observed_tx, observed_rx) = mpsc::channel();
-    let alive = Arc::new(());
-    let worker_alive = Arc::clone(&alive);
+    let (exited_tx, exited_rx) = mpsc::channel();
 
     let owner = thread::spawn(move || {
         let mut builder = Builder::new(1);
         builder
             .worker(WorkerId::new(0), move |context| async move {
-                let _alive = worker_alive;
+                notify_on_thread_exit(exited_tx);
                 context.shutdown_requested().await;
                 let _ = observed_tx.send(());
             })
@@ -87,6 +104,6 @@ fn owner_panic_still_requests_shutdown_of_detached_workers() {
 
     assert!(owner.join().is_err(), "the owner's panic propagates");
     let observed = observed_rx.recv_timeout(Duration::from_secs(5));
-    wait_for_worker_exit(alive);
+    wait_for_worker_exit(&exited_rx);
     observed.expect("detached worker never observed the shutdown request");
 }

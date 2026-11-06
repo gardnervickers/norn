@@ -883,10 +883,12 @@ struct WorkerThread {
 ///
 /// # Dropping
 ///
-/// [`Drop`] requests shutdown and then blocks until every worker thread
-/// exits, so every worker main must observe
-/// [`WorkerContext::shutdown_requested`] and return. A worker that ignores
-/// shutdown makes the drop wait forever. That includes a drop caused by an
+/// [`Drop`] requests shutdown and then blocks until every other worker
+/// thread exits, so every worker main must observe
+/// [`WorkerContext::shutdown_requested`] and return. As with
+/// [`join`](RuntimeGroup::join), a group dropped on one of its own workers
+/// leaves that worker running. A worker that ignores shutdown makes the drop
+/// wait forever. That includes a drop caused by an
 /// early `?` return in the owner, which cannot be told apart from a normal
 /// drop.
 ///
