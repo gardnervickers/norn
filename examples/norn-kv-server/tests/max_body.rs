@@ -1,7 +1,8 @@
 //! A large `--max-body` must not cost memory up front. A limit beyond the
 //! protocol's 32-bit body length is rejected before the server listens, and a
 //! large valid limit leaves connections serving under an address-space limit,
-//! where a frame too large to buffer fails only its own connection.
+//! where a frame too large to buffer fails only its own connection and a
+//! frame that was buffered but cannot be stored fails only its own request.
 #![cfg(target_os = "linux")]
 
 use std::io::{BufRead, BufReader, Read, Write};
@@ -184,4 +185,86 @@ fn large_max_body_serves_connections_exact() {
 #[test]
 fn large_max_body_serves_connections_sharded() {
     large_limit_serves_connections("--workers=2");
+}
+
+/// Send one SET of `value_len` bytes and return the status of its reply, if
+/// the server sent one.
+fn send_large_set(address: SocketAddr, key: &[u8], value_len: usize) -> Option<u16> {
+    let mut stream = TcpStream::connect(address).unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    let body_len = 8 + key.len() + value_len;
+    let mut header = [0_u8; HEADER_LEN];
+    header[0] = 0x80;
+    header[1] = 0x01;
+    header[2..4].copy_from_slice(&(key.len() as u16).to_be_bytes());
+    header[4] = 8;
+    header[8..12].copy_from_slice(&(body_len as u32).to_be_bytes());
+    header[12..16].copy_from_slice(&2_u32.to_be_bytes());
+    let _ = stream.write_all(&header);
+    let _ = stream.write_all(&[0; 8]);
+    let _ = stream.write_all(key);
+    let chunk = vec![b'v'; 1024 * 1024];
+    let mut sent = 0;
+    while sent < value_len {
+        let n = chunk.len().min(value_len - sent);
+        if stream.write_all(&chunk[..n]).is_err() {
+            break;
+        }
+        sent += n;
+    }
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut reply = [0; HEADER_LEN];
+    stream.read_exact(&mut reply).ok()?;
+    Some(u16::from_be_bytes([reply[6], reply[7]]))
+}
+
+/// A value that fits the receive buffers but whose copy into the store does
+/// not must not abort the process: the SET is answered with the protocol's
+/// out-of-memory status and the server keeps serving.
+fn large_set_fails_only_its_request(mode: &str, keys: &[&[u8]], value_len: usize) {
+    let (mut child, address) = spawn_limited(mode);
+    for key in keys {
+        let status = send_large_set(address, key, value_len);
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "one client's SET killed the server"
+        );
+        assert_eq!(status, Some(0x0082), "SET of {value_len} bytes under limit");
+    }
+    assert_noop_round_trips(address);
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "server exited under the address-space limit"
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Multishot: `pending` grows by doubling to 512 MiB, which fits; the 480 MB
+/// store copy then does not.
+#[test]
+fn large_buffered_set_fails_only_its_request_multishot() {
+    large_set_fails_only_its_request("--recv-mode=multishot", &[b"big"], 480_000_000);
+}
+
+/// Exact: the 540 MB body buffer fits; the 540 MB store copy does not.
+#[test]
+fn large_buffered_set_fails_only_its_request_exact() {
+    large_set_fails_only_its_request("--recv-mode=exact", &[b"big"], 540_000_000);
+}
+
+/// Sharded: whichever worker owns the key, copying the value either to the
+/// owner or into its store fails only that request. Several keys cover both
+/// the local and the remote path.
+#[test]
+fn large_buffered_set_fails_only_its_request_sharded() {
+    large_set_fails_only_its_request(
+        "--workers=2",
+        &[b"big0", b"big1", b"big2", b"big3"],
+        480_000_000,
+    );
 }

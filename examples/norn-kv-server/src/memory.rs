@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 
 use foldhash::fast::RandomState;
+use thiserror::Error;
 
 /// A value stored by [`MemoryStore`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +33,20 @@ pub struct Stats {
     pub value_bytes: usize,
 }
 
+/// An allocation for the store failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("out of memory")]
+pub struct OutOfMemory;
+
+/// Copy `bytes` into a vector sized exactly, reporting allocation failure.
+fn copy_exact(bytes: &[u8]) -> Result<Vec<u8>, OutOfMemory> {
+    let mut copy = Vec::new();
+    copy.try_reserve_exact(bytes.len())
+        .map_err(|_| OutOfMemory)?;
+    copy.extend_from_slice(bytes);
+    Ok(copy)
+}
+
 /// A single-threaded in-memory key/value store.
 #[derive(Debug, Default)]
 pub struct MemoryStore {
@@ -55,22 +70,42 @@ impl MemoryStore {
     }
 
     /// Insert or replace a value.
-    pub fn set(&mut self, key: &[u8], flags: u32, value: &[u8]) {
+    ///
+    /// Every allocation is fallible and happens before the store changes, so
+    /// on error the store is exactly as it was: a value too large for the
+    /// process's memory limit fails only this request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OutOfMemory`] if the key, value or table slot cannot be
+    /// allocated.
+    pub fn set(&mut self, key: &[u8], flags: u32, value: &[u8]) -> Result<(), OutOfMemory> {
         if let Some(current) = self.entries.get_mut(key) {
-            self.value_bytes -= current.value.len();
+            // Reuse the existing allocation when it is big enough; otherwise
+            // build the replacement before dropping the old value.
+            let previous_len = current.value.len();
+            if current.value.capacity() >= value.len() {
+                current.value.clear();
+                current.value.extend_from_slice(value);
+            } else {
+                current.value = copy_exact(value)?;
+            }
             current.flags = flags;
-            current.value.clear();
-            current.value.extend_from_slice(value);
-        } else {
-            self.entries.insert(
-                key.to_vec(),
-                Entry {
-                    flags,
-                    value: value.to_vec(),
-                },
-            );
+            self.value_bytes = self.value_bytes - previous_len + value.len();
+            return Ok(());
         }
+        let key = copy_exact(key)?;
+        let value_copy = copy_exact(value)?;
+        self.entries.try_reserve(1).map_err(|_| OutOfMemory)?;
+        self.entries.insert(
+            key,
+            Entry {
+                flags,
+                value: value_copy,
+            },
+        );
         self.value_bytes += value.len();
+        Ok(())
     }
 
     /// Delete a key, returning whether it was present.
@@ -99,14 +134,14 @@ mod tests {
     #[test]
     fn set_get_replace_delete() {
         let mut store = MemoryStore::new();
-        store.set(b"key", 7, b"first");
+        store.set(b"key", 7, b"first").unwrap();
         let first = store.get(b"key").unwrap();
         assert_eq!(first.flags(), 7);
         assert_eq!(first.value(), b"first");
         assert_eq!(store.stats().items, 1);
         assert_eq!(store.stats().value_bytes, 5);
 
-        store.set(b"key", 9, b"replacement");
+        store.set(b"key", 9, b"replacement").unwrap();
         let replacement = store.get(b"key").unwrap();
         assert_eq!(replacement.flags(), 9);
         assert_eq!(replacement.value(), b"replacement");

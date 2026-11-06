@@ -33,6 +33,7 @@ use smallvec::SmallVec;
 
 use crate::codec::{DecodeStatus, DecodedFrame, FrameDecoder, ResponseEncoder};
 use crate::handler::{ConnectionAction, HandlerConfig, MemoryHandler};
+use crate::memory::OutOfMemory;
 use crate::protocol::{Command, EncodeError, RequestHeader, Status, HEADER_LEN};
 use crate::server::{
     close_rejected, discard_multishot, lingering_close, recover_from_accept_error, RecvMode,
@@ -1092,7 +1093,19 @@ async fn dispatch_frame(
     // buffers of the worker's ring (`max_unconsumed_per_receive`), so a
     // connection waiting here cannot take the whole ring.
     let permit = router.acquire(owner).await?;
-    let command = OwnedCommand::copy_from(command).expect("keyed command must be ownable");
+    let command = match OwnedCommand::copy_from(command).expect("keyed command must be ownable") {
+        Ok(command) => command,
+        Err(OutOfMemory) => {
+            // Nothing was submitted, so dropping the permit returns its
+            // credit. Fail this request, not the connection or the process.
+            drop(permit);
+            reply_local(replies, output, close_ready, |out| {
+                out.append_empty(header, Status::OutOfMemory)?;
+                Ok(ConnectionAction::Continue)
+            })?;
+            return Ok(closes);
+        }
+    };
     router.submit_remote(replies, permit, worker, owner, header, command)?;
     Ok(closes)
 }
@@ -1110,14 +1123,12 @@ fn reply_local(
     encode: impl FnOnce(&mut ResponseEncoder<'_>) -> Result<ConnectionAction, EncodeError>,
 ) -> io::Result<()> {
     if replies.at_head()? {
-        let action = encode(&mut ResponseEncoder::new(output))
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let action = encode(&mut ResponseEncoder::new(output)).map_err(io::Error::from)?;
         *close_ready |= action == ConnectionAction::Close;
         return Ok(());
     }
     let mut bytes = replies.take_buffer();
-    let action = encode(&mut ResponseEncoder::new(&mut bytes))
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let action = encode(&mut ResponseEncoder::new(&mut bytes)).map_err(io::Error::from)?;
     replies.push_ready(CommandResponse { action, bytes })
 }
 
@@ -2020,27 +2031,38 @@ impl Drop for CreditPermit {
 }
 
 impl OwnedCommand {
-    fn copy_from(command: Command<'_>) -> Option<Self> {
+    /// Copy a keyed command so it can cross to its owning worker.
+    ///
+    /// Returns `None` for a command without a key, and an error if the value
+    /// cannot be allocated.
+    fn copy_from(command: Command<'_>) -> Option<Result<Self, OutOfMemory>> {
         match command {
-            Command::Get { key, quiet } => Some(Self::Get {
+            Command::Get { key, quiet } => Some(Ok(Self::Get {
                 key: SmallVec::from_slice(key),
                 quiet,
-            }),
+            })),
             Command::Set {
                 key,
                 flags,
                 value,
                 quiet,
-            } => Some(Self::Set {
+            } => {
+                let mut copy = Vec::new();
+                if copy.try_reserve_exact(value.len()).is_err() {
+                    return Some(Err(OutOfMemory));
+                }
+                copy.extend_from_slice(value);
+                Some(Ok(Self::Set {
+                    key: SmallVec::from_slice(key),
+                    flags,
+                    value: copy,
+                    quiet,
+                }))
+            }
+            Command::Delete { key, quiet } => Some(Ok(Self::Delete {
                 key: SmallVec::from_slice(key),
-                flags,
-                value: value.to_vec(),
                 quiet,
-            }),
-            Command::Delete { key, quiet } => Some(Self::Delete {
-                key: SmallVec::from_slice(key),
-                quiet,
-            }),
+            })),
             Command::Noop
             | Command::Version
             | Command::Stat { .. }
@@ -2233,6 +2255,7 @@ mod tests {
             key: b"memtier-0000000000000042",
             quiet: false,
         })
+        .unwrap()
         .unwrap();
         let OwnedCommand::Get { key, .. } = command else {
             unreachable!();
@@ -2248,6 +2271,7 @@ mod tests {
             value: b"value",
             quiet: true,
         })
+        .unwrap()
         .unwrap();
         assert_eq!(command.key(), b"key");
         assert_eq!(
@@ -3032,7 +3056,7 @@ mod tests {
         const GETS: usize = 256;
         let response_len = HEADER_LEN + 4 + 4096;
         let mut store = crate::memory::MemoryStore::new();
-        store.set(b"a", 0, &[42; 4096]);
+        store.set(b"a", 0, &[42; 4096]).unwrap();
         let handler = MemoryHandler::new(store);
         let (router, _requests, _fatal, _driver) = router_fixture(1);
         let replies = router.register_connection(7).unwrap();
@@ -3072,7 +3096,7 @@ mod tests {
     fn replies_behind_remote_head_reuse_pooled_buffers_in_order() {
         const ROUNDS: usize = 256;
         let mut store = crate::memory::MemoryStore::new();
-        store.set(b"local", 0, &[42; 4096]);
+        store.set(b"local", 0, &[42; 4096]).unwrap();
         let handler = MemoryHandler::new(store);
         let (router, requests, _fatal, driver) = router_fixture(1);
         let driver = driver.build(SpinPark);
@@ -3100,6 +3124,7 @@ mod tests {
                         key: b"remote",
                         quiet: false,
                     })
+                    .unwrap()
                     .unwrap(),
                 )
                 .unwrap();
