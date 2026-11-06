@@ -49,6 +49,7 @@ fn run_in_child(name: &str, f: fn()) {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "spawns a child process")]
 fn driver_dropped_during_unwind_with_panicking_waker_does_not_abort() {
     run_in_child(
         "driver_dropped_during_unwind_with_panicking_waker_does_not_abort",
