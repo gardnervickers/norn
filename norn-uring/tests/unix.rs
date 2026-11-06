@@ -463,12 +463,17 @@ fn connect_waits_for_backlog_space() -> Result<(), Box<dyn std::error::Error>> {
         // the id it read: a client only sees its own id back if it was
         // paired with the right server socket.
         let connected = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let failed = std::rc::Rc::new(std::cell::Cell::new(0usize));
         let mut clients = Vec::new();
         for id in 0..CLIENTS {
             let name = name.clone();
             let connected = connected.clone();
+            let failed = failed.clone();
             clients.push(spawn(async move {
-                let mut stream = UnixSocket::connect_addr(&name).await?.into_stream();
+                let socket = UnixSocket::connect_addr(&name).await.inspect_err(|_| {
+                    failed.set(failed.get() + 1);
+                })?;
+                let mut stream = socket.into_stream();
                 connected.set(connected.get() + 1);
                 stream.write_all(&[id]).await?;
                 // The connected socket is nonblocking again: this read with
@@ -486,10 +491,13 @@ fn connect_waits_for_backlog_space() -> Result<(), Box<dyn std::error::Error>> {
             norn_uring::noop().await?;
         }
         // A backlog of one holds two connections, so the rest must still be
-        // waiting for space.
+        // waiting for space rather than failed (a failed connect would leave
+        // an accept below waiting forever).
+        assert_eq!(failed.get(), 0, "a connect failed instead of waiting");
         assert!(
-            connected.get() < usize::from(CLIENTS),
-            "every connect completed without anything being accepted"
+            connected.get() <= 2,
+            "{} connects completed with a backlog of one and nothing accepted",
+            connected.get()
         );
 
         // Accepting makes room, and the waiting connects then complete.
