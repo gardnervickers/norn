@@ -3,7 +3,7 @@
 use std::cell::Cell;
 use std::future::Future;
 use std::io;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::pin::pin;
 use std::rc::Rc;
 
@@ -313,19 +313,25 @@ const MAX_CQ_ENTRIES: u32 = 65_536;
 /// overflowed completion when it cannot allocate the overflow entry, which
 /// fails the driver.
 ///
-/// The kernel rounds the CQ up to a power of two, and clamps it at its
-/// limit (65536 entries) rather than failing. In multishot mode that limit
-/// is reached at about 14000 `max_connections`; a larger request is still
-/// clamped, and this prints a warning with the effective size.
+/// The kernel rounds the CQ up to a power of two, and the driver caps it at
+/// the kernel's limit (65536 entries) rather than failing. In multishot mode
+/// that limit is reached at about 14000 `max_connections`; a larger request
+/// is still capped, and this prints a warning with the effective size.
 ///
 /// # Errors
 ///
 /// Returns an error when the kernel cannot create the ring.
 pub fn driver(ring_entries: u32, config: &ServerConfig) -> io::Result<norn_uring::Driver> {
-    let requested = cq_entries(ring_entries, config);
+    // An oversized `ring_entries` gets the kernel's largest SQ rather than an
+    // error.
     let mut builder = io_uring::IoUring::builder();
-    builder.setup_clamp().setup_cqsize(requested);
-    let driver = norn_uring::Driver::new(builder, ring_entries)?;
+    builder.setup_clamp();
+    let requested = cq_entries(ring_entries, config);
+    let options = norn_uring::DriverOptions {
+        cq_entries: NonZeroU32::new(requested),
+        ..norn_uring::DriverOptions::default()
+    };
+    let driver = norn_uring::Driver::new_with_options(builder, ring_entries, options)?;
     if requested > MAX_CQ_ENTRIES {
         eprintln!(
             "warning: the completion queue needs {requested} entries for \
@@ -1043,8 +1049,16 @@ mod tests {
             ..ServerConfig::default()
         };
         assert_eq!(cq_entries(256, &huge), u32::MAX);
-        // The kernel clamps rather than rejects an oversized CQ.
+        // The driver caps an oversized CQ at the kernel's limit instead of failing.
         let clamped = driver(256, &huge).unwrap();
+        assert_eq!(clamped.handle().cq_entries(), MAX_CQ_ENTRIES);
+    }
+
+    /// `--ring-entries` above the kernel's SQ limit gets the largest SQ
+    /// rather than an error.
+    #[test]
+    fn oversized_ring_entries_are_clamped() {
+        let clamped = driver(40_000, &ServerConfig::default()).unwrap();
         assert_eq!(clamped.handle().cq_entries(), MAX_CQ_ENTRIES);
     }
 

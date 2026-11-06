@@ -1016,7 +1016,11 @@ fn readiness_stream_survives_a_full_completion_queue() -> Result<(), Box<dyn std
     // The socket is still healthy, so the stream must not end.
     let mut builder = io_uring::IoUring::builder();
     builder.setup_cqsize(2);
-    let driver = norn_uring::Driver::new(builder, 2)?;
+    let options = norn_uring::DriverOptions {
+        cq_entries: None,
+        ..norn_uring::DriverOptions::default()
+    };
+    let driver = norn_uring::Driver::new_with_options(builder, 2, options)?;
     let mut ex = norn_executor::LocalExecutor::new(driver);
     ex.block_on(async {
         let receiver = UdpSocket::bind("127.0.0.1:0".parse()?).await?;

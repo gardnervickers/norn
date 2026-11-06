@@ -46,9 +46,12 @@ where
     let server = thread::spawn(move || -> io::Result<()> {
         // Room for every ring buffer, as the server sizes its CQ, and for
         // each connection's other completions.
-        let mut builder = io_uring::IoUring::builder();
-        builder.setup_cqsize(256 + u32::from(RING_BUFFERS) + 4 * (PROBES + 1));
-        let driver = norn_uring::Driver::new(builder, 256)?;
+        let options = norn_uring::DriverOptions {
+            cq_entries: std::num::NonZeroU32::new(256 + u32::from(RING_BUFFERS) + 4 * (PROBES + 1)),
+            ..norn_uring::DriverOptions::default()
+        };
+        let driver =
+            norn_uring::Driver::new_with_options(io_uring::IoUring::builder(), 256, options)?;
         let mut executor = LocalExecutor::new(driver);
         executor.block_on(async move {
             let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap(), 16).await?;
