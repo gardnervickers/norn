@@ -634,8 +634,8 @@ impl Builder {
     ///
     /// `main` is moved to the worker thread before it is invoked. Its returned
     /// future does not need to implement [`Send`]. The future may return `()`
-    /// or `Result<(), E>` for an error type implementing [`Error`], [`Send`],
-    /// and [`Sync`].
+    /// or `Result<(), E>` for any error type `E` that converts into
+    /// [`BoxError`], including [`BoxError`] itself and `anyhow::Error`.
     pub fn worker<F, Fut, O>(
         &mut self,
         worker: WorkerId,
@@ -880,6 +880,21 @@ struct WorkerThread {
 /// Call [`RuntimeGroup::join`] or [`RuntimeGroup::shutdown`] to observe worker
 /// failures. Dropping the group requests shutdown and waits for the workers
 /// to exit, but it cannot report their failures.
+///
+/// # Dropping
+///
+/// [`Drop`] requests shutdown and then blocks until every worker thread
+/// exits, so every worker main must observe
+/// [`WorkerContext::shutdown_requested`] and return. A worker that ignores
+/// shutdown makes the drop wait forever. That includes a drop caused by an
+/// early `?` return in the owner, which cannot be told apart from a normal
+/// drop.
+///
+/// While the owner thread is panicking, `Drop` still requests shutdown but
+/// detaches the workers instead of joining them, so the panic keeps
+/// unwinding instead of hanging behind a worker that never exits. Detached
+/// workers keep running until they observe the request, and the process may
+/// exit before they finish.
 #[must_use = "dropping a RuntimeGroup discards worker failures; call `join` or `shutdown`"]
 pub struct RuntimeGroup {
     control: Arc<GroupControl>,
@@ -988,7 +1003,14 @@ impl Drop for RuntimeGroup {
         // process exit. A group dropped on one of its own workers cannot join
         // that thread, so it leaves only that worker running.
         let others = self.take_other_workers();
-        join_worker_threads(others);
+        if thread::panicking() {
+            // Joining here could turn the owner's panic into a hang behind a
+            // worker that ignores shutdown. Shutdown was requested above;
+            // dropping the handles detaches the threads.
+            drop(others);
+        } else {
+            join_worker_threads(others);
+        }
     }
 }
 
