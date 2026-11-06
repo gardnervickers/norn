@@ -87,6 +87,20 @@ pin_project_lite::pin_project! {
     }
 }
 
+/// Convert a path argument. Like `std`, reject NUL bytes: the kernel would
+/// cut the path at the first one, and a leading one names the abstract
+/// namespace instead of a file.
+fn unix_path(path: &Path) -> io::Result<SockAddr> {
+    use std::os::unix::ffi::OsStrExt;
+    if path.as_os_str().as_bytes().contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "paths must not contain null bytes",
+        ));
+    }
+    SockAddr::unix(path)
+}
+
 impl std::fmt::Debug for UnixListener {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UnixListener").finish()
@@ -144,7 +158,7 @@ impl UnixListener {
     ///
     /// Panics if called outside an active [`Driver`](crate::Driver) context.
     pub async fn bind(path: impl AsRef<Path>, backlog: u32) -> io::Result<UnixListener> {
-        Self::bind_sockaddr(SockAddr::unix(path)?, backlog).await
+        Self::bind_sockaddr(unix_path(path.as_ref())?, backlog).await
     }
 
     /// Creates a listener bound to `addr`, which may name a path or an
@@ -249,6 +263,10 @@ impl UnixSocket {
 
     /// Connects to the listener bound to the socket file at `path`.
     ///
+    /// While the listener's backlog is full, the connect waits for space,
+    /// like a blocking `connect(2)`, in an `io_uring` worker thread.
+    /// Dropping the future cancels it.
+    ///
     /// # Errors
     ///
     /// Returns an error if the path is too long, or if the socket cannot be
@@ -258,11 +276,12 @@ impl UnixSocket {
     ///
     /// Panics if called outside an active [`Driver`](crate::Driver) context.
     pub async fn connect(path: impl AsRef<Path>) -> io::Result<UnixSocket> {
-        Self::connect_sockaddr(SockAddr::unix(path)?).await
+        Self::connect_sockaddr(unix_path(path.as_ref())?).await
     }
 
     /// Connects to the listener bound to `addr`, which may name a path or an
-    /// abstract name.
+    /// abstract name. It waits for backlog space like
+    /// [`UnixSocket::connect`].
     ///
     /// # Errors
     ///
@@ -277,8 +296,14 @@ impl UnixSocket {
     }
 
     async fn connect_sockaddr(addr: SockAddr) -> io::Result<UnixSocket> {
-        let socket = socket::Socket::open(Domain::UNIX, Type::STREAM, None).await?;
+        // A nonblocking Unix stream connect to a listener with a full backlog
+        // fails with `EAGAIN` and queues nothing, unlike TCP's
+        // `EINPROGRESS`. Connect on a blocking socket so the kernel waits for
+        // backlog space, as a blocking `connect(2)` does, then switch it to
+        // nonblocking for the readiness-driven stream.
+        let socket = socket::Socket::open_blocking(Domain::UNIX, Type::STREAM).await?;
         socket.connect(addr).await?;
+        socket.set_nonblocking()?;
         Ok(UnixSocket { socket })
     }
 
@@ -532,7 +557,7 @@ impl UnixDatagram {
     ///
     /// Panics if called outside an active [`Driver`](crate::Driver) context.
     pub async fn bind(path: impl AsRef<Path>) -> io::Result<UnixDatagram> {
-        Self::bind_sockaddr(SockAddr::unix(path)?).await
+        Self::bind_sockaddr(unix_path(path.as_ref())?).await
     }
 
     /// Creates a datagram socket bound to `addr`, which may name a path or an
@@ -597,7 +622,7 @@ impl UnixDatagram {
     /// Returns an error if the path is too long or the socket cannot be
     /// connected.
     pub async fn connect(&self, path: impl AsRef<Path>) -> io::Result<()> {
-        self.inner.connect(SockAddr::unix(path)?).await
+        self.inner.connect(unix_path(path.as_ref())?).await
     }
 
     /// Connect this socket to `addr`, which may name a path or an abstract
@@ -647,7 +672,8 @@ impl UnixDatagram {
     where
         B: StableBuf + 'static,
     {
-        self.inner.send_to(buf, UnixDest::new(SockAddr::unix(path)))
+        self.inner
+            .send_to(buf, UnixDest::new(unix_path(path.as_ref())))
     }
 
     /// Sends a single datagram to `addr`, which may name a path or an

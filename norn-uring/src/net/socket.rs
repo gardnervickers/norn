@@ -608,11 +608,28 @@ impl Socket {
         socket_type: Type,
         protocol: Option<Protocol>,
     ) -> io::Result<Self> {
+        Self::open_with(domain, socket_type, protocol, true).await
+    }
+
+    /// Open a socket without `O_NONBLOCK`, for an operation that must wait
+    /// in the kernel. Call [`set_nonblocking`](Self::set_nonblocking) before
+    /// handing it to code that expects a nonblocking descriptor.
+    pub(crate) async fn open_blocking(domain: Domain, socket_type: Type) -> io::Result<Self> {
+        Self::open_with(domain, socket_type, None, false).await
+    }
+
+    async fn open_with(
+        domain: Domain,
+        socket_type: Type,
+        protocol: Option<Protocol>,
+        nonblocking: bool,
+    ) -> io::Result<Self> {
         let handle = crate::Handle::current();
         let op = OpenSocket {
             domain,
             socket_type,
             protocol,
+            nonblocking,
             handle: handle.clone(),
         };
         let fd = handle.submit(op).await?;
@@ -872,6 +889,10 @@ impl Socket {
         Unix::from_sockaddr(&self.as_socket().peer_addr()?)
     }
 
+    pub(crate) fn set_nonblocking(&self) -> io::Result<()> {
+        self.as_socket().set_nonblocking(true)
+    }
+
     pub(crate) fn as_socket(&self) -> ManuallyDrop<socket2::Socket> {
         let sock = unsafe { socket2::Socket::from_raw_fd(self.fd.fd().0) };
         ManuallyDrop::new(sock)
@@ -1029,6 +1050,7 @@ struct OpenSocket {
     domain: Domain,
     socket_type: Type,
     protocol: Option<Protocol>,
+    nonblocking: bool,
     handle: crate::Handle,
 }
 
@@ -1039,7 +1061,12 @@ unsafe impl Operation for OpenSocket {
 
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let ty: i32 = self.socket_type.into();
-        let ty = ty | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC;
+        let ty = ty | libc::SOCK_CLOEXEC;
+        let ty = if self.nonblocking {
+            ty | libc::SOCK_NONBLOCK
+        } else {
+            ty
+        };
         Ok(io_uring::opcode::Socket::new(
             self.domain.into(),
             ty,

@@ -63,8 +63,8 @@ impl RecvOptions {
     /// length and may exceed the initialized length of the returned buffer;
     /// the excess is discarded. Stream receives, on TCP and Unix stream
     /// sockets, reject it with [`io::ErrorKind::InvalidInput`] and return the
-    /// buffer unchanged, because on a stream it discards input without
-    /// filling the buffer.
+    /// buffer unchanged: on TCP it discards input without filling the
+    /// buffer, and a stream has no datagram length to report.
     ///
     /// [`io::ErrorKind::InvalidInput`]: std::io::ErrorKind::InvalidInput
     #[must_use]

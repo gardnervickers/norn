@@ -1,5 +1,6 @@
 #![cfg(target_os = "linux")]
 
+use std::future::Future;
 use std::io;
 use std::os::linux::net::SocketAddrExt;
 use std::os::unix::net::SocketAddr;
@@ -13,6 +14,33 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 mod util;
 
+/// A directory for socket files with a short path, since `sun_path` holds
+/// only 108 bytes, however long `TMPDIR` is. Removed on drop.
+struct SocketDir(std::path::PathBuf);
+
+impl SocketDir {
+    fn new(tag: &str) -> Self {
+        let path = Path::new("/tmp").join(format!("norn-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+}
+
+impl std::ops::Deref for SocketDir {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for SocketDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 fn abstract_name(tag: &str) -> SocketAddr {
     let name = format!("norn-test-{}-{tag}", std::process::id());
     SocketAddr::from_abstract_name(name.as_bytes()).unwrap()
@@ -20,7 +48,7 @@ fn abstract_name(tag: &str) -> SocketAddr {
 
 #[test]
 fn stream_connects_over_a_path() -> Result<(), Box<dyn std::error::Error>> {
-    let dir = util::ThreadNameTestDir::new();
+    let dir = SocketDir::new("path");
     let path = dir.join("sock");
     util::with_test_env(|| async move {
         let listener = UnixListener::bind(&path, 8).await?;
@@ -243,7 +271,7 @@ fn stream_write_to_a_closed_peer_fails() -> Result<(), Box<dyn std::error::Error
 
 #[test]
 fn datagrams_carry_their_source_address() -> Result<(), Box<dyn std::error::Error>> {
-    let dir = util::ThreadNameTestDir::new();
+    let dir = SocketDir::new("dgram");
     let server_path = dir.join("server");
     let client_path = dir.join("client");
     util::with_test_env(|| async move {
@@ -389,7 +417,7 @@ fn peers_bound_to_a_full_length_path_are_reported_unnamed() -> Result<(), Box<dy
 {
     use std::os::fd::AsRawFd;
 
-    let dir = util::ThreadNameTestDir::new();
+    let dir = SocketDir::new("long");
     let dir_path = dir.to_path_buf();
     util::with_test_env(|| async move {
         // A datagram from such a sender is still received.
@@ -417,6 +445,94 @@ fn peers_bound_to_a_full_length_path_are_reported_unnamed() -> Result<(), Box<dy
         assert!(peer.is_unnamed());
         let (res, _) = server.send(&b"ok"[..]).await;
         assert_eq!(res?, 2);
+        Ok(())
+    })
+}
+
+#[test]
+fn connect_waits_for_backlog_space() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let name = abstract_name("backlog");
+        let listener = UnixListener::bind_addr(&name, 1).await?;
+
+        let mut clients = Vec::new();
+        for _ in 0..6 {
+            let name = name.clone();
+            clients.push(spawn(async move { UnixSocket::connect_addr(&name).await }));
+        }
+        // Let every connect reach the kernel while nothing is accepted.
+        let started = std::time::Instant::now();
+        while started.elapsed() < std::time::Duration::from_millis(50) {
+            norn_uring::noop().await?;
+        }
+        let mut servers = Vec::new();
+        for _ in 0..6 {
+            servers.push(listener.accept().await?.0);
+        }
+        for (client, server) in clients.into_iter().zip(servers) {
+            // The connected socket is nonblocking again: a read with nothing
+            // queued waits in the driver instead of blocking this thread,
+            // so the send that follows can run.
+            let mut stream = client.await??.into_stream();
+            let read = spawn(async move {
+                let mut buf = [0u8; 1];
+                stream.read_exact(&mut buf).await.map(|_| buf[0])
+            });
+            norn_uring::noop().await?;
+            server.send(vec![9u8]).await.0?;
+            assert_eq!(read.await??, 9);
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn paths_with_null_bytes_are_rejected() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        for path in ["/tmp/norn\0suffix", "\0abstract"] {
+            let err = UnixListener::bind(path, 8).await.unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+            let err = UnixSocket::connect(path).await.unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+            let err = UnixDatagram::bind(path).await.unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+            let socket = UnixDatagram::unbound().await?;
+            let err = socket.connect(path).await.unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+            let (res, buf) = socket.send_to(vec![1u8], path).await;
+            assert_eq!(res.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(buf, [1]);
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn dropping_a_waiting_connect_cancels_it() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let name = abstract_name("cancel");
+        let listener = UnixListener::bind_addr(&name, 0).await?;
+        // A backlog of zero holds one connection; this one fills it.
+        let first = UnixSocket::connect_addr(&name).await?;
+
+        // This connect waits in the kernel for backlog space. Drive it until
+        // it has been submitted, then drop it.
+        let mut waiting = Box::pin(UnixSocket::connect_addr(&name));
+        for _ in 0..10 {
+            let pending = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(waiting.as_mut().poll(cx).is_pending())
+            })
+            .await;
+            assert!(pending, "the connect should wait for backlog space");
+            norn_uring::noop().await?;
+        }
+        drop(waiting);
+
+        // The listener still works, and the driver shuts down cleanly with
+        // the canceled connect.
+        let (server, _) = listener.accept().await?;
+        first.send(vec![1u8]).await.0?;
+        assert_eq!(server.recv(vec![0u8; 1]).await.0?, 1);
         Ok(())
     })
 }
