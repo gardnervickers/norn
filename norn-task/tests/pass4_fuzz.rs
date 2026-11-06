@@ -238,6 +238,8 @@ fn run_seed(seed: u64, max_spawn: u32) {
 
 #[test]
 fn random_reentrancy() {
+    // Miri hides the host environment, so widen a Miri sweep with
+    // `MIRIFLAGS="-Zmiri-env-forward=PASS4_SEEDS -Zmiri-env-forward=PASS4_START"`.
     let seeds: u64 = std::env::var("PASS4_SEEDS")
         .ok()
         .and_then(|s| s.parse().ok())

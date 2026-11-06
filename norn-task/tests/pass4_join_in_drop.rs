@@ -2,10 +2,11 @@
 //! shutdown destroys that task's future (the window #185 made a supported,
 //! Pending-returning path).
 //!
-//! `take_output` (and `begin_drop`/`destroy` via `drop_join_handle`) create a
+//! `take_output` (and `begin_drop`/`destroy` via `drop_join_handle`) created a
 //! reference to the whole `FutureCell` storage while the future stored there
-//! is still being dropped, and a field of that future is borrowed by its own
-//! `Drop::drop(&mut self)`. Miri reports Undefined Behavior.
+//! was still being dropped, and a field of that future is borrowed by its own
+//! `Drop::drop(&mut self)`. Before FutureCell moved its state out of the
+//! storage cell, Miri (Stacked Borrows) reported Undefined Behavior here.
 use std::cell::RefCell;
 use std::future::Future;
 use std::pin::Pin;
