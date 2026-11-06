@@ -178,6 +178,10 @@ struct Shared {
     deferred_cancels: RefCell<VecDeque<PendingCancel>>,
     /// Set once shutdown has requested cancellation of every outstanding request.
     cancel_all_requested: Cell<bool>,
+    /// Set once a request with a hard link was submitted. Shutdown then
+    /// cancels again after each completion, because a hard-linked request is
+    /// issued only once the request before it ends.
+    hard_links: Cell<bool>,
     /// Linked requests whose first cancellation found nothing (ENOENT).
     ///
     /// A request linked behind another is invisible to cancellation until the
@@ -631,6 +635,12 @@ impl Handle {
         self.shared.cancel_all_requested.get()
     }
 
+    /// Record that a request with a hard link is being submitted, so shutdown
+    /// cancels its later requests as soon as they are issued.
+    pub(crate) fn note_hard_link(&self) {
+        self.shared.hard_links.set(true);
+    }
+
     /// Whether the driver still accepts work.
     pub(crate) fn is_running(&self) -> bool {
         self.shared.status() == Status::Running
@@ -810,6 +820,7 @@ impl Driver {
                 status: Cell::new(Status::Running),
                 deferred_cancels: RefCell::new(VecDeque::new()),
                 cancel_all_requested: Cell::new(false),
+                hard_links: Cell::new(false),
                 cancel_retries: RefCell::new(Vec::new()),
                 submit_error: RefCell::new(None),
                 shutdown_outcome: Cell::new(None),
@@ -1221,6 +1232,7 @@ impl Driver {
             return;
         }
         if self.drain_exhaustive() > 0 {
+            self.cancel_issued_hard_links();
             return;
         }
         if self.shared.in_flight() == 0 {
@@ -1245,7 +1257,11 @@ impl Driver {
             self.retry_shutdown("park", &err);
             return;
         }
-        if self.drain_exhaustive() == 0 && self.shared.in_flight() > 0 {
+        if self.drain_exhaustive() > 0 {
+            // Under DEFER_TASKRUN the park runs the task work that completes a
+            // canceled request and issues the request hard-linked behind it.
+            self.cancel_issued_hard_links();
+        } else if self.shared.in_flight() > 0 {
             // Like the first cancel, this matches every request. That includes a
             // drop-close (`CLOSE_FD_TOKEN`) still queued in io-wq, which only
             // happens for files whose close flushes (FUSE, NFS); cancelling one
@@ -1259,6 +1275,22 @@ impl Driver {
             );
             if let Err(err) = self.shared.cancel_all() {
                 trace!(target: LOG, "shutdown.recancel {err:?}");
+            }
+        }
+    }
+
+    /// Cancel again after a step that reaped completions, if a hard link may
+    /// have issued a request since the last cancel.
+    ///
+    /// A hard-linked request is issued only once the request before it
+    /// completes, so the cancel that ended its predecessor did not see it.
+    /// Issuing and cancelling it now, instead of after the timed wait in
+    /// `drain_for_shutdown`, saves a chain one wait per hard link.
+    fn cancel_issued_hard_links(&self) {
+        if self.shared.hard_links.get() && self.shared.in_flight() > 0 {
+            self.shared.run_all_task_work();
+            if let Err(err) = self.shared.cancel_all() {
+                trace!(target: LOG, "shutdown.hard_link_cancel {err:?}");
             }
         }
     }
@@ -3740,6 +3772,72 @@ mod tests {
                 && second.load(Ordering::Acquire)),
             "both reads must end"
         );
+    }
+
+    #[test]
+    fn shutdown_cancels_each_hard_linked_request_without_waiting() {
+        let mut builders = Vec::new();
+        builders.push(("default", io_uring::IoUring::builder()));
+        let mut coop = io_uring::IoUring::builder();
+        coop.setup_coop_taskrun();
+        builders.push(("coop", coop));
+        let mut defer = io_uring::IoUring::builder();
+        defer
+            .setup_coop_taskrun()
+            .setup_defer_taskrun()
+            .setup_single_issuer();
+        builders.push(("defer", defer));
+        let mut sqpoll = io_uring::IoUring::builder();
+        sqpoll.setup_sqpoll(1000);
+        builders.push(("sqpoll", sqpoll));
+
+        for (name, builder) in builders {
+            let mut driver = Driver::new(builder, 8).unwrap();
+            let handle = driver.handle();
+            let ended: [Arc<AtomicBool>; 4] =
+                std::array::from_fn(|_| Arc::new(AtomicBool::new(false)));
+            let mut chain = Box::pin(
+                long_lived_read(&handle, &ended[0])
+                    .then_always(long_lived_read(&handle, &ended[1]))
+                    .then_always(long_lived_read(&handle, &ended[2]))
+                    .then_always(long_lived_read(&handle, &ended[3])),
+            );
+            let waker = futures_test::task::noop_waker();
+            assert!(chain
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending());
+            driver.park(ParkMode::NoPark).unwrap();
+
+            // Each read is issued only after the one before it ends, so
+            // shutdown cancels four times. Waiting out SHUTDOWN_CANCEL_TIMEOUT
+            // before each later cancel made this take three timeouts.
+            let started = std::time::Instant::now();
+            drop(driver);
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed < SHUTDOWN_CANCEL_TIMEOUT,
+                "{name}: shutdown took {elapsed:?}"
+            );
+            drop(chain);
+            assert!(
+                ended.iter().all(|ended| ended.load(Ordering::Acquire)),
+                "{name}"
+            );
+        }
+    }
+
+    /// Only a submitted hard link makes shutdown cancel after every reap.
+    #[test]
+    fn building_a_then_always_does_not_mark_the_driver() {
+        let driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let handle = driver.handle();
+        let (first, second) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        drop(long_lived_read(&handle, &first).then_always(long_lived_read(&handle, &second)));
+        assert!(!driver.shared.hard_links.get());
     }
 
     #[test]
