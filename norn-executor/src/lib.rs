@@ -408,15 +408,18 @@ impl<P: park::Park> Drop for LocalExecutor<P> {
             self.park.enter_for_shutdown(),
             context::Context::enter_for_shutdown(self.handle()),
         );
-        // Task destructors are user code: count them as running, so a
-        // watchdog can see a shutdown that hangs in one.
-        let _running = metrics::Activity::flip(&self.counters.activity);
         // `TaskQueue::shutdown` finishes every task and then re-raises the
         // first join-waker panic. Still shut the park down while the context
         // guard is alive, then resume the panic.
-        let tasks = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.taskqueue.shutdown();
-        }));
+        let tasks = {
+            // Task destructors are user code: count them as running, so a
+            // watchdog can see a shutdown that hangs in one. The park's own
+            // shutdown below waits for the kernel, which is not running.
+            let _running = metrics::Activity::flip(&self.counters.activity);
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.taskqueue.shutdown();
+            }))
+        };
         self.park.shutdown();
         if let Err(payload) = tasks {
             std::panic::resume_unwind(payload);
