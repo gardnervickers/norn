@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 norn-channel = { path = "../norn-channel" }
 norn-executor = { path = "../norn-executor" }
+norn-metrics = { path = "../norn-metrics" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2.149"

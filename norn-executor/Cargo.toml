@@ -7,6 +7,7 @@ edition = "2021"
 
 [dependencies]
 norn-task = { path = "../norn-task" }
+norn-metrics = { path = "../norn-metrics" }
 
 [dev-dependencies]
 futures-test = "0.3.29"

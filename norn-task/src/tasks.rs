@@ -120,6 +120,12 @@ impl TaskSet {
         }
     }
 
+    /// The number of tasks in the set.
+    pub(crate) fn len(&self) -> usize {
+        // Safety: `TaskSet` is `!Send` and only accessed from one thread.
+        unsafe { (*self.inner.get()).list.len() }
+    }
+
     /// Remove a task from the [`TaskSet`].
     ///
     /// # Safety

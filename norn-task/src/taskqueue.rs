@@ -3,8 +3,12 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::panic::{self, AssertUnwindSafe};
 use std::rc::Rc;
+use std::sync::Arc;
 
-use crate::{JoinHandle, Runnable, Schedule, TaskSet};
+use norn_metrics::Padded;
+
+use crate::metrics::TaskCounters;
+use crate::{JoinHandle, Runnable, Schedule, TaskMetrics, TaskSet};
 
 /// [`TaskQueue`] provides a way to spawn and run tasks.
 ///
@@ -56,6 +60,7 @@ struct Shared {
     runqueue: UnsafeCell<VecDeque<Runnable>>,
     taskset: TaskSet,
     external_handles: Cell<usize>,
+    counters: Arc<Padded<TaskCounters>>,
 }
 
 impl TaskQueue {
@@ -65,6 +70,7 @@ impl TaskQueue {
             runqueue: UnsafeCell::new(VecDeque::with_capacity(1024)),
             taskset: TaskSet::default(),
             external_handles: Cell::new(1),
+            counters: Arc::default(),
         };
         Self {
             shared: Rc::new(shared),
@@ -101,6 +107,7 @@ impl TaskQueue {
         //         all references it captures.
         let (runnable, handle) = unsafe { self.shared.taskset.bind(future, sched) };
         if let Some(runnable) = runnable {
+            self.shared.counters.spawned.incr();
             self.shared.push_runnable(runnable);
         }
         handle
@@ -115,6 +122,11 @@ impl TaskQueue {
     /// Returns the number of [`Runnable`]s in the queue.
     pub fn runnable(&self) -> usize {
         self.shared.runnable_len()
+    }
+
+    /// A view of this queue's task counts that any thread can read.
+    pub fn metrics(&self) -> TaskMetrics {
+        TaskMetrics(Arc::clone(&self.shared.counters))
     }
 
     /// Shutdown the [`TaskQueue`].
@@ -145,7 +157,10 @@ impl Schedule for Rc<Shared> {
     }
 
     fn unbind(&self, registered: &crate::RegisteredTask) {
-        unsafe { self.taskset.remove(registered) };
+        // A task that shutdown already took from the set was counted there.
+        if unsafe { self.taskset.remove(registered) }.is_some() {
+            self.counters.finished.incr();
+        }
     }
 }
 
@@ -154,7 +169,11 @@ impl Shared {
     fn shutdown(&self) {
         // Queued runnables reference this queue through their scheduler. Clear
         // them even if a join waker panics, or the cycle leaks every task.
+        // Shutdown cancels every task in the set, and none can join it once
+        // it is closed.
+        let cancelled = self.taskset.len();
         let result = panic::catch_unwind(AssertUnwindSafe(|| self.taskset.shutdown()));
+        self.counters.finished.add(cancelled as u64);
         self.clear_runqueue();
         if let Err(payload) = result {
             panic::resume_unwind(payload);
@@ -342,5 +361,50 @@ mod tests {
 
         assert_eq!(drops.get(), 1);
         assert!(shared.upgrade().is_none());
+    }
+
+    /// Every task is counted once when it finishes, whether it completed or
+    /// shutdown cancelled it, and the counts stay readable after the queue
+    /// is gone.
+    #[test]
+    fn metrics_count_spawned_and_finished_tasks() {
+        let queue = TaskQueue::new();
+        let metrics = queue.metrics();
+        for _ in 0..3 {
+            queue.spawn(async {}).detach();
+        }
+        let drops = Rc::new(Cell::new(0));
+        for _ in 0..2 {
+            queue
+                .spawn(SelfWoken {
+                    _guard: CountDrop(Rc::clone(&drops)),
+                })
+                .detach();
+        }
+        // One pass: the three empty tasks complete, the self-waking ones
+        // stay alive.
+        for _ in 0..5 {
+            queue.next().unwrap().run();
+        }
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.spawned, 5);
+        assert_eq!(snapshot.finished, 3);
+        assert_eq!(snapshot.alive(), 2);
+
+        drop(queue);
+        assert_eq!(drops.get(), 2);
+        let snapshot = metrics.snapshot();
+        assert_eq!((snapshot.spawned, snapshot.finished), (5, 5));
+        assert_eq!(snapshot.alive(), 0);
+    }
+
+    /// A task spawned after shutdown is never accepted, so it is not counted.
+    #[test]
+    fn metrics_skip_tasks_spawned_after_shutdown() {
+        let queue = TaskQueue::new();
+        queue.shutdown();
+        queue.spawn(async {}).detach();
+        let snapshot = queue.metrics().snapshot();
+        assert_eq!((snapshot.spawned, snapshot.finished), (0, 0));
     }
 }
