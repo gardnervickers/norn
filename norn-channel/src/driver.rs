@@ -1,11 +1,12 @@
+use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::fmt;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::task::Waker;
+use std::{fmt, mem, thread};
 
 use norn_executor::park::{Park, ParkMode, Unpark};
 
@@ -80,7 +81,8 @@ impl Registry {
         self.wake_all(wakers);
     }
 
-    /// Wake every waker in `wakers`, then resume the first panic, if any.
+    /// Wake every waker in `wakers`, then resume the first panic, if any,
+    /// unless the thread is already unwinding.
     ///
     /// Each waker runs under `catch_unwind`, so a panicking callback cannot
     /// lose the remaining receivers' wakeups, and a second panic does not
@@ -89,14 +91,23 @@ impl Registry {
         let mut panic = None;
         while let Some(waker) = wakers.pop() {
             if let Err(payload) = catch_unwind(AssertUnwindSafe(|| waker.wake())) {
-                panic.get_or_insert(payload);
+                match panic {
+                    None => panic = Some(payload),
+                    Some(_) => drop_payload(payload),
+                }
             }
         }
         // Reentrant wakeups may have populated their own empty storage. No
         // wakers are dropped while this cache is borrowed.
         self.wake_storage.replace(wakers);
         if let Some(payload) = panic {
-            resume_unwind(payload);
+            // Resuming while the thread already unwinds, for example when the
+            // driver is dropped during an unrelated panic, would abort.
+            if thread::panicking() {
+                drop_payload(payload);
+            } else {
+                resume_unwind(payload);
+            }
         }
     }
 }
@@ -374,5 +385,14 @@ where
 impl<P> Drop for Driver<P> {
     fn drop(&mut self) {
         self.registry.shutdown();
+    }
+}
+
+/// Drop a waker's panic payload without letting a panicking payload
+/// destructor escape, which would skip the remaining wakers. A payload whose
+/// destructor panics is leaked.
+fn drop_payload(payload: Box<dyn Any + Send>) {
+    if let Err(nested) = catch_unwind(AssertUnwindSafe(|| drop(payload))) {
+        mem::forget(nested);
     }
 }

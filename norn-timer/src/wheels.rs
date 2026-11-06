@@ -1,9 +1,10 @@
+use std::any::Any;
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::VecDeque;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::pin::Pin;
-use std::ptr;
 use std::task::Waker;
+use std::{mem, ptr, thread};
 
 use cordyceps::List;
 
@@ -227,7 +228,8 @@ impl Wheels {
         self.wake_all(wakers);
     }
 
-    /// Wake every waker in `wakers`, then resume the first panic, if any.
+    /// Wake every waker in `wakers`, then resume the first panic, if any,
+    /// unless the thread is already unwinding.
     ///
     /// Each waker runs under `catch_unwind`, so a panicking callback cannot
     /// lose the remaining timers' wakeups, and a second panic does not unwind
@@ -236,14 +238,23 @@ impl Wheels {
         let mut panic = None;
         while let Some(waker) = wakers.pop_front() {
             if let Err(payload) = catch_unwind(AssertUnwindSafe(|| waker.wake())) {
-                panic.get_or_insert(payload);
+                match panic {
+                    None => panic = Some(payload),
+                    Some(_) => drop_payload(payload),
+                }
             }
         }
         // Reentrant advancement may have populated its own empty storage. No
         // wakers are dropped while this cache is borrowed.
         self.wake_storage.replace(wakers);
         if let Some(payload) = panic {
-            resume_unwind(payload);
+            // Resuming while the thread already unwinds, for example when the
+            // driver is dropped during an unrelated panic, would abort.
+            if thread::panicking() {
+                drop_payload(payload);
+            } else {
+                resume_unwind(payload);
+            }
         }
     }
 }
@@ -267,6 +278,15 @@ const fn wheel_for(elapsed: u64, when: u64) -> usize {
     let significant = 63 - leading_zeros;
 
     significant / NUM_LEVELS
+}
+
+/// Drop a waker's panic payload without letting a panicking payload
+/// destructor escape, which would skip the remaining wakers. A payload whose
+/// destructor panics is leaked.
+fn drop_payload(payload: Box<dyn Any + Send>) {
+    if let Err(nested) = catch_unwind(AssertUnwindSafe(|| drop(payload))) {
+        mem::forget(nested);
+    }
 }
 
 #[cfg(test)]
