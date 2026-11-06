@@ -13,10 +13,85 @@ use futures_util::StreamExt;
 use norn_executor::spawn;
 use norn_uring::buf::StableBuf;
 use norn_uring::bufring::RecvBufRing;
-use norn_uring::net::{SendZcUsage, TcpListener, TcpListenerOptions, TcpSocket};
+use norn_uring::net::{
+    RecvOptions, SendOptions, SendZcUsage, TcpListener, TcpListenerOptions, TcpSocket,
+};
+use norn_uring::{Request, WithOptions};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 mod util;
+
+#[test]
+fn tcp_recv_rejects_peek_with_wait_all_without_consuming_input(
+) -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let (server, client) = connected_pair().await?;
+        client.send(&b"abcd"[..]).await.0?;
+
+        // With only four of eight bytes queued, a peeking wait-all retry would
+        // copy "abcd" again and report eight bytes.
+        let opts = RecvOptions::new().peek(true).wait_all(true);
+        let (result, buf) = server.recv(vec![0xa5u8; 8]).options(opts).await;
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(buf, [0xa5u8; 8]);
+
+        let (result, buf) = server
+            .recv(vec![0u8; 4])
+            .options(RecvOptions::new().wait_all(true))
+            .await;
+        assert_eq!(result?, 4);
+        assert_eq!(buf, b"abcd");
+
+        server.close().await?;
+        client.close().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn recv_and_send_options_apply_to_one_request() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let (server, client) = connected_pair().await?;
+
+        // `more` lets the kernel merge this segment with the next send.
+        let more = SendOptions::new().more(true);
+        client.send(&b"hel"[..]).options(more).await.0?;
+        client.send(&b"lo"[..]).await.0?;
+
+        // Both sends have completed, so the peek normally sees all five bytes;
+        // retry in case the second segment is still in flight.
+        let mut buf = vec![0u8; 5];
+        let mut peeked = 0;
+        while peeked < 5 {
+            let (result, b) = server
+                .recv(buf)
+                .options(RecvOptions::new().peek(true))
+                .await;
+            peeked = result?;
+            buf = b;
+        }
+        assert_eq!(buf, b"hello");
+
+        // The peeked bytes are still queued for a receive without options.
+        let (result, buf) = server.recv(vec![0u8; 5]).await;
+        assert_eq!(result?, 5);
+        assert_eq!(buf, b"hello");
+
+        // Options compose with request combinators.
+        client.send(&b"world"[..]).await.0?;
+        let (result, buf) = server
+            .recv(vec![0u8; 5])
+            .options(RecvOptions::new().wait_all(true))
+            .timeout(std::time::Duration::from_secs(5))
+            .await;
+        assert_eq!(result?, 5);
+        assert_eq!(buf, b"world");
+
+        server.close().await?;
+        client.close().await?;
+        Ok(())
+    })
+}
 
 #[test]
 fn msg_trunc_is_rejected_without_modifying_buffers_or_consuming_input(
@@ -28,11 +103,8 @@ fn msg_trunc_is_rejected_without_modifying_buffers_or_consuming_input(
         use std::io::Write;
         let mut peer = peer;
 
-        for flags in [
-            libc::MSG_TRUNC,
-            libc::MSG_TRUNC | libc::MSG_PEEK,
-            libc::MSG_TRUNC | libc::MSG_WAITALL,
-        ] {
+        let trunc = RecvOptions::new().trunc(true);
+        for opts in [trunc, trunc.peek(true), trunc.wait_all(true)] {
             for initialized in [false, true] {
                 peer.write_all(b"hello")?;
                 let buf = if initialized {
@@ -42,7 +114,7 @@ fn msg_trunc_is_rejected_without_modifying_buffers_or_consuming_input(
                 };
                 let ptr = buf.as_ptr();
                 let capacity = buf.capacity();
-                let (result, buf) = server.recv_with_flags(buf, flags).await;
+                let (result, buf) = server.recv(buf).options(opts).await;
                 assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
                 assert_eq!(buf.as_ptr(), ptr);
                 assert_eq!(buf.capacity(), capacity);
@@ -54,7 +126,10 @@ fn msg_trunc_is_rejected_without_modifying_buffers_or_consuming_input(
                         Vec::new()
                     }
                 );
-                let (result, buf) = server.recv_with_flags(buf, libc::MSG_WAITALL).await;
+                let (result, buf) = server
+                    .recv(buf)
+                    .options(RecvOptions::new().wait_all(true))
+                    .await;
                 assert_eq!(result?, 5);
                 assert_eq!(buf, b"hello");
 
@@ -65,12 +140,15 @@ fn msg_trunc_is_rejected_without_modifying_buffers_or_consuming_input(
                 }
                 let ptr = buf.as_ptr();
                 let capacity = buf.capacity();
-                let (result, buf) = server.recv_with_flags(buf, flags).await;
+                let (result, buf) = server.recv(buf).options(opts).await;
                 assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
                 assert_eq!(buf.as_ptr(), ptr);
                 assert_eq!(buf.capacity(), capacity);
                 assert_eq!(&buf[..], if initialized { &[0xa5; 5][..] } else { &[][..] });
-                let (result, buf) = server.recv_with_flags(buf, libc::MSG_WAITALL).await;
+                let (result, buf) = server
+                    .recv(buf)
+                    .options(RecvOptions::new().wait_all(true))
+                    .await;
                 assert_eq!(result?, 5);
                 assert_eq!(&buf[..], b"hello");
             }
@@ -724,93 +802,6 @@ fn recv_bundle_recycles_compact_and_materialized_buffers() -> Result<(), Box<dyn
             }
 
             assert!(saw_multi_buffer_bundle);
-            assert_eq!(received, payload);
-        }
-
-        server.close().await?;
-        client.close().await?;
-        Ok(())
-    })
-}
-
-/// A partial `MSG_WAITALL` bundle can leave the kernel's buffer commits out of
-/// step with its completion, letting the kernel reselect a buffer the bundle
-/// owns. Single-shot bundles reject the flag before consuming input.
-#[test]
-fn recv_bundle_rejects_waitall_without_consuming_input() -> Result<(), Box<dyn std::error::Error>> {
-    util::with_test_env(|| async {
-        let (server, client) = connected_pair().await?;
-        let ring = RecvBufRing::builder(15).buf_cnt(2).buf_len(256).build()?;
-
-        // The payload fills the whole ring, so an accepted receive would
-        // complete rather than wait for more data.
-        let payload = vec![0x22; 512];
-        let (send_result, payload) = client.send(payload).await;
-        assert_eq!(send_result?, payload.len());
-
-        let err = server
-            .recv_bundle_with_flags(&ring, libc::MSG_WAITALL)
-            .await
-            .expect_err("MSG_WAITALL bundle receive must be rejected");
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-
-        let mut received = Vec::with_capacity(payload.len());
-        while received.len() < payload.len() {
-            let bundle = match server.recv_bundle(&ring).await {
-                Ok(bundle) => bundle,
-                Err(err) if util::recv_bundle_unsupported(&err) => break,
-                Err(err) => return Err(err.into()),
-            };
-            received.extend(bundle.iter().flatten().copied());
-        }
-        if !received.is_empty() {
-            assert_eq!(received, payload);
-        }
-
-        server.close().await?;
-        client.close().await?;
-        Ok(())
-    })
-}
-
-/// A peeking bundle that fills its buffers while more data is queued retries
-/// in the kernel and copies the start of the queue again. Bundles reject
-/// `MSG_PEEK` before consuming input.
-#[test]
-fn recv_bundle_rejects_peek_without_consuming_input() -> Result<(), Box<dyn std::error::Error>> {
-    util::with_test_env(|| async {
-        let (server, client) = connected_pair().await?;
-        let ring = RecvBufRing::builder(16).buf_cnt(8).buf_len(256).build()?;
-
-        let payload: Vec<u8> = (0..1024u32).map(|i| (i % 251) as u8).collect();
-        let (send_result, payload) = client.send(payload).await;
-        assert_eq!(send_result?, payload.len());
-
-        let err = server
-            .recv_bundle_with_flags(&ring, libc::MSG_PEEK)
-            .await
-            .expect_err("MSG_PEEK bundle receive must be rejected");
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-
-        let mut multi = pin!(server.recv_bundle_multi_with_flags(&ring, libc::MSG_PEEK));
-        let err = multi
-            .next()
-            .await
-            .expect("configuration failure must produce one stream item")
-            .expect_err("MSG_PEEK multishot bundle receive must be rejected");
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-        assert!(multi.next().await.is_none());
-
-        let mut received: Vec<u8> = Vec::with_capacity(payload.len());
-        while received.len() < payload.len() {
-            let bundle = match server.recv_bundle(&ring).await {
-                Ok(bundle) => bundle,
-                Err(err) if util::recv_bundle_unsupported(&err) => break,
-                Err(err) => return Err(err.into()),
-            };
-            received.extend(bundle.iter().flatten().copied());
-        }
-        if !received.is_empty() {
             assert_eq!(received, payload);
         }
 

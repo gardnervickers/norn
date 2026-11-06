@@ -1,23 +1,32 @@
 //! Socket operations.
 //!
 //! [Socket] is the core socket type
-//! used by both TCP and UDP sockets
+//! used by TCP, UDP and Unix domain sockets
 use io_uring::opcode;
 use io_uring::squeue::Flags;
 use libc::{SOCK_CLOEXEC, SOCK_NONBLOCK};
 use socket2::{Domain, Protocol, SockAddr, SockAddrStorage, Type};
+use std::future::Future;
 use std::io;
-use std::mem::{ManuallyDrop, MaybeUninit};
+use std::marker::PhantomData;
+use std::mem::{self, ManuallyDrop, MaybeUninit};
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+use std::os::linux::net::SocketAddrExt;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::net::SocketAddr as UnixAddr;
 use std::pin::Pin;
+use std::sync::OnceLock;
 use std::task::{ready, Context, Poll as TaskPoll};
 
 use crate::buf::{set_init_checked, StableBuf, StableBufMut};
 use crate::bufring::{BufRingBuf, BufRingBufBundle, RecvBufRing};
 use crate::fd::{NornFd, UringFd};
+use crate::net::options::{RecvOptions, SendOptions};
 use crate::operation::{CQEResult, Multishot, Op, OpTarget, Operation, OperationId, Singleshot};
+use crate::request::{AcceptsOptions, OptionsSealed};
+use crate::WithOptions;
 
 pub(crate) struct RingRecvCompletion<T> {
     pub(crate) result: io::Result<T>,
@@ -323,6 +332,28 @@ fn invalid_zc_notification_error() -> io::Error {
     )
 }
 
+/// Reject stream receive flags that would report bytes the buffer does not
+/// hold. TCP and Unix stream receives share them.
+#[cold]
+fn validate_stream_recv_flags(flags: i32) -> io::Result<()> {
+    if flags & libc::MSG_TRUNC != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "MSG_TRUNC is unsupported for stream socket receives",
+        ));
+    }
+    // A partial `MSG_WAITALL` receive is retried by `io_uring` with the buffer
+    // advanced. Under `MSG_PEEK` each retry copies the start of the queue
+    // again, so the buffer fills with a repeated prefix.
+    if flags & libc::MSG_PEEK != 0 && flags & libc::MSG_WAITALL != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "MSG_PEEK with MSG_WAITALL is unsupported for stream socket receives because a partial retry peeks the start of the queue again",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_recv_bundle_flags(flags: i32) -> io::Result<()> {
     if flags & libc::MSG_TRUNC != 0 {
         return Err(io::Error::new(
@@ -390,6 +421,160 @@ fn as_socket_addr_or_peer(
     as_socket_addr(addr)
 }
 
+/// The address family of a socket, which decides the public type its
+/// addresses convert to.
+pub(crate) trait AddrKind: 'static {
+    type Addr;
+
+    /// Convert an address the kernel reported, such as a local or peer name.
+    fn from_sockaddr(addr: &SockAddr) -> io::Result<Self::Addr>;
+
+    /// Convert the source address of a received datagram, which the kernel
+    /// reports with length zero when it has none.
+    fn from_source(addr: &SockAddr) -> io::Result<Self::Addr> {
+        Self::from_sockaddr(addr)
+    }
+}
+
+/// IPv4 and IPv6 sockets.
+pub(crate) enum Inet {}
+
+impl AddrKind for Inet {
+    type Addr = SocketAddr;
+
+    fn from_sockaddr(addr: &SockAddr) -> io::Result<SocketAddr> {
+        as_socket_addr(addr)
+    }
+
+    fn from_source(addr: &SockAddr) -> io::Result<SocketAddr> {
+        if addr.len() == 0 {
+            return Err(no_source_addr_error());
+        }
+        as_socket_addr(addr)
+    }
+}
+
+/// Unix domain sockets. A datagram from an unbound socket has no source
+/// address, which converts to an unnamed one.
+pub(crate) enum Unix {}
+
+impl AddrKind for Unix {
+    type Addr = UnixAddr;
+
+    fn from_sockaddr(addr: &SockAddr) -> io::Result<UnixAddr> {
+        // The kernel reports an unnamed address with just the family, and a
+        // datagram from an unbound sender with no address at all.
+        if addr.len() as usize <= mem::size_of::<libc::sa_family_t>() {
+            return unnamed_unix_addr();
+        }
+        if !addr.is_unix() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "socket operation returned a non-unix socket address",
+            ));
+        }
+        if let Some(path) = addr.as_pathname() {
+            // A peer can bind a path that fills `sun_path` without a NUL,
+            // which `std` cannot represent. Report it as unnamed instead of
+            // failing an accept or receive that has already consumed its
+            // connection or datagram.
+            return UnixAddr::from_pathname(path).or_else(|_| unnamed_unix_addr());
+        }
+        if let Some(name) = addr.as_abstract_namespace() {
+            return UnixAddr::from_abstract_name(name);
+        }
+        unnamed_unix_addr()
+    }
+}
+
+/// An unnamed Unix socket address.
+///
+/// `std` has no constructor for one. An empty path converts to an address
+/// with just the family, which is unnamed; if a `std` version ever changes
+/// that, fall back to reading the local address of an unbound socket. Either
+/// way the result is cached, so converting does not need a descriptor after
+/// the first call, and normally never does.
+fn unnamed_unix_addr() -> io::Result<UnixAddr> {
+    static UNNAMED: OnceLock<UnixAddr> = OnceLock::new();
+    if let Some(addr) = UNNAMED.get() {
+        return Ok(addr.clone());
+    }
+    let addr = match UnixAddr::from_pathname("") {
+        Ok(addr) if addr.is_unnamed() => addr,
+        _ => std::os::unix::net::UnixDatagram::unbound()?.local_addr()?,
+    };
+    Ok(UNNAMED.get_or_init(|| addr).clone())
+}
+
+/// Convert a named Unix socket address for `bind`, `connect` or `sendmsg`.
+pub(crate) fn unix_sockaddr(addr: &UnixAddr) -> io::Result<SockAddr> {
+    if let Some(path) = addr.as_pathname() {
+        return SockAddr::unix(path);
+    }
+    if let Some(name) = addr.as_abstract_name() {
+        // socket2 encodes a path that starts with a NUL byte as an abstract
+        // name, without a trailing NUL.
+        let mut bytes = Vec::with_capacity(name.len() + 1);
+        bytes.push(0);
+        bytes.extend_from_slice(name);
+        return SockAddr::unix(std::ffi::OsStr::from_bytes(&bytes));
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "an unnamed unix socket address cannot be bound or connected to",
+    ))
+}
+
+/// A datagram destination address.
+pub(crate) trait DestAddr: 'static {
+    /// Call `f` with the address to send to, or fail with the error that
+    /// converting it produced.
+    fn with_sockaddr<R>(&mut self, f: impl FnOnce(&SockAddr) -> R) -> io::Result<R>;
+
+    /// The address to send to, for a send that is submitted to `io_uring`.
+    /// Called only after [`with_sockaddr`](Self::with_sockaddr) succeeded.
+    fn to_sockaddr(&self) -> SockAddr;
+}
+
+impl DestAddr for SocketAddr {
+    #[inline]
+    fn with_sockaddr<R>(&mut self, f: impl FnOnce(&SockAddr) -> R) -> io::Result<R> {
+        Ok(f(&SockAddr::from(*self)))
+    }
+
+    fn to_sockaddr(&self) -> SockAddr {
+        SockAddr::from(*self)
+    }
+}
+
+/// A Unix socket destination, or the error converting it, which the send
+/// reports.
+pub(crate) struct UnixDest(Result<SockAddr, Option<io::Error>>);
+
+impl UnixDest {
+    pub(crate) fn new(addr: io::Result<SockAddr>) -> Self {
+        Self(addr.map_err(Some))
+    }
+}
+
+impl DestAddr for UnixDest {
+    fn with_sockaddr<R>(&mut self, f: impl FnOnce(&SockAddr) -> R) -> io::Result<R> {
+        match &mut self.0 {
+            Ok(addr) => Ok(f(addr)),
+            Err(err) => Err(err
+                .take()
+                .unwrap_or_else(|| io::Error::other("destination address already reported"))),
+        }
+    }
+
+    fn to_sockaddr(&self) -> SockAddr {
+        match &self.0 {
+            Ok(addr) => addr.clone(),
+            Err(_) => unreachable!("an invalid destination is never submitted"),
+        }
+    }
+}
+
 pub(crate) struct Socket {
     fd: UringFd,
 }
@@ -426,11 +611,28 @@ impl Socket {
         socket_type: Type,
         protocol: Option<Protocol>,
     ) -> io::Result<Self> {
+        Self::open_with(domain, socket_type, protocol, true).await
+    }
+
+    /// Open a socket without `O_NONBLOCK`, for an operation that must wait
+    /// in the kernel. Call [`set_nonblocking`](Self::set_nonblocking) before
+    /// handing it to code that expects a nonblocking descriptor.
+    pub(crate) async fn open_blocking(domain: Domain, socket_type: Type) -> io::Result<Self> {
+        Self::open_with(domain, socket_type, None, false).await
+    }
+
+    async fn open_with(
+        domain: Domain,
+        socket_type: Type,
+        protocol: Option<Protocol>,
+        nonblocking: bool,
+    ) -> io::Result<Self> {
         let handle = crate::Handle::current();
         let op = OpenSocket {
             domain,
             socket_type,
             protocol,
+            nonblocking,
             handle: handle.clone(),
         };
         let fd = handle.submit(op).await?;
@@ -452,6 +654,15 @@ impl Socket {
         socket_type: Type,
         reuse_port: bool,
     ) -> io::Result<Self> {
+        Self::bind_sockaddr(SockAddr::from(addr), domain, socket_type, reuse_port).await
+    }
+
+    pub(crate) async fn bind_sockaddr(
+        addr: SockAddr,
+        domain: Domain,
+        socket_type: Type,
+        reuse_port: bool,
+    ) -> io::Result<Self> {
         let socket = Self::open(domain, socket_type, None).await?;
         if reuse_port {
             socket.set_reuse_port(true).await?;
@@ -469,8 +680,30 @@ impl Socket {
         self.fd.submit(op).await
     }
 
-    pub(crate) async fn accept(&self) -> io::Result<(Self, SocketAddr)> {
-        let op = Accept::new(self.fd.lease());
+    /// Create a connected pair of sockets bound to the current driver.
+    pub(crate) fn pair(socket_type: Type) -> io::Result<(Self, Self)> {
+        let handle = crate::Handle::current();
+        let ty: i32 = socket_type.into();
+        let mut fds = [0; 2];
+        // Safety: `fds` has room for the two descriptors `socketpair` writes.
+        let rc = unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                ty | SOCK_NONBLOCK | SOCK_CLOEXEC,
+                0,
+                fds.as_mut_ptr(),
+            )
+        };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let a = Self::from_fd(NornFd::from_fd_on(fds[0], handle.clone()));
+        let b = Self::from_fd(NornFd::from_fd_on(fds[1], handle));
+        Ok((a, b))
+    }
+
+    pub(crate) async fn accept<K: AddrKind>(&self) -> io::Result<(Self, K::Addr)> {
+        let op = Accept::<K>::new(self.fd.lease());
         let (fd, addr) = self.fd.submit(op).await?;
         let socket = Self::from_fd(fd);
         Ok((socket, addr))
@@ -488,7 +721,7 @@ impl Socket {
         self.fd.submit(op)
     }
 
-    pub(crate) async fn connect(&self, addr: SocketAddr) -> io::Result<()> {
+    pub(crate) async fn connect(&self, addr: SockAddr) -> io::Result<()> {
         let op = Connect::new(self.fd.lease(), addr);
         self.fd.submit(op).await?;
         Ok(())
@@ -548,16 +781,6 @@ impl Socket {
         self.fd.submit(op)
     }
 
-    pub(crate) fn recv_ring_bundle_with_flags(
-        &self,
-        ring: &RecvBufRing,
-        flags: i32,
-    ) -> Op<RecvRingBundle> {
-        self.assert_bufring_driver(ring);
-        let op = RecvRingBundle::new(self.fd.lease(), ring.clone(), flags);
-        self.fd.submit(op)
-    }
-
     pub(crate) fn recv_ring_bundle_multi_with_flags(
         &self,
         ring: &RecvBufRing,
@@ -568,43 +791,34 @@ impl Socket {
         self.fd.submit(op)
     }
 
-    pub(crate) async fn recv_from<B>(&self, buf: B) -> (io::Result<(usize, SocketAddr)>, B)
+    pub(crate) fn recv_from<K, B>(&self, buf: B) -> RecvFromFuture<'_, B, K>
     where
+        K: AddrKind,
         B: StableBufMut + 'static,
     {
-        let mut buf = buf;
-        if let Some(result) = self.try_recv_from(&mut buf, 0) {
-            return (result, buf);
+        RecvFromFuture {
+            kind: PhantomData,
+            state: TryFirst::Start {
+                socket: self,
+                buf,
+                flags: 0,
+            },
         }
-        let op = RecvFrom::new(self.fd.lease(), buf, 0);
-        self.fd.submit(op).await
     }
 
-    pub(crate) async fn send_to<B>(&self, buf: B, addr: SocketAddr) -> (io::Result<usize>, B)
+    pub(crate) fn send_to<B, A>(&self, buf: B, addr: A) -> SendToFuture<'_, B, A>
     where
         B: StableBuf + 'static,
+        A: DestAddr,
     {
-        if let Some(result) = self.try_send_to(&buf, Some(addr), 0) {
-            return (result, buf);
+        SendToFuture {
+            addr,
+            state: TryFirst::Start {
+                socket: self,
+                buf,
+                flags: 0,
+            },
         }
-        let op = SendTo::new(self.fd.lease(), buf, Some(addr), 0);
-        self.fd.submit(op).await
-    }
-
-    pub(crate) async fn recv_from_with_flags<B>(
-        &self,
-        buf: B,
-        flags: i32,
-    ) -> (io::Result<(usize, SocketAddr)>, B)
-    where
-        B: StableBufMut + 'static,
-    {
-        let mut buf = buf;
-        if let Some(result) = self.try_recv_from(&mut buf, flags) {
-            return (result, buf);
-        }
-        let op = RecvFrom::new(self.fd.lease(), buf, flags as u32);
-        self.fd.submit(op).await
     }
 
     pub(crate) fn recv<B>(&self, buf: B) -> Op<Recv<B>>
@@ -623,19 +837,11 @@ impl Socket {
         self.fd.submit(op)
     }
 
-    pub(crate) fn recv_with_flags<B>(&self, buf: B, flags: i32) -> Op<Recv<B>>
+    pub(crate) fn recv_stream<B>(&self, buf: B) -> Op<Recv<B, true>>
     where
         B: StableBufMut + 'static,
     {
-        let op = Recv::new(self.fd.lease(), buf, flags);
-        self.fd.submit(op)
-    }
-
-    pub(crate) fn recv_tcp_with_flags<B>(&self, buf: B, flags: i32) -> Op<Recv<B, true>>
-    where
-        B: StableBufMut + 'static,
-    {
-        let op = Recv::new(self.fd.lease(), buf, flags);
+        let op = Recv::new(self.fd.lease(), buf, 0);
         self.fd.submit(op)
     }
 
@@ -676,6 +882,18 @@ impl Socket {
 
     pub(crate) fn peer_addr(&self) -> io::Result<SocketAddr> {
         as_socket_addr(&self.as_socket().peer_addr()?)
+    }
+
+    pub(crate) fn unix_local_addr(&self) -> io::Result<UnixAddr> {
+        Unix::from_sockaddr(&self.as_socket().local_addr()?)
+    }
+
+    pub(crate) fn unix_peer_addr(&self) -> io::Result<UnixAddr> {
+        Unix::from_sockaddr(&self.as_socket().peer_addr()?)
+    }
+
+    pub(crate) fn set_nonblocking(&self) -> io::Result<()> {
+        self.as_socket().set_nonblocking(true)
     }
 
     pub(crate) fn as_socket(&self) -> ManuallyDrop<socket2::Socket> {
@@ -744,48 +962,26 @@ impl Socket {
         self.fd.submit(op).await
     }
 
-    fn try_send_to<B>(
-        &self,
-        buf: &B,
-        addr: Option<SocketAddr>,
-        flags: i32,
-    ) -> Option<io::Result<usize>>
+    fn try_send_to<B>(&self, buf: &B, addr: &SockAddr, flags: i32) -> Option<io::Result<usize>>
     where
         B: StableBuf,
     {
-        let fd = self.fd.fd().0;
-        let (name, namelen) = match addr {
-            Some(addr) => {
-                let addr = SockAddr::from(addr);
-                let rc = unsafe {
-                    libc::sendto(
-                        fd,
-                        buf.stable_ptr().cast(),
-                        buf.bytes_init(),
-                        flags,
-                        addr.as_ptr().cast(),
-                        addr.len(),
-                    )
-                };
-                return direct_io_result(rc).map(|res| res.map(|n| n as usize));
-            }
-            None => (std::ptr::null(), 0),
-        };
         let rc = unsafe {
             libc::sendto(
-                fd,
+                self.fd.fd().0,
                 buf.stable_ptr().cast(),
                 buf.bytes_init(),
                 flags,
-                name,
-                namelen,
+                addr.as_ptr().cast(),
+                addr.len(),
             )
         };
         direct_io_result(rc).map(|res| res.map(|n| n as usize))
     }
 
-    fn try_recv_from<B>(&self, buf: &mut B, flags: i32) -> Option<io::Result<(usize, SocketAddr)>>
+    fn try_recv_from<K, B>(&self, buf: &mut B, flags: i32) -> Option<io::Result<(usize, K::Addr)>>
     where
+        K: AddrKind,
         B: StableBufMut,
     {
         let fd = self.fd.fd().0;
@@ -809,15 +1005,16 @@ impl Socket {
         };
         match addr {
             Ok((n, addr)) => {
-                if n == 0 && addr.len() == 0 {
-                    return Some(Err(no_source_addr_error()));
-                }
+                let addr = match K::from_source(&addr) {
+                    Ok(addr) => addr,
+                    Err(err) => return Some(Err(err)),
+                };
                 let reported_len =
                     match complete_recv_buffer(buf, submitted_len, n as usize, flags as u32) {
                         Ok(reported_len) => reported_len,
                         Err(err) => return Some(Err(err)),
                     };
-                Some(as_socket_addr(&addr).map(|addr| (reported_len, addr)))
+                Some(Ok((reported_len, addr)))
             }
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => None,
             Err(err) => Some(Err(err)),
@@ -856,6 +1053,7 @@ struct OpenSocket {
     domain: Domain,
     socket_type: Type,
     protocol: Option<Protocol>,
+    nonblocking: bool,
     handle: crate::Handle,
 }
 
@@ -866,7 +1064,12 @@ unsafe impl Operation for OpenSocket {
 
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let ty: i32 = self.socket_type.into();
-        let ty = ty | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC;
+        let ty = ty | libc::SOCK_CLOEXEC;
+        let ty = if self.nonblocking {
+            ty | libc::SOCK_NONBLOCK
+        } else {
+            ty
+        };
         Ok(io_uring::opcode::Socket::new(
             self.domain.into(),
             ty,
@@ -888,6 +1091,130 @@ impl Singleshot for OpenSocket {
     }
 }
 
+/// A datagram operation that first tries a nonblocking system call, and
+/// submits an `io_uring` operation only if that would block.
+enum TryFirst<'a, B: 'static, T: 'static> {
+    Start {
+        socket: &'a Socket,
+        buf: B,
+        flags: i32,
+    },
+    Submitted(Op<T>),
+    Done,
+}
+
+impl<B: 'static, T: 'static> TryFirst<'_, B, T> {
+    #[track_caller]
+    fn set_flags(&mut self, new_flags: i32) {
+        let TryFirst::Start { flags, .. } = self else {
+            panic!("request options must be set before the request is first polled");
+        };
+        *flags = new_flags;
+    }
+}
+
+/// [`Socket::recv_from`]: a nonblocking `recvfrom`, then `IORING_OP_RECVMSG`.
+pub(crate) struct RecvFromFuture<'a, B: 'static, K: AddrKind = Inet> {
+    kind: PhantomData<fn() -> K>,
+    state: TryFirst<'a, B, RecvFrom<B, K>>,
+}
+
+// `B` is moved, never pinned, and `Op` is `Unpin`.
+impl<B: 'static, K: AddrKind> Unpin for RecvFromFuture<'_, B, K> {}
+
+impl<B, K> Future for RecvFromFuture<'_, B, K>
+where
+    B: StableBufMut + 'static,
+    K: AddrKind,
+{
+    type Output = (io::Result<(usize, K::Addr)>, B);
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> TaskPoll<Self::Output> {
+        let state = &mut self.get_mut().state;
+        if let TryFirst::Start { .. } = state {
+            let TryFirst::Start {
+                socket,
+                mut buf,
+                flags,
+            } = mem::replace(state, TryFirst::Done)
+            else {
+                unreachable!()
+            };
+            if let Some(result) = socket.try_recv_from::<K, B>(&mut buf, flags) {
+                return TaskPoll::Ready((result, buf));
+            }
+            let op = RecvFrom::<B, K>::new(socket.fd.lease(), buf, flags as u32);
+            *state = TryFirst::Submitted(socket.fd.submit(op));
+        }
+        match state {
+            TryFirst::Submitted(op) => Pin::new(op).poll(cx),
+            _ => panic!("datagram receive polled after completion"),
+        }
+    }
+}
+
+impl<B: 'static, K: AddrKind> OptionsSealed for RecvFromFuture<'_, B, K> {}
+
+impl<B: StableBufMut + 'static, K: AddrKind> WithOptions<RecvOptions> for RecvFromFuture<'_, B, K> {
+    #[track_caller]
+    fn options(mut self, opts: RecvOptions) -> Self {
+        self.state.set_flags(opts.flags());
+        self
+    }
+}
+
+/// [`Socket::send_to`]: a nonblocking `sendto`, then `IORING_OP_SENDMSG`.
+pub(crate) struct SendToFuture<'a, B: 'static, A = SocketAddr> {
+    addr: A,
+    state: TryFirst<'a, B, SendTo<B>>,
+}
+
+// `B` is moved, never pinned, and `Op` is `Unpin`.
+impl<B: 'static, A> Unpin for SendToFuture<'_, B, A> {}
+
+impl<B, A> Future for SendToFuture<'_, B, A>
+where
+    B: StableBuf + 'static,
+    A: DestAddr,
+{
+    type Output = (io::Result<usize>, B);
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> TaskPoll<Self::Output> {
+        let this = self.get_mut();
+        let state = &mut this.state;
+        if let TryFirst::Start { .. } = state {
+            let TryFirst::Start { socket, buf, flags } = mem::replace(state, TryFirst::Done) else {
+                unreachable!()
+            };
+            match this
+                .addr
+                .with_sockaddr(|addr| socket.try_send_to(&buf, addr, flags))
+            {
+                Ok(Some(result)) => return TaskPoll::Ready((result, buf)),
+                Err(err) => return TaskPoll::Ready((Err(err), buf)),
+                Ok(None) => {}
+            }
+            let addr = Some(this.addr.to_sockaddr());
+            let op = SendTo::new(socket.fd.lease(), buf, addr, flags as u32);
+            *state = TryFirst::Submitted(socket.fd.submit(op));
+        }
+        match state {
+            TryFirst::Submitted(op) => Pin::new(op).poll(cx),
+            _ => panic!("datagram send polled after completion"),
+        }
+    }
+}
+
+impl<B: 'static, A> OptionsSealed for SendToFuture<'_, B, A> {}
+
+impl<B: StableBuf + 'static, A: DestAddr> WithOptions<SendOptions> for SendToFuture<'_, B, A> {
+    #[track_caller]
+    fn options(mut self, opts: SendOptions) -> Self {
+        self.state.set_flags(opts.flags());
+        self
+    }
+}
+
 struct SendTo<B> {
     fd: NornFd,
     buf: B,
@@ -901,8 +1228,7 @@ impl<B> SendTo<B>
 where
     B: StableBuf,
 {
-    pub(crate) fn new(fd: NornFd, buf: B, addr: Option<SocketAddr>, flags: u32) -> Self {
-        let addr = addr.map(SockAddr::from);
+    pub(crate) fn new(fd: NornFd, buf: B, addr: Option<SockAddr>, flags: u32) -> Self {
         Self {
             fd,
             buf,
@@ -977,7 +1303,8 @@ where
     }
 }
 
-struct RecvFrom<B> {
+struct RecvFrom<B, K = Inet> {
+    kind: PhantomData<fn() -> K>,
     fd: NornFd,
     buf: B,
     addr: SockAddr,
@@ -987,7 +1314,7 @@ struct RecvFrom<B> {
     iovec: MaybeUninit<libc::iovec>,
 }
 
-impl<B> RecvFrom<B>
+impl<B, K> RecvFrom<B, K>
 where
     B: StableBufMut,
 {
@@ -996,6 +1323,7 @@ where
         let addr = unsafe { SockAddr::try_init(|_, _| Ok(())) }.unwrap().1;
         let submitted_len = buf.bytes_remaining();
         Self {
+            kind: PhantomData,
             fd,
             buf,
             addr,
@@ -1009,9 +1337,10 @@ where
 
 // Safety: the owned mutable stable buffer, socket address, msghdr, and iovec
 // storage remain pinned and exclusive through the terminal CQE.
-unsafe impl<B> Operation for RecvFrom<B>
+unsafe impl<B, K> Operation for RecvFrom<B, K>
 where
     B: StableBufMut,
+    K: AddrKind,
 {
     type Completion = CQEResult;
 
@@ -1050,11 +1379,12 @@ fn recv_from_iovec<B: StableBufMut>(buf: &mut B, len: usize) -> libc::iovec {
     }
 }
 
-impl<B> Singleshot for RecvFrom<B>
+impl<B, K> Singleshot for RecvFrom<B, K>
 where
     B: StableBufMut,
+    K: AddrKind,
 {
-    type Output = (io::Result<(usize, SocketAddr)>, B);
+    type Output = (io::Result<(usize, K::Addr)>, B);
 
     fn complete(self, result: crate::operation::CQEResult) -> Self::Output {
         let mut this = self;
@@ -1062,12 +1392,9 @@ where
             Ok(bytes_read) => {
                 // Safety: the msghdr was initialized when the sqe was configured.
                 let msg_namelen = unsafe { this.msghdr.assume_init_ref().msg_namelen };
-                if msg_namelen == 0 {
-                    return (Err(no_source_addr_error()), this.buf);
-                }
                 // Safety: the kernel wrote at most `msg_namelen` bytes into `addr`.
                 unsafe { this.addr.set_length(msg_namelen) };
-                let addr = match as_socket_addr(&this.addr) {
+                let addr = match K::from_source(&this.addr) {
                     Ok(addr) => addr,
                     Err(err) => return (Err(err), this.buf),
                 };
@@ -1651,25 +1978,31 @@ fn socket_addr_from_name(name: &[u8]) -> io::Result<SocketAddr> {
     }
 }
 
-pub(crate) struct Accept {
+pub(crate) struct Accept<K> {
+    kind: PhantomData<fn() -> K>,
     fd: NornFd,
     addr: SockAddr,
     addr_len: libc::socklen_t,
 }
 
-impl Accept {
+impl<K> Accept<K> {
     pub(crate) fn new(fd: NornFd) -> Self {
         // Safety: We won't read from the socket addr until it's initialized.
         let addr = unsafe { SockAddr::try_init(|_, _| Ok(())) }.unwrap().1;
         let addr_len = addr.len();
-        Self { fd, addr, addr_len }
+        Self {
+            kind: PhantomData,
+            fd,
+            addr,
+            addr_len,
+        }
     }
 }
 
 // Safety: `NornFd` retains the listener and the pinned socket-address storage
 // remains valid for the CQE. `reap` converts the accepted descriptor to
 // `OwnedFd` before waking application code.
-unsafe impl Operation for Accept {
+unsafe impl<K: AddrKind> Operation for Accept<K> {
     type Completion = io::Result<OwnedFd>;
 
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
@@ -1688,15 +2021,15 @@ unsafe impl Operation for Accept {
     }
 }
 
-impl Singleshot for Accept {
-    type Output = io::Result<(NornFd, SocketAddr)>;
+impl<K: AddrKind> Singleshot for Accept<K> {
+    type Output = io::Result<(NornFd, K::Addr)>;
 
     fn complete(self, completion: Self::Completion) -> Self::Output {
         let mut this = self;
         let fd = completion?;
         // Safety: the kernel wrote at most `addr_len` bytes into `addr`.
         unsafe { this.addr.set_length(this.addr_len) };
-        let addr = as_socket_addr(&this.addr)?;
+        let addr = K::from_sockaddr(&this.addr)?;
         Ok((bind_accepted_fd(fd, &this.fd), addr))
     }
 }
@@ -1781,11 +2114,8 @@ struct BindSocket {
 }
 
 impl BindSocket {
-    fn new(fd: NornFd, addr: SocketAddr) -> Self {
-        Self {
-            fd,
-            addr: SockAddr::from(addr),
-        }
+    fn new(fd: NornFd, addr: SockAddr) -> Self {
+        Self { fd, addr }
     }
 }
 
@@ -1908,8 +2238,7 @@ struct Connect {
 }
 
 impl Connect {
-    pub(crate) fn new(fd: NornFd, addr: SocketAddr) -> Self {
-        let addr = SockAddr::from(addr);
+    pub(crate) fn new(fd: NornFd, addr: SockAddr) -> Self {
         Self { fd, addr }
     }
 }
@@ -1974,15 +2303,39 @@ impl Singleshot for Shutdown {
         result.result.map(|_| ())
     }
 }
+impl<B, const STREAM: bool> AcceptsOptions<RecvOptions> for Recv<B, STREAM> {
+    fn set_options(&mut self, opts: RecvOptions) {
+        self.flags = opts.flags();
+    }
+}
+
+impl<B> AcceptsOptions<SendOptions> for Send<B> {
+    fn set_options(&mut self, opts: SendOptions) {
+        self.flags = opts.flags();
+    }
+}
+
+impl<B> AcceptsOptions<SendOptions> for SendZc<B> {
+    fn set_options(&mut self, opts: SendOptions) {
+        self.flags = opts.flags();
+    }
+}
+
+impl<B> AcceptsOptions<SendOptions> for SendMsgZc<B> {
+    fn set_options(&mut self, opts: SendOptions) {
+        self.flags = opts.flags();
+    }
+}
+
 #[derive(Debug)]
-pub(crate) struct Recv<B, const TCP: bool = false> {
+pub(crate) struct Recv<B, const STREAM: bool = false> {
     fd: NornFd,
     buf: B,
     flags: i32,
     submitted_len: usize,
 }
 
-impl<B, const TCP: bool> Recv<B, TCP>
+impl<B, const STREAM: bool> Recv<B, STREAM>
 where
     B: StableBufMut,
 {
@@ -1999,18 +2352,15 @@ where
 
 // Safety: `NornFd` retains the socket and the owned `StableBufMut` keeps the
 // writable region stable and exclusive through completion.
-unsafe impl<B, const TCP: bool> Operation for Recv<B, TCP>
+unsafe impl<B, const STREAM: bool> Operation for Recv<B, STREAM>
 where
     B: StableBufMut,
 {
     type Completion = CQEResult;
 
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
-        if TCP && self.flags & libc::MSG_TRUNC != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "MSG_TRUNC is unsupported for TCP receives",
-            ));
+        if STREAM && self.flags & (libc::MSG_TRUNC | libc::MSG_PEEK) != 0 {
+            validate_stream_recv_flags(self.flags)?;
         }
         let len = checked_scalar_len(self.submitted_len, "receive buffer length")?;
         let ptr = self.buf.stable_ptr_mut();
@@ -2024,7 +2374,7 @@ where
     }
 }
 
-impl<B, const TCP: bool> Singleshot for Recv<B, TCP>
+impl<B, const STREAM: bool> Singleshot for Recv<B, STREAM>
 where
     B: StableBufMut,
 {
@@ -2491,6 +2841,15 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn unnamed_unix_addr_needs_no_descriptor() {
+        // The cache is filled from an empty path, not an unbound socket, so a
+        // process at its descriptor limit still converts unnamed addresses.
+        let addr = UnixAddr::from_pathname("").unwrap();
+        assert!(addr.is_unnamed());
+        assert!(unnamed_unix_addr().unwrap().is_unnamed());
+    }
+
     fn drive_receive<T: RingReceive>(
         driver: &mut crate::Driver,
         stream: &mut Pin<Box<RingRecvStream<T>>>,
@@ -2641,7 +3000,7 @@ mod tests {
             listener.listen(1).await?;
             let connector = connect_from_thread(listener.local_addr()?);
 
-            let (socket, _) = listener.accept().await?;
+            let (socket, _) = listener.accept::<Inet>().await?;
             assert_accept_flags(socket.fd.fd());
 
             connector.join().expect("connector thread panicked")?;
@@ -2673,6 +3032,32 @@ mod tests {
             connector.join().expect("connector thread panicked")?;
             socket.close().await?;
             listener.close().await
+        })
+    }
+
+    /// The public API no longer passes flags to bundle receives, but the
+    /// stream's configuration-failure path must still release the socket.
+    #[test]
+    fn terminal_bundle_configuration_error_releases_socket_ownership() -> io::Result<()> {
+        let driver = crate::Driver::new(io_uring::IoUring::builder(), 8)?;
+        let mut executor = LocalExecutor::new(driver);
+
+        executor.block_on(async {
+            let ring = RecvBufRing::builder(16).buf_cnt(1).buf_len(128).build()?;
+            let socket =
+                Socket::bind("127.0.0.1:0".parse().unwrap(), Domain::IPV4, Type::DGRAM).await?;
+            let mut recv = Box::pin(socket.recv_ring_bundle_stream(&ring, libc::MSG_TRUNC));
+
+            let err = recv
+                .next()
+                .await
+                .expect("configuration failure must produce one stream item")
+                .unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+            socket.close().await?;
+            drop(recv);
+            Ok(())
         })
     }
 
@@ -2743,7 +3128,6 @@ mod tests {
         drop(socket.recv_from_ring_multi(ring));
         drop(socket.recv_ring_multi(ring));
         drop(socket.recv_ring_bundle(ring));
-        drop(socket.recv_ring_bundle_with_flags(ring, 0));
         drop(socket.recv_ring_bundle_multi_with_flags(ring, 0));
         drop(socket.recv_ring_bundle_multi_with_flags(ring, 0));
     }
@@ -2772,7 +3156,7 @@ mod tests {
         assert_driver_mismatch(|| drop(socket.recv_ring_multi(&first_ring)));
         assert_driver_mismatch(|| drop(socket.recv_ring_bundle(&first_ring)));
         assert_driver_mismatch(|| {
-            drop(socket.recv_ring_bundle_with_flags(&first_ring, 0));
+            drop(socket.recv_ring_bundle(&first_ring));
         });
         assert_driver_mismatch(|| {
             drop(socket.recv_ring_bundle_multi_with_flags(&first_ring, 0));
