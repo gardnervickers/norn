@@ -196,14 +196,14 @@ fn incoming_pauses_its_accept_at_the_limit() -> Result<(), Box<dyn std::error::E
 }
 
 /// The limit does not bound the descriptors an `incoming()` stream holds. The
-/// kernel's multishot accept loops while the listen queue is non-empty and
-/// accepts the whole queued backlog before userspace reaps the first
-/// completion, so the stream holds the limit plus the backlog queued when the
-/// accept was armed. The pause still takes effect after that burst: connections
-/// that arrive later stay in the listen backlog until the consumer catches up.
+/// kernel's multishot accept takes every connection queued when it is armed
+/// before userspace reaps the first completion, so the stream holds all of
+/// them, past the limit. The pause still takes effect after that burst:
+/// connections that arrive later stay in the listen backlog until the
+/// consumer catches up.
 #[test]
-fn incoming_limit_bounds_held_connections_by_limit_plus_queued_backlog(
-) -> Result<(), Box<dyn std::error::Error>> {
+fn incoming_limit_holds_the_queue_at_arm_time_then_pauses() -> Result<(), Box<dyn std::error::Error>>
+{
     const LIMIT: usize = 2;
     const QUEUED: usize = 40;
     const LATER: usize = 10;
@@ -234,27 +234,69 @@ fn incoming_limit_bounds_held_connections_by_limit_plus_queued_backlog(
         while let Poll::Ready(next) = futures_util::poll!(incoming.next()) {
             accepted.push(next.expect("accept stream ended")?);
         }
-        assert!(
-            accepted.len() >= LIMIT,
-            "held {} connections, below the limit {LIMIT}",
-            accepted.len()
-        );
-        assert!(
-            accepted.len() <= LIMIT + QUEUED,
-            "held {} connections, above the limit {LIMIT} plus {QUEUED} queued",
-            accepted.len()
-        );
-        assert!(
-            accepted.len() <= QUEUED,
-            "held {} connections, so connections that arrived after the burst \
-             were accepted despite the pause",
-            accepted.len()
+        assert_eq!(
+            accepted.len(),
+            QUEUED,
+            "the whole queue at arm time is held, past the limit {LIMIT}, \
+             and the connections that arrived after the pause are not"
         );
 
         // The consumer catches up, and every connection is eventually yielded.
         while accepted.len() < clients.len() {
             accepted.push(incoming.next().await.expect("accept stream ended")?);
         }
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })
+}
+
+/// The listen backlog does not bound what `incoming()` holds either. Armed on
+/// an empty queue with a listen backlog of 1, connections that arrive while
+/// the executor does not reach the driver are each accepted in their own
+/// kernel pass, so the queue never holds more than one. The accept ends only
+/// when the completion queue is full, at about its size in descriptors. The
+/// connects run on the executor thread, so nothing here depends on scheduling.
+#[test]
+fn incoming_limit_is_not_bounded_by_the_listen_backlog() -> Result<(), Box<dyn std::error::Error>> {
+    const LIMIT: usize = 2;
+    const SQ_ENTRIES: u32 = 256;
+    // The default completion queue holds twice the submission queue.
+    const CQ_ENTRIES: usize = 2 * SQ_ENTRIES as usize;
+    let driver = norn_uring::Driver::new(io_uring::IoUring::builder(), SQ_ENTRIES)?;
+    let mut executor = norn_executor::LocalExecutor::new(driver);
+    executor.block_on(async {
+        let listener = TcpListener::bind("127.0.0.1:0".parse()?, 1).await?;
+        let addr = listener.local_addr()?;
+        let mut incoming = pin!(listener.incoming_with_limit(NonZeroUsize::new(LIMIT)));
+        assert!(futures_util::poll!(incoming.next()).is_pending());
+        // The accept is armed on an empty queue.
+        norn_uring::noop().await?;
+
+        // Connections beyond the completion queue time out in the backlog.
+        let mut clients = Vec::new();
+        for _ in 0..CQ_ENTRIES + 16 {
+            if let Ok(client) =
+                std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(50))
+            {
+                clients.push(client);
+            }
+        }
+        for _ in 0..8 {
+            norn_uring::noop().await?;
+        }
+
+        let mut held = 0;
+        while let Poll::Ready(next) = futures_util::poll!(incoming.next()) {
+            next.expect("accept stream ended")?;
+            held += 1;
+        }
+        assert!(
+            held > LIMIT + 1,
+            "held {held} connections, bounded by the limit {LIMIT} and a listen backlog of 1"
+        );
+        assert!(
+            held <= CQ_ENTRIES + 1,
+            "held {held} connections, above the completion queue size {CQ_ENTRIES} plus one"
+        );
         Ok::<_, Box<dyn std::error::Error>>(())
     })
 }

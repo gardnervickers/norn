@@ -321,15 +321,18 @@ impl TcpListener {
     /// catches up.
     ///
     /// The limit does not bound the descriptors the stream holds. The pause
-    /// is decided when completions are reaped, but the kernel's multishot
-    /// accept keeps looping while the listen queue is non-empty and accepts
-    /// the whole queued backlog in one pass, before the first completion is
-    /// visible. The stream can therefore hold about the limit plus the listen
-    /// backlog (and any connections that arrive during that pass), and each
-    /// re-arm after a pause can take the whole queued backlog again. A caller
-    /// that needs a hard bound on descriptors should size the backlog passed
-    /// to [`bind`](Self::bind) accordingly, or use
-    /// [`accept`](Self::accept), which takes one connection per request.
+    /// is a cancellation that takes effect only after the driver reaps the
+    /// completions and submits it, and the kernel's multishot accept takes
+    /// every connection it can until then. The stream holds the limit plus
+    /// every connection accepted before the pause takes effect: the whole
+    /// queue at arm time, and every arrival until the driver next reaps and
+    /// submits the cancellation, which lasts as long as the executor runs
+    /// without parking. The listen backlog does not bound this (it may never
+    /// hold more than one connection), and the kernel ends an arm only when
+    /// the completion queue is full, at about its size in descriptors. Each
+    /// re-arm after a pause can take the same again. A caller that needs a
+    /// hard bound on descriptors should use [`accept`](Self::accept), which
+    /// takes one connection per request.
     /// [`incoming_with_limit`](Self::incoming_with_limit) sets another limit.
     ///
     /// An error is yielded as an item and does not end the stream; the next
@@ -348,15 +351,17 @@ impl TcpListener {
     /// connection the kernel accepts.
     ///
     /// `limit` is when the pause is requested, not a bound on the descriptors
-    /// held. Connections the kernel accepted before the pause took effect are
-    /// still yielded, and that includes the whole listen backlog queued when
-    /// the accept is armed or re-armed: the kernel's multishot accept loops
-    /// while the listen queue is non-empty, so it accepts them all in one pass
-    /// before the first completion is reaped. The stream can hold about
-    /// `limit` plus the listen backlog (and connections that arrive during
-    /// that pass). For a hard bound, size the backlog passed to
-    /// [`bind`](Self::bind) or use [`accept`](Self::accept). Otherwise it
-    /// behaves like [`incoming`](Self::incoming).
+    /// held. The pause takes effect only after the driver reaps the
+    /// completions and submits the cancellation, and the kernel's multishot
+    /// accept takes every connection it can until then. The stream holds
+    /// `limit` plus every connection accepted before the pause takes effect:
+    /// the whole queue at arm time, and every arrival until the driver next
+    /// reaps and submits the cancellation, which lasts as long as the
+    /// executor runs without parking. The listen backlog does not bound this,
+    /// and the kernel ends an arm only when the completion queue is full, at
+    /// about its size in descriptors. For a hard bound, use
+    /// [`accept`](Self::accept). Otherwise it behaves like
+    /// [`incoming`](Self::incoming).
     pub fn incoming_with_limit(
         &self,
         limit: Option<NonZeroUsize>,
