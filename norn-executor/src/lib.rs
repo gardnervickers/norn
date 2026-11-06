@@ -206,6 +206,10 @@ impl<P: park::Park> LocalExecutor<P> {
             None => wakerfn::root_notifier(self.park.unparker()),
         };
         let mut root = wakerfn::FutureHarness::new(fut, notifier);
+        let counters = &*self.counters;
+        // Running from here until return, unwinding included; parks below
+        // flip it off and back on.
+        let _running = metrics::Activity::flip(&counters.activity);
 
         loop {
             if let Some(result) = root.try_poll() {
@@ -214,11 +218,17 @@ impl<P: park::Park> LocalExecutor<P> {
             }
             let mut has_remaining_tasks = false;
             let budget = self.config.task_poll_budget.get();
-            let mut polled = 0;
+            // Published once per tick rather than per poll, before parking so
+            // a reader sees them while the executor waits, and on unwind.
+            let mut tick = metrics::TickPolls {
+                counter: &counters.polls,
+                polled: 0,
+            };
             while let Some(next) = self.taskqueue.next() {
+                // Counted before running, so a run that unwinds counts too.
+                tick.polled += 1;
                 next.run();
-                polled += 1;
-                if polled == budget {
+                if tick.polled == budget {
                     has_remaining_tasks = self.taskqueue.runnable() > 0;
                     break;
                 }
@@ -227,11 +237,10 @@ impl<P: park::Park> LocalExecutor<P> {
                     break;
                 }
             }
-            // Published once per tick rather than per poll, and before parking
-            // so that a reader sees them while the executor waits.
-            let counters = &*self.counters;
-            counters.polls.add(polled as u64);
-            if polled == budget && has_remaining_tasks {
+            let budget_exhausted = tick.polled == budget && has_remaining_tasks;
+            drop(tick);
+            counters.ticks.incr();
+            if budget_exhausted {
                 counters.budget_exhausted.incr();
             }
             let mut mode = park::ParkMode::NextCompletion;
@@ -240,9 +249,10 @@ impl<P: park::Park> LocalExecutor<P> {
             } else {
                 counters.waiting_parks.incr();
             }
-            counters.park_epoch.incr();
-            let parked = self.park.park(mode);
-            counters.park_epoch.incr();
+            let parked = {
+                let _parked = metrics::Activity::flip(&counters.activity);
+                self.park.park(mode)
+            };
             parked?;
         }
     }
@@ -334,6 +344,9 @@ impl<P: park::Park> Drop for LocalExecutor<P> {
             self.park.enter_for_shutdown(),
             context::Context::enter_for_shutdown(self.handle()),
         );
+        // Task destructors are user code: count them as running, so a
+        // watchdog can see a shutdown that hangs in one.
+        let _running = metrics::Activity::flip(&self.counters.activity);
         // `TaskQueue::shutdown` finishes every task and then re-raises the
         // first join-waker panic. Still shut the park down while the context
         // guard is alive, then resume the panic.
@@ -431,7 +444,7 @@ mod tests {
         fn shutdown(&mut self) {}
     }
 
-    /// Ticks and polls are published once per tick, and the parked flag is
+    /// Ticks and polls are published once per tick, and the running flag is
     /// clear once `block_on` returns.
     #[test]
     fn metrics_count_ticks_and_polls() {
@@ -469,7 +482,8 @@ mod tests {
         // Woken tasks requeue behind the others, so one tick can poll all
         // eight within the default budget.
         assert!(snapshot.ticks >= 1, "{snapshot:?}");
-        assert!(!snapshot.parked);
+        assert!(!snapshot.running);
+        assert_eq!(snapshot.activity % 2, 0);
         assert_eq!(snapshot.tasks.spawned, 4);
         assert_eq!(snapshot.tasks.finished, 4);
     }
@@ -503,7 +517,9 @@ mod tests {
         });
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.polls, 5);
-        assert!(snapshot.budget_exhausted >= 2, "{snapshot:?}");
+        // Ticks one and two each run two of the five tasks and stop with
+        // tasks left; tick three runs the last one.
+        assert_eq!(snapshot.budget_exhausted, 2, "{snapshot:?}");
     }
 
     #[test]

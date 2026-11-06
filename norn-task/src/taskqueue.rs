@@ -157,7 +157,7 @@ impl Schedule for Rc<Shared> {
     }
 
     fn unbind(&self, registered: &crate::RegisteredTask) {
-        // A task that shutdown already took from the set was counted there.
+        // A task that shutdown already took out of the set was counted there.
         if unsafe { self.taskset.remove(registered) }.is_some() {
             self.counters.finished.incr();
         }
@@ -169,11 +169,10 @@ impl Shared {
     fn shutdown(&self) {
         // Queued runnables reference this queue through their scheduler. Clear
         // them even if a join waker panics, or the cycle leaks every task.
-        // Shutdown cancels every task in the set, and none can join it once
-        // it is closed.
-        let cancelled = self.taskset.len();
-        let result = panic::catch_unwind(AssertUnwindSafe(|| self.taskset.shutdown()));
-        self.counters.finished.add(cancelled as u64);
+        let result = panic::catch_unwind(AssertUnwindSafe(|| {
+            self.taskset
+                .shutdown_counting(|| self.counters.finished.incr())
+        }));
         self.clear_runqueue();
         if let Err(payload) = result {
             panic::resume_unwind(payload);
@@ -406,5 +405,63 @@ mod tests {
         queue.spawn(async {}).detach();
         let snapshot = queue.metrics().snapshot();
         assert_eq!((snapshot.spawned, snapshot.finished), (0, 0));
+    }
+
+    /// Shuts the queue down again from a destructor that shutdown runs.
+    struct ShutdownOnDrop(TaskQueue);
+
+    impl Drop for ShutdownOnDrop {
+        fn drop(&mut self) {
+            self.0.shutdown();
+        }
+    }
+
+    /// Runs the queue from a destructor that shutdown runs.
+    struct RunOnDrop(TaskQueue);
+
+    impl Drop for RunOnDrop {
+        fn drop(&mut self) {
+            while let Some(runnable) = self.0.next() {
+                runnable.run();
+            }
+        }
+    }
+
+    #[test]
+    fn metrics_count_tasks_once_when_shutdown_reenters() {
+        let queue = TaskQueue::new();
+        let metrics = queue.metrics();
+        let guard = ShutdownOnDrop(queue.clone());
+        queue
+            .spawn(async move {
+                let _guard = guard;
+                std::future::pending::<()>().await
+            })
+            .detach();
+        for _ in 0..3 {
+            queue.spawn(std::future::pending::<()>()).detach();
+        }
+        queue.shutdown();
+        let snapshot = metrics.snapshot();
+        assert_eq!((snapshot.spawned, snapshot.finished), (4, 4));
+    }
+
+    #[test]
+    fn metrics_count_a_task_completed_during_shutdown_once() {
+        let queue = TaskQueue::new();
+        let metrics = queue.metrics();
+        let guard = RunOnDrop(queue.clone());
+        queue
+            .spawn(async move {
+                let _guard = guard;
+                std::future::pending::<()>().await
+            })
+            .detach();
+        // Still queued when shutdown starts; the destructor above runs it to
+        // completion, so it leaves the set through `unbind`.
+        queue.spawn(async {}).detach();
+        queue.shutdown();
+        let snapshot = metrics.snapshot();
+        assert_eq!((snapshot.spawned, snapshot.finished), (2, 2));
     }
 }
