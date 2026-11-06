@@ -48,7 +48,8 @@ The project is intentionally not general-purpose today; APIs are still in flux i
 - `try_block_on` propagates park errors; `block_on` panics on them.
 - `Drop` installs its context via `Park::enter_for_shutdown` (restoring any
   existing context; tolerating destroyed TLS), shuts down `TaskQueue`, then
-  calls `Park::shutdown`.
+  calls `Park::shutdown`. A join-waker panic from the `TaskQueue` shutdown is
+  caught so `Park::shutdown` still runs, then resumed.
 
 ### `norn-timer` model
 
