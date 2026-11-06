@@ -326,3 +326,84 @@ fn connected_datagrams_over_an_abstract_name() -> Result<(), Box<dyn std::error:
         Ok(())
     })
 }
+
+/// Bind a raw socket to a path that fills all of `sun_path`, with no NUL,
+/// which `std` cannot represent.
+fn bind_full_length_path(
+    dir: &Path,
+    ty: libc::c_int,
+) -> io::Result<(std::os::fd::OwnedFd, std::path::PathBuf)> {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    let prefix = dir.as_os_str().as_bytes();
+    let path_len = addr.sun_path.len();
+    assert!(
+        prefix.len() + 2 < path_len,
+        "test directory path is too long"
+    );
+    let mut bytes = prefix.to_vec();
+    bytes.push(b'/');
+    bytes.resize(path_len, b'p');
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (dst, src) in addr.sun_path.iter_mut().zip(&bytes) {
+        *dst = *src as libc::c_char;
+    }
+    let fd = unsafe { libc::socket(libc::AF_UNIX, ty | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+    let rc = unsafe {
+        libc::bind(
+            std::os::fd::AsRawFd::as_raw_fd(&fd),
+            (&addr as *const libc::sockaddr_un).cast(),
+            std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((
+        fd,
+        std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&bytes)),
+    ))
+}
+
+#[test]
+fn peers_bound_to_a_full_length_path_are_reported_unnamed() -> Result<(), Box<dyn std::error::Error>>
+{
+    use std::os::fd::AsRawFd;
+
+    let dir = util::ThreadNameTestDir::new();
+    let dir_path = dir.to_path_buf();
+    util::with_test_env(|| async move {
+        // A datagram from such a sender is still received.
+        let server_path = dir_path.join("server");
+        let server = UnixDatagram::bind(&server_path).await?;
+        let (sender, _) = bind_full_length_path(&dir_path, libc::SOCK_DGRAM)?;
+        let std_sender = std::os::unix::net::UnixDatagram::from(sender);
+        std_sender.send_to(b"long", &server_path)?;
+        let (res, buf) = server.recv_from(vec![0u8; 8]).await;
+        let (n, from) = res?;
+        assert_eq!(&buf[..n], b"long");
+        assert!(from.is_unnamed());
+
+        // A connection from such a client is still accepted.
+        let listener_path = dir_path.join("listener");
+        let listener = UnixListener::bind(&listener_path, 8).await?;
+        let client_dir = dir_path.join("c");
+        std::fs::create_dir_all(&client_dir)?;
+        let (client, _) = bind_full_length_path(&client_dir, libc::SOCK_STREAM)?;
+        let client = std::os::unix::net::UnixStream::from(client);
+        let addr = socket2::SockAddr::unix(&listener_path)?;
+        let rc = unsafe { libc::connect(client.as_raw_fd(), addr.as_ptr().cast(), addr.len()) };
+        assert_eq!(rc, 0, "{}", io::Error::last_os_error());
+        let (server, peer) = listener.accept().await?;
+        assert!(peer.is_unnamed());
+        let (res, _) = server.send(&b"ok"[..]).await;
+        assert_eq!(res?, 2);
+        Ok(())
+    })
+}

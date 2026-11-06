@@ -449,7 +449,11 @@ impl AddrKind for Unix {
             ));
         }
         if let Some(path) = addr.as_pathname() {
-            return UnixAddr::from_pathname(path);
+            // A peer can bind a path that fills `sun_path` without a NUL,
+            // which `std` cannot represent. Report it as unnamed instead of
+            // failing an accept or receive that has already consumed its
+            // connection or datagram.
+            return UnixAddr::from_pathname(path).or_else(|_| unnamed_unix_addr());
         }
         if let Some(name) = addr.as_abstract_namespace() {
             return UnixAddr::from_abstract_name(name);
@@ -460,14 +464,20 @@ impl AddrKind for Unix {
 
 /// An unnamed Unix socket address.
 ///
-/// `std` has no constructor for one, so the first call reads the local
-/// address of an unbound socket and later calls clone it.
+/// `std` has no constructor for one. An empty path converts to an address
+/// with just the family, which is unnamed; if a `std` version ever changes
+/// that, fall back to reading the local address of an unbound socket. Either
+/// way the result is cached, so converting does not need a descriptor after
+/// the first call, and normally never does.
 fn unnamed_unix_addr() -> io::Result<UnixAddr> {
     static UNNAMED: OnceLock<UnixAddr> = OnceLock::new();
     if let Some(addr) = UNNAMED.get() {
         return Ok(addr.clone());
     }
-    let addr = std::os::unix::net::UnixDatagram::unbound()?.local_addr()?;
+    let addr = match UnixAddr::from_pathname("") {
+        Ok(addr) if addr.is_unnamed() => addr,
+        _ => std::os::unix::net::UnixDatagram::unbound()?.local_addr()?,
+    };
     Ok(UNNAMED.get_or_init(|| addr).clone())
 }
 
@@ -2772,6 +2782,15 @@ mod tests {
     use norn_executor::LocalExecutor;
 
     use super::*;
+
+    #[test]
+    fn unnamed_unix_addr_needs_no_descriptor() {
+        // The cache is filled from an empty path, not an unbound socket, so a
+        // process at its descriptor limit still converts unnamed addresses.
+        let addr = UnixAddr::from_pathname("").unwrap();
+        assert!(addr.is_unnamed());
+        assert!(unnamed_unix_addr().unwrap().is_unnamed());
+    }
 
     fn drive_receive<T: RingReceive>(
         driver: &mut crate::Driver,

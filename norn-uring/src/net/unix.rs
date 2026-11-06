@@ -10,7 +10,9 @@
 //! bound, such as the client end of a connection or a socket from
 //! [`UnixSocket::pair`], has an unnamed address. Names in the Linux abstract
 //! namespace are supported through
-//! [`SocketAddrExt`](std::os::linux::net::SocketAddrExt).
+//! [`SocketAddrExt`](std::os::linux::net::SocketAddrExt). A peer bound to a
+//! path that fills all of `sun_path`, which `std` cannot represent, is
+//! reported as unnamed.
 use std::future::Future;
 use std::io;
 use std::num::NonZeroUsize;
