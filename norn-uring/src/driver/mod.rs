@@ -2005,6 +2005,7 @@ impl Shared {
         let source = match (ebadr, dropped) {
             (true, 0) => "io_uring_enter returned EBADR".to_owned(),
             (true, n) => format!("io_uring_enter returned EBADR; dropped-CQE counter is {n}"),
+            (false, 0) => "dropped-CQE counter wrapped to 0".to_owned(),
             (false, n) => format!("dropped-CQE counter is {n}"),
         };
         format!(
@@ -4455,6 +4456,9 @@ mod tests {
         };
         let mut driver =
             Driver::new_with_options(io_uring::IoUring::builder(), 2, options).unwrap();
+        // No rate limit, so a line logged on every park while the flag stays
+        // up shows here instead of being held back.
+        driver.shared.overflow_log.interval.set(Duration::ZERO);
         driver.park(ParkMode::NoPark).unwrap();
         assert_eq!(captured_error_logs("cq.overflow"), 0);
 
