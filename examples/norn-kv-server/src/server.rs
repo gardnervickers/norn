@@ -218,8 +218,8 @@ const MAX_CQ_ENTRIES: u32 = 65_536;
 /// The kernel posts completions while the worker is busy, and a park reaps
 /// them only later. The CQ needs room for every buffer of the multishot
 /// receive ring (one completion per buffer filled), for
-/// [`CQES_PER_CONNECTION`] per connection up to `config.max_connections`,
-/// for [`ACCEPT_CQES`] from the multishot accept, and for `ring_entries`
+/// `CQES_PER_CONNECTION` per connection up to `config.max_connections`,
+/// for `ACCEPT_CQES` from the multishot accept, and for `ring_entries`
 /// more as slack for timers, closes, rejected connections and the driver's
 /// eventfd read. Without that, completions overflow the CQ (a
 /// full CQ also ends multishot receives), and the kernel may drop an
