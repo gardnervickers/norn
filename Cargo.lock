@@ -1264,6 +1264,7 @@ dependencies = [
  "cordyceps",
  "futures-test",
  "norn-executor",
+ "norn-metrics",
  "pin-project-lite",
  "proptest",
  "thiserror",

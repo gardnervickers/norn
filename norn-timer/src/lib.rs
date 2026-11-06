@@ -234,6 +234,10 @@ where
         self.inner.needs_park()
     }
 
+    fn metric_sources(&self, sources: &mut norn_metrics::Sources) {
+        self.inner.metric_sources(sources);
+    }
+
     fn shutdown(&mut self) {
         // A sleeper's waker may panic. Still shut the inner park down, then
         // resume the panic.

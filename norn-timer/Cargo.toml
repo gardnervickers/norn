@@ -9,6 +9,7 @@ edition = "2021"
 cordyceps.workspace = true
 pin-project-lite.workspace = true
 norn-executor = { path = "../norn-executor" }
+norn-metrics = { path = "../norn-metrics" }
 thiserror.workspace = true
 
 [dev-dependencies]
