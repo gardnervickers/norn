@@ -76,6 +76,11 @@ The project is intentionally not general-purpose today; APIs are still in flux i
   non-empty, new entries queue behind it and `needs_park` reports true.
 - Driver park loop drains the CQ before parking and treats `EBUSY`, `EAGAIN`
   and `ENOMEM` from `io_uring_enter` as transient: drain and retry, or yield.
+  A waiting park that fails with `EAGAIN`/`ENOMEM`, has nothing to reap, and did
+  not just consume a remote wake first does a wait-only enter (no submissions)
+  bounded by min(10 ms, the park's timeout), so a persistent allocation failure
+  polls at a low rate instead of spinning. The bound exists because the eventfd
+  read may be among the unsubmitted entries, so a remote wake cannot end the wait.
   `EINTR` retries the enter, except in a timed park, which returns early so a
   steady signal stream cannot restart the full timeout (callers re-check their
   deadlines). Other enter errors are recorded as a health error and close the

@@ -285,6 +285,8 @@ pub enum Status {
     InvalidArguments = 0x0004,
     /// The opcode is unsupported.
     UnknownCommand = 0x0081,
+    /// The server could not allocate memory for the request.
+    OutOfMemory = 0x0082,
     /// The server encountered an internal failure.
     InternalError = 0x0084,
 }
@@ -294,7 +296,8 @@ pub enum Status {
 /// # Errors
 ///
 /// Returns [`EncodeError`] when the key or total body cannot be represented by
-/// the binary protocol header.
+/// the binary protocol header, or when `out` cannot grow to hold the frame. On
+/// error nothing is appended.
 #[allow(clippy::too_many_arguments)]
 pub fn append_response(
     out: &mut Vec<u8>,
@@ -316,7 +319,13 @@ pub fn append_response(
         .ok_or(EncodeError::BodyLength(usize::MAX))?;
     let body_len_u32 = u32::try_from(body_len).map_err(|_| EncodeError::BodyLength(body_len))?;
 
-    out.reserve(HEADER_LEN + body_len);
+    // Grow fallibly so that a large GET value under a memory limit fails only
+    // this connection instead of aborting the process. Prefer amortized
+    // growth, but settle for the exact size when the doubled one does not fit.
+    let needed = HEADER_LEN + body_len;
+    if out.try_reserve(needed).is_err() && out.try_reserve_exact(needed).is_err() {
+        return Err(EncodeError::OutOfMemory(needed));
+    }
     out.push(RESPONSE_MAGIC);
     out.push(opcode);
     out.extend_from_slice(&key_len.to_be_bytes());
@@ -384,6 +393,19 @@ pub enum EncodeError {
     /// Response body length exceeds the header field.
     #[error("response body length {0} exceeds u32")]
     BodyLength(usize),
+    /// The response buffer could not grow by this many bytes.
+    #[error("cannot allocate {0} bytes for a response")]
+    OutOfMemory(usize),
+}
+
+impl From<EncodeError> for std::io::Error {
+    fn from(error: EncodeError) -> Self {
+        let kind = match error {
+            EncodeError::OutOfMemory(_) => std::io::ErrorKind::OutOfMemory,
+            _ => std::io::ErrorKind::InvalidData,
+        };
+        std::io::Error::new(kind, error)
+    }
 }
 
 #[cfg(test)]

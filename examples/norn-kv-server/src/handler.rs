@@ -126,7 +126,12 @@ impl MemoryHandler {
                 quiet,
             } => {
                 if let Backend::Memory(store) = &self.backend {
-                    store.borrow_mut().set(key, flags, value);
+                    if store.borrow_mut().set(key, flags, value).is_err() {
+                        // Report the failure even for a quiet SET; the store
+                        // is unchanged and the connection stays usable.
+                        out.append_empty(header, Status::OutOfMemory)?;
+                        return Ok(ConnectionAction::Continue);
+                    }
                 }
                 if !quiet {
                     out.append_empty(header, Status::Success)?;

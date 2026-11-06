@@ -33,6 +33,18 @@ use tracker::{BufferToken, BundleClaim, PublicationTracker, TrackerError};
 /// polling it, so one stalled consumer can hold every buffer of a shared ring
 /// unless [`Builder::max_unconsumed_per_receive`] bounds it.
 ///
+/// That bound applies when the stream sees completions. While the driver's
+/// thread is busy, a multishot receive keeps posting one completion per
+/// buffer it fills, until the ring runs out of buffers or the completion
+/// queue (CQ) is full. On a full CQ the kernel ends the receive, and its final
+/// completion, like any other completion that arrives then, goes to the
+/// kernel's overflow list, from which it may be dropped; see
+/// [`Driver::new`](crate::Driver::new). The CQ therefore needs room for the
+/// buffers of every ring in use plus every other completion that can be
+/// pending, including one final completion per multishot receive.
+/// [`Builder::build`] logs a warning when the rings registered with a driver
+/// have more buffers in total than its CQ has entries.
+///
 /// # Example
 ///
 /// ```no_run
@@ -591,6 +603,19 @@ impl Registry {
         }
     }
 
+    /// The total buffer count of the rings the kernel may still select
+    /// buffers from, or `None` while the registry is borrowed.
+    pub(crate) fn kernel_buffers(&self) -> Option<u32> {
+        let registrations = self.registrations.try_borrow().ok()?;
+        Some(
+            registrations
+                .iter()
+                .filter(|registration| registration.state() != RegistrationState::Unregistered)
+                .map(|registration| u32::from(registration._storage.buf_cnt))
+                .sum(),
+        )
+    }
+
     pub(crate) fn reserve(
         &self,
         ring: &RefCell<IoUring>,
@@ -819,6 +844,11 @@ impl Builder {
     }
 
     /// The number of buffers to allocate. If left zero, the `ring_entries` value will be used.
+    ///
+    /// Multishot receives can post one completion per buffer before the
+    /// driver reaps any, so the driver's completion queue needs room for
+    /// every buffer of every ring in use, plus every other completion that
+    /// can be pending; see [`Driver::new`](crate::Driver::new).
     pub fn buf_cnt(mut self, buf_cnt: u16) -> Builder {
         self.buf_cnt = buf_cnt;
         self
@@ -881,6 +911,10 @@ impl Builder {
     /// Returns an error for an invalid ring configuration, allocation failure,
     /// duplicate buffer-group ID, or kernel registration failure.
     ///
+    /// When the rings registered with the driver, this one included, have
+    /// more buffers in total than the driver's completion queue has entries,
+    /// the ring is still built, but a warning is logged: see [`RecvBufRing`].
+    ///
     /// # Panics
     ///
     /// Panics if called outside an active [`Driver`](crate::Driver) context.
@@ -916,6 +950,17 @@ impl Builder {
         let reservation = handle.reserve_buf_ring(Rc::clone(&storage))?;
         reservation.register(|submitter| storage.register(submitter))?;
         let registration = reservation.commit();
+        let cq_entries = handle.cq_entries();
+        if let Some(buffers) = handle.buf_ring_buffers().filter(|&n| n > cq_entries) {
+            warn!(
+                target: "norn_uring::bufring",
+                "buf_ring.exceeds_cq bgid={} buf_cnt={} ring_buffers_total={buffers} \
+                 cq_entries={cq_entries}: multishot receives can fill the completion queue, \
+                 and completions that overflow it may be dropped; size it with setup_cqsize",
+                b.bgid,
+                b.buf_cnt,
+            );
+        }
         Ok(RecvBufRing::new(
             registration,
             storage,
@@ -1608,5 +1653,104 @@ mod tests {
         assert!(unsafe { std::slice::from_raw_parts(ok.as_ptr(), 64) }
             .iter()
             .all(|byte| *byte == 0));
+    }
+
+    async fn connected_pair() -> io::Result<(crate::net::TcpSocket, std::net::TcpStream)> {
+        let listener = crate::net::TcpListener::bind("127.0.0.1:0".parse().unwrap(), 8).await?;
+        let peer = std::net::TcpStream::connect(listener.local_addr()?)?;
+        let (server, _) = listener.accept().await?;
+        Ok((server, peer))
+    }
+
+    /// An error CQE can still carry `IORING_CQE_F_BUFFER` when the kernel
+    /// committed the selected buffer before the failure (io-wq issue). Ignoring
+    /// that flag loses the buffer from the ring permanently.
+    #[test]
+    fn failed_ring_receive_does_not_lose_a_committed_buffer() -> io::Result<()> {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        use std::pin::pin;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let driver = Driver::new(io_uring::IoUring::builder(), 32)?;
+        // While the drain fence is active the kernel defers every new request
+        // behind the driver's outstanding eventfd read. Keep completing that
+        // read so the test can make progress.
+        let unparker = Park::unparker(&driver);
+        let stop = Arc::new(AtomicBool::new(false));
+        let helper = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                use norn_executor::park::Unpark;
+                let deadline = Instant::now() + Duration::from_secs(20);
+                while !stop.load(Ordering::Acquire) {
+                    if Instant::now() > deadline {
+                        eprintln!("failed ring receive test timed out");
+                        std::process::exit(101);
+                    }
+                    unparker.unpark();
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            })
+        };
+        let handle = driver.handle();
+        let mut executor = norn_executor::LocalExecutor::new(driver);
+        let result: io::Result<()> = executor.block_on(async {
+            let (server, peer) = connected_pair().await?;
+            let (server2, mut peer2) = connected_pair().await?;
+            let (idle, mut idle_peer) = connected_pair().await?;
+            let ring = RecvBufRing::builder(43).buf_cnt(1).buf_len(256).build()?;
+
+            // An in-flight request ahead of a drain fence keeps the fence
+            // pending; the ring receive queued behind it is issued from
+            // io-wq, where the kernel commits the selected buffer immediately.
+            let mut blocker = pin!(idle.poll_readiness(libc::POLLIN as u32));
+            assert!(futures_util::poll!(&mut blocker).is_pending());
+            handle.test_push_drain_fence();
+            let mut recv = pin!(server.recv_ring(&ring));
+            assert!(futures_util::poll!(&mut recv).is_pending());
+
+            idle_peer.write_all(b"x")?;
+            let _readiness = blocker.await?;
+            // Let the io-wq worker select (and commit) the only buffer, find
+            // no data, and arm its poll.
+            std::thread::sleep(Duration::from_millis(50));
+
+            // Reset the connection so the waiting receive fails.
+            let linger = libc::linger {
+                l_onoff: 1,
+                l_linger: 0,
+            };
+            let rc = unsafe {
+                libc::setsockopt(
+                    peer.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_LINGER,
+                    (&linger as *const libc::linger).cast(),
+                    std::mem::size_of::<libc::linger>() as libc::socklen_t,
+                )
+            };
+            assert_eq!(rc, 0);
+            drop(peer);
+            let failed = recv.await;
+            assert!(failed.is_err(), "reset receive unexpectedly succeeded");
+
+            // The ring has one buffer and nobody owns it, so this must succeed.
+            peer2.write_all(b"hello")?;
+            std::thread::sleep(Duration::from_millis(50));
+            let result = server2.recv_ring(&ring).await;
+            assert!(
+                result.is_ok(),
+                "receive after a failed receive returned {:?}; the failed CQE's buffer was lost",
+                result.as_ref().err()
+            );
+            assert_eq!(&result?[..], b"hello");
+            Ok(())
+        });
+        stop.store(true, Ordering::Release);
+        helper.join().expect("unpark helper panicked");
+        result
     }
 }

@@ -44,7 +44,11 @@ where
 {
     let (address_tx, address_rx) = mpsc::sync_channel::<SocketAddr>(1);
     let server = thread::spawn(move || -> io::Result<()> {
-        let driver = norn_uring::Driver::new(io_uring::IoUring::builder(), 256)?;
+        // Room for every ring buffer, as the server sizes its CQ, and for
+        // each connection's other completions.
+        let mut builder = io_uring::IoUring::builder();
+        builder.setup_cqsize(256 + u32::from(RING_BUFFERS) + 4 * (PROBES + 1));
+        let driver = norn_uring::Driver::new(builder, 256)?;
         let mut executor = LocalExecutor::new(driver);
         executor.block_on(async move {
             let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap(), 16).await?;

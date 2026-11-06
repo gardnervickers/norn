@@ -451,37 +451,66 @@ fn peers_bound_to_a_full_length_path_are_reported_unnamed() -> Result<(), Box<dy
 
 #[test]
 fn connect_waits_for_backlog_space() -> Result<(), Box<dyn std::error::Error>> {
+    const CLIENTS: u8 = 6;
     util::with_test_env(|| async {
         let name = abstract_name("backlog");
         let listener = UnixListener::bind_addr(&name, 1).await?;
 
+        // Blocked connects join the listen backlog in whatever order the
+        // kernel wakes them, not in spawn order, so the i-th accepted
+        // connection need not belong to the i-th client. Each client
+        // therefore sends its own id first, and the server side answers with
+        // the id it read: a client only sees its own id back if it was
+        // paired with the right server socket.
+        let connected = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let failed = std::rc::Rc::new(std::cell::Cell::new(0usize));
         let mut clients = Vec::new();
-        for _ in 0..6 {
+        for id in 0..CLIENTS {
             let name = name.clone();
-            clients.push(spawn(async move { UnixSocket::connect_addr(&name).await }));
+            let connected = connected.clone();
+            let failed = failed.clone();
+            clients.push(spawn(async move {
+                let socket = UnixSocket::connect_addr(&name).await.inspect_err(|_| {
+                    failed.set(failed.get() + 1);
+                })?;
+                let mut stream = socket.into_stream();
+                connected.set(connected.get() + 1);
+                stream.write_all(&[id]).await?;
+                // The connected socket is nonblocking again: this read with
+                // nothing queued waits in the driver instead of blocking the
+                // thread, so the server can run and answer it.
+                let mut buf = [0u8; 1];
+                stream.read_exact(&mut buf).await?;
+                assert_eq!(buf[0], id, "client {id} was answered with another id");
+                io::Result::Ok(())
+            }));
         }
         // Let every connect reach the kernel while nothing is accepted.
         let started = std::time::Instant::now();
         while started.elapsed() < std::time::Duration::from_millis(50) {
             norn_uring::noop().await?;
         }
-        let mut servers = Vec::new();
-        for _ in 0..6 {
-            servers.push(listener.accept().await?.0);
+        // A backlog of one holds two connections, so the rest must still be
+        // waiting for space rather than failed (a failed connect would leave
+        // an accept below waiting forever).
+        assert_eq!(failed.get(), 0, "a connect failed instead of waiting");
+        assert!(
+            connected.get() <= 2,
+            "{} connects completed with a backlog of one and nothing accepted",
+            connected.get()
+        );
+
+        // Accepting makes room, and the waiting connects then complete.
+        for _ in 0..CLIENTS {
+            let (server, _) = listener.accept().await?;
+            let (n, buf) = server.recv(vec![0u8; 1]).await.buf_ok()?;
+            assert_eq!(n, 1);
+            server.send(buf).await.drop_buf()?;
         }
-        for (client, server) in clients.into_iter().zip(servers) {
-            // The connected socket is nonblocking again: a read with nothing
-            // queued waits in the driver instead of blocking this thread,
-            // so the send that follows can run.
-            let mut stream = client.await??.into_stream();
-            let read = spawn(async move {
-                let mut buf = [0u8; 1];
-                stream.read_exact(&mut buf).await.map(|_| buf[0])
-            });
-            norn_uring::noop().await?;
-            server.send(vec![9u8]).await.drop_buf()?;
-            assert_eq!(read.await??, 9);
+        for client in clients {
+            client.await??;
         }
+        assert_eq!(connected.get(), usize::from(CLIENTS));
         Ok(())
     })
 }

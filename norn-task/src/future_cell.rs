@@ -6,7 +6,7 @@
 //!
 //! [`Future`]: std::future::Future
 use std::any::Any;
-use std::cell::UnsafeCell;
+use std::cell::{Cell, UnsafeCell};
 use std::future::Future;
 use std::panic;
 use std::pin::Pin;
@@ -21,9 +21,11 @@ where
 {
     // Task state is the borrow discipline for this cell: only the running task
     // may poll, and cancellation/destruction of a running task is deferred.
-    // Methods release Rust references before invoking user destructors, while
-    // the `Dropping` state makes destructor re-entry leave storage untouched.
-    inner: UnsafeCell<Inner<F>>,
+    // `state` lives outside `storage`, so lifecycle checks never create a
+    // reference covering a future or output whose destructor may be running.
+    // The `Dropping` state makes destructor re-entry leave storage untouched.
+    state: Cell<State>,
+    storage: UnsafeCell<Storage<F>>,
 }
 
 impl<F> FutureCell<F>
@@ -32,7 +34,10 @@ where
 {
     pub(crate) fn new(future: F) -> Self {
         Self {
-            inner: UnsafeCell::new(Inner::new(future)),
+            state: Cell::new(State::Future),
+            storage: UnsafeCell::new(Storage {
+                future: ManuallyDrop::new(future),
+            }),
         }
     }
 
@@ -62,10 +67,7 @@ where
             State::FutureResult => self.drop_output(),
             State::Empty | State::Dropping => return,
         }
-        // Safety: no future/output borrow crosses user destructor execution,
-        // and `Dropping` makes destructor re-entry a no-op.
-        let this = unsafe { &mut *self.inner.get() };
-        this.state = State::Empty;
+        self.state.set(State::Empty);
     }
 
     /// Take the output of the future, if it has been polled to completion.
@@ -79,10 +81,7 @@ where
     /// already taken (a [`JoinHandle`](crate::JoinHandle) polled again after it
     /// returned `Ready`), this method will panic.
     pub(crate) fn take_output(&self) -> Option<Result<F::Output, TaskError>> {
-        // Safety: task state permits output access only after polling has
-        // finished, and the single-thread task contract excludes concurrency.
-        let this = unsafe { &mut *self.inner.get() };
-        match this.state {
+        match self.state.get() {
             State::FutureResult => {}
             State::Dropping => return None,
             State::Future => panic!("task output requested before the task completed"),
@@ -90,8 +89,11 @@ where
                 "task output already taken: a JoinHandle was polled again after returning Ready"
             ),
         }
-        this.state = State::Empty;
-        Some(unsafe { ManuallyDrop::take(&mut this.storage.output) })
+        self.state.set(State::Empty);
+        // Safety: `FutureResult` means storage holds an initialized output
+        // and no destructor is running. The single-thread task contract
+        // excludes concurrent access.
+        Some(unsafe { ManuallyDrop::take(&mut (*self.storage.get()).output) })
     }
 
     /// Perform the poll operation on the future.
@@ -106,28 +108,31 @@ where
     /// This method will panic if the future has already been polled to completion,
     /// or has been dropped.
     ///
-    pub(crate) unsafe fn poll(&self, cx: Context<'_>) -> Poll<()> {
-        // Safety: the caller guarantees exclusive access while the task is
-        // running. `Inner::poll` catches unwinding from the user future.
-        let result = unsafe { (&mut *self.inner.get()).poll(cx) };
-
-        match result {
-            Poll::Ready(result) => {
-                self.drop_future();
-                self.finish_result(result);
-                Poll::Ready(())
-            }
-            Poll::Pending => Poll::Pending,
+    pub(crate) unsafe fn poll(&self, mut cx: Context<'_>) -> Poll<()> {
+        match self.state.get() {
+            State::Future => {}
+            State::FutureResult => unreachable!("FutureCell is complete"),
+            State::Empty => unreachable!("FutureCell is empty"),
+            State::Dropping => unreachable!("FutureCell is transitioning"),
         }
+        // Safety: the caller guarantees exclusive access to the future while
+        // the task is running, and the future is never moved out of storage.
+        let fut = unsafe { Pin::new_unchecked(&mut *(*self.storage.get()).future) };
+        let result = match panic::catch_unwind(panic::AssertUnwindSafe(|| fut.poll(&mut cx))) {
+            Ok(Poll::Ready(output)) => Ok(output),
+            Ok(Poll::Pending) => return Poll::Pending,
+            Err(err) => Err(TaskError::panic(err)),
+        };
+        self.state.set(State::Dropping);
+        self.drop_future();
+        self.finish_result(result);
+        Poll::Ready(())
     }
 
     fn begin_drop(&self) -> State {
-        // Safety: task state serializes lifecycle transitions. This method
-        // never invokes user code while the mutable access is live.
-        let this = unsafe { &mut *self.inner.get() };
-        let state = this.state;
+        let state = self.state.get();
         if matches!(state, State::Future | State::FutureResult) {
-            this.state = State::Dropping;
+            self.state.set(State::Dropping);
         }
         state
     }
@@ -135,7 +140,7 @@ where
     fn drop_future(&self) {
         // Take only a raw pointer across user destructor execution so
         // re-entrant lifecycle calls do not alias a live Rust reference.
-        let storage = unsafe { &raw mut (*self.inner.get()).storage };
+        let storage = self.storage.get();
         abort_on_panic(|| unsafe {
             ManuallyDrop::drop(&mut (*storage).future);
         });
@@ -144,21 +149,38 @@ where
     fn drop_output(&self) {
         // See `drop_future`: `Dropping` prevents re-entry from touching the
         // storage while its destructor is running.
-        let storage = unsafe { &raw mut (*self.inner.get()).storage };
+        let storage = self.storage.get();
         abort_on_panic(|| unsafe {
             ManuallyDrop::drop(&mut (*storage).output);
         });
     }
 
     fn finish_result(&self, result: Result<F::Output, TaskError>) {
+        debug_assert_eq!(self.state.get(), State::Dropping);
         // Safety: the preceding poll/drop transition owns the lifecycle and
-        // left the cell in `Dropping` without retaining a reference.
-        let this = unsafe { &mut *self.inner.get() };
-        debug_assert_eq!(this.state, State::Dropping);
+        // left the cell in `Dropping`, so no other access to storage is live.
         unsafe {
-            ptr::write(&mut this.storage.output, ManuallyDrop::new(result));
+            ptr::write(
+                &raw mut (*self.storage.get()).output,
+                ManuallyDrop::new(result),
+            );
         }
-        this.state = State::FutureResult;
+        self.state.set(State::FutureResult);
+    }
+}
+
+impl<F: Future> Drop for FutureCell<F> {
+    fn drop(&mut self) {
+        let storage = self.storage.get_mut();
+        match self.state.get() {
+            State::Future => abort_on_panic(|| unsafe {
+                ManuallyDrop::drop(&mut storage.future);
+            }),
+            State::FutureResult => abort_on_panic(|| unsafe {
+                ManuallyDrop::drop(&mut storage.output);
+            }),
+            State::Empty | State::Dropping => {}
+        }
     }
 }
 
@@ -173,60 +195,6 @@ enum State {
 union Storage<F: Future> {
     future: ManuallyDrop<F>,
     output: ManuallyDrop<Result<F::Output, TaskError>>,
-}
-
-struct Inner<F: Future> {
-    state: State,
-    storage: Storage<F>,
-}
-
-impl<F: Future> Inner<F> {
-    fn new(future: F) -> Self {
-        Self {
-            state: State::Future,
-            storage: Storage {
-                future: ManuallyDrop::new(future),
-            },
-        }
-    }
-
-    /// Poll the inner future to completion.
-    ///
-    unsafe fn poll(&mut self, mut cx: Context<'_>) -> Poll<Result<F::Output, TaskError>> {
-        match self.state {
-            State::Future => {
-                let fut = unsafe { Pin::new_unchecked(&mut *self.storage.future) };
-                match panic::catch_unwind(panic::AssertUnwindSafe(|| fut.poll(&mut cx))) {
-                    Ok(Poll::Ready(result)) => {
-                        self.state = State::Dropping;
-                        Poll::Ready(Ok(result))
-                    }
-                    Ok(Poll::Pending) => Poll::Pending,
-                    Err(err) => {
-                        self.state = State::Dropping;
-                        Poll::Ready(Err(TaskError::panic(err)))
-                    }
-                }
-            }
-            State::FutureResult => unreachable!("FutureCell is complete"),
-            State::Empty => unreachable!("FutureCell is empty"),
-            State::Dropping => unreachable!("FutureCell is transitioning"),
-        }
-    }
-}
-
-impl<F: Future> Drop for Inner<F> {
-    fn drop(&mut self) {
-        match self.state {
-            State::Future => abort_on_panic(|| unsafe {
-                ManuallyDrop::drop(&mut self.storage.future);
-            }),
-            State::FutureResult => abort_on_panic(|| unsafe {
-                ManuallyDrop::drop(&mut self.storage.output);
-            }),
-            State::Empty | State::Dropping => {}
-        }
-    }
 }
 
 /// [`TaskError`] indicates a failure in a task.
