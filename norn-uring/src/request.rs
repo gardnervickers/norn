@@ -35,7 +35,7 @@ mod private {
         fn fail_submit(self: Pin<&mut Self>, err: &SubmitError);
     }
 
-    // Public solely so it can seal `WithOptions`.
+    // Public solely so `WithOptions` can name it.
     #[allow(unnameable_types)]
     pub trait AcceptsOptions<O> {
         fn set_options(&mut self, opts: O);
@@ -106,6 +106,11 @@ pub trait Request: Future + Sized + private::Chainable {
     /// If an operation fails during configuration, earlier configured operations are still
     /// submitted, while that operation reports its configuration error and later linked
     /// operations complete with `ECANCELED` without reaching the kernel.
+    ///
+    /// `io_uring` also breaks the link when `self` completes short: a read or
+    /// write that transfers fewer bytes than requested returns its byte count,
+    /// but `next` completes with `ECANCELED`. Use [`Request::then_always`] to
+    /// run `next` regardless.
     ///
     /// # Panics
     ///

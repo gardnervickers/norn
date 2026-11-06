@@ -23,18 +23,54 @@ use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 mod util;
 
 #[test]
+fn tcp_recv_rejects_peek_with_wait_all_without_consuming_input(
+) -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let (server, client) = connected_pair().await?;
+        client.send(&b"abcd"[..]).await.drop_buf()?;
+
+        // With only four of eight bytes queued, a peeking wait-all retry would
+        // copy "abcd" again and report eight bytes.
+        let opts = RecvOptions::new().peek(true).wait_all(true);
+        let BufResult(result, buf) = server.recv(vec![0xa5u8; 8]).options(opts).await;
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(buf, [0xa5u8; 8]);
+
+        let BufResult(result, buf) = server
+            .recv(vec![0u8; 4])
+            .options(RecvOptions::new().wait_all(true))
+            .await;
+        assert_eq!(result?, 4);
+        assert_eq!(buf, b"abcd");
+
+        server.close().await?;
+        client.close().await?;
+        Ok(())
+    })
+}
+
+#[test]
 fn recv_and_send_options_apply_to_one_request() -> Result<(), Box<dyn std::error::Error>> {
     util::with_test_env(|| async {
         let (server, client) = connected_pair().await?;
 
-        // `more` holds back the partial segment until a send without it.
+        // `more` lets the kernel merge this segment with the next send.
         let more = SendOptions::new().more(true);
         client.send(&b"hel"[..]).options(more).await.drop_buf()?;
         client.send(&b"lo"[..]).await.drop_buf()?;
 
-        let peek = RecvOptions::new().peek(true).wait_all(true);
-        let BufResult(result, buf) = server.recv(vec![0u8; 5]).options(peek).await;
-        assert_eq!(result?, 5);
+        // Both sends have completed, so the peek normally sees all five bytes;
+        // retry in case the second segment is still in flight.
+        let mut buf = vec![0u8; 5];
+        let mut peeked = 0;
+        while peeked < 5 {
+            let BufResult(result, b) = server
+                .recv(buf)
+                .options(RecvOptions::new().peek(true))
+                .await;
+            peeked = result?;
+            buf = b;
+        }
         assert_eq!(buf, b"hello");
 
         // The peeked bytes are still queued for a receive without options.

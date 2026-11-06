@@ -330,6 +330,28 @@ fn invalid_zc_notification_error() -> io::Error {
     )
 }
 
+/// Reject stream receive flags that would report bytes the buffer does not
+/// hold. TCP and Unix stream receives share them.
+#[cold]
+fn validate_stream_recv_flags(flags: i32) -> io::Result<()> {
+    if flags & libc::MSG_TRUNC != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "MSG_TRUNC is unsupported for stream socket receives",
+        ));
+    }
+    // A partial `MSG_WAITALL` receive is retried by `io_uring` with the buffer
+    // advanced. Under `MSG_PEEK` each retry copies the start of the queue
+    // again, so the buffer fills with a repeated prefix.
+    if flags & libc::MSG_PEEK != 0 && flags & libc::MSG_WAITALL != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "MSG_PEEK with MSG_WAITALL is unsupported for stream socket receives because a partial retry peeks the start of the queue again",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_recv_bundle_flags(flags: i32) -> io::Result<()> {
     if flags & libc::MSG_TRUNC != 0 {
         return Err(io::Error::new(
@@ -450,7 +472,11 @@ impl AddrKind for Unix {
             ));
         }
         if let Some(path) = addr.as_pathname() {
-            return UnixAddr::from_pathname(path);
+            // A peer can bind a path that fills `sun_path` without a NUL,
+            // which `std` cannot represent. Report it as unnamed instead of
+            // failing an accept or receive that has already consumed its
+            // connection or datagram.
+            return UnixAddr::from_pathname(path).or_else(|_| unnamed_unix_addr());
         }
         if let Some(name) = addr.as_abstract_namespace() {
             return UnixAddr::from_abstract_name(name);
@@ -461,14 +487,20 @@ impl AddrKind for Unix {
 
 /// An unnamed Unix socket address.
 ///
-/// `std` has no constructor for one, so the first call reads the local
-/// address of an unbound socket and later calls clone it.
+/// `std` has no constructor for one. An empty path converts to an address
+/// with just the family, which is unnamed; if a `std` version ever changes
+/// that, fall back to reading the local address of an unbound socket. Either
+/// way the result is cached, so converting does not need a descriptor after
+/// the first call, and normally never does.
 fn unnamed_unix_addr() -> io::Result<UnixAddr> {
     static UNNAMED: OnceLock<UnixAddr> = OnceLock::new();
     if let Some(addr) = UNNAMED.get() {
         return Ok(addr.clone());
     }
-    let addr = std::os::unix::net::UnixDatagram::unbound()?.local_addr()?;
+    let addr = match UnixAddr::from_pathname("") {
+        Ok(addr) if addr.is_unnamed() => addr,
+        _ => std::os::unix::net::UnixDatagram::unbound()?.local_addr()?,
+    };
     Ok(UNNAMED.get_or_init(|| addr).clone())
 }
 
@@ -577,11 +609,28 @@ impl Socket {
         socket_type: Type,
         protocol: Option<Protocol>,
     ) -> io::Result<Self> {
+        Self::open_with(domain, socket_type, protocol, true).await
+    }
+
+    /// Open a socket without `O_NONBLOCK`, for an operation that must wait
+    /// in the kernel. Call [`set_nonblocking`](Self::set_nonblocking) before
+    /// handing it to code that expects a nonblocking descriptor.
+    pub(crate) async fn open_blocking(domain: Domain, socket_type: Type) -> io::Result<Self> {
+        Self::open_with(domain, socket_type, None, false).await
+    }
+
+    async fn open_with(
+        domain: Domain,
+        socket_type: Type,
+        protocol: Option<Protocol>,
+        nonblocking: bool,
+    ) -> io::Result<Self> {
         let handle = crate::Handle::current();
         let op = OpenSocket {
             domain,
             socket_type,
             protocol,
+            nonblocking,
             handle: handle.clone(),
         };
         let fd = handle.submit(op).await?;
@@ -841,6 +890,10 @@ impl Socket {
         Unix::from_sockaddr(&self.as_socket().peer_addr()?)
     }
 
+    pub(crate) fn set_nonblocking(&self) -> io::Result<()> {
+        self.as_socket().set_nonblocking(true)
+    }
+
     pub(crate) fn as_socket(&self) -> ManuallyDrop<socket2::Socket> {
         let sock = unsafe { socket2::Socket::from_raw_fd(self.fd.fd().0) };
         ManuallyDrop::new(sock)
@@ -998,6 +1051,7 @@ struct OpenSocket {
     domain: Domain,
     socket_type: Type,
     protocol: Option<Protocol>,
+    nonblocking: bool,
     handle: crate::Handle,
 }
 
@@ -1008,7 +1062,12 @@ unsafe impl Operation for OpenSocket {
 
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
         let ty: i32 = self.socket_type.into();
-        let ty = ty | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC;
+        let ty = ty | libc::SOCK_CLOEXEC;
+        let ty = if self.nonblocking {
+            ty | libc::SOCK_NONBLOCK
+        } else {
+            ty
+        };
         Ok(io_uring::opcode::Socket::new(
             self.domain.into(),
             ty,
@@ -2289,11 +2348,8 @@ where
     type Completion = CQEResult;
 
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
-        if STREAM && self.flags & libc::MSG_TRUNC != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "MSG_TRUNC is unsupported for stream socket receives",
-            ));
+        if STREAM && self.flags & (libc::MSG_TRUNC | libc::MSG_PEEK) != 0 {
+            validate_stream_recv_flags(self.flags)?;
         }
         let len = checked_scalar_len(self.submitted_len, "receive buffer length")?;
         let ptr = self.buf.stable_ptr_mut();
@@ -2773,6 +2829,15 @@ mod tests {
     use norn_executor::LocalExecutor;
 
     use super::*;
+
+    #[test]
+    fn unnamed_unix_addr_needs_no_descriptor() {
+        // The cache is filled from an empty path, not an unbound socket, so a
+        // process at its descriptor limit still converts unnamed addresses.
+        let addr = UnixAddr::from_pathname("").unwrap();
+        assert!(addr.is_unnamed());
+        assert!(unnamed_unix_addr().unwrap().is_unnamed());
+    }
 
     fn drive_receive<T: RingReceive>(
         driver: &mut crate::Driver,

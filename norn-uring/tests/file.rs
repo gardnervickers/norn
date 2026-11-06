@@ -556,8 +556,6 @@ fn read_write_options_round_trip() -> Result<(), Box<dyn std::error::Error>> {
     })
 }
 
-/// `RWF_NOWAIT` fails a read that would wait instead of waiting for data.
-/// Without the flag, io_uring waits for the empty pipe to become readable.
 #[test]
 #[should_panic(expected = "request options must be set before the request is first polled")]
 fn options_on_a_polled_request_panic() {
@@ -574,6 +572,8 @@ fn options_on_a_polled_request_panic() {
     .unwrap();
 }
 
+/// `RWF_NOWAIT` fails a read that would wait instead of waiting for data.
+/// Without the flag, io_uring waits for the empty pipe to become readable.
 #[test]
 fn nowait_read_of_an_empty_pipe_fails_instead_of_waiting() -> Result<(), Box<dyn std::error::Error>>
 {

@@ -45,8 +45,9 @@ impl ReadOptions {
     /// This sets `RWF_NOWAIT`. A read that would block completes with
     /// [`io::ErrorKind::WouldBlock`] and is not retried by the kernel. A read
     /// that can only partly complete without blocking may return fewer bytes
-    /// than requested. Files that do not support nonblocking reads fail with
-    /// `EOPNOTSUPP`.
+    /// than requested, which cancels a request linked after it with
+    /// [`Request::then`](crate::Request::then). Files that do not support
+    /// nonblocking reads fail with `EOPNOTSUPP`.
     ///
     /// [`io::ErrorKind::WouldBlock`]: std::io::ErrorKind::WouldBlock
     #[must_use]
@@ -106,18 +107,21 @@ impl WriteOptions {
         }
     }
 
-    /// Configure whether the write has `O_DSYNC` semantics.
+    /// Configure whether this write requests `O_DSYNC` semantics.
     ///
-    /// This sets `RWF_DSYNC`. A successful completion means the written data,
+    /// This sets `RWF_DSYNC`. Disabling it only clears the request; it does
+    /// not remove `O_DSYNC` or `O_SYNC` from a file opened with them, nor
+    /// the data guarantee that [`WriteOptions::sync`] already includes. A successful completion means the written data,
     /// and the metadata required to retrieve it, reached stable storage.
     #[must_use]
     pub const fn dsync(self, enabled: bool) -> Self {
         self.with_flag(libc::RWF_DSYNC, enabled)
     }
 
-    /// Configure whether the write has `O_SYNC` semantics.
+    /// Configure whether this write requests `O_SYNC` semantics.
     ///
-    /// This sets `RWF_SYNC`. A successful completion means the written data
+    /// This sets `RWF_SYNC`. Disabling it only clears the request; it does
+    /// not remove `O_SYNC` from a file opened with it. A successful completion means the written data
     /// and all associated file metadata reached stable storage.
     #[must_use]
     pub const fn sync(self, enabled: bool) -> Self {
@@ -129,9 +133,8 @@ impl WriteOptions {
     /// This sets `RWF_NOWAIT`. A write that would block completes with
     /// [`io::ErrorKind::WouldBlock`] and is not retried by the kernel. A write
     /// that can only partly complete without blocking may return fewer bytes
-    /// than requested; `io_uring` still counts such a write as failed, so a
-    /// request linked after it with [`Request::then`](crate::Request::then) is
-    /// canceled. Files that do not support nonblocking writes fail with
+    /// than requested, which cancels a request linked after it with
+    /// [`Request::then`](crate::Request::then). Files that do not support nonblocking writes fail with
     /// `EOPNOTSUPP`. A buffered write to a filesystem that cannot attempt one
     /// without blocking, such as ext4, fails with `WouldBlock` every time, so
     /// retrying it does not help.

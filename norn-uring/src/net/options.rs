@@ -30,7 +30,13 @@ impl RecvOptions {
 
     /// Configure whether the receive leaves the data queued.
     ///
-    /// This sets `MSG_PEEK`. A later receive returns the same data.
+    /// This sets `MSG_PEEK`. A later receive returns the same data. TCP and
+    /// Unix stream receives reject it together with [`RecvOptions::wait_all`] with
+    /// [`io::ErrorKind::InvalidInput`]: `io_uring` retries a partial wait-all
+    /// receive, and each peeking retry would copy the start of the queue
+    /// again.
+    ///
+    /// [`io::ErrorKind::InvalidInput`]: std::io::ErrorKind::InvalidInput
     #[must_use]
     pub const fn peek(self, enabled: bool) -> Self {
         self.with_flag(libc::MSG_PEEK, enabled)
@@ -40,8 +46,13 @@ impl RecvOptions {
     ///
     /// This sets `MSG_WAITALL`. On a stream socket the receive completes
     /// once the buffer is full, or earlier with fewer bytes at end of stream,
-    /// on an error, or when interrupted. On a datagram socket it has no effect
-    /// beyond receiving one datagram.
+    /// on an error, or when interrupted. A datagram socket still receives one
+    /// datagram.
+    ///
+    /// `io_uring` counts a wait-all receive that returns fewer bytes than the
+    /// buffer holds as failed, whatever the socket type, so a request linked
+    /// after it with [`Request::then`](crate::Request::then) is canceled. On
+    /// a datagram socket that means any datagram shorter than the buffer.
     #[must_use]
     pub const fn wait_all(self, enabled: bool) -> Self {
         self.with_flag(libc::MSG_WAITALL, enabled)
@@ -53,8 +64,8 @@ impl RecvOptions {
     /// length and may exceed the initialized length of the returned buffer;
     /// the excess is discarded. Stream receives, on TCP and Unix stream
     /// sockets, reject it with [`io::ErrorKind::InvalidInput`] and return the
-    /// buffer unchanged, because on a stream it discards input without
-    /// filling the buffer.
+    /// buffer unchanged: on TCP it discards input without filling the
+    /// buffer, and a stream has no datagram length to report.
     ///
     /// [`io::ErrorKind::InvalidInput`]: std::io::ErrorKind::InvalidInput
     #[must_use]
@@ -93,10 +104,15 @@ impl SendOptions {
 
     /// Configure whether more data follows this send.
     ///
-    /// This sets `MSG_MORE`. On TCP the kernel holds a partial segment back
-    /// for the next send, as with `TCP_CORK`, until a send without the flag.
-    /// On UDP the payload is appended to a pending datagram that a later
-    /// send without the flag completes.
+    /// This sets `MSG_MORE`. On TCP the kernel may hold a partial segment back
+    /// to merge with the next send, as with `TCP_CORK`; it sends held data
+    /// after about 200 ms even if no send follows.
+    ///
+    /// On UDP the payload starts or extends a pending datagram, which the
+    /// next send without the flag completes. Later sends join that pending
+    /// datagram and go to its destination: the address passed to a later
+    /// [`UdpSocket::send_to`](crate::net::UdpSocket::send_to) is ignored
+    /// until the datagram is sent.
     #[must_use]
     pub const fn more(mut self, enabled: bool) -> Self {
         self.flags = set_flag(self.flags, libc::MSG_MORE, enabled);
