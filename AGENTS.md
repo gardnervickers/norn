@@ -126,6 +126,9 @@ The project is intentionally not general-purpose today; APIs are still in flux i
   dropping them does not need a driver context. Constructing a `RecvBufRing`
   still calls `Handle::current()`.
 - I/O buffers must implement `StableBuf`/`StableBufMut` (stable pointer guarantees).
+- Ops that take a buffer resolve to `BufResult<T, B>(io::Result<T>, B)`, returning the
+  buffer on success and failure. Use `.buf_ok()?` or `.drop_buf()?` to propagate errors;
+  destructure `BufResult(res, buf)` when the buffer is needed after a failure.
 - Bufring uses registered kernel buffer rings and returns buffers to ring on `BufRingBuf::drop`.
 
 ## Platform and Build Constraints

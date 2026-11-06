@@ -1,3 +1,4 @@
+use crate::BufResult;
 use std::io;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
@@ -431,7 +432,7 @@ impl TcpSocket {
     /// Recv data into the given buffer.
     ///
     /// This takes ownership of the buffer, and returns future which resolves
-    /// to a tuple of the original buffer and the number of bytes read.
+    /// to a [`BufResult`](crate::BufResult) holding the number of bytes read and the buffer.
     ///
     /// Set per-operation [`RecvOptions`] with [`WithOptions::options`]. A
     /// receive with [`RecvOptions::trunc`] fails with
@@ -441,23 +442,21 @@ impl TcpSocket {
     pub fn recv<B: StableBufMut>(
         &self,
         buf: B,
-    ) -> impl crate::Request<Output = (io::Result<usize>, B)> + crate::WithOptions<RecvOptions>
-    {
+    ) -> impl crate::Request<Output = BufResult<usize, B>> + crate::WithOptions<RecvOptions> {
         self.socket.recv_stream(buf)
     }
 
     /// Send data from the given buffer.
     ///
     /// This takes ownership of the buffer, and returns a future which resolves
-    /// to a tuple of the original buffer and the number of bytes sent.
+    /// to a [`BufResult`](crate::BufResult) holding the number of bytes sent and the buffer.
     ///
     /// Set per-operation [`SendOptions`] with
     /// [`WithOptions::options`](crate::WithOptions::options).
     pub fn send<B: StableBuf>(
         &self,
         buf: B,
-    ) -> impl crate::Request<Output = (io::Result<usize>, B)> + crate::WithOptions<SendOptions>
-    {
+    ) -> impl crate::Request<Output = BufResult<usize, B>> + crate::WithOptions<SendOptions> {
         self.socket.send(buf)
     }
 
@@ -475,7 +474,7 @@ impl TcpSocket {
     pub fn send_zc<B: StableBuf>(
         &self,
         buf: B,
-    ) -> impl crate::Request<Output = (io::Result<SendZcResult>, B)> + crate::WithOptions<SendOptions>
+    ) -> impl crate::Request<Output = BufResult<SendZcResult, B>> + crate::WithOptions<SendOptions>
     {
         self.socket.send_zc(buf)
     }
@@ -494,7 +493,7 @@ impl TcpSocket {
     pub fn send_msg_zc<B: StableBuf>(
         &self,
         buf: B,
-    ) -> impl crate::Request<Output = (io::Result<SendZcResult>, B)> + crate::WithOptions<SendOptions>
+    ) -> impl crate::Request<Output = BufResult<SendZcResult, B>> + crate::WithOptions<SendOptions>
     {
         self.socket.send_msg_zc(buf)
     }

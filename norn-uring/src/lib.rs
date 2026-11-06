@@ -7,8 +7,9 @@
 //! that runtime context.
 //!
 //! I/O methods take ownership of their buffers while the kernel may access
-//! them and return those buffers with the completion result. See [`buf`] for
-//! the stable-address contracts that make this safe.
+//! them and return those buffers with the completion result, as a
+//! [`BufResult`]. See [`buf`] for the stable-address contracts that make this
+//! safe.
 //!
 //! # Example
 //!
@@ -20,8 +21,8 @@
 //! let mut executor = LocalExecutor::new(driver);
 //! executor.block_on(async {
 //!     let file = File::open("data.bin").await?;
-//!     let (result, buffer) = file.read_at(vec![0_u8; 4096], 0).await;
-//!     let bytes_read = result?;
+//!     // The buffer comes back on success; on failure `?` drops it.
+//!     let (bytes_read, buffer) = file.read_at(vec![0_u8; 4096], 0).await.buf_ok()?;
 //!     file.close().await?;
 //!     assert!(bytes_read <= buffer.len());
 //!     Ok::<(), std::io::Error>(())
@@ -98,6 +99,7 @@ pub(crate) mod util;
 pub mod block;
 /// Stable buffer traits and adapters for io_uring operations.
 pub mod buf;
+mod buf_result;
 /// Registered io_uring buffer-ring support.
 pub mod bufring;
 /// Epoll instances driven through io_uring.
@@ -111,6 +113,7 @@ pub mod net;
 /// Device-specific commands submitted through `IORING_OP_URING_CMD`.
 pub mod uring_cmd;
 
+pub use buf_result::{BufError, BufResult};
 pub use driver::{Driver, DriverOptions, Handle};
 pub use fd::UringFd;
 pub use operation::{CQEResult, Multishot, Op, Operation, Singleshot};

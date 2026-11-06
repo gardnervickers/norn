@@ -1,5 +1,6 @@
 #![cfg(target_os = "linux")]
 
+use norn_uring::BufResult;
 use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -24,12 +25,14 @@ fn localhost() -> SocketAddr {
 }
 
 async fn send_datagram(from: &UdpSocket, to: &UdpSocket) -> io::Result<()> {
-    from.send_to(b"ping".to_vec(), to.local_addr()?).await.0?;
+    from.send_to(b"ping".to_vec(), to.local_addr()?)
+        .await
+        .drop_buf()?;
     Ok(())
 }
 
 async fn assert_no_events(epoll: &Epoll) -> io::Result<Events> {
-    let (result, events) = epoll
+    let BufResult(result, events) = epoll
         .wait(Events::with_capacity(4))
         .timeout(Duration::from_millis(20))
         .await;
@@ -52,7 +55,7 @@ fn wait_reports_registered_readiness() -> Result<(), Box<dyn std::error::Error>>
             .await?;
 
         send_datagram(&sender, &receiver).await?;
-        let (result, events) = epoll.wait(Events::with_capacity(4)).await;
+        let BufResult(result, events) = epoll.wait(Events::with_capacity(4)).await;
 
         assert_eq!(result?, 1);
         assert_eq!(events.len(), 1);
@@ -87,7 +90,7 @@ fn wait_stays_pending_until_readiness() -> Result<(), Box<dyn std::error::Error>
         assert!(futures_util::poll!(wait.as_mut()).is_pending());
 
         send_datagram(&sender, &receiver).await?;
-        let (result, events) = wait.await;
+        let BufResult(result, events) = wait.await;
 
         assert_eq!(result?, 1);
         assert_eq!(events.iter().next().unwrap().token(), 1);
@@ -109,7 +112,7 @@ fn modify_and_delete_update_interest_list() -> Result<(), Box<dyn std::error::Er
         let events = assert_no_events(&epoll).await?;
 
         epoll.modify(fd, Interest::WRITABLE, 2).await?;
-        let (result, events) = epoll.wait(events).await;
+        let BufResult(result, events) = epoll.wait(events).await;
         assert_eq!(result?, 1);
         let event = events.iter().next().unwrap();
         assert_eq!(event.token(), 2);
@@ -176,12 +179,12 @@ fn oneshot_registration_requires_rearm() -> Result<(), Box<dyn std::error::Error
         let fd = socket.as_uring_fd();
         epoll.add(fd, Interest::WRITABLE.oneshot(), 5).await?;
 
-        let (result, events) = epoll.wait(Events::with_capacity(4)).await;
+        let BufResult(result, events) = epoll.wait(Events::with_capacity(4)).await;
         assert_eq!(result?, 1);
         assert_no_events(&epoll).await?;
 
         epoll.modify(fd, Interest::WRITABLE.oneshot(), 6).await?;
-        let (result, events) = epoll.wait(events).await;
+        let BufResult(result, events) = epoll.wait(events).await;
         assert_eq!(result?, 1);
         assert_eq!(events.iter().next().unwrap().token(), 6);
         Ok(())
@@ -206,13 +209,13 @@ fn edge_triggered_registration_reports_transitions() -> Result<(), Box<dyn std::
             .await?;
 
         send_datagram(&sender, &receiver).await?;
-        let (result, _events) = epoll.wait(Events::with_capacity(4)).await;
+        let BufResult(result, _events) = epoll.wait(Events::with_capacity(4)).await;
         assert_eq!(result?, 1);
         // The datagram is still queued, but no new transition occurred.
         assert_no_events(&epoll).await?;
 
         send_datagram(&sender, &receiver).await?;
-        let (result, events) = epoll.wait(Events::with_capacity(4)).await;
+        let BufResult(result, events) = epoll.wait(Events::with_capacity(4)).await;
         assert_eq!(result?, 1);
         assert_eq!(events.iter().next().unwrap().token(), 8);
         Ok(())
@@ -235,17 +238,17 @@ fn wait_truncates_to_capacity() -> Result<(), Box<dyn std::error::Error>> {
             .add(second.as_uring_fd(), Interest::WRITABLE, 2)
             .await?;
 
-        let (result, events) = epoll.wait(Events::with_capacity(1)).await;
+        let BufResult(result, events) = epoll.wait(Events::with_capacity(1)).await;
         assert_eq!(result?, 1);
         assert_eq!(events.len(), 1);
 
-        let (result, events) = epoll.wait(Events::with_capacity(4)).await;
+        let BufResult(result, events) = epoll.wait(Events::with_capacity(4)).await;
         assert_eq!(result?, 2);
         let mut tokens: Vec<_> = events.iter().map(|event| event.token()).collect();
         tokens.sort_unstable();
         assert_eq!(tokens, [1, 2]);
 
-        let (result, events) = epoll.wait(Events::with_capacity(0)).await;
+        let BufResult(result, events) = epoll.wait(Events::with_capacity(0)).await;
         assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EINVAL));
         assert!(events.is_empty());
         Ok(())
@@ -273,14 +276,14 @@ fn dropped_wait_is_cancelled() -> Result<(), Box<dyn std::error::Error>> {
 
         // Level-triggered readiness is not consumed by the cancelled wait.
         send_datagram(&sender, &receiver).await?;
-        let (result, events) = epoll.wait(Events::with_capacity(4)).await;
+        let BufResult(result, events) = epoll.wait(Events::with_capacity(4)).await;
         assert_eq!(result?, 1);
         assert_eq!(events.iter().next().unwrap().token(), 3);
 
         // Leave a submitted wait pending when the root future finishes; the
         // driver must cancel and drain it during shutdown.
         let mut wait = std::pin::pin!(epoll.wait(Events::with_capacity(4)));
-        receiver.recv(vec![0; 4]).await.0?;
+        receiver.recv(vec![0; 4]).await.drop_buf()?;
         assert!(futures_util::poll!(wait.as_mut()).is_pending());
         Ok(())
     })

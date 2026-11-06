@@ -1,5 +1,6 @@
 #![cfg(target_os = "linux")]
 
+use norn_uring::BufResult;
 use std::future::Future;
 use std::io;
 use std::pin::pin;
@@ -30,7 +31,7 @@ fn pending_recv_from_initializes_vec_and_bytes_mut() -> Result<(), Box<dyn std::
             .send_to(b"hello".to_vec(), receiver.local_addr()?)
             .await
             .0?;
-        let (result, buf) = recv.await;
+        let BufResult(result, buf) = recv.await;
         let (len, addr) = result?;
         assert_eq!(addr, sender.local_addr()?);
         assert_eq!(len, 5);
@@ -118,13 +119,13 @@ fn send_recv() -> Result<(), Box<dyn std::error::Error>> {
 
         // Send hello to s2
         let buf = Bytes::from_static(b"hello");
-        let (res, buf) = s1.send_to(buf, s2.local_addr()?).await;
+        let BufResult(res, buf) = s1.send_to(buf, s2.local_addr()?).await;
         // Assert that we sent 5 bytes
         assert_eq!(buf.len(), res?);
 
         // Receive hello on s2
         let buf = BytesMut::with_capacity(5);
-        let (res, buf) = s2.recv_from(buf).await;
+        let BufResult(res, buf) = s2.recv_from(buf).await;
         let (n, addr) = res?;
         // Assert that we received 5 bytes
         assert_eq!(5, n);
@@ -150,19 +151,17 @@ fn connected_send_recv() -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(s2.peer_addr()?, s1.local_addr()?);
 
         let req = Bytes::from_static(b"ping");
-        let (res, req) = s1.send(req).await;
+        let BufResult(res, req) = s1.send(req).await;
         assert_eq!(req.len(), res?);
 
-        let (res, buf) = s2.recv(BytesMut::with_capacity(16)).await;
-        let n = res?;
+        let (n, buf) = s2.recv(BytesMut::with_capacity(16)).await.buf_ok()?;
         assert_eq!(&buf[..n], b"ping");
 
         let rsp = Bytes::from_static(b"pong");
-        let (res, rsp) = s2.send(rsp).await;
+        let BufResult(res, rsp) = s2.send(rsp).await;
         assert_eq!(rsp.len(), res?);
 
-        let (res, buf) = s1.recv(BytesMut::with_capacity(16)).await;
-        let n = res?;
+        let (n, buf) = s1.recv(BytesMut::with_capacity(16)).await.buf_ok()?;
         assert_eq!(&buf[..n], b"pong");
 
         Ok(())
@@ -190,7 +189,7 @@ fn connected_send_recv_zc() -> Result<(), Box<dyn std::error::Error>> {
         let recv_task =
             norn_executor::spawn(async move { s2.recv(BytesMut::with_capacity(64)).await });
         let payload = Bytes::from_static(b"udp-zc");
-        let (res, sent) = s1.send_zc(payload).await;
+        let BufResult(res, sent) = s1.send_zc(payload).await;
         let sent_n = match res {
             Ok(n) => n,
             Err(err) => {
@@ -204,8 +203,7 @@ fn connected_send_recv_zc() -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(sent_n.bytes_sent(), sent.len());
         assert_ne!(sent_n.usage(), SendZcUsage::Unknown);
 
-        let (res, buf) = recv_task.await?;
-        let n = res?;
+        let (n, buf) = recv_task.await?.buf_ok()?;
         assert_eq!(&buf[..n], b"udp-zc");
 
         s1.close().await?;
@@ -234,7 +232,7 @@ fn connected_send_recv_msg_zc() -> Result<(), Box<dyn std::error::Error>> {
         let recv_task =
             norn_executor::spawn(async move { s2.recv(BytesMut::with_capacity(64)).await });
         let payload = Bytes::from_static(b"udp-zc-msg");
-        let (res, sent) = s1.send_msg_zc(payload).await;
+        let BufResult(res, sent) = s1.send_msg_zc(payload).await;
         let sent_n = match res {
             Ok(n) => n,
             Err(err) => {
@@ -248,8 +246,7 @@ fn connected_send_recv_msg_zc() -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(sent_n.bytes_sent(), sent.len());
         assert_ne!(sent_n.usage(), SendZcUsage::Unknown);
 
-        let (res, buf) = recv_task.await?;
-        let n = res?;
+        let (n, buf) = recv_task.await?.buf_ok()?;
         assert_eq!(&buf[..n], b"udp-zc-msg");
 
         s1.close().await?;
@@ -268,13 +265,13 @@ fn recv_from_options_apply_with_and_without_waiting() -> Result<(), Box<dyn std:
         s1.send_to(Bytes::from_static(b"ready"), s2.local_addr()?)
             .await
             .0?;
-        let (res, buf) = s2
+        let BufResult(res, buf) = s2
             .recv_from(BytesMut::with_capacity(16))
             .options(peek)
             .await;
         assert_eq!(res?, (5, s1.local_addr()?));
         assert_eq!(&buf[..], b"ready");
-        let (res, buf) = s2.recv_from(BytesMut::with_capacity(16)).await;
+        let BufResult(res, buf) = s2.recv_from(BytesMut::with_capacity(16)).await;
         assert_eq!(res?.0, 5);
         assert_eq!(&buf[..], b"ready");
 
@@ -284,10 +281,10 @@ fn recv_from_options_apply_with_and_without_waiting() -> Result<(), Box<dyn std:
         s1.send_to(Bytes::from_static(b"later"), s2.local_addr()?)
             .await
             .0?;
-        let (res, buf) = recv.await;
+        let BufResult(res, buf) = recv.await;
         assert_eq!(res?.0, 5);
         assert_eq!(&buf[..], b"later");
-        let (res, buf) = s2.recv_from(BytesMut::with_capacity(16)).await;
+        let BufResult(res, buf) = s2.recv_from(BytesMut::with_capacity(16)).await;
         assert_eq!(res?.0, 5);
         assert_eq!(&buf[..], b"later");
 
@@ -309,14 +306,17 @@ fn send_with_more_joins_one_datagram() -> Result<(), Box<dyn std::error::Error>>
         s1.send_to(Bytes::from_static(b"lo"), s2.local_addr()?)
             .await
             .0?;
-        let (res, buf) = s2.recv_from(BytesMut::with_capacity(16)).await;
+        let BufResult(res, buf) = s2.recv_from(BytesMut::with_capacity(16)).await;
         assert_eq!(res?.0, 5);
         assert_eq!(&buf[..], b"hello");
 
         s1.connect(s2.local_addr()?).await?;
-        s1.send(Bytes::from_static(b"wor")).options(more).await.0?;
-        s1.send(Bytes::from_static(b"ld")).await.0?;
-        let (res, buf) = s2.recv_from(BytesMut::with_capacity(16)).await;
+        s1.send(Bytes::from_static(b"wor"))
+            .options(more)
+            .await
+            .drop_buf()?;
+        s1.send(Bytes::from_static(b"ld")).await.drop_buf()?;
+        let BufResult(res, buf) = s2.recv_from(BytesMut::with_capacity(16)).await;
         assert_eq!(res?.0, 5);
         assert_eq!(&buf[..], b"world");
 
@@ -338,7 +338,7 @@ fn msg_trunc_direct_recv_from_caps_vec_initialization() -> Result<(), Box<dyn st
         let buf = Vec::with_capacity(1);
         let submitted_len = buf.capacity();
         assert!(submitted_len < TRUNC_PAYLOAD.len());
-        let (res, buf) = receiver
+        let BufResult(res, buf) = receiver
             .recv_from(buf)
             .options(RecvOptions::new().trunc(true))
             .await;
@@ -375,7 +375,7 @@ fn msg_trunc_uring_recv_from_caps_bytes_mut_initialization(
             .send_to(Bytes::from_static(TRUNC_PAYLOAD), receiver.local_addr()?)
             .await
             .0?;
-        let (res, buf) = recv.await;
+        let BufResult(res, buf) = recv.await;
         let (reported_len, addr) = res?;
 
         assert_eq!(reported_len, TRUNC_PAYLOAD.len());
@@ -395,10 +395,13 @@ fn msg_trunc_connected_recv_caps_vec_and_bytes_mut_initialization(
         sender.connect(receiver.local_addr()?).await?;
         receiver.connect(sender.local_addr()?).await?;
 
-        sender.send(Bytes::from_static(TRUNC_PAYLOAD)).await.0?;
+        sender
+            .send(Bytes::from_static(TRUNC_PAYLOAD))
+            .await
+            .drop_buf()?;
         let vec_buf = Vec::with_capacity(1);
         let vec_submitted_len = vec_buf.capacity();
-        let (res, vec_buf) = receiver
+        let BufResult(res, vec_buf) = receiver
             .recv(vec_buf)
             .options(RecvOptions::new().trunc(true))
             .await;
@@ -406,10 +409,13 @@ fn msg_trunc_connected_recv_caps_vec_and_bytes_mut_initialization(
         assert_eq!(vec_buf.len(), vec_submitted_len);
         assert_eq!(&vec_buf[..], &TRUNC_PAYLOAD[..vec_submitted_len]);
 
-        sender.send(Bytes::from_static(TRUNC_PAYLOAD)).await.0?;
+        sender
+            .send(Bytes::from_static(TRUNC_PAYLOAD))
+            .await
+            .drop_buf()?;
         let bytes_buf = BytesMut::with_capacity(1);
         let bytes_submitted_len = bytes_buf.capacity();
-        let (res, bytes_buf) = receiver
+        let BufResult(res, bytes_buf) = receiver
             .recv(bytes_buf)
             .options(RecvOptions::new().trunc(true))
             .await;
@@ -432,7 +438,7 @@ fn send_recv_ring() -> Result<(), Box<dyn std::error::Error>> {
 
         // Send hello to s2
         let buf = Bytes::from_static(b"hello");
-        s1.send_to(buf, s2.local_addr()?).await.0?;
+        s1.send_to(buf, s2.local_addr()?).await.drop_buf()?;
 
         // Receive hello on s2 using the ring
         let (buf, addr) = s2.recv_from_ring(&ring).await?;
@@ -544,14 +550,14 @@ fn recv_ring_buf_can_be_sent_directly_and_retains_its_slot(
             .send_to(Bytes::from_static(b"held-slot"), server_addr)
             .await
             .0?;
-        let (send_result, buf) = server.send_to(buf, peer).await;
+        let BufResult(send_result, buf) = server.send_to(buf, peer).await;
         assert_eq!(send_result?, b"direct-echo".len());
         assert_eq!(buf.as_slice().as_ptr(), stable_ptr);
 
         let err = server.recv_from_ring(&ring).await.unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::ENOBUFS));
 
-        let (recv_result, reply) = client.recv_from(BytesMut::with_capacity(32)).await;
+        let BufResult(recv_result, reply) = client.recv_from(BytesMut::with_capacity(32)).await;
         let (reply_len, reply_peer) = recv_result?;
         assert_eq!(reply_peer, server_addr);
         assert_eq!(&reply[..reply_len], b"direct-echo");
@@ -622,7 +628,7 @@ fn send_recv_ring_multi_msg() -> Result<(), Box<dyn std::error::Error>> {
         let messages: [&[u8]; 3] = [b"alpha", b"beta", b"gamma"];
         for message in messages {
             let payload = Bytes::copy_from_slice(message);
-            s1.send_to(payload, s2.local_addr()?).await.0?;
+            s1.send_to(payload, s2.local_addr()?).await.drop_buf()?;
             let (buf, addr) = recv.next().await.expect("multishot stream ended")?;
             assert_eq!(addr, sender);
             assert_eq!(&buf[..], message);
@@ -649,11 +655,11 @@ fn recv_msg_ring_buf_can_be_sent_directly() -> Result<(), Box<dyn std::error::Er
             recv.next().await.expect("multishot stream ended")?;
         assert_eq!(&buf[..], b"echo");
 
-        let (res, buf) = server.send_to(buf, peer).await;
+        let BufResult(res, buf) = server.send_to(buf, peer).await;
         assert_eq!(res?, b"echo".len());
         drop(buf);
 
-        let (res, reply) = client.recv_from(BytesMut::with_capacity(16)).await;
+        let BufResult(res, reply) = client.recv_from(BytesMut::with_capacity(16)).await;
         let (n, peer) = res?;
         assert_eq!(peer, server.local_addr()?);
         assert_eq!(&reply[..n], b"echo");
@@ -725,7 +731,7 @@ fn connected_send_recv_ring_multi() -> Result<(), Box<dyn std::error::Error>> {
         let mut recv = pin!(s2.recv_ring_multi(&ring));
         let messages: [&[u8]; 3] = [b"one", b"two", b"three"];
         for message in messages {
-            s1.send(Bytes::copy_from_slice(message)).await.0?;
+            s1.send(Bytes::copy_from_slice(message)).await.drop_buf()?;
             let buf = recv.next().await.expect("multishot stream ended")?;
             assert_eq!(&buf[..], message);
         }
@@ -744,12 +750,14 @@ fn connected_recv_ring_multi_preserves_empty_datagrams() -> Result<(), Box<dyn s
         s2.connect(s1.local_addr()?).await?;
 
         let mut recv = pin!(s2.recv_ring_multi(&ring));
-        assert_eq!(s1.send(Bytes::new()).await.0?, 0);
+        assert_eq!(s1.send(Bytes::new()).await.drop_buf()?, 0);
         let empty = recv.next().await.expect("empty datagram ended stream")?;
         assert!(empty.is_empty());
         assert_eq!(empty.capacity(), 0);
 
-        s1.send(Bytes::from_static(b"after-empty")).await.0?;
+        s1.send(Bytes::from_static(b"after-empty"))
+            .await
+            .drop_buf()?;
         let following = recv.next().await.expect("multishot stream ended")?;
         assert_eq!(&following[..], b"after-empty");
         Ok(())
@@ -767,7 +775,7 @@ fn connected_send_recv_from_ring_multi() -> Result<(), Box<dyn std::error::Error
 
         let mut recv = pin!(s2.recv_from_ring_multi(&ring));
         let payload = Bytes::from_static(b"peer-fallback");
-        s1.send(payload.clone()).await.0?;
+        s1.send(payload.clone()).await.drop_buf()?;
         let (buf, addr) = recv.next().await.expect("multishot stream ended")?;
         assert_eq!(addr, s1.local_addr()?);
         assert_eq!(&buf[..], payload.as_ref());
@@ -786,7 +794,7 @@ fn connected_send_recv_bundle() -> Result<(), Box<dyn std::error::Error>> {
         s2.connect(s1.local_addr()?).await?;
 
         let payload = Bytes::from_static(b"bundle-single");
-        s1.send(payload.clone()).await.0?;
+        s1.send(payload.clone()).await.drop_buf()?;
 
         let bundle = match s2.recv_bundle(&ring).await {
             Ok(bundle) => bundle,
@@ -812,7 +820,7 @@ fn connected_send_recv_bundle_multi() -> Result<(), Box<dyn std::error::Error>> 
         let mut recv = pin!(s2.recv_bundle_multi(&ring));
         let messages: [&[u8]; 3] = [b"bundle-a", b"bundle-b", b"bundle-c"];
         for message in messages {
-            s1.send(Bytes::copy_from_slice(message)).await.0?;
+            s1.send(Bytes::copy_from_slice(message)).await.drop_buf()?;
             let bundle = match recv.next().await.expect("multishot stream ended") {
                 Ok(bundle) => bundle,
                 Err(err) if util::recv_bundle_unsupported(&err) => return Ok(()),
@@ -836,7 +844,7 @@ fn connected_recv_bundle_multi_preserves_empty_datagrams() -> Result<(), Box<dyn
         s2.connect(s1.local_addr()?).await?;
 
         let mut recv = pin!(s2.recv_bundle_multi(&ring));
-        assert_eq!(s1.send(Bytes::new()).await.0?, 0);
+        assert_eq!(s1.send(Bytes::new()).await.drop_buf()?, 0);
         let empty = match recv.next().await.expect("empty datagram ended stream") {
             Ok(bundle) => bundle,
             Err(err) if util::recv_bundle_unsupported(&err) => return Ok(()),
@@ -845,7 +853,9 @@ fn connected_recv_bundle_multi_preserves_empty_datagrams() -> Result<(), Box<dyn
         assert!(empty.is_empty());
         assert_eq!(empty.buffer_count(), 0);
 
-        s1.send(Bytes::from_static(b"after-empty")).await.0?;
+        s1.send(Bytes::from_static(b"after-empty"))
+            .await
+            .drop_buf()?;
         let following = recv.next().await.expect("multishot stream ended")?;
         assert_eq!(flatten_bundle(&following), b"after-empty");
         Ok(())
@@ -874,8 +884,7 @@ impl UdpEchoServer {
         loop {
             let (buf, origin) = self.socket.recv_from_ring(&bufring).await?;
             let buf = Bytes::copy_from_slice(&buf[..]);
-            let (res, _) = self.socket.send_to(buf, origin).await;
-            res?;
+            self.socket.send_to(buf, origin).await.drop_buf()?;
         }
     }
 }
@@ -895,8 +904,8 @@ fn echo_server_1k_requests() -> Result<(), Box<dyn std::error::Error>> {
         for i in 0..1024 {
             let payload = format!("hello-{}", i);
             let payload = payload.as_bytes().to_vec();
-            s1.send_to(payload.clone(), addr).await.0?;
-            let (res, buf) = s1.recv_from(BytesMut::with_capacity(1024)).await;
+            s1.send_to(payload.clone(), addr).await.drop_buf()?;
+            let BufResult(res, buf) = s1.recv_from(BytesMut::with_capacity(1024)).await;
             res?;
             assert_eq!(payload, buf)
         }
@@ -922,16 +931,22 @@ fn buffer_exhaustion() -> Result<(), Box<dyn std::error::Error>> {
             .build()?;
 
         let s1 = UdpSocket::bind("0.0.0.0:0".parse()?).await?;
-        s1.send_to(Bytes::from_static(b"hello"), addr).await.0?;
+        s1.send_to(Bytes::from_static(b"hello"), addr)
+            .await
+            .drop_buf()?;
         let b1 = s1.recv_from_ring(&bufring).await?;
-        s1.send_to(Bytes::from_static(b"hello"), addr).await.0?;
+        s1.send_to(Bytes::from_static(b"hello"), addr)
+            .await
+            .drop_buf()?;
         let _b2 = s1.recv_from_ring(&bufring).await?;
 
         // The third recv should fail with an error
         let res = s1.recv_from_ring(&bufring).await;
         assert!(res.is_err());
 
-        s1.send_to(Bytes::from_static(b"hello"), addr).await.0?;
+        s1.send_to(Bytes::from_static(b"hello"), addr)
+            .await
+            .drop_buf()?;
         // Dropping the buffers should allow the third recv to succeed
         drop(b1);
         s1.recv_from_ring(&bufring).await?;
@@ -979,8 +994,7 @@ fn poll_readiness_smoke() -> Result<(), Box<dyn std::error::Error>> {
         let readable = s2.poll_readiness(libc::POLLIN as u32).await?;
         assert!(readable.is_readable());
 
-        let (res, _) = s2.recv_from(BytesMut::with_capacity(16)).await;
-        res?;
+        s2.recv_from(BytesMut::with_capacity(16)).await.drop_buf()?;
 
         s1.send_to(Bytes::from_static(b"y"), s2.local_addr()?)
             .await
@@ -992,8 +1006,7 @@ fn poll_readiness_smoke() -> Result<(), Box<dyn std::error::Error>> {
             .expect("multishot readiness stream ended")?;
         assert!(readable.is_readable());
 
-        let (res, _) = s2.recv_from(BytesMut::with_capacity(16)).await;
-        res?;
+        s2.recv_from(BytesMut::with_capacity(16)).await.drop_buf()?;
         Ok(())
     })
 }
@@ -1036,8 +1049,10 @@ fn readiness_stream_survives_a_full_completion_queue() -> Result<(), Box<dyn std
                 .unwrap_or_else(|| panic!("readiness stream ended in round {round}"))?;
             assert!(event.is_readable());
             for _ in 0..4 {
-                let (received, _) = receiver.recv_from(BytesMut::with_capacity(8)).await;
-                received?;
+                receiver
+                    .recv_from(BytesMut::with_capacity(8))
+                    .await
+                    .drop_buf()?;
             }
         }
         Ok::<_, Box<dyn std::error::Error>>(())

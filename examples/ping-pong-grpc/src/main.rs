@@ -170,8 +170,7 @@ mod linux {
 
         let write_buf = payload.as_bytes().to_vec();
         let expected_len = write_buf.len();
-        let (write_res, _) = file.write_at(write_buf, 0).await;
-        let bytes_written = write_res?;
+        let (bytes_written, _) = file.write_at(write_buf, 0).await.buf_ok()?;
         if bytes_written != expected_len {
             return Err(io::Error::new(
                 io::ErrorKind::WriteZero,
@@ -181,8 +180,7 @@ mod linux {
 
         file.sync().await?;
 
-        let (read_res, read_buf) = file.read_at(vec![0_u8; expected_len], 0).await;
-        let bytes_read = read_res?;
+        let (bytes_read, read_buf) = file.read_at(vec![0_u8; expected_len], 0).await.buf_ok()?;
         if bytes_read != expected_len {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,

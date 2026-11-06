@@ -3,6 +3,7 @@
 //! Descriptors returned by opens and accepts belong to the driver that
 //! submitted the operation, not to the context that finishes the future.
 
+use norn_uring::BufResult;
 use std::future::{poll_fn, Future};
 use std::io::{Read, Write};
 use std::pin::{pin, Pin};
@@ -47,7 +48,8 @@ fn open_finished_outside_driver_context_returns_usable_file() {
     let file = finish_outside_context(&mut executor, File::open(path.clone())).unwrap();
 
     // Back inside the same driver's context, using the file must not panic.
-    let (result, buf) = executor.block_on(async { file.read_at(Vec::with_capacity(4), 0).await });
+    let BufResult(result, buf) =
+        executor.block_on(async { file.read_at(Vec::with_capacity(4), 0).await });
     assert_eq!(result.unwrap(), 4);
     assert_eq!(buf, b"norn");
     std::fs::remove_file(&path).unwrap();
@@ -74,10 +76,10 @@ fn accept_finished_outside_driver_context_returns_usable_socket() {
 
     // Back inside the driver's context, using the socket must not panic.
     executor.block_on(async {
-        let (result, buf) = socket.recv(Vec::with_capacity(4)).await;
+        let BufResult(result, buf) = socket.recv(Vec::with_capacity(4)).await;
         assert_eq!(result.unwrap(), 4);
         assert_eq!(buf, b"norn");
-        let (result, _) = socket.send(b"ok".to_vec()).await;
+        let BufResult(result, _) = socket.send(b"ok".to_vec()).await;
         assert_eq!(result.unwrap(), 2);
         socket.close().await.unwrap();
     });
@@ -110,10 +112,10 @@ fn incoming_connection_finished_outside_driver_context_returns_usable_socket() {
     .unwrap();
 
     executor.block_on(async {
-        let (result, buf) = socket.recv(Vec::with_capacity(4)).await;
+        let BufResult(result, buf) = socket.recv(Vec::with_capacity(4)).await;
         assert_eq!(result.unwrap(), 4);
         assert_eq!(buf, b"norn");
-        let (result, _) = socket.send(b"ok".to_vec()).await;
+        let BufResult(result, _) = socket.send(b"ok".to_vec()).await;
         assert_eq!(result.unwrap(), 2);
         socket.close().await.unwrap();
     });

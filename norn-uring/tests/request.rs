@@ -1,5 +1,6 @@
 #![cfg(target_os = "linux")]
 
+use norn_uring::BufResult;
 use std::cell::Cell;
 use std::rc::Rc;
 use std::time::Duration;
@@ -19,7 +20,7 @@ fn linked_file_write_then_read_observes_prior_write() -> Result<(), Box<dyn std:
         opts.create(true).truncate(true).read(true).write(true);
 
         let file = opts.open(path).await?;
-        let ((write_res, _), (read_res, buf)) = file
+        let (BufResult(write_res, _), BufResult(read_res, buf)) = file
             .write_at(&b"hello"[..], 0)
             .then(file.read_at(vec![0; 5], 0))
             .await;
@@ -42,13 +43,13 @@ fn then_always_runs_after_a_failed_file_write() -> Result<(), Box<dyn std::error
         let mut opts = fs::OpenOptions::new();
         opts.create(true).truncate(true).write(true);
         let file = opts.open(&path).await?;
-        file.write_at(&b"hello"[..], 0).await.0?;
+        file.write_at(&b"hello"[..], 0).await.drop_buf()?;
         file.close().await?;
 
         // A write to a read-only file fails. The hard-linked read runs anyway,
         // while a soft-linked one is cancelled.
         let file = fs::OpenOptions::new().read(true).open(&path).await?;
-        let ((write_res, _), (read_res, buf)) = file
+        let (BufResult(write_res, _), BufResult(read_res, buf)) = file
             .write_at(&b"x"[..], 0)
             .then_always(file.read_at(vec![0; 5], 0))
             .await;
@@ -56,7 +57,7 @@ fn then_always_runs_after_a_failed_file_write() -> Result<(), Box<dyn std::error
         let n = read_res?;
         assert_eq!(&buf[..n], b"hello");
 
-        let ((write_res, _), (read_res, _)) = file
+        let (BufResult(write_res, _), BufResult(read_res, _)) = file
             .write_at(&b"x"[..], 0)
             .then(file.read_at(vec![0; 5], 0))
             .await;
@@ -80,16 +81,15 @@ fn then_aux_preserves_primary_result_for_real_file_ops() -> Result<(), Box<dyn s
         let payload = &b"persisted"[..];
         let aux_ran = Rc::new(Cell::new(false));
         let aux_seen = Rc::clone(&aux_ran);
-        let (write_res, returned) = file
+        let BufResult(write_res, returned) = file
             .write_at(payload, 0)
-            .then_aux(
-                file.read_at(vec![0; payload.len()], 0)
-                    .map(move |(read_res, buf)| {
-                        let n = read_res.expect("auxiliary read should succeed");
-                        assert_eq!(&buf[..n], b"persisted");
-                        aux_seen.set(true);
-                    }),
-            )
+            .then_aux(file.read_at(vec![0; payload.len()], 0).map(
+                move |BufResult(read_res, buf)| {
+                    let n = read_res.expect("auxiliary read should succeed");
+                    assert_eq!(&buf[..n], b"persisted");
+                    aux_seen.set(true);
+                },
+            ))
             .await;
 
         assert_eq!(write_res?, returned.len());
@@ -108,11 +108,11 @@ fn map_transforms_real_file_op_output() -> Result<(), Box<dyn std::error::Error>
         opts.create(true).truncate(true).read(true).write(true);
 
         let file = opts.open(path).await?;
-        file.write_at(&b"mapped"[..], 0).await.0?;
+        file.write_at(&b"mapped"[..], 0).await.drop_buf()?;
 
         let payload = file
             .read_at(vec![0; 16], 0)
-            .map(|(read_res, buf)| {
+            .map(|BufResult(read_res, buf)| {
                 let n = read_res.expect("read should succeed");
                 buf[..n].to_vec()
             })
@@ -134,7 +134,7 @@ fn linked_tcp_send_then_recv_round_trip() -> Result<(), Box<dyn std::error::Erro
             let (server, peer) = listener.accept().await?;
             listener.close().await?;
 
-            let ((recv_res, buf), (send_res, _)) = server
+            let (BufResult(recv_res, buf), BufResult(send_res, _)) = server
                 .recv(vec![0; 4])
                 .then(server.send(&b"pong"[..]))
                 .await;
@@ -150,7 +150,7 @@ fn linked_tcp_send_then_recv_round_trip() -> Result<(), Box<dyn std::error::Erro
         });
 
         let client = TcpSocket::connect(addr).await?;
-        let ((send_res, _), (recv_res, buf)) = client
+        let (BufResult(send_res, _), BufResult(recv_res, buf)) = client
             .send(&b"ping"[..])
             .then(client.recv(vec![0; 4]))
             .await;
@@ -178,7 +178,7 @@ fn linked_timeout_cancels_blocked_recv() -> Result<(), Box<dyn std::error::Error
         });
 
         let client = TcpSocket::connect(addr).await?;
-        let (recv_res, buf) = client
+        let BufResult(recv_res, buf) = client
             .recv(vec![0; 1])
             .timeout(Duration::from_millis(10))
             .await;
@@ -252,7 +252,7 @@ fn linked_timeout_can_be_reset_after_submission() -> Result<(), Box<dyn std::err
 
         norn_uring::noop().await.unwrap();
         assert!(control.reset(Duration::from_millis(5)).await?);
-        let (recv_res, buf) = waiter.await?;
+        let BufResult(recv_res, buf) = waiter.await?;
         assert_eq!(recv_res.unwrap_err().raw_os_error(), Some(libc::ECANCELED));
         assert_eq!(buf.len(), 1);
         assert!(!control.reset(Duration::from_secs(1)).await?);

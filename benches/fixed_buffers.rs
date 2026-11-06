@@ -1,5 +1,6 @@
 #![cfg(target_os = "linux")]
 
+use norn_uring::BufResult;
 use std::borrow::Cow;
 use std::fs::File as StdFile;
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -446,7 +447,7 @@ async fn ordinary_read<const N: usize>(
     buffer: AlignedBuf<N>,
     operation: usize,
 ) -> (usize, io::Result<usize>, AlignedBuf<N>) {
-    let (result, buffer) = file.read_at(buffer, offset::<N>(operation)).await;
+    let BufResult(result, buffer) = file.read_at(buffer, offset::<N>(operation)).await;
     (operation, result, buffer)
 }
 
@@ -455,7 +456,7 @@ async fn ordinary_write<const N: usize>(
     buffer: AlignedBuf<N>,
     operation: usize,
 ) -> (usize, io::Result<usize>, AlignedBuf<N>) {
-    let (result, buffer) = file.write_at(buffer, offset::<N>(operation)).await;
+    let BufResult(result, buffer) = file.write_at(buffer, offset::<N>(operation)).await;
     (operation, result, buffer)
 }
 
@@ -464,7 +465,7 @@ async fn fixed_read<const N: usize>(
     buffer: FixedBuf<AlignedBuf<N>>,
     operation: usize,
 ) -> (usize, io::Result<usize>, FixedBuf<AlignedBuf<N>>) {
-    let (result, buffer) = file.read_fixed_at(buffer, offset::<N>(operation)).await;
+    let BufResult(result, buffer) = file.read_fixed_at(buffer, offset::<N>(operation)).await;
     (operation, result, buffer)
 }
 
@@ -473,7 +474,7 @@ async fn fixed_write<const N: usize>(
     buffer: FixedBuf<AlignedBuf<N>>,
     operation: usize,
 ) -> (usize, io::Result<usize>, FixedBuf<AlignedBuf<N>>) {
-    let (result, buffer) = file.write_fixed_at(buffer, offset::<N>(operation)).await;
+    let BufResult(result, buffer) = file.write_fixed_at(buffer, offset::<N>(operation)).await;
     (operation, result, buffer)
 }
 

@@ -1,5 +1,6 @@
 #![cfg(target_os = "linux")]
 
+use norn_uring::BufResult;
 use std::future::poll_fn;
 use std::io;
 use std::net::SocketAddr;
@@ -28,22 +29,22 @@ fn recv_and_send_options_apply_to_one_request() -> Result<(), Box<dyn std::error
 
         // `more` holds back the partial segment until a send without it.
         let more = SendOptions::new().more(true);
-        client.send(&b"hel"[..]).options(more).await.0?;
-        client.send(&b"lo"[..]).await.0?;
+        client.send(&b"hel"[..]).options(more).await.drop_buf()?;
+        client.send(&b"lo"[..]).await.drop_buf()?;
 
         let peek = RecvOptions::new().peek(true).wait_all(true);
-        let (result, buf) = server.recv(vec![0u8; 5]).options(peek).await;
+        let BufResult(result, buf) = server.recv(vec![0u8; 5]).options(peek).await;
         assert_eq!(result?, 5);
         assert_eq!(buf, b"hello");
 
         // The peeked bytes are still queued for a receive without options.
-        let (result, buf) = server.recv(vec![0u8; 5]).await;
+        let BufResult(result, buf) = server.recv(vec![0u8; 5]).await;
         assert_eq!(result?, 5);
         assert_eq!(buf, b"hello");
 
         // Options compose with request combinators.
-        client.send(&b"world"[..]).await.0?;
-        let (result, buf) = server
+        client.send(&b"world"[..]).await.drop_buf()?;
+        let BufResult(result, buf) = server
             .recv(vec![0u8; 5])
             .options(RecvOptions::new().wait_all(true))
             .timeout(std::time::Duration::from_secs(5))
@@ -78,7 +79,7 @@ fn msg_trunc_is_rejected_without_modifying_buffers_or_consuming_input(
                 };
                 let ptr = buf.as_ptr();
                 let capacity = buf.capacity();
-                let (result, buf) = server.recv(buf).options(opts).await;
+                let BufResult(result, buf) = server.recv(buf).options(opts).await;
                 assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
                 assert_eq!(buf.as_ptr(), ptr);
                 assert_eq!(buf.capacity(), capacity);
@@ -90,7 +91,7 @@ fn msg_trunc_is_rejected_without_modifying_buffers_or_consuming_input(
                         Vec::new()
                     }
                 );
-                let (result, buf) = server
+                let BufResult(result, buf) = server
                     .recv(buf)
                     .options(RecvOptions::new().wait_all(true))
                     .await;
@@ -104,12 +105,12 @@ fn msg_trunc_is_rejected_without_modifying_buffers_or_consuming_input(
                 }
                 let ptr = buf.as_ptr();
                 let capacity = buf.capacity();
-                let (result, buf) = server.recv(buf).options(opts).await;
+                let BufResult(result, buf) = server.recv(buf).options(opts).await;
                 assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
                 assert_eq!(buf.as_ptr(), ptr);
                 assert_eq!(buf.capacity(), capacity);
                 assert_eq!(&buf[..], if initialized { &[0xa5; 5][..] } else { &[][..] });
-                let (result, buf) = server
+                let BufResult(result, buf) = server
                     .recv(buf)
                     .options(RecvOptions::new().wait_all(true))
                     .await;
@@ -293,9 +294,8 @@ fn tcp_socket_round_trips_through_uring_fd() -> Result<(), Box<dyn std::error::E
         let server = TcpSocket::from_uring_fd(server.into_uring_fd());
 
         let payload = b"round-trip".to_vec();
-        client.send(payload).await.0?;
-        let (result, buffer) = server.recv(BytesMut::with_capacity(16)).await;
-        let length = result?;
+        client.send(payload).await.drop_buf()?;
+        let (length, buffer) = server.recv(BytesMut::with_capacity(16)).await.buf_ok()?;
         assert_eq!(&buffer[..length], b"round-trip");
 
         server.close().await?;
@@ -309,7 +309,7 @@ fn tcp_socket_round_trips_through_uring_fd() -> Result<(), Box<dyn std::error::E
 fn send_zc_rejects_buffers_larger_than_u32_max() -> Result<(), Box<dyn std::error::Error>> {
     util::with_test_env(|| async {
         let (server, client) = connected_pair().await?;
-        let (result, buffer) = server.send_zc(OversizedBuf(u32::MAX as usize + 1)).await;
+        let BufResult(result, buffer) = server.send_zc(OversizedBuf(u32::MAX as usize + 1)).await;
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
         assert_eq!(buffer.0, u32::MAX as usize + 1);
 
@@ -330,9 +330,8 @@ fn close_rejects_unpolled_operation_without_invalidating_it(
         assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
 
         let payload = b"still-open".to_vec();
-        client.send(payload).await.0?;
-        let (res, buf) = recv.await;
-        let len = res?;
+        client.send(payload).await.drop_buf()?;
+        let (len, buf) = recv.await.buf_ok()?;
         assert_eq!(&buf[..len], b"still-open");
 
         client.close().await?;
@@ -353,9 +352,8 @@ fn close_rejects_queued_operation_without_invalidating_it() -> Result<(), Box<dy
         assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
 
         let payload = b"still-open".to_vec();
-        client.send(payload).await.0?;
-        let (res, buf) = recv.await;
-        let len = res?;
+        client.send(payload).await.drop_buf()?;
+        let (len, buf) = recv.await.buf_ok()?;
         assert_eq!(&buf[..len], b"still-open");
 
         client.close().await?;
@@ -379,9 +377,8 @@ fn close_rejects_submitted_operation_without_invalidating_it(
         assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
 
         let payload = b"still-open".to_vec();
-        client.send(payload).await.0?;
-        let (res, buf) = recv_task.await?;
-        let len = res?;
+        client.send(payload).await.drop_buf()?;
+        let (len, buf) = recv_task.await?.buf_ok()?;
         assert_eq!(&buf[..len], b"still-open");
 
         client.close().await?;
@@ -431,7 +428,7 @@ fn recv_ring_receives_payload_from_connected_peer() -> Result<(), Box<dyn std::e
 
         let ring = RecvBufRing::builder(7).buf_cnt(16).buf_len(1024).build()?;
         let payload = b"hello".to_vec();
-        let (send_res, payload) = client.send(payload).await;
+        let BufResult(send_res, payload) = client.send(payload).await;
         assert_eq!(send_res?, payload.len());
 
         let buf = server.recv_ring(&ring).await?;
@@ -451,16 +448,18 @@ fn recv_ring_buf_can_be_echoed_directly() -> Result<(), Box<dyn std::error::Erro
         let ring = RecvBufRing::builder(8).buf_cnt(1).buf_len(1024).build()?;
         let payload = b"direct-tcp-echo".to_vec();
 
-        client.send(payload.clone()).await.0?;
+        client.send(payload.clone()).await.drop_buf()?;
         let buf = server.recv_ring(&ring).await?;
         assert_eq!(buf.as_slice(), payload.as_slice());
 
-        let (send_result, buf) = server.send(buf).await;
+        let BufResult(send_result, buf) = server.send(buf).await;
         assert_eq!(send_result?, payload.len());
         drop(buf);
 
-        let (recv_result, reply) = client.recv(BytesMut::with_capacity(payload.len())).await;
-        let reply_len = recv_result?;
+        let (reply_len, reply) = client
+            .recv(BytesMut::with_capacity(payload.len()))
+            .await
+            .buf_ok()?;
         assert_eq!(&reply[..reply_len], payload.as_slice());
 
         server.close().await?;
@@ -583,10 +582,10 @@ fn recv_ring_buf_can_be_echoed_with_send_zc() -> Result<(), Box<dyn std::error::
         }
 
         let payload = b"direct-tcp-zc-echo".to_vec();
-        client.send(payload.clone()).await.0?;
+        client.send(payload.clone()).await.drop_buf()?;
         let buf = server.recv_ring(&ring).await?;
 
-        let (send_result, buf) = server.send_zc(buf).await;
+        let BufResult(send_result, buf) = server.send_zc(buf).await;
         let sent = match send_result {
             Ok(sent) => sent,
             Err(err) => {
@@ -603,8 +602,10 @@ fn recv_ring_buf_can_be_echoed_with_send_zc() -> Result<(), Box<dyn std::error::
         assert_ne!(sent.usage(), SendZcUsage::Unknown);
         drop(buf);
 
-        let (recv_result, reply) = client.recv(BytesMut::with_capacity(payload.len())).await;
-        let reply_len = recv_result?;
+        let (reply_len, reply) = client
+            .recv(BytesMut::with_capacity(payload.len()))
+            .await
+            .buf_ok()?;
         assert_eq!(&reply[..reply_len], payload.as_slice());
 
         server.close().await?;
@@ -628,7 +629,7 @@ fn recv_bundle_recycles_compact_and_materialized_buffers() -> Result<(), Box<dyn
         // compact representation's sparse fallback.
         for (round, materialize_in_reverse) in [true, false, false].into_iter().enumerate() {
             let payload = vec![0x5A + round as u8; 4_096];
-            let (send_result, payload) = client.send(payload).await;
+            let BufResult(send_result, payload) = client.send(payload).await;
             assert_eq!(send_result?, payload.len());
 
             let mut received = Vec::with_capacity(payload.len());
@@ -681,8 +682,8 @@ fn recv_bundle_shared_ring_handles_reverse_poll_order() -> Result<(), Box<dyn st
         assert!(futures_util::poll!(&mut first_recv).is_pending());
         assert!(futures_util::poll!(&mut second_recv).is_pending());
 
-        first_client.send(b"first".to_vec()).await.0?;
-        second_client.send(b"second".to_vec()).await.0?;
+        first_client.send(b"first".to_vec()).await.drop_buf()?;
+        second_client.send(b"second".to_vec()).await.drop_buf()?;
 
         // Poll the receive futures in the opposite order from submission.
         // Reaping must reconcile ownership before either future is polled.
@@ -731,8 +732,8 @@ fn recv_bundle_multishot_shared_ring_handles_reverse_poll_order(
         })
         .await;
 
-        first_client.send(b"first".to_vec()).await.0?;
-        second_client.send(b"second".to_vec()).await.0?;
+        first_client.send(b"first".to_vec()).await.drop_buf()?;
+        second_client.send(b"second".to_vec()).await.drop_buf()?;
 
         let second = match second_recv.next().await.expect("multishot stream ended") {
             Ok(bundle) => bundle,
@@ -770,7 +771,7 @@ fn send_zc_smoke() -> Result<(), Box<dyn std::error::Error>> {
         let expected_len = payload.len();
         let recv_task =
             spawn(async move { server.recv(BytesMut::with_capacity(expected_len)).await });
-        let (send_res, sent_buf) = client.send_zc(payload).await;
+        let BufResult(send_res, sent_buf) = client.send_zc(payload).await;
         let sent = match send_res {
             Ok(sent) => sent,
             Err(err) => {
@@ -784,8 +785,7 @@ fn send_zc_smoke() -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(sent.bytes_sent(), sent_buf.len());
         assert_ne!(sent.usage(), SendZcUsage::Unknown);
 
-        let (recv_res, recv_buf) = recv_task.await?;
-        let recv_n = recv_res?;
+        let (recv_n, recv_buf) = recv_task.await?.buf_ok()?;
         assert_eq!(&recv_buf[..recv_n], sent_buf.as_slice());
 
         client.close().await?;
@@ -809,7 +809,7 @@ fn send_msg_zc_smoke() -> Result<(), Box<dyn std::error::Error>> {
         let expected_len = payload.len();
         let recv_task =
             spawn(async move { server.recv(BytesMut::with_capacity(expected_len)).await });
-        let (send_res, sent_buf) = client.send_msg_zc(payload).await;
+        let BufResult(send_res, sent_buf) = client.send_msg_zc(payload).await;
         let sent = match send_res {
             Ok(sent) => sent,
             Err(err) => {
@@ -823,8 +823,7 @@ fn send_msg_zc_smoke() -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(sent.bytes_sent(), sent_buf.len());
         assert_ne!(sent.usage(), SendZcUsage::Unknown);
 
-        let (recv_res, recv_buf) = recv_task.await?;
-        let recv_n = recv_res?;
+        let (recv_n, recv_buf) = recv_task.await?.buf_ok()?;
         assert_eq!(&recv_buf[..recv_n], sent_buf.as_slice());
 
         client.close().await?;

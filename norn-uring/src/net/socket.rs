@@ -2,6 +2,7 @@
 //!
 //! [Socket] is the core socket type
 //! used by TCP, UDP and Unix domain sockets
+use crate::BufResult;
 use io_uring::opcode;
 use io_uring::squeue::Flags;
 use libc::{SOCK_CLOEXEC, SOCK_NONBLOCK};
@@ -1065,7 +1066,7 @@ where
     B: StableBufMut + 'static,
     K: AddrKind,
 {
-    type Output = (io::Result<(usize, K::Addr)>, B);
+    type Output = BufResult<(usize, K::Addr), B>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> TaskPoll<Self::Output> {
         let state = &mut self.get_mut().state;
@@ -1079,7 +1080,7 @@ where
                 unreachable!()
             };
             if let Some(result) = socket.try_recv_from::<K, B>(&mut buf, flags) {
-                return TaskPoll::Ready((result, buf));
+                return TaskPoll::Ready(BufResult(result, buf));
             }
             let op = RecvFrom::<B, K>::new(socket.fd.lease(), buf, flags as u32);
             *state = TryFirst::Submitted(socket.fd.submit(op));
@@ -1115,7 +1116,7 @@ where
     B: StableBuf + 'static,
     A: DestAddr,
 {
-    type Output = (io::Result<usize>, B);
+    type Output = BufResult<usize, B>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> TaskPoll<Self::Output> {
         let this = self.get_mut();
@@ -1128,8 +1129,8 @@ where
                 .addr
                 .with_sockaddr(|addr| socket.try_send_to(&buf, addr, flags))
             {
-                Ok(Some(result)) => return TaskPoll::Ready((result, buf)),
-                Err(err) => return TaskPoll::Ready((Err(err), buf)),
+                Ok(Some(result)) => return TaskPoll::Ready(BufResult(result, buf)),
+                Err(err) => return TaskPoll::Ready(BufResult(Err(err), buf)),
                 Ok(None) => {}
             }
             let addr = Some(this.addr.to_sockaddr());
@@ -1234,10 +1235,10 @@ impl<B> Singleshot for SendTo<B>
 where
     B: StableBuf,
 {
-    type Output = (io::Result<usize>, B);
+    type Output = BufResult<usize, B>;
 
     fn complete(self, result: crate::operation::CQEResult) -> Self::Output {
-        (result.result.map(|v| v as usize), self.buf)
+        BufResult(result.result.map(|v| v as usize), self.buf)
     }
 }
 
@@ -1322,7 +1323,7 @@ where
     B: StableBufMut,
     K: AddrKind,
 {
-    type Output = (io::Result<(usize, K::Addr)>, B);
+    type Output = BufResult<(usize, K::Addr), B>;
 
     fn complete(self, result: crate::operation::CQEResult) -> Self::Output {
         let mut this = self;
@@ -1334,7 +1335,7 @@ where
                 unsafe { this.addr.set_length(msg_namelen) };
                 let addr = match K::from_source(&this.addr) {
                     Ok(addr) => addr,
-                    Err(err) => return (Err(err), this.buf),
+                    Err(err) => return BufResult(Err(err), this.buf),
                 };
                 let mut buf = this.buf;
                 let reported_len = match complete_recv_buffer(
@@ -1344,11 +1345,11 @@ where
                     this.flags,
                 ) {
                     Ok(reported_len) => reported_len,
-                    Err(err) => return (Err(err), buf),
+                    Err(err) => return BufResult(Err(err), buf),
                 };
-                (Ok((reported_len, addr)), buf)
+                BufResult(Ok((reported_len, addr)), buf)
             }
-            Err(err) => (Err(err), this.buf),
+            Err(err) => BufResult(Err(err), this.buf),
         }
     }
 }
@@ -2310,7 +2311,7 @@ impl<B, const STREAM: bool> Singleshot for Recv<B, STREAM>
 where
     B: StableBufMut,
 {
-    type Output = (io::Result<usize>, B);
+    type Output = BufResult<usize, B>;
 
     fn complete(mut self, result: crate::operation::CQEResult) -> Self::Output {
         match result.result {
@@ -2321,9 +2322,9 @@ where
                     bytes_read as usize,
                     self.flags as u32,
                 );
-                (reported_len, self.buf)
+                BufResult(reported_len, self.buf)
             }
-            Err(err) => (Err(err), self.buf),
+            Err(err) => BufResult(Err(err), self.buf),
         }
     }
 }
@@ -2369,10 +2370,10 @@ impl<B> Singleshot for Send<B>
 where
     B: StableBuf,
 {
-    type Output = (io::Result<usize>, B);
+    type Output = BufResult<usize, B>;
 
     fn complete(self, result: crate::operation::CQEResult) -> Self::Output {
-        (result.result.map(|v| v as usize), self.buf)
+        BufResult(result.result.map(|v| v as usize), self.buf)
     }
 }
 
@@ -2499,7 +2500,7 @@ impl<B> Singleshot for SendZc<B>
 where
     B: StableBuf,
 {
-    type Output = (io::Result<SendZcResult>, B);
+    type Output = BufResult<SendZcResult, B>;
 
     fn update(&mut self, result: crate::operation::CQEResult) {
         update_send_zc_primary(&mut self.primary_result, result);
@@ -2507,7 +2508,7 @@ where
 
     fn complete(self, result: crate::operation::CQEResult) -> Self::Output {
         let this = self;
-        (
+        BufResult(
             complete_send_zc_result(this.primary_result, result),
             this.buf,
         )
@@ -2588,7 +2589,7 @@ impl<B> Singleshot for SendMsgZc<B>
 where
     B: StableBuf,
 {
-    type Output = (io::Result<SendZcResult>, B);
+    type Output = BufResult<SendZcResult, B>;
 
     fn update(&mut self, result: crate::operation::CQEResult) {
         update_send_zc_primary(&mut self.primary_result, result);
@@ -2596,7 +2597,7 @@ where
 
     fn complete(self, result: crate::operation::CQEResult) -> Self::Output {
         let this = self;
-        (
+        BufResult(
             complete_send_zc_result(this.primary_result, result),
             this.buf,
         )

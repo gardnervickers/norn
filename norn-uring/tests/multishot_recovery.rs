@@ -45,10 +45,10 @@ fn tcp_multishot_recovers_after_buffer_return() -> Result<(), Box<dyn std::error
         let (server, client) = tcp_pair().await?;
         let ring = RecvBufRing::builder(1).buf_cnt(1).buf_len(1024).build()?;
         let mut stream = Box::pin(server.recv_ring_multi(&ring));
-        client.send(b"first".to_vec()).await.0?;
+        client.send(b"first".to_vec()).await.drop_buf()?;
         let held = stream.next().await.unwrap()?;
         assert_eq!(&held[..], b"first");
-        client.send(b"second".to_vec()).await.0?;
+        client.send(b"second".to_vec()).await.drop_buf()?;
         let count = assert_waiting(stream.as_mut()).await;
         let wakes = count.get();
         assert_eq!(&held[..], b"first");
@@ -57,7 +57,7 @@ fn tcp_multishot_recovers_after_buffer_return() -> Result<(), Box<dyn std::error
         let next = stream.next().await.expect("stream ended on exhaustion")?;
         assert_eq!(&next[..], b"second");
         drop(next);
-        client.send(b"third".to_vec()).await.0?;
+        client.send(b"third".to_vec()).await.drop_buf()?;
         assert_eq!(&stream.next().await.unwrap()?[..], b"third");
         Ok(())
     })
@@ -69,10 +69,10 @@ fn tcp_bundle_recovers_after_buffer_return() -> Result<(), Box<dyn std::error::E
         let (server, client) = tcp_pair().await?;
         let ring = RecvBufRing::builder(1).buf_cnt(1).buf_len(1024).build()?;
         let mut stream = Box::pin(server.recv_bundle_multi(&ring));
-        client.send(b"first".to_vec()).await.0?;
+        client.send(b"first".to_vec()).await.drop_buf()?;
         let held = stream.next().await.unwrap()?;
         assert_eq!(held.len(), 5);
-        client.send(b"second".to_vec()).await.0?;
+        client.send(b"second".to_vec()).await.drop_buf()?;
         let count = assert_waiting(stream.as_mut()).await;
         let wakes = count.get();
         drop(held);
@@ -119,9 +119,9 @@ fn udp_multishot_recovers_all_variants() -> Result<(), Box<dyn std::error::Error
                         .map(|r| r.map(|b| Box::new(b) as Box<dyn std::any::Any>)),
                 ),
             };
-            client.send(b"first".to_vec()).await.0?;
+            client.send(b"first".to_vec()).await.drop_buf()?;
             let held = stream.next().await.unwrap()?;
-            client.send(b"second".to_vec()).await.0?;
+            client.send(b"second".to_vec()).await.drop_buf()?;
             if early_return {
                 // Terminal ENOBUFS has been reaped, but the stream has not yet
                 // consumed it or registered its buffer-return waiter.
@@ -283,7 +283,7 @@ fn stalled_consumer_pauses_without_starving_its_ring() -> Result<(), Box<dyn std
         for index in 0..64_u8 {
             let segment = vec![index; 16];
             expected.extend_from_slice(&segment);
-            stalled_client.send(segment).await.0?;
+            stalled_client.send(segment).await.drop_buf()?;
             for _ in 0..4 {
                 norn_uring::noop().await?;
             }
@@ -292,7 +292,7 @@ fn stalled_consumer_pauses_without_starving_its_ring() -> Result<(), Box<dyn std
         let (server, client) = tcp_pair().await?;
         let mut stream = Box::pin(server.recv_ring_multi(&ring));
         for index in 0..64_u8 {
-            client.send(vec![index; 16]).await.0?;
+            client.send(vec![index; 16]).await.drop_buf()?;
             let received = next_within(&mut stream).await?;
             assert_eq!(&received[..], &[index; 16]);
         }
@@ -302,7 +302,7 @@ fn stalled_consumer_pauses_without_starving_its_ring() -> Result<(), Box<dyn std
             received.extend_from_slice(&next_within(&mut stalled).await?);
         }
         assert_eq!(received, expected);
-        stalled_client.send(b"after".to_vec()).await.0?;
+        stalled_client.send(b"after".to_vec()).await.drop_buf()?;
         assert_eq!(&next_within(&mut stalled).await?[..], b"after");
         Ok(())
     })

@@ -11,6 +11,7 @@
 //! [`UnixSocket::pair`], has an unnamed address. Names in the Linux abstract
 //! namespace are supported through
 //! [`SocketAddrExt`](std::os::linux::net::SocketAddrExt).
+use crate::BufResult;
 use std::future::Future;
 use std::io;
 use std::num::NonZeroUsize;
@@ -324,7 +325,7 @@ impl UnixSocket {
     /// Recv data into the given buffer.
     ///
     /// This takes ownership of the buffer, and returns a future which resolves
-    /// to a tuple of the original buffer and the number of bytes read. Zero
+    /// to a [`BufResult`](crate::BufResult) holding the number of bytes read and the buffer. Zero
     /// bytes read means the peer shut down its write half.
     ///
     /// Set per-operation [`RecvOptions`] with [`WithOptions::options`]. As on
@@ -333,21 +334,21 @@ impl UnixSocket {
     pub fn recv<B: StableBufMut>(
         &self,
         buf: B,
-    ) -> impl crate::Request<Output = (io::Result<usize>, B)> + WithOptions<RecvOptions> {
+    ) -> impl crate::Request<Output = BufResult<usize, B>> + WithOptions<RecvOptions> {
         self.socket.recv_stream(buf)
     }
 
     /// Send data from the given buffer.
     ///
     /// This takes ownership of the buffer, and returns a future which resolves
-    /// to a tuple of the original buffer and the number of bytes sent.
+    /// to a [`BufResult`](crate::BufResult) holding the number of bytes sent and the buffer.
     ///
     /// Set per-operation [`SendOptions`] with [`WithOptions::options`]. Unix
     /// stream sockets ignore [`SendOptions::more`].
     pub fn send<B: StableBuf>(
         &self,
         buf: B,
-    ) -> impl crate::Request<Output = (io::Result<usize>, B)> + WithOptions<SendOptions> {
+    ) -> impl crate::Request<Output = BufResult<usize, B>> + WithOptions<SendOptions> {
         self.socket.send(buf)
     }
 
@@ -640,7 +641,7 @@ impl UnixDatagram {
         &self,
         buf: B,
         path: impl AsRef<Path>,
-    ) -> impl Future<Output = (io::Result<usize>, B)> + WithOptions<SendOptions> + '_
+    ) -> impl Future<Output = BufResult<usize, B>> + WithOptions<SendOptions> + '_
     where
         B: StableBuf + 'static,
     {
@@ -656,7 +657,7 @@ impl UnixDatagram {
         &self,
         buf: B,
         addr: &SocketAddr,
-    ) -> impl Future<Output = (io::Result<usize>, B)> + WithOptions<SendOptions> + '_
+    ) -> impl Future<Output = BufResult<usize, B>> + WithOptions<SendOptions> + '_
     where
         B: StableBuf + 'static,
     {
@@ -670,7 +671,7 @@ impl UnixDatagram {
     pub fn send<B>(
         &self,
         buf: B,
-    ) -> impl crate::Request<Output = (io::Result<usize>, B)> + WithOptions<SendOptions>
+    ) -> impl crate::Request<Output = BufResult<usize, B>> + WithOptions<SendOptions>
     where
         B: StableBuf + 'static,
     {
@@ -690,7 +691,7 @@ impl UnixDatagram {
     pub fn recv_from<B>(
         &self,
         buf: B,
-    ) -> impl Future<Output = (io::Result<(usize, SocketAddr)>, B)> + WithOptions<RecvOptions> + '_
+    ) -> impl Future<Output = BufResult<(usize, SocketAddr), B>> + WithOptions<RecvOptions> + '_
     where
         B: StableBufMut + 'static,
     {
@@ -706,7 +707,7 @@ impl UnixDatagram {
     pub fn recv<B>(
         &self,
         buf: B,
-    ) -> impl crate::Request<Output = (io::Result<usize>, B)> + WithOptions<RecvOptions>
+    ) -> impl crate::Request<Output = BufResult<usize, B>> + WithOptions<RecvOptions>
     where
         B: StableBufMut + 'static,
     {

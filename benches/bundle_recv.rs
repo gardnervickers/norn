@@ -1,5 +1,6 @@
 #![cfg(target_os = "linux")]
 
+use norn_uring::BufResult;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::io;
 use std::pin::pin;
@@ -82,7 +83,7 @@ async fn receive_bundles(
         }
         assert_eq!(received_buffers, segments);
 
-        let (result, returned) = server.send(acknowledgements).await;
+        let BufResult(result, returned) = server.send(acknowledgements).await;
         acknowledgements = returned;
         assert_eq!(result?, 1);
     }
@@ -96,11 +97,11 @@ async fn send_requests(client: &TcpSocket, requests: usize, segments: usize) -> 
     let mut acknowledgement = Vec::with_capacity(1);
 
     for _ in 0..requests {
-        let (result, returned) = client.send(payload).await;
+        let BufResult(result, returned) = client.send(payload).await;
         payload = returned;
         assert_eq!(result?, payload_len);
 
-        let (result, returned) = client.recv(acknowledgement).await;
+        let BufResult(result, returned) = client.recv(acknowledgement).await;
         acknowledgement = returned;
         assert_eq!(result?, 1);
         assert_eq!(acknowledgement, [0xA5]);

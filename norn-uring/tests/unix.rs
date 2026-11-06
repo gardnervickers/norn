@@ -1,5 +1,6 @@
 #![cfg(target_os = "linux")]
 
+use norn_uring::BufResult;
 use std::io;
 use std::os::linux::net::SocketAddrExt;
 use std::os::unix::net::SocketAddr;
@@ -37,14 +38,14 @@ fn stream_connects_over_a_path() -> Result<(), Box<dyn std::error::Error>> {
         assert!(client.local_addr()?.is_unnamed());
         assert_eq!(client.peer_addr()?.as_pathname(), Some(path.as_path()));
 
-        let (res, _) = client.send(&b"ping"[..]).await;
+        let BufResult(res, _) = client.send(&b"ping"[..]).await;
         assert_eq!(res?, 4);
-        let (res, buf) = server.recv(vec![0u8; 4]).await;
+        let BufResult(res, buf) = server.recv(vec![0u8; 4]).await;
         assert_eq!(res?, 4);
         assert_eq!(buf, b"ping");
 
         client.shutdown(std::net::Shutdown::Write).await?;
-        let (res, _) = server.recv(vec![0u8; 4]).await;
+        let BufResult(res, _) = server.recv(vec![0u8; 4]).await;
         assert_eq!(res?, 0, "a shut-down peer reads as end of stream");
         Ok(())
     })
@@ -69,9 +70,9 @@ fn stream_connects_over_an_abstract_name() -> Result<(), Box<dyn std::error::Err
             name.as_abstract_name()
         );
 
-        let (res, _) = server.send(&b"pong"[..]).await;
+        let BufResult(res, _) = server.send(&b"pong"[..]).await;
         assert_eq!(res?, 4);
-        let (res, buf) = client.recv(vec![0u8; 4]).await;
+        let BufResult(res, buf) = client.recv(vec![0u8; 4]).await;
         assert_eq!(res?, 4);
         assert_eq!(buf, b"pong");
         Ok(())
@@ -93,12 +94,12 @@ fn unnamed_addresses_cannot_be_bound_or_connected_to() -> Result<(), Box<dyn std
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
 
         let socket = UnixDatagram::unbound().await?;
-        let (res, buf) = socket.send_to_addr(vec![1u8, 2, 3], &unnamed).await;
+        let BufResult(res, buf) = socket.send_to_addr(vec![1u8, 2, 3], &unnamed).await;
         assert_eq!(res.unwrap_err().kind(), io::ErrorKind::InvalidInput);
         assert_eq!(buf, [1, 2, 3], "a failed send returns its buffer");
 
         let long = Path::new("/").join("x".repeat(200));
-        let (res, buf) = socket.send_to(vec![4u8], &long).await;
+        let BufResult(res, buf) = socket.send_to(vec![4u8], &long).await;
         assert_eq!(res.unwrap_err().kind(), io::ErrorKind::InvalidInput);
         assert_eq!(buf, [4]);
         Ok(())
@@ -116,8 +117,7 @@ fn incoming_yields_each_connection() -> Result<(), Box<dyn std::error::Error>> {
             let name = name.clone();
             clients.push(spawn(async move {
                 let client = UnixSocket::connect_addr(&name).await?;
-                let (res, _) = client.send(vec![i]).await;
-                res?;
+                client.send(vec![i]).await.drop_buf()?;
                 io::Result::Ok(client)
             }));
         }
@@ -126,7 +126,7 @@ fn incoming_yields_each_connection() -> Result<(), Box<dyn std::error::Error>> {
         let mut seen = Vec::new();
         for _ in 0..3 {
             let server = incoming.next().await.expect("stream ended")?;
-            let (res, buf) = server.recv(vec![0u8; 1]).await;
+            let BufResult(res, buf) = server.recv(vec![0u8; 1]).await;
             assert_eq!(res?, 1);
             seen.push(buf[0]);
         }
@@ -143,22 +143,22 @@ fn incoming_yields_each_connection() -> Result<(), Box<dyn std::error::Error>> {
 fn stream_receive_options_apply_to_one_request() -> Result<(), Box<dyn std::error::Error>> {
     util::with_test_env(|| async {
         let (a, b) = UnixSocket::pair()?;
-        a.send(&b"hel"[..]).await.0?;
-        a.send(&b"lo"[..]).await.0?;
+        a.send(&b"hel"[..]).await.drop_buf()?;
+        a.send(&b"lo"[..]).await.drop_buf()?;
 
         let peek = RecvOptions::new().peek(true).wait_all(true);
-        let (res, buf) = b.recv(vec![0u8; 5]).options(peek).await;
+        let BufResult(res, buf) = b.recv(vec![0u8; 5]).options(peek).await;
         assert_eq!(res?, 5);
         assert_eq!(buf, b"hello");
 
         // A stream receive rejects `trunc` and returns the buffer untouched.
         let trunc = RecvOptions::new().trunc(true);
-        let (res, buf) = b.recv(vec![7u8; 5]).options(trunc).await;
+        let BufResult(res, buf) = b.recv(vec![7u8; 5]).options(trunc).await;
         assert_eq!(res.unwrap_err().kind(), io::ErrorKind::InvalidInput);
         assert_eq!(buf, [7; 5]);
 
         // The peeked bytes are still queued.
-        let (res, buf) = b.recv(vec![0u8; 5]).await;
+        let BufResult(res, buf) = b.recv(vec![0u8; 5]).await;
         assert_eq!(res?, 5);
         assert_eq!(buf, b"hello");
         Ok(())
@@ -242,17 +242,17 @@ fn datagrams_carry_their_source_address() -> Result<(), Box<dyn std::error::Erro
         );
 
         // Queued before the receive: the nonblocking fast path.
-        let (res, _) = client.send_to(&b"one"[..], &server_path).await;
+        let BufResult(res, _) = client.send_to(&b"one"[..], &server_path).await;
         assert_eq!(res?, 3);
-        let (res, buf) = server.recv_from(vec![0u8; 8]).await;
+        let BufResult(res, buf) = server.recv_from(vec![0u8; 8]).await;
         let (n, from) = res?;
         assert_eq!(&buf[..n], b"one");
         assert_eq!(from.as_pathname(), Some(client_path.as_path()));
 
         // A reply to the reported address.
-        let (res, _) = server.send_to_addr(&b"two"[..], &from).await;
+        let BufResult(res, _) = server.send_to_addr(&b"two"[..], &from).await;
         assert_eq!(res?, 3);
-        let (res, buf) = client.recv_from(vec![0u8; 8]).await;
+        let BufResult(res, buf) = client.recv_from(vec![0u8; 8]).await;
         let (n, from) = res?;
         assert_eq!(&buf[..n], b"two");
         assert_eq!(from.as_pathname(), Some(server_path.as_path()));
@@ -261,11 +261,11 @@ fn datagrams_carry_their_source_address() -> Result<(), Box<dyn std::error::Erro
         // queued when the receive starts.
         let unbound = UnixDatagram::unbound().await?;
         let recv = spawn(async move {
-            let (res, buf) = server.recv_from(vec![0u8; 8]).await;
+            let BufResult(res, buf) = server.recv_from(vec![0u8; 8]).await;
             res.map(|(n, from)| (buf[..n].to_vec(), from))
         });
         norn_uring::noop().await?;
-        let (res, _) = unbound.send_to(&b"three"[..], &server_path).await;
+        let BufResult(res, _) = unbound.send_to(&b"three"[..], &server_path).await;
         assert_eq!(res?, 5);
         let (data, from) = recv.await??;
         assert_eq!(data, b"three");
@@ -280,26 +280,26 @@ fn datagram_options_apply_to_one_request() -> Result<(), Box<dyn std::error::Err
         let (a, b) = UnixDatagram::pair()?;
         assert!(a.peer_addr()?.is_unnamed());
 
-        a.send(&b"datagram"[..]).await.0?;
+        a.send(&b"datagram"[..]).await.drop_buf()?;
 
         // A truncated receive reports the full length and leaves it queued
         // when peeking.
         let opts = RecvOptions::new().peek(true).trunc(true);
-        let (res, buf) = b.recv(vec![0u8; 4]).options(opts).await;
+        let BufResult(res, buf) = b.recv(vec![0u8; 4]).options(opts).await;
         assert_eq!(res?, 8);
         assert_eq!(buf, b"data");
 
-        let (res, buf) = b.recv_from(vec![0u8; 16]).options(RecvOptions::new()).await;
+        let BufResult(res, buf) = b.recv_from(vec![0u8; 16]).options(RecvOptions::new()).await;
         let (n, from) = res?;
         assert_eq!(&buf[..n], b"datagram");
         assert!(from.is_unnamed());
 
         // Each datagram keeps its boundary.
-        a.send(&b"x"[..]).await.0?;
-        a.send(&b"yz"[..]).await.0?;
-        let (res, _) = b.recv(vec![0u8; 16]).await;
+        a.send(&b"x"[..]).await.drop_buf()?;
+        a.send(&b"yz"[..]).await.drop_buf()?;
+        let BufResult(res, _) = b.recv(vec![0u8; 16]).await;
         assert_eq!(res?, 1);
-        let (res, _) = b.recv(vec![0u8; 16]).await;
+        let BufResult(res, _) = b.recv(vec![0u8; 16]).await;
         assert_eq!(res?, 2);
         Ok(())
     })
@@ -317,9 +317,9 @@ fn connected_datagrams_over_an_abstract_name() -> Result<(), Box<dyn std::error:
             name.as_abstract_name()
         );
 
-        let (res, _) = client.send(&b"hi"[..]).await;
+        let BufResult(res, _) = client.send(&b"hi"[..]).await;
         assert_eq!(res?, 2);
-        let (res, buf) = server.recv_from(vec![0u8; 4]).await;
+        let BufResult(res, buf) = server.recv_from(vec![0u8; 4]).await;
         let (n, from) = res?;
         assert_eq!(&buf[..n], b"hi");
         assert!(from.is_unnamed());
