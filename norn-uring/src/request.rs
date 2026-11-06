@@ -119,7 +119,10 @@ pub trait Request: Future + Sized + private::Chainable {
     ///
     /// # Panics
     ///
-    /// Panics if `self` and `next` target different drivers.
+    /// Panics if `self` and `next` target different drivers. The returned
+    /// request panics when the chain is submitted if `self` or `next`
+    /// contains an operation that was already submitted: polling an operation
+    /// submits it on its own, after which it can no longer be linked.
     fn then<R>(self, next: R) -> Then<Self, R>
     where
         R: Request,
@@ -134,6 +137,10 @@ pub trait Request: Future + Sized + private::Chainable {
     /// to close a descriptor after a write. `next` also runs if this request
     /// fails configuration. Both results are returned, as with
     /// [`Request::then`].
+    ///
+    /// Like [`Request::then`], the returned request panics when the chain is
+    /// submitted if `self` or `next` contains an operation that was already
+    /// submitted.
     ///
     /// Dropping the returned request cancels both requests, as it does for
     /// [`Request::then`]. Cancelling this request does not break a hard link,
@@ -183,7 +190,10 @@ pub trait Request: Future + Sized + private::Chainable {
     ///
     /// # Panics
     ///
-    /// Panics if `self` and `next` target different drivers.
+    /// Panics if `self` and `next` target different drivers. Like
+    /// [`Request::then`], the returned request panics when the chain is
+    /// submitted if `self` or `next` contains an operation that was already
+    /// submitted.
     fn then_aux<R>(self, next: R) -> ThenAux<Self, R>
     where
         R: Request,
@@ -213,6 +223,11 @@ pub trait Request: Future + Sized + private::Chainable {
     /// it against [`Handle::timeout`](crate::Handle::timeout) and drop the
     /// chain on expiry. Call [`WithTimeout::control`] before moving the
     /// future if the deadline may need to be reset while the request is active.
+    ///
+    /// # Panics
+    ///
+    /// The returned request panics when it is submitted if `self` contains an
+    /// operation that was already submitted, as with [`Request::then`].
     fn timeout(self, duration: Duration) -> WithTimeout<Self> {
         WithTimeout::new(self, duration)
     }
@@ -1370,6 +1385,40 @@ mod tests {
         });
 
         assert_eq!(output, 12);
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot link an operation that was already submitted")]
+    fn configure_failure_panics_on_an_already_submitted_next() {
+        let driver = crate::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let handle = driver.handle();
+        let mut ex = LocalExecutor::new(driver);
+        let waker = futures_util::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let _ = ex.block_on(async {
+            // Polling submits `next` on its own, so the failed configuration
+            // ahead of it can no longer cancel it.
+            let mut next = handle.submit(TaggedNop(2));
+            assert!(Pin::new(&mut next).poll(&mut cx).is_pending());
+            handle.submit(ConfigureFailed("x")).then(next).await
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot link an operation that was already submitted")]
+    fn timeout_panics_on_an_already_submitted_request() {
+        let driver = crate::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let handle = driver.handle();
+        let mut ex = LocalExecutor::new(driver);
+        let waker = futures_util::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let _ = ex.block_on(async {
+            let mut op = handle.submit(TaggedNop(2));
+            assert!(Pin::new(&mut op).poll(&mut cx).is_pending());
+            op.timeout(Duration::from_secs(1)).await
+        });
     }
 
     #[test]

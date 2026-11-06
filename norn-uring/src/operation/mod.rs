@@ -397,7 +397,27 @@ where
         }
     }
 
+    /// Panic unless the operation is still prepared.
+    ///
+    /// A linked batch can only hold operations it submits itself. One that was
+    /// polled first has already been submitted on its own, so the link could
+    /// not be honored.
+    fn assert_prepared_for_link(&self) {
+        assert!(
+            matches!(self, State::Prepared { .. }),
+            "cannot link an operation that was already submitted: polling an operation submits it \
+             on its own"
+        );
+    }
+
+    /// Configure a prepared operation into `batch`, and return whether requests
+    /// linked after it may be submitted.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the operation was already submitted.
     fn prepare_batch(&mut self, batch: &mut SmallVec<[ConfiguredEntry; 4]>) -> bool {
+        self.assert_prepared_for_link();
         match self.configure() {
             Some(entry) => {
                 batch.push(entry);
@@ -407,15 +427,18 @@ where
         }
     }
 
-    fn cancel_unsubmitted(&mut self) -> bool {
-        if !matches!(self, State::Prepared { .. }) {
-            return false;
-        }
+    /// Cancel a prepared operation without the kernel, because a request it
+    /// is soft-linked behind failed configuration.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the operation was already submitted.
+    fn cancel_unsubmitted(&mut self) {
+        self.assert_prepared_for_link();
         let State::Prepared { handle } = mem::replace(self, State::Done) else {
             unreachable!("operation state changed during cancellation");
         };
         Self::complete_synthetic(self, handle, io::Error::from_raw_os_error(libc::ECANCELED));
-        true
     }
 
     fn finish_submit(&mut self) {
@@ -514,7 +537,7 @@ where
 
     pub(crate) fn cancel_unsubmitted(mut self: Pin<&mut Self>) {
         let this = self.as_mut().project();
-        let _ = this.state.cancel_unsubmitted();
+        this.state.cancel_unsubmitted();
     }
 
     pub(crate) fn finish_submit(mut self: Pin<&mut Self>) {
