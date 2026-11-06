@@ -743,7 +743,8 @@ impl Handle {
     /// completion queue (`IORING_SQ_CQ_OVERFLOW`).
     ///
     /// The kernel keeps such completions on an overflow list and the driver's
-    /// next park posts them, which clears this flag again. An overflow is not
+    /// next park posts them as CQ space allows, and the flag clears once they
+    /// all fit. An overflow is not
     /// itself an error, but on a ring without `IORING_SETUP_DEFER_TASKRUN` the
     /// kernel may fail to allocate an overflow entry and drop the completion;
     /// see [`Driver::new`]. A ring sized for its workload never overflows, so
@@ -755,7 +756,8 @@ impl Handle {
     /// Returns how many completions the kernel has dropped because it could
     /// not allocate an overflow entry for them.
     ///
-    /// The count never decreases. A nonzero count means some operation's
+    /// This is the kernel's counter, which only increases (as a `u32`, so it
+    /// wraps after 2^32 drops). A nonzero count means some operation's
     /// completion was lost; see [`Driver::new`].
     pub fn cqes_dropped(&self) -> u32 {
         self.shared.ring.borrow_mut().completion().overflow()

@@ -198,6 +198,9 @@ impl ServerConfig {
 /// Completions one connection can have pending at once: its receive (a
 /// multishot receive's final completion, or an exact receive), a send, the
 /// lingering-close timeout, and a cancellation from a pause or a drop.
+/// A closed connection's slot is reused as soon as its task returns, while
+/// its close and cancellation completions may still be pending; those rely
+/// on the slack from rounding up to a power of two and `ring_entries`.
 const CQES_PER_CONNECTION: u64 = 4;
 
 /// Completions the listener's multishot accept can have pending: twice the
@@ -791,8 +794,15 @@ mod tests {
         const BURST_BUFFERS: usize = 1_024;
         const BURST: usize = BURST_BUFFERS * RECV_BUFFER_LEN;
 
-        // The server's default `--ring-entries`.
-        let driver = driver(256, &ServerConfig::default()).unwrap();
+        // The server's default `--ring-entries`. One connection keeps the
+        // per-connection term small, so the CQ is big enough only because it
+        // counts the receive ring's buffers (16384 entries with them, 512
+        // without).
+        let config = ServerConfig {
+            max_connections: 1,
+            ..ServerConfig::default()
+        };
+        let driver = driver(256, &config).unwrap();
         let mut executor = LocalExecutor::new(driver);
         executor.block_on(async {
             let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap(), 8)
