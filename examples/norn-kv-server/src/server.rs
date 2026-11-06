@@ -31,6 +31,47 @@ const LINGER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 /// Most input a failed connection discards before it is closed.
 const LINGER_MAX_BYTES: usize = 16 * 1024 * 1024;
 
+/// How the listener reacts to a failed accept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcceptRecovery {
+    /// A load condition: wait briefly, then accept again.
+    BackOff,
+    /// Concerns only the connection being accepted: accept again at once.
+    Skip,
+    /// Not recoverable: stop the listener.
+    Stop,
+}
+
+/// Classify the `errno` of a failed accept.
+///
+/// accept(2) documents that Linux passes the pending network errors of the new
+/// connection through accept and that they should be treated like `EAGAIN`:
+/// `ENETDOWN`, `EPROTO`, `ENOPROTOOPT`, `EHOSTDOWN`, `ENONET`, `EHOSTUNREACH`,
+/// `EOPNOTSUPP` and `ENETUNREACH`. `ECONNABORTED` is a connection that died
+/// before it was accepted, `EACCES` is a security module refusing one
+/// connection (accept(2): "Firewall rules forbid connection"), and `EPERM` and
+/// `EINTR` are likewise transient.
+fn classify_accept_error(errno: Option<i32>) -> AcceptRecovery {
+    match errno {
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM) => AcceptRecovery::BackOff,
+        Some(
+            libc::ECONNABORTED
+            | libc::EPROTO
+            | libc::EPERM
+            | libc::EINTR
+            | libc::EACCES
+            | libc::ENETDOWN
+            | libc::ENOPROTOOPT
+            | libc::EHOSTDOWN
+            | libc::ENONET
+            | libc::EHOSTUNREACH
+            | libc::EOPNOTSUPP
+            | libc::ENETUNREACH,
+        ) => AcceptRecovery::Skip,
+        _ => AcceptRecovery::Stop,
+    }
+}
+
 /// Decide whether an accept failure should stop the listener.
 ///
 /// Descriptor and memory exhaustion are load conditions: back off briefly so
@@ -38,16 +79,16 @@ const LINGER_MAX_BYTES: usize = 16 * 1024 * 1024;
 /// that concern only the connection being accepted are skipped. Anything else
 /// is returned to the caller.
 pub(crate) async fn recover_from_accept_error(error: io::Error) -> io::Result<()> {
-    match error.raw_os_error() {
-        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM) => {
+    match classify_accept_error(error.raw_os_error()) {
+        AcceptRecovery::BackOff => {
             eprintln!("accept failed: {error}; backing off");
             norn_uring::Handle::current()
                 .timeout(ACCEPT_BACKOFF)
                 .await?;
             Ok(())
         }
-        Some(libc::ECONNABORTED | libc::EPROTO | libc::EPERM | libc::EINTR) => Ok(()),
-        _ => Err(error),
+        AcceptRecovery::Skip => Ok(()),
+        AcceptRecovery::Stop => Err(error),
     }
 }
 
@@ -675,13 +716,61 @@ mod tests {
     };
 
     #[test]
+    fn accept_errors_are_classified() {
+        for errno in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
+            assert_eq!(
+                classify_accept_error(Some(errno)),
+                AcceptRecovery::BackOff,
+                "errno {errno}"
+            );
+        }
+        // accept(2)'s retry-like-EAGAIN list, plus the connection-local errors
+        // skipped before it, and EACCES from a security module.
+        for errno in [
+            libc::ENETDOWN,
+            libc::EPROTO,
+            libc::ENOPROTOOPT,
+            libc::EHOSTDOWN,
+            libc::ENONET,
+            libc::EHOSTUNREACH,
+            libc::EOPNOTSUPP,
+            libc::ENETUNREACH,
+            libc::ECONNABORTED,
+            libc::EPERM,
+            libc::EINTR,
+            libc::EACCES,
+        ] {
+            assert_eq!(
+                classify_accept_error(Some(errno)),
+                AcceptRecovery::Skip,
+                "errno {errno}"
+            );
+        }
+        for errno in [libc::EBADF, libc::EINVAL, libc::ENOTSOCK, libc::EFAULT] {
+            assert_eq!(
+                classify_accept_error(Some(errno)),
+                AcceptRecovery::Stop,
+                "errno {errno}"
+            );
+        }
+        assert_eq!(classify_accept_error(None), AcceptRecovery::Stop);
+    }
+
+    #[test]
     fn accept_errors_back_off_skip_or_stop_the_listener() {
         use norn_executor::LocalExecutor;
 
         let driver = norn_uring::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
         let mut executor = LocalExecutor::new(driver);
         executor.block_on(async {
-            for errno in [libc::EMFILE, libc::ENFILE, libc::ECONNABORTED, libc::EPROTO] {
+            for errno in [
+                libc::EMFILE,
+                libc::ENFILE,
+                libc::ECONNABORTED,
+                libc::EPROTO,
+                libc::ENETDOWN,
+                libc::EACCES,
+            ] {
                 recover_from_accept_error(io::Error::from_raw_os_error(errno))
                     .await
                     .unwrap_or_else(|error| panic!("errno {errno} stopped the listener: {error}"));
