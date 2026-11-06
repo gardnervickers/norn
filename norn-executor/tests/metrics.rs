@@ -134,3 +134,80 @@ fn polls_of_an_unwinding_tick_are_counted() {
     assert_eq!(snapshot.polls, 1, "{snapshot:?}");
     assert!(!snapshot.running, "{snapshot:?}");
 }
+
+/// Records what the metrics say while its own shutdown runs.
+struct RecordShutdown {
+    metrics: Rc<RefCell<Option<ExecutorMetrics>>>,
+    running_in_shutdown: Rc<Cell<Option<bool>>>,
+}
+
+impl Park for RecordShutdown {
+    type Unparker = NoopUnpark;
+    type Guard = ();
+
+    fn park(&mut self, _: ParkMode) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn enter(&self) -> Self::Guard {}
+
+    fn unparker(&self) -> Self::Unparker {
+        NoopUnpark
+    }
+
+    fn needs_park(&self) -> bool {
+        false
+    }
+
+    fn shutdown(&mut self) {
+        if let Some(metrics) = &*self.metrics.borrow() {
+            self.running_in_shutdown
+                .set(Some(metrics.snapshot().running));
+        }
+    }
+}
+
+/// Records whether the executor reports running when this task is dropped.
+struct RecordDrop {
+    metrics: ExecutorMetrics,
+    running_in_drop: Rc<Cell<Option<bool>>>,
+}
+
+impl Drop for RecordDrop {
+    fn drop(&mut self) {
+        self.running_in_drop
+            .set(Some(self.metrics.snapshot().running));
+    }
+}
+
+/// Dropping tasks is user code and counts as running; the park layer's own
+/// shutdown, which waits for the kernel, does not.
+#[test]
+fn drop_runs_task_destructors_but_not_park_shutdown() {
+    let slot = Rc::new(RefCell::new(None));
+    let running_in_shutdown = Rc::new(Cell::new(None));
+    let running_in_drop = Rc::new(Cell::new(None));
+    let executor = LocalExecutor::new(RecordShutdown {
+        metrics: Rc::clone(&slot),
+        running_in_shutdown: Rc::clone(&running_in_shutdown),
+    });
+    let metrics = executor.metrics();
+    *slot.borrow_mut() = Some(metrics.clone());
+    let guard = RecordDrop {
+        metrics: metrics.clone(),
+        running_in_drop: Rc::clone(&running_in_drop),
+    };
+    executor
+        .handle()
+        .spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await
+        })
+        .detach();
+    drop(executor);
+    assert_eq!(
+        (running_in_drop.get(), running_in_shutdown.get()),
+        (Some(true), Some(false))
+    );
+    assert!(!metrics.snapshot().running);
+}

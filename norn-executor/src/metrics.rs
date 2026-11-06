@@ -111,8 +111,8 @@ pub struct ExecutorSnapshot {
     pub waiting_parks: u64,
     /// Whether the executor was running when read: polling its root future or
     /// a task, or running a waker or destructor they triggered, inside
-    /// `block_on` or while dropping its tasks. It is false while parked and
-    /// whenever no `block_on` is in progress.
+    /// `block_on` or while dropping its tasks. It is false while parked, while
+    /// the park layer shuts down, and whenever no `block_on` is in progress.
     pub running: bool,
     /// A word that changes every time the executor starts or stops running;
     /// it is odd exactly when [`running`](Self::running) is true.
