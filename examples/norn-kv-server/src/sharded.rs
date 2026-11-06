@@ -724,7 +724,10 @@ fn execute_remote(worker: usize, handler: &MemoryHandler, request: ShardRequest)
             &mut ResponseEncoder::new(&mut bytes),
         )
         .map(|action| CommandResponse { action, bytes })
-        .map_err(|error| RemoteError::Encoding(error.to_string()));
+        .map_err(|error| match error {
+            EncodeError::OutOfMemory(_) => RemoteError::OutOfMemory(error.to_string()),
+            _ => RemoteError::Encoding(error.to_string()),
+        });
     // Every admitted request produces exactly one reverse envelope, even when
     // a quiet command deliberately encodes zero wire bytes.
     ShardResponse {
@@ -954,8 +957,7 @@ async fn serve_sharded_connection(
             };
             let response = result?;
             close_ready |= response.action == ConnectionAction::Close;
-            output.extend_from_slice(&response.bytes);
-            replies.recycle(response.bytes);
+            replies.append_to(&mut output, response.bytes)?;
             completed += 1;
         }
 
@@ -1035,8 +1037,7 @@ async fn serve_sharded_connection(
             Event::Response(response) => {
                 let response = response?;
                 close_ready |= response.action == ConnectionAction::Close;
-                output.extend_from_slice(&response.bytes);
-                replies.recycle(response.bytes);
+                replies.append_to(&mut output, response.bytes)?;
             }
         }
     }
@@ -1236,6 +1237,8 @@ struct ShardResponse {
 enum RemoteError {
     ChannelClosed,
     Encoding(String),
+    /// The owner could not allocate the reply.
+    OutOfMemory(String),
 }
 
 impl std::fmt::Display for RemoteError {
@@ -1245,6 +1248,9 @@ impl std::fmt::Display for RemoteError {
             Self::Encoding(message) => {
                 write!(formatter, "shard response encoding failed: {message}")
             }
+            Self::OutOfMemory(message) => {
+                write!(formatter, "shard response allocation failed: {message}")
+            }
         }
     }
 }
@@ -1253,7 +1259,11 @@ impl std::error::Error for RemoteError {}
 
 impl From<RemoteError> for io::Error {
     fn from(error: RemoteError) -> Self {
-        io::Error::new(io::ErrorKind::BrokenPipe, error)
+        let kind = match error {
+            RemoteError::OutOfMemory(_) => io::ErrorKind::OutOfMemory,
+            RemoteError::ChannelClosed | RemoteError::Encoding(_) => io::ErrorKind::BrokenPipe,
+        };
+        io::Error::new(kind, error)
     }
 }
 
@@ -1641,6 +1651,29 @@ impl ConnectionReplies {
 
     fn recycle(&self, bytes: Vec<u8>) {
         self.router.recycle(bytes);
+    }
+
+    /// Append a reply that waited in the window to the connection batch and
+    /// recycle its buffer.
+    ///
+    /// A reply can hold a whole GET value, so the batch grows fallibly: on
+    /// failure only this connection fails, not the process. When the batch is
+    /// empty and too small for the reply, the reply's buffer becomes the batch
+    /// and no copy is made.
+    fn append_to(&self, output: &mut Vec<u8>, mut bytes: Vec<u8>) -> io::Result<()> {
+        if output.is_empty() && bytes.len() > output.capacity() {
+            std::mem::swap(output, &mut bytes);
+        } else {
+            output.try_reserve(bytes.len()).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    "cannot grow the connection's response batch",
+                )
+            })?;
+            output.extend_from_slice(&bytes);
+        }
+        self.recycle(bytes);
+        Ok(())
     }
 
     fn reserve_remote(&self, owner: usize) -> io::Result<RequestId> {
@@ -2408,6 +2441,24 @@ mod tests {
         router.complete(response(1, 0, Vec::new())).unwrap();
         assert!(replies.try_next().unwrap().is_ok());
         assert_eq!(router.credits[0].borrow().available, 1);
+    }
+
+    #[test]
+    fn queued_reply_is_appended_without_copying_into_an_empty_batch() {
+        let (router, _requests, _fatal, _driver) = router_fixture(1);
+        let replies = router.register_connection(7).unwrap();
+
+        let reply = vec![7_u8; 4096];
+        let reply_ptr = reply.as_ptr();
+        let mut output = Vec::with_capacity(16);
+        replies.append_to(&mut output, reply).unwrap();
+        assert_eq!(output.as_ptr(), reply_ptr);
+        assert_eq!(output, vec![7_u8; 4096]);
+
+        // A non-empty batch grows and keeps its earlier bytes in order.
+        replies.append_to(&mut output, vec![8_u8; 4]).unwrap();
+        assert_eq!(output.len(), 4100);
+        assert_eq!(&output[4094..4100], &[7, 7, 8, 8, 8, 8]);
     }
 
     #[test]

@@ -268,3 +268,107 @@ fn large_buffered_set_fails_only_its_request_sharded() {
         480_000_000,
     );
 }
+
+fn get_request(key: &[u8], opaque: u32) -> Vec<u8> {
+    let mut request = vec![0_u8; HEADER_LEN];
+    request[0] = 0x80;
+    request[2..4].copy_from_slice(&(key.len() as u16).to_be_bytes());
+    request[8..12].copy_from_slice(&(key.len() as u32).to_be_bytes());
+    request[12..16].copy_from_slice(&opaque.to_be_bytes());
+    request.extend_from_slice(key);
+    request
+}
+
+/// Store `stored` (the first entry is read back), leaving too little room to
+/// buffer its reply, then pipeline a GET for it behind misses (which, in sharded mode,
+/// queue the big replies behind remote ones). Growing a response buffer or
+/// batch can then only fail that connection.
+fn large_get_fails_only_its_connection(
+    mode: &str,
+    stored: &[(&str, usize)],
+    held_body: usize,
+    gets: u32,
+) {
+    let (mut child, address) = spawn_limited(mode);
+    for (key, len) in stored {
+        assert_eq!(
+            send_large_set(address, key.as_bytes(), *len),
+            Some(0),
+            "setup SET of {key} must succeed"
+        );
+    }
+
+    // Another connection holds `held_body` bytes of an unfinished SET.
+    let mut holder = TcpStream::connect(address).unwrap();
+    if held_body != 0 {
+        let mut header = [0_u8; HEADER_LEN];
+        header[0] = 0x80;
+        header[1] = 0x01;
+        header[2..4].copy_from_slice(&1_u16.to_be_bytes());
+        header[4] = 8;
+        header[8..12].copy_from_slice(&(9 + held_body as u32).to_be_bytes());
+        header[12..16].copy_from_slice(&3_u32.to_be_bytes());
+        holder.write_all(&header).unwrap();
+        holder.write_all(&[0; 8]).unwrap();
+        holder.write_all(b"h").unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    {
+        let mut stream = TcpStream::connect(address).unwrap();
+        let mut pipeline = Vec::new();
+        for (opaque, key) in [b"a", b"b", b"c", b"d", b"e", b"f"].iter().enumerate() {
+            pipeline.extend_from_slice(&get_request(*key, 10 + opaque as u32));
+        }
+        for opaque in 0..gets {
+            pipeline.extend_from_slice(&get_request(stored[0].0.as_bytes(), 100 + opaque));
+        }
+        stream.write_all(&pipeline).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .unwrap();
+        // Read until the server answers everything or fails this connection.
+        let mut sink = vec![0; 1024 * 1024];
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            match stream.read(&mut sink) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    drop(holder);
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "one client's GET pipeline killed the server"
+    );
+    assert_noop_round_trips(address);
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn large_get_fails_only_its_connection_exact() {
+    // 600 MB stored and 350 MB held by an unfinished SET on another
+    // connection: a 150 MB reply no longer fits under the 1 GiB limit.
+    let stored: Vec<_> = ["k0", "k1", "k2", "k3"]
+        .into_iter()
+        .map(|key| (key, 150_000_000))
+        .collect();
+    large_get_fails_only_its_connection("--recv-mode=exact", &stored, 350_000_000, 1);
+}
+
+#[test]
+fn large_get_fails_only_its_connection_sharded() {
+    // The reply fits on the owning worker, but copying it into the
+    // connection's batch behind the misses does not.
+    let mut stored = vec![("big", 200_000_000)];
+    stored.extend(
+        [
+            "filler0", "filler1", "filler2", "filler3", "filler4", "filler5",
+        ]
+        .into_iter()
+        .map(|key| (key, 50_000_000)),
+    );
+    large_get_fails_only_its_connection("--workers=2", &stored, 0, 1);
+}
