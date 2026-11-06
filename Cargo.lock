@@ -1232,9 +1232,12 @@ version = "0.1.0"
 name = "norn-multicore"
 version = "0.1.0"
 dependencies = [
+ "io-uring",
  "norn-channel",
  "norn-executor",
  "norn-metrics",
+ "norn-timer",
+ "norn-uring",
 ]
 
 [[package]]
@@ -1263,6 +1266,7 @@ dependencies = [
  "cordyceps",
  "futures-test",
  "norn-executor",
+ "norn-metrics",
  "pin-project-lite",
  "proptest",
  "thiserror",
@@ -1282,6 +1286,7 @@ dependencies = [
  "libc",
  "log",
  "norn-executor",
+ "norn-metrics",
  "norn-timer",
  "pin-project-lite",
  "smallvec",
