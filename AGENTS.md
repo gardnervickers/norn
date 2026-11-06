@@ -74,6 +74,9 @@ The project is intentionally not general-purpose today; APIs are still in flux i
   non-empty, new entries queue behind it and `needs_park` reports true.
 - Driver park loop drains the CQ before parking and treats `EBUSY`, `EAGAIN`
   and `ENOMEM` from `io_uring_enter` as transient: drain and retry, or yield.
+  A waiting park that fails with `EAGAIN`/`ENOMEM` and has nothing to reap, but
+  entries in the kernel, first does a wait-only enter (no submissions, honoring
+  the park's timeout) so a persistent allocation failure cannot spin idle waits.
   `EINTR` retries the enter, except in a timed park, which returns early so a
   steady signal stream cannot restart the full timeout (callers re-check their
   deadlines). Other enter errors are recorded as a health error and close the

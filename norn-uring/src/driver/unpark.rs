@@ -131,6 +131,11 @@ impl Unparker {
         }
     }
 
+    /// Whether a remote thread has requested a wake that the reactor has not consumed.
+    pub(crate) fn is_woken(&self) -> bool {
+        UnparkerState(self.flag.load(Ordering::Acquire)).woken()
+    }
+
     /// Reset this unparker. This should be called to clear the parking status from the reactor.
     pub(crate) fn reset(&self) {
         self.flag.fetch_and(
