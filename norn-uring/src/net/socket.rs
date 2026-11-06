@@ -324,6 +324,27 @@ fn invalid_zc_notification_error() -> io::Error {
     )
 }
 
+/// Reject TCP receive flags that would report bytes the buffer does not hold.
+#[cold]
+fn validate_tcp_recv_flags(flags: i32) -> io::Result<()> {
+    if flags & libc::MSG_TRUNC != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "MSG_TRUNC is unsupported for TCP receives",
+        ));
+    }
+    // A partial `MSG_WAITALL` receive is retried by `io_uring` with the buffer
+    // advanced. Under `MSG_PEEK` each retry copies the start of the queue
+    // again, so the buffer fills with a repeated prefix.
+    if flags & libc::MSG_PEEK != 0 && flags & libc::MSG_WAITALL != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "MSG_PEEK with MSG_WAITALL is unsupported for TCP receives because a partial retry peeks the start of the queue again",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_recv_bundle_flags(flags: i32) -> io::Result<()> {
     if flags & libc::MSG_TRUNC != 0 {
         return Err(io::Error::new(
@@ -2107,11 +2128,8 @@ where
     type Completion = CQEResult;
 
     fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
-        if TCP && self.flags & libc::MSG_TRUNC != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "MSG_TRUNC is unsupported for TCP receives",
-            ));
+        if TCP && self.flags & (libc::MSG_TRUNC | libc::MSG_PEEK) != 0 {
+            validate_tcp_recv_flags(self.flags)?;
         }
         let len = checked_scalar_len(self.submitted_len, "receive buffer length")?;
         let ptr = self.buf.stable_ptr_mut();
