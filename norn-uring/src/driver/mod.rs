@@ -205,8 +205,11 @@ struct Shared {
     /// Whether the last look found the kernel's CQ overflow flag raised, so
     /// that only the transition into overflow is logged.
     cq_overflowing: Cell<bool>,
-    /// The kernel's dropped-CQE counter as of the last look.
+    /// The kernel's dropped-CQE counter as of the last time it was logged.
     cqes_dropped_seen: Cell<u32>,
+    /// Limits the `cq.overflow` and `cq.dropped` error logs.
+    overflow_log: LogLimiter,
+    dropped_log: LogLimiter,
     /// Whether that fallback barrier is in the SQ or the kernel, or has
     /// completed. Cleared only when it fails.
     drain_barrier_pushed: Cell<bool>,
@@ -216,6 +219,40 @@ struct Shared {
     // order, so retained registered storage is released only after the ring.
     registered_buf_rings: RegisteredBufRings,
     registered_buffers: RegisteredBuffers,
+}
+
+/// Admits at most one log line per interval and counts the ones it refused,
+/// so a persistently undersized CQ cannot flood the log.
+struct LogLimiter {
+    interval: Cell<Duration>,
+    last: Cell<Option<std::time::Instant>>,
+    suppressed: Cell<u64>,
+}
+
+impl LogLimiter {
+    const INTERVAL: Duration = Duration::from_secs(1);
+
+    fn new() -> Self {
+        Self {
+            interval: Cell::new(Self::INTERVAL),
+            last: Cell::new(None),
+            suppressed: Cell::new(0),
+        }
+    }
+
+    /// Returns how many lines were suppressed since the last admitted one, or
+    /// `None` if this one is suppressed too.
+    fn admit(&self) -> Option<u64> {
+        let now = std::time::Instant::now();
+        if let Some(last) = self.last.get() {
+            if now.saturating_duration_since(last) < self.interval.get() {
+                self.suppressed.set(self.suppressed.get() + 1);
+                return None;
+            }
+        }
+        self.last.set(Some(now));
+        Some(self.suppressed.replace(0))
+    }
 }
 
 #[cfg(test)]
@@ -819,6 +856,8 @@ impl Driver {
                 cqes_dropped: Cell::new(false),
                 cq_overflowing: Cell::new(false),
                 cqes_dropped_seen: Cell::new(0),
+                overflow_log: LogLimiter::new(),
+                dropped_log: LogLimiter::new(),
                 drain_barrier_pushed: Cell::new(false),
                 #[cfg(test)]
                 shutdown_test: ShutdownTest::default(),
@@ -1135,7 +1174,8 @@ impl Park for Driver {
     fn park(&mut self, mode: ParkMode) -> Result<(), io::Error> {
         self.shared.check_cqes_dropped()?;
         let budget = self.options.completion_drain_budget.map(NonZeroUsize::get);
-        self.park_with_completion_budget(mode, budget)?;
+        self.park_with_completion_budget(mode, budget)
+            .map_err(|err| self.shared.lost_completions_error(err))?;
         self.shared.check_cqes_dropped()
     }
 
@@ -1743,13 +1783,7 @@ impl Shared {
                     return Err(err);
                 }
                 Err(err) => {
-                    let err = if err.raw_os_error() == Some(libc::EBADR) {
-                        let err = self.cqes_dropped_error();
-                        error!(target: LOG, "io_uring_enter.ebadr {err}");
-                        err
-                    } else {
-                        err
-                    };
+                    let err = self.lost_completions_error(err);
                     if Self::should_record_submit_error(&err) {
                         self.record_submit_error(&err);
                     }
@@ -1768,19 +1802,44 @@ impl Shared {
     fn check_cqes_dropped(&self) -> io::Result<()> {
         self.log_cq_health();
         if self.cqes_dropped.get() || self.ring.borrow_mut().completion().overflow() > 0 {
-            let err = self.cqes_dropped_error();
-            self.record_submit_error(&err);
-            return Err(err);
+            return Err(self.mark_cqes_dropped());
         }
         Ok(())
+    }
+
+    /// Turn a failed enter into the lost-completions error when it reports one.
+    ///
+    /// That is `EBADR` from any `io_uring_enter`, or any error once the
+    /// dropped counter is non-zero (the drop is the more useful diagnosis).
+    /// Every path that returns an enter error from a park goes through here,
+    /// so the error, log line, broken accounting and health error do not
+    /// depend on which enter failed. Other errors pass through unchanged.
+    fn lost_completions_error(&self, err: io::Error) -> io::Error {
+        let ebadr = err.raw_os_error() == Some(libc::EBADR);
+        let dropped = self.ring.borrow_mut().completion().overflow() > 0;
+        if !ebadr && !dropped && !self.cqes_dropped.get() {
+            return err;
+        }
+        self.log_cq_health();
+        let first = !self.cqes_dropped.get();
+        let lost = self.mark_cqes_dropped();
+        if ebadr {
+            error!(target: LOG, "io_uring_enter.ebadr {lost}");
+        } else if first {
+            error!(target: LOG, "park.failed_with_dropped_cqes error={err}: {lost}");
+        }
+        lost
     }
 
     /// Log, at error level, the kernel's CQ falling into overflow and every
     /// increase of its dropped-CQE counter.
     ///
-    /// Overflow is logged on the transition into it, not on every park while it
-    /// lasts. The overflow list is lossless (`IORING_FEAT_NODROP`) but a sign
-    /// that the CQ is too small; dropped completions are lost for good.
+    /// Overflow is logged on the transition into it, and each kind is limited
+    /// to one line per [`LogLimiter::INTERVAL`]; a line reports how many were
+    /// suppressed. The overflow list is lossless (`IORING_FEAT_NODROP`) but a
+    /// sign that the CQ is too small; dropped completions are lost for good.
+    /// A suppressed drop is not forgotten: the delta accumulates until a line
+    /// is admitted.
     fn log_cq_health(&self) {
         let mut ring = self.ring.borrow_mut();
         let overflowing = ring.submission().cq_overflow();
@@ -1788,30 +1847,37 @@ impl Shared {
         let cq_size = ring.completion().capacity();
         drop(ring);
         if overflowing && !self.cq_overflowing.get() {
-            error!(
-                target: LOG,
-                "cq.overflow cq_size={cq_size} in_flight={}; completions are parked in the \
-                 kernel's overflow list, size the CQ larger with setup_cqsize",
-                self.in_flight.get()
-            );
+            if let Some(suppressed) = self.overflow_log.admit() {
+                error!(
+                    target: LOG,
+                    "cq.overflow cq_size={cq_size} in_flight={} suppressed={suppressed}; \
+                     completions are parked in the kernel's overflow list, size the CQ \
+                     larger with setup_cqsize",
+                    self.in_flight.get()
+                );
+            }
         }
         self.cq_overflowing.set(overflowing);
         let seen = self.cqes_dropped_seen.get();
         if dropped != seen {
-            self.cqes_dropped_seen.set(dropped);
-            error!(
-                target: LOG,
-                "cq.dropped delta={} total={dropped} cq_size={cq_size} in_flight={}",
-                dropped.wrapping_sub(seen),
-                self.in_flight.get()
-            );
+            if let Some(suppressed) = self.dropped_log.admit() {
+                self.cqes_dropped_seen.set(dropped);
+                error!(
+                    target: LOG,
+                    "cq.dropped delta={} total={dropped} cq_size={cq_size} in_flight={} \
+                     suppressed={suppressed}",
+                    dropped.wrapping_sub(seen),
+                    self.in_flight.get()
+                );
+            }
         }
     }
 
     /// The error for lost completions. Marks the in-flight count untrusted, so
-    /// shutdown keeps leaking the data of operations whose CQE was lost.
+    /// shutdown keeps leaking the data of operations whose CQE was lost, and
+    /// makes it the driver's health error even if another error came first.
     #[cold]
-    fn cqes_dropped_error(&self) -> io::Error {
+    fn mark_cqes_dropped(&self) -> io::Error {
         self.cqes_dropped.set(true);
         self.accounting_broken.set(true);
         let dropped = self.ring.borrow_mut().completion().overflow();
@@ -1820,12 +1886,17 @@ impl Shared {
         } else {
             "completions".to_owned()
         };
-        io::Error::other(format!(
+        let err = io::Error::other(format!(
             "io_uring {count} were dropped by the kernel because the completion queue \
              overflowed and the overflow entry could not be allocated (EBADR); \
              pending operations may never complete. Size the completion queue larger \
              with IoUring::builder().setup_cqsize(..)"
-        ))
+        ));
+        *self.submit_error.borrow_mut() = Some((err.kind(), err.to_string()));
+        if self.status() == Status::Running {
+            self.set_status(Status::Closing);
+        }
+        err
     }
 
     /// Submit every SQE currently visible in the userspace submission queue.
@@ -4180,6 +4251,7 @@ mod tests {
             driver.park(ParkMode::NoPark).unwrap();
         }
         assert!(!driver.shared.ring.borrow_mut().submission().cq_overflow());
+        driver.shared.overflow_log.interval.set(Duration::ZERO);
         overflow_cq(&driver, 1);
         driver.shared.log_cq_health();
         assert_eq!(captured_error_logs("cq.overflow"), 2);
@@ -4193,6 +4265,181 @@ mod tests {
         driver.park(ParkMode::NextCompletion).unwrap_err();
         assert_eq!(captured_error_logs("io_uring_enter.ebadr"), 1);
         assert_eq!(captured_error_logs("dropped by the kernel"), 1);
+    }
+
+    /// Bump the kernel's dropped-CQE counter through a second shared mapping
+    /// of the CQ ring, as a real drop would.
+    fn bump_kernel_dropped_counter(driver: &Driver, by: u32) {
+        let ring = driver.shared.ring.borrow();
+        let fd = ring.as_raw_fd();
+        // io_uring_params: 10 u32, sq_off (40 bytes), cq_off; overflow is cq_off+16.
+        let params = ring.params() as *const io_uring::Parameters as *const u8;
+        let off = unsafe { *(params.add(96) as *const u32) } as usize;
+        let len = (off + 4).next_multiple_of(4096);
+        let map = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_POPULATE,
+                fd,
+                0x8000000,
+            )
+        };
+        assert_ne!(map, libc::MAP_FAILED, "{}", io::Error::last_os_error());
+        let counter =
+            unsafe { &*((map as *mut u8).add(off) as *const std::sync::atomic::AtomicU32) };
+        counter.fetch_add(by, Ordering::SeqCst);
+        unsafe { libc::munmap(map, len) };
+        drop(ring);
+        assert!(driver.shared.ring.borrow_mut().completion().overflow() >= by);
+    }
+
+    #[test]
+    fn counter_only_drop_fails_park_and_leaks_lost_op() {
+        capture_error_logs();
+        let reaped = Arc::new(AtomicUsize::new(0));
+        let completions_dropped = Arc::new(AtomicUsize::new(0));
+        let operations_dropped = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = mpsc::channel();
+        let ops_dropped = Arc::clone(&operations_dropped);
+        let reaped_out = Arc::clone(&reaped);
+        let t = std::thread::spawn(move || {
+            capture_error_logs();
+            let mut driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+            let handle = driver.handle();
+            let mut op = Box::pin(handle.submit(TrackedNop {
+                reaped: Arc::clone(&reaped),
+                completions_dropped: Arc::clone(&completions_dropped),
+                operations_dropped: Arc::clone(&ops_dropped),
+            }));
+            let waker = futures_test::task::noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            assert!(Future::poll(op.as_mut(), &mut cx).is_pending());
+            // Submit and lose its CQE.
+            {
+                let mut ring = driver.shared.ring.borrow_mut();
+                ring.submitter().submit_and_wait(1).unwrap();
+                let mut cq = ring.completion();
+                let lost = cq.next().expect("nop cqe");
+                assert!(lost.user_data() > 1024);
+            }
+            bump_kernel_dropped_counter(&driver, 1);
+            let err = driver
+                .park(ParkMode::NoPark)
+                .expect_err("counter-only drop must fail park");
+            assert!(
+                err.to_string().contains("1 completions were dropped"),
+                "{err}"
+            );
+            assert_eq!(captured_error_logs("cq.dropped delta=1 total=1"), 1);
+            assert!(driver.shared.accounting_broken.get());
+            for _ in 0..3 {
+                driver.park(ParkMode::NextCompletion).expect_err("sticky");
+            }
+            assert_eq!(
+                captured_error_logs("cq.dropped"),
+                1,
+                "delta logged only once"
+            );
+            // More drops inside the limiter window are held back, then
+            // reported together with the suppressed count once it opens.
+            bump_kernel_dropped_counter(&driver, 2);
+            driver.park(ParkMode::NoPark).expect_err("sticky");
+            assert_eq!(captured_error_logs("cq.dropped"), 1, "rate limited");
+            driver.shared.dropped_log.last.set(None);
+            driver.park(ParkMode::NoPark).expect_err("sticky");
+            assert_eq!(captured_error_logs("cq.dropped delta=2 total=3"), 1);
+            drop(op);
+            assert_eq!(ops_dropped.load(Ordering::SeqCst), 0);
+            let outcome = driver.shutdown_with_outcome();
+            tx.send(outcome).unwrap();
+            drop(handle);
+            drop(driver);
+        });
+        let outcome = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("shutdown hung");
+        t.join().unwrap();
+        eprintln!("shutdown outcome {outcome:?}");
+        assert_eq!(reaped_out.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            operations_dropped.load(Ordering::SeqCst),
+            0,
+            "op data whose CQE was lost must be leaked, not freed"
+        );
+    }
+
+    #[test]
+    fn cq_overflow_log_is_rate_limited() {
+        capture_error_logs();
+        let mut driver = Driver::new(io_uring::IoUring::builder(), 2).unwrap();
+        // The flag rises and clears on every iteration: one transition each.
+        for _ in 0..200 {
+            overflow_cq(&driver, 1);
+            driver.park(ParkMode::NoPark).unwrap();
+            driver.park(ParkMode::NoPark).unwrap();
+        }
+        assert_eq!(
+            captured_error_logs("cq.overflow"),
+            1,
+            "an undersized CQ must not log on every transition"
+        );
+
+        // Once the interval passes, the next line reports what was held back.
+        driver.shared.overflow_log.last.set(None);
+        overflow_cq(&driver, 1);
+        driver.park(ParkMode::NoPark).unwrap();
+        driver.park(ParkMode::NoPark).unwrap();
+        assert_eq!(captured_error_logs("cq.overflow"), 2);
+        assert_eq!(captured_error_logs("suppressed=199"), 1);
+    }
+
+    #[test]
+    fn lost_completions_error_is_independent_of_the_failing_enter() {
+        capture_error_logs();
+        let driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        // Another failure got there first; the first recorded error used to win.
+        driver
+            .shared
+            .record_submit_error(&io::Error::from_raw_os_error(libc::EIO));
+
+        // Errors unrelated to dropped completions pass through.
+        let eio = driver
+            .shared
+            .lost_completions_error(io::Error::from_raw_os_error(libc::EIO));
+        assert_eq!(eio.raw_os_error(), Some(libc::EIO));
+        assert!(!driver.shared.accounting_broken.get());
+
+        // EBADR from an enter that did not go through `Shared::submit`.
+        let err = driver
+            .shared
+            .lost_completions_error(io::Error::from_raw_os_error(libc::EBADR));
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert!(err.to_string().contains("setup_cqsize"), "{err}");
+        assert!(driver.shared.accounting_broken.get());
+        assert_eq!(captured_error_logs("io_uring_enter.ebadr"), 1);
+        assert_eq!(
+            driver.handle().health_error().unwrap().to_string(),
+            err.to_string()
+        );
+    }
+
+    #[test]
+    fn any_enter_error_with_dropped_counter_reports_the_drop() {
+        capture_error_logs();
+        let driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        bump_kernel_dropped_counter(&driver, 3);
+        let err = driver
+            .shared
+            .lost_completions_error(io::Error::from_raw_os_error(libc::EIO));
+        assert!(
+            err.to_string().contains("3 completions were dropped"),
+            "{err}"
+        );
+        assert!(driver.shared.accounting_broken.get());
+        assert_eq!(captured_error_logs("park.failed_with_dropped_cqes"), 1);
+        assert_eq!(captured_error_logs("cq.dropped delta=3 total=3"), 1);
     }
 
     #[test]
