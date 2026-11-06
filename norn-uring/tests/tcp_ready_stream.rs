@@ -322,6 +322,9 @@ fn drop_while_waiting_closes_the_socket() -> TestResult {
             "the writer did not arm a readiness poll, so only the read waits at the drop"
         );
 
+        // The write's poll is only queued so far. Let the driver submit it,
+        // so that both polls are armed in the kernel at the drop.
+        turn().await;
         drop(stream);
         peer.set_nonblocking(true)?;
         let mut buf = vec![0_u8; 1 << 20];

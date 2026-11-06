@@ -34,6 +34,9 @@ static LIVE: AtomicIsize = AtomicIsize::new(0);
 static COMPLETED: AtomicUsize = AtomicUsize::new(0);
 /// Linked chains of NOPs that completed successfully through the kernel.
 static LINKED_OK: AtomicUsize = AtomicUsize::new(0);
+/// Requests the kernel cancelled because a soft-linked predecessor failed in
+/// the kernel.
+static KERNEL_CANCELLED: AtomicUsize = AtomicUsize::new(0);
 /// Timeout-bounded blocked reads that the linked timeout cancelled.
 static TIMED_OUT: AtomicUsize = AtomicUsize::new(0);
 
@@ -60,6 +63,9 @@ impl Drop for Live {
 enum Kind {
     Nop,
     FailConfigure,
+    /// A read from a bad descriptor: the kernel fails it with `EBADF`, which
+    /// cancels whatever is soft-linked after it.
+    FailKernel,
     /// A read from a pipe nobody writes: completes only by cancellation.
     Blocked(i32),
 }
@@ -94,6 +100,12 @@ unsafe impl Operation for Tracked {
         match self.kind {
             Kind::Nop => Ok(io_uring::opcode::Nop::new().build()),
             Kind::FailConfigure => Err(io::Error::from_raw_os_error(libc::EINVAL)),
+            Kind::FailKernel => {
+                Ok(
+                    io_uring::opcode::Read::new(io_uring::types::Fd(-1), self.buf.as_mut_ptr(), 8)
+                        .build(),
+                )
+            }
             Kind::Blocked(fd) => {
                 Ok(
                     io_uring::opcode::Read::new(io_uring::types::Fd(fd), self.buf.as_mut_ptr(), 8)
@@ -173,7 +185,9 @@ fn unexpected(kind: Kind, result: &io::Result<u32>) -> Option<String> {
     let cancelled_or_failed = |err: &io::Error| {
         matches!(
             (kind, err.raw_os_error()),
-            (_, Some(libc::ECANCELED)) | (Kind::FailConfigure, Some(libc::EINVAL))
+            (_, Some(libc::ECANCELED))
+                | (Kind::FailConfigure, Some(libc::EINVAL))
+                | (Kind::FailKernel, Some(libc::EBADF))
         )
     };
     match result {
@@ -191,6 +205,7 @@ fn kind_name(kind: Kind) -> &'static str {
     match kind {
         Kind::Nop => "Nop",
         Kind::FailConfigure => "FailConfigure",
+        Kind::FailKernel => "FailKernel",
         Kind::Blocked(_) => "Blocked",
     }
 }
@@ -207,12 +222,30 @@ fn check_chain(
 ) -> bool {
     let mut failures = failures.borrow_mut();
     let mut failed = false;
+    let mut kernel_failed = false;
     for (kind, output) in outputs {
+        if soft
+            && kernel_failed
+            && output
+                .as_ref()
+                .is_err_and(|e| e.raw_os_error() == Some(libc::ECANCELED))
+        {
+            KERNEL_CANCELLED.fetch_add(1, Ordering::SeqCst);
+        }
+        kernel_failed |= matches!(kind, Kind::FailKernel) && output.is_err();
         if let Some(message) = unexpected(*kind, output) {
             failures.push(format!("{what}: {message}"));
-        } else if soft && failed && output.is_ok() {
+        } else if soft
+            && failed
+            && !matches!(kind, Kind::FailConfigure)
+            && !output
+                .as_ref()
+                .is_err_and(|e| e.raw_os_error() == Some(libc::ECANCELED))
+        {
+            // The kernel cancels what follows a failed soft link, and the
+            // driver does the same when configuration fails.
             failures.push(format!(
-                "{what}: a {} ran after a failed link",
+                "{what}: a {} after a failed link was not cancelled: {output:?}",
                 kind_name(*kind)
             ));
         }
@@ -232,6 +265,9 @@ fn check_single(kind: Kind, output: &io::Result<u32>, failures: &Failures) {
         Kind::FailConfigure => output
             .as_ref()
             .is_err_and(|e| e.raw_os_error() == Some(libc::EINVAL)),
+        Kind::FailKernel => output
+            .as_ref()
+            .is_err_and(|e| e.raw_os_error() == Some(libc::EBADF)),
         // Cancelled by its linked timeout, when it has one.
         Kind::Blocked(_) => output
             .as_ref()
@@ -247,6 +283,7 @@ fn kind(rng: &mut Rng, pipe: i32) -> Kind {
     match rng.below(10) {
         0 => Kind::FailConfigure,
         1 | 2 => Kind::Blocked(pipe),
+        3 => Kind::FailKernel,
         _ => Kind::Nop,
     }
 }
@@ -452,7 +489,10 @@ fn run(seed: u64, builder: io_uring::Builder, entries: u32) {
         .unwrap_or_else(|_| {
             panic!("seed {seed} entries {entries}: scenario panicked, or it or shutdown stalled")
         });
-    assert_eq!(live, 0, "seed {seed}: leaked or double-dropped op data");
+    assert_eq!(
+        live, 0,
+        "seed {seed} entries {entries}: leaked or double-dropped op data"
+    );
     // A 1-entry ring has no room to link; larger rings must have run chains.
     assert_eq!(
         linked > 0,
@@ -507,13 +547,18 @@ fn op_lifecycle_stress() {
         }
     }
     assert!(
+        KERNEL_CANCELLED.load(Ordering::SeqCst) > 0,
+        "no kernel failure ever cancelled a soft-linked request"
+    );
+    assert!(
         TIMED_OUT.load(Ordering::SeqCst) > 0,
         "no linked timeout ever cancelled a blocked read"
     );
     eprintln!(
-        "completed {} ops, {} linked chains, {} timeouts",
+        "completed {} ops, {} linked chains, {} kernel cancellations, {} timeouts",
         COMPLETED.load(Ordering::SeqCst),
         LINKED_OK.load(Ordering::SeqCst),
+        KERNEL_CANCELLED.load(Ordering::SeqCst),
         TIMED_OUT.load(Ordering::SeqCst)
     );
 }
