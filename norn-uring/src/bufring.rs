@@ -33,6 +33,18 @@ use tracker::{BufferToken, BundleClaim, PublicationTracker, TrackerError};
 /// polling it, so one stalled consumer can hold every buffer of a shared ring
 /// unless [`Builder::max_unconsumed_per_receive`] bounds it.
 ///
+/// That bound applies when the stream sees completions. While the driver's
+/// thread is busy, a multishot receive keeps posting one completion per
+/// buffer it fills, until the ring runs out of buffers or the completion
+/// queue (CQ) is full. On a full CQ the kernel ends the receive, and its final
+/// completion, like any other completion that arrives then, goes to the
+/// kernel's overflow list, from which it may be dropped; see
+/// [`Driver::new`](crate::Driver::new). The CQ therefore needs room for the
+/// buffers of every ring in use plus every other completion that can be
+/// pending, including one final completion per multishot receive.
+/// [`Builder::build`] logs a warning when the rings registered with a driver
+/// have more buffers in total than its CQ has entries.
+///
 /// # Example
 ///
 /// ```no_run
@@ -591,6 +603,19 @@ impl Registry {
         }
     }
 
+    /// The total buffer count of the rings the kernel may still select
+    /// buffers from, or `None` while the registry is borrowed.
+    pub(crate) fn kernel_buffers(&self) -> Option<u32> {
+        let registrations = self.registrations.try_borrow().ok()?;
+        Some(
+            registrations
+                .iter()
+                .filter(|registration| registration.state() != RegistrationState::Unregistered)
+                .map(|registration| u32::from(registration._storage.buf_cnt))
+                .sum(),
+        )
+    }
+
     pub(crate) fn reserve(
         &self,
         ring: &RefCell<IoUring>,
@@ -819,6 +844,11 @@ impl Builder {
     }
 
     /// The number of buffers to allocate. If left zero, the `ring_entries` value will be used.
+    ///
+    /// Multishot receives can post one completion per buffer before the
+    /// driver reaps any, so the driver's completion queue needs room for
+    /// every buffer of every ring in use, plus every other completion that
+    /// can be pending; see [`Driver::new`](crate::Driver::new).
     pub fn buf_cnt(mut self, buf_cnt: u16) -> Builder {
         self.buf_cnt = buf_cnt;
         self
@@ -881,6 +911,10 @@ impl Builder {
     /// Returns an error for an invalid ring configuration, allocation failure,
     /// duplicate buffer-group ID, or kernel registration failure.
     ///
+    /// When the rings registered with the driver, this one included, have
+    /// more buffers in total than the driver's completion queue has entries,
+    /// the ring is still built, but a warning is logged: see [`RecvBufRing`].
+    ///
     /// # Panics
     ///
     /// Panics if called outside an active [`Driver`](crate::Driver) context.
@@ -916,6 +950,17 @@ impl Builder {
         let reservation = handle.reserve_buf_ring(Rc::clone(&storage))?;
         reservation.register(|submitter| storage.register(submitter))?;
         let registration = reservation.commit();
+        let cq_entries = handle.cq_entries();
+        if let Some(buffers) = handle.buf_ring_buffers().filter(|&n| n > cq_entries) {
+            warn!(
+                target: "norn_uring::bufring",
+                "buf_ring.exceeds_cq bgid={} buf_cnt={} ring_buffers_total={buffers} \
+                 cq_entries={cq_entries}: multishot receives can fill the completion queue, \
+                 and completions that overflow it may be dropped; size it with setup_cqsize",
+                b.bgid,
+                b.buf_cnt,
+            );
+        }
         Ok(RecvBufRing::new(
             registration,
             storage,

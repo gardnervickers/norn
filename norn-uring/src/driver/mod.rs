@@ -707,6 +707,12 @@ impl Handle {
         })
     }
 
+    /// The total buffer count of the provided-buffer rings registered with
+    /// this driver, or `None` while the registry is borrowed.
+    pub(crate) fn buf_ring_buffers(&self) -> Option<u32> {
+        self.shared.registered_buf_rings.kernel_buffers()
+    }
+
     pub(crate) fn reserve_buf_ring(
         &self,
         storage: Rc<BufRingStorage>,
@@ -807,6 +813,38 @@ impl Handle {
         self.shared.health_error()
     }
 
+    /// Returns the number of entries in the driver's completion queue (CQ).
+    ///
+    /// The kernel rounds the requested size up to a power of two; see
+    /// [`Driver::new`] for how to size it.
+    pub fn cq_entries(&self) -> u32 {
+        self.shared.ring.borrow().params().cq_entries()
+    }
+
+    /// Whether the kernel holds completions that did not fit in the
+    /// completion queue (`IORING_SQ_CQ_OVERFLOW`).
+    ///
+    /// The kernel keeps such completions on an overflow list and the driver's
+    /// next park posts them as CQ space allows, and the flag clears once they
+    /// all fit. An overflow is not
+    /// itself an error, but on a ring without `IORING_SETUP_DEFER_TASKRUN` the
+    /// kernel may fail to allocate an overflow entry and drop the completion;
+    /// see [`Driver::new`]. A ring sized for its workload never overflows, so
+    /// this is useful for checking that sizing.
+    pub fn cq_overflow_pending(&self) -> bool {
+        self.shared.ring.borrow_mut().submission().cq_overflow()
+    }
+
+    /// Returns how many completions the kernel has dropped because it could
+    /// not allocate an overflow entry for them.
+    ///
+    /// This is the kernel's counter, which only increases (as a `u32`, so it
+    /// wraps after 2^32 drops). A nonzero count means some operation's
+    /// completion was lost; see [`Driver::new`].
+    pub fn cqes_dropped(&self) -> u32 {
+        self.shared.ring.borrow_mut().completion().overflow()
+    }
+
     pub(crate) fn same_driver(&self, other: &Self) -> bool {
         Rc::ptr_eq(&self.shared, &other.shared)
     }
@@ -828,8 +866,48 @@ impl Driver {
 
     /// Create a new [`Driver`] with the provided size from the provided [`io_uring::Builder`].
     ///
+    /// `size` is the number of submission queue (SQ) entries. By default the
+    /// kernel gives the completion queue (CQ) twice as many entries;
+    /// [`io_uring::Builder::setup_cqsize`] sets a larger CQ.
+    ///
     /// This uses [`DriverOptions::default`]. Use
     /// [`Driver::new_with_options`] to customize driver behavior.
+    ///
+    /// # Sizing the completion queue
+    ///
+    /// The CQ should hold every completion the kernel may post before the
+    /// driver reaps it. A normal park handles at most
+    /// [`DriverOptions::completion_drain_budget`] completions (32 by
+    /// default), so completions can wait in the CQ across several parks:
+    /// size it for everything that can be pending at once, not for one
+    /// park's worth. The SQ size does not bound this either: entries that do
+    /// not fit in the SQ wait in the driver's overflow queue and are
+    /// submitted by later parks, so any number of operations can be in
+    /// flight. Count:
+    ///
+    /// - one completion per in-flight single-shot operation, including the
+    ///   cancellations and closes that drops submit, and two for an
+    ///   operation with a linked timeout (the operation and the timeout each
+    ///   complete) or a zero-copy send (its result and its buffer
+    ///   notification);
+    /// - for each multishot receive on a
+    ///   [`RecvBufRing`](crate::bufring::RecvBufRing), one completion per
+    ///   buffer it fills while the thread is busy, bounded across receives by
+    ///   the rings' total `buf_cnt`, plus the receive's final completion.
+    ///
+    /// For example, a server with one ring, whose connections each may have a
+    /// multishot receive, a send, a timer and a cancellation in flight, needs
+    /// about `buf_cnt + 4 * connections` CQ entries, plus slack for its
+    /// accept, its other timers and the driver's own eventfd read.
+    ///
+    /// When the CQ is full, a multishot receive is ended and its final
+    /// completion, like any other completion posted then, goes to the
+    /// kernel's overflow list. On a ring without `IORING_SETUP_DEFER_TASKRUN`
+    /// the kernel allocates those entries without waiting (and charges them
+    /// to the memory cgroup), and when the allocation fails it drops the
+    /// completion. The next `io_uring_enter` then fails with `EBADR`, which
+    /// the driver currently treats as fatal. Registering buffer rings with
+    /// more buffers in total than the CQ has entries logs a warning.
     ///
     /// # Errors
     ///
