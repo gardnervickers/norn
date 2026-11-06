@@ -263,3 +263,36 @@ fn linked_timeout_can_be_reset_after_submission() -> Result<(), Box<dyn std::err
         Ok(())
     })
 }
+
+#[test]
+#[should_panic(expected = "cannot link an operation that was already polled")]
+fn then_panics_on_an_already_polled_request() {
+    let _ = util::with_test_env(|| async {
+        let dir = util::ThreadNameTestDir::new();
+        let mut opts = fs::OpenOptions::new();
+        opts.create(true).truncate(true).read(true).write(true);
+        let file = opts.open(dir.join("then-polled")).await?;
+
+        // Polling submits the read on its own, so it can no longer be linked.
+        let mut read = file.read_at(vec![0; 1], 0);
+        assert!(futures_util::poll!(&mut read).is_pending());
+        let _ = read.then(file.read_at(vec![0; 1], 0)).await;
+        Ok(())
+    });
+}
+
+#[test]
+#[should_panic(expected = "cannot link an operation that was already polled")]
+fn then_always_panics_on_an_already_polled_request() {
+    let _ = util::with_test_env(|| async {
+        let dir = util::ThreadNameTestDir::new();
+        let mut opts = fs::OpenOptions::new();
+        opts.create(true).truncate(true).read(true).write(true);
+        let file = opts.open(dir.join("then-always-polled")).await?;
+
+        let mut read = file.read_at(vec![0; 1], 0);
+        assert!(futures_util::poll!(&mut read).is_pending());
+        let _ = read.then_always(file.read_at(vec![0; 1], 0)).await;
+        Ok(())
+    });
+}

@@ -397,7 +397,18 @@ where
         }
     }
 
+    /// Configure a prepared operation into `batch`, and return whether requests
+    /// linked after it may be submitted.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the operation is not prepared: it was already polled, and so
+    /// submitted on its own, before it was linked.
     fn prepare_batch(&mut self, batch: &mut SmallVec<[ConfiguredEntry; 4]>) -> bool {
+        assert!(
+            matches!(self, State::Prepared { .. }),
+            "cannot link an operation that was already polled: polling submits it on its own"
+        );
         match self.configure() {
             Some(entry) => {
                 batch.push(entry);

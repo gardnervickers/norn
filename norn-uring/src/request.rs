@@ -46,7 +46,10 @@ pub trait Request: Future + Sized + private::Chainable {
     ///
     /// # Panics
     ///
-    /// Panics if `self` and `next` target different drivers.
+    /// Panics if `self` and `next` target different drivers. The returned
+    /// request panics when first polled if `self` or `next` contains an
+    /// operation that was already polled, since polling submitted it on its
+    /// own and it can no longer be linked.
     fn then<R>(self, next: R) -> Then<Self, R>
     where
         R: Request,
@@ -61,6 +64,9 @@ pub trait Request: Future + Sized + private::Chainable {
     /// to close a descriptor after a write. `next` also runs if this request
     /// fails configuration. Both results are returned, as with
     /// [`Request::then`].
+    ///
+    /// Like [`Request::then`], the returned request panics when first polled
+    /// if `self` or `next` contains an operation that was already polled.
     ///
     /// Dropping the returned request cancels both requests, as it does for
     /// [`Request::then`]. Cancelling this request does not break a hard link,
@@ -85,7 +91,9 @@ pub trait Request: Future + Sized + private::Chainable {
     ///
     /// # Panics
     ///
-    /// Panics if `self` and `next` target different drivers.
+    /// Panics if `self` and `next` target different drivers. Like
+    /// [`Request::then`], the returned request panics when first polled if
+    /// `self` or `next` contains an operation that was already polled.
     fn then_aux<R>(self, next: R) -> ThenAux<Self, R>
     where
         R: Request,
