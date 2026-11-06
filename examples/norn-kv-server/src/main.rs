@@ -243,10 +243,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             io::Error::new(error.kind(), format!("pin server to CPU {cpu}: {error}"))
         })?;
     }
-    let builder = io_uring::IoUring::builder();
-    let driver = norn_uring::Driver::new(builder, config.ring_entries).map_err(|error| {
-        io::Error::new(error.kind(), format!("create io_uring driver: {error}"))
-    })?;
+    let driver = norn_kv_server::server::driver(config.ring_entries, config.server.recv_mode)
+        .map_err(|error| {
+            io::Error::new(error.kind(), format!("create io_uring driver: {error}"))
+        })?;
     let mut executor = LocalExecutor::new(driver);
     executor.block_on(async move {
         let listener = TcpListener::bind(config.listen, config.backlog)

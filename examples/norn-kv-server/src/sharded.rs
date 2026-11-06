@@ -42,7 +42,6 @@ use crate::server::{
 const INLINE_KEY_LEN: usize = 32;
 const DEFAULT_PAIR_CAPACITY: usize = 1_024;
 const PUMP_BATCH: usize = 64;
-const RECV_RING_BUFFERS: u16 = 8_192;
 const RECV_BUFFER_LEN: usize = 8 * 1024;
 const MAX_IN_FLIGHT_PER_CONNECTION: usize = 32;
 // Reply buffers are recycled per worker. Larger buffers (rare large GETs) are
@@ -446,13 +445,12 @@ fn run_worker(
         })?;
     }
 
-    let uring =
-        norn_uring::Driver::new(io_uring::IoUring::builder(), ring_entries).map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!("create worker {index} io_uring driver: {error}"),
-            )
-        })?;
+    let uring = crate::server::driver(ring_entries, RecvMode::Multishot).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("create worker {index} io_uring driver: {error}"),
+        )
+    })?;
     let WorkerChannels {
         driver,
         request_txs,
@@ -522,7 +520,7 @@ async fn worker_main(
                 )
             })?;
     let address = listener.local_addr()?;
-    let recv_ring = crate::server::recv_ring(RECV_RING_BUFFERS)?;
+    let recv_ring = crate::server::recv_ring(crate::server::RECV_RING_BUFFERS)?;
     startup.ready(address);
 
     match control_rx.recv().await {

@@ -725,6 +725,27 @@ impl Handle {
         self.shared.health_error()
     }
 
+    /// Returns the number of entries in the driver's completion queue (CQ).
+    ///
+    /// The kernel rounds the requested size up to a power of two; see
+    /// [`Driver::new`] for how to size it.
+    pub fn cq_entries(&self) -> u32 {
+        self.shared.ring.borrow().params().cq_entries()
+    }
+
+    /// Whether the kernel holds completions that did not fit in the
+    /// completion queue (`IORING_SQ_CQ_OVERFLOW`).
+    ///
+    /// The kernel keeps such completions on an overflow list and the driver's
+    /// next park posts them, which clears this flag again. An overflow is not
+    /// itself an error, but on a ring without `IORING_SETUP_DEFER_TASKRUN` the
+    /// kernel may fail to allocate an overflow entry and drop the completion;
+    /// see [`Driver::new`]. A ring sized for its workload never overflows, so
+    /// this is useful for checking that sizing.
+    pub fn cq_overflow_pending(&self) -> bool {
+        self.shared.ring.borrow_mut().submission().cq_overflow()
+    }
+
     pub(crate) fn same_driver(&self, other: &Self) -> bool {
         Rc::ptr_eq(&self.shared, &other.shared)
     }
@@ -746,8 +767,32 @@ impl Driver {
 
     /// Create a new [`Driver`] with the provided size from the provided [`io_uring::Builder`].
     ///
+    /// `size` is the number of submission queue (SQ) entries. By default the
+    /// kernel gives the completion queue (CQ) twice as many entries;
+    /// [`io_uring::Builder::setup_cqsize`] sets a larger CQ.
+    ///
     /// This uses [`DriverOptions::default`]. Use
     /// [`Driver::new_with_options`] to customize driver behavior.
+    ///
+    /// # Sizing the completion queue
+    ///
+    /// The CQ must hold every completion the kernel may post before the
+    /// driver next reaps it. Most operations post one completion each, so
+    /// they are bounded by the SQ size and the in-flight count. A multishot
+    /// receive on a [`RecvBufRing`](crate::bufring::RecvBufRing) is not: it
+    /// posts one completion per buffer it selects, and keeps selecting while
+    /// the thread is busy, so it can post up to the ring's buffer count
+    /// before the driver reaps any. Give the CQ at least the sum of
+    /// `buf_cnt` over the buffer rings in use plus the operations that can be
+    /// in flight (for example `setup_cqsize(size + buf_cnt)`).
+    ///
+    /// Completions that do not fit go to the kernel's overflow list. On a
+    /// ring without `IORING_SETUP_DEFER_TASKRUN` the kernel allocates those
+    /// entries without waiting (and charges them to the memory cgroup), and
+    /// when the allocation fails it drops the completion. The next
+    /// `io_uring_enter` then fails with `EBADR`, which the driver currently
+    /// treats as fatal. Registering a buffer ring with more buffers than the CQ has
+    /// entries logs a warning.
     ///
     /// # Errors
     ///

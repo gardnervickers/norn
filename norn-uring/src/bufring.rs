@@ -33,6 +33,15 @@ use tracker::{BufferToken, BundleClaim, PublicationTracker, TrackerError};
 /// polling it, so one stalled consumer can hold every buffer of a shared ring
 /// unless [`Builder::max_unconsumed_per_receive`] bounds it.
 ///
+/// That bound applies when the stream sees completions. While the driver's
+/// thread is busy, the kernel keeps posting one completion per selected
+/// buffer, up to the ring's buffer count, so the driver's completion queue
+/// should have at least the sum of `buf_cnt` over the rings in use plus the
+/// operations that can be in flight. Completions beyond the completion queue
+/// go to the kernel's overflow list, from which the kernel may drop them; see
+/// [`Driver::new`](crate::Driver::new). [`Builder::build`] logs a warning
+/// when a ring has more buffers than the completion queue has entries.
+///
 /// # Example
 ///
 /// ```no_run
@@ -819,6 +828,11 @@ impl Builder {
     }
 
     /// The number of buffers to allocate. If left zero, the `ring_entries` value will be used.
+    ///
+    /// A multishot receive can post one completion per buffer before the
+    /// driver reaps any, so the driver's completion queue should have room
+    /// for every buffer of every ring in use, plus the in-flight operations;
+    /// see [`Driver::new`](crate::Driver::new).
     pub fn buf_cnt(mut self, buf_cnt: u16) -> Builder {
         self.buf_cnt = buf_cnt;
         self
@@ -881,6 +895,9 @@ impl Builder {
     /// Returns an error for an invalid ring configuration, allocation failure,
     /// duplicate buffer-group ID, or kernel registration failure.
     ///
+    /// A ring with more buffers than the driver's completion queue has
+    /// entries is still built, but logs a warning: see [`RecvBufRing`].
+    ///
     /// # Panics
     ///
     /// Panics if called outside an active [`Driver`](crate::Driver) context.
@@ -907,6 +924,17 @@ impl Builder {
         b.ring_entries = b.ring_entries.next_power_of_two();
 
         let handle = crate::Handle::current();
+        let cq_entries = handle.cq_entries();
+        if u32::from(b.buf_cnt) > cq_entries {
+            warn!(
+                target: "norn_uring::bufring",
+                "buf_ring.exceeds_cq bgid={} buf_cnt={} cq_entries={cq_entries}: \
+                 a multishot receive can overflow the completion queue, and the kernel \
+                 may drop overflowed completions; size the CQ with setup_cqsize",
+                b.bgid,
+                b.buf_cnt,
+            );
+        }
         let storage = Rc::new(BufRingStorage::new(
             b.bgid,
             b.ring_entries,

@@ -17,7 +17,7 @@ use crate::codec::{decode_body, DecodeStatus, FrameDecoder, ResponseEncoder};
 use crate::handler::{ConnectionAction, MemoryHandler};
 use crate::protocol::{EncodeError, RequestHeader, HEADER_LEN};
 
-const RECV_RING_BUFFERS: u16 = 8_192;
+pub(crate) const RECV_RING_BUFFERS: u16 = 8_192;
 const RECV_BUFFER_LEN: usize = 8 * 1024;
 /// Buffers one connection's receive may hold before it pauses. This sits
 /// above the backlog a polling connection builds up between polls in the
@@ -193,6 +193,31 @@ impl ServerConfig {
         }
         Ok(())
     }
+}
+
+/// Create a worker's `io_uring` driver with `ring_entries` submission queue
+/// entries and a completion queue that also has room for every buffer of
+/// the receive ring.
+///
+/// A multishot receive posts one completion per ring buffer it fills, and
+/// keeps filling while the worker is busy, so with the default CQ (twice the
+/// SQ) a burst overflows it. The kernel may drop an overflowed completion
+/// when it cannot allocate the overflow entry, and the driver then fails.
+///
+/// # Errors
+///
+/// Returns an error when the kernel cannot create the ring.
+pub fn driver(ring_entries: u32, recv_mode: RecvMode) -> io::Result<norn_uring::Driver> {
+    let recv_buffers = match recv_mode {
+        RecvMode::Exact => 0,
+        RecvMode::Multishot => u32::from(RECV_RING_BUFFERS),
+    };
+    let mut builder = io_uring::IoUring::builder();
+    // Clamp rather than reject sizes above the kernel's limits.
+    builder
+        .setup_clamp()
+        .setup_cqsize(ring_entries.saturating_add(recv_buffers));
+    norn_uring::Driver::new(builder, ring_entries)
 }
 
 /// Build the provided-buffer ring that every multishot connection on a worker
@@ -673,6 +698,81 @@ mod tests {
     use crate::protocol::{
         Status, OP_GET, OP_NOOP, OP_QUIT, OP_SET, REQUEST_MAGIC, RESPONSE_MAGIC,
     };
+
+    /// A multishot receive keeps filling ring buffers while the worker is
+    /// busy, posting a completion for each. The worker's completion queue
+    /// must hold all of them: completions that overflow it can be dropped by
+    /// the kernel, after which the driver fails with `EBADR`.
+    #[test]
+    fn multishot_burst_fits_in_the_completion_queue() {
+        use std::io::Write;
+        use std::net::TcpStream;
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        use norn_executor::LocalExecutor;
+
+        // Twice the default 512-entry CQ of the server's default 256-entry SQ.
+        const BURST_BUFFERS: usize = 1_024;
+        const BURST: usize = BURST_BUFFERS * RECV_BUFFER_LEN;
+
+        // The server's default `--ring-entries`.
+        let driver = driver(256, RecvMode::Multishot).unwrap();
+        let mut executor = LocalExecutor::new(driver);
+        executor.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap(), 8)
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            let ring = recv_ring(RECV_RING_BUFFERS).unwrap();
+            let (start_tx, start_rx) = mpsc::channel::<()>();
+            let peer = thread::spawn(move || {
+                let mut stream = TcpStream::connect(address).unwrap();
+                start_rx.recv().unwrap();
+                stream.write_all(&vec![7_u8; BURST]).unwrap();
+                stream
+            });
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut incoming = pin!(socket.recv_ring_multi(&ring));
+
+            // Arm the receive and let a park submit it.
+            assert!(futures_util::poll!(incoming.next()).is_pending());
+            let mut yielded = false;
+            std::future::poll_fn(|cx| {
+                if std::mem::replace(&mut yielded, true) {
+                    std::task::Poll::Ready(())
+                } else {
+                    cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                }
+            })
+            .await;
+
+            // Keep the worker busy, without reaping, while the burst arrives.
+            // The kernel completes the receive from task work meanwhile.
+            start_tx.send(()).unwrap();
+            let peer_stream = peer.join().unwrap();
+            thread::sleep(Duration::from_millis(500));
+            let handle = norn_uring::Handle::current();
+            assert!(
+                !handle.cq_overflow_pending(),
+                "a {BURST_BUFFERS}-buffer multishot burst overflowed the {}-entry CQ",
+                handle.cq_entries(),
+            );
+
+            let mut received = 0;
+            let mut buffers = 0;
+            while received < BURST {
+                let buffer = incoming.next().await.unwrap().unwrap();
+                received += buffer.len();
+                buffers += 1;
+            }
+            assert_eq!(received, BURST);
+            assert!(buffers >= BURST_BUFFERS);
+            drop(peer_stream);
+        });
+    }
 
     #[test]
     fn accept_errors_back_off_skip_or_stop_the_listener() {
