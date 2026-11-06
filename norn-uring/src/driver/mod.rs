@@ -766,7 +766,10 @@ impl Handle {
             .test_fail_next_release(errno);
     }
 
-    /// Returns the first recorded fatal driver submit error, if any.
+    /// Returns the recorded fatal driver submit error, if any.
+    ///
+    /// This is the first fatal error, except that a lost-completions error
+    /// (the kernel dropped CQEs) takes precedence over an earlier one.
     pub fn health_error(&self) -> Option<io::Error> {
         self.shared.health_error()
     }
@@ -1813,19 +1816,23 @@ impl Shared {
     /// dropped counter is non-zero (the drop is the more useful diagnosis).
     /// Every path that returns an enter error from a park goes through here,
     /// so the error, log line, broken accounting and health error do not
-    /// depend on which enter failed. Other errors pass through unchanged.
+    /// depend on which enter failed. Other errors pass through unchanged, and
+    /// so does every error after the first conversion: the driver is already
+    /// failed, and shutdown's retry logs should keep the real errno.
     fn lost_completions_error(&self, err: io::Error) -> io::Error {
+        if self.cqes_dropped.get() {
+            return err;
+        }
         let ebadr = err.raw_os_error() == Some(libc::EBADR);
         let dropped = self.ring.borrow_mut().completion().overflow() > 0;
-        if !ebadr && !dropped && !self.cqes_dropped.get() {
+        if !ebadr && !dropped {
             return err;
         }
         self.log_cq_health();
-        let first = !self.cqes_dropped.get();
         let lost = self.mark_cqes_dropped();
         if ebadr {
             error!(target: LOG, "io_uring_enter.ebadr {lost}");
-        } else if first {
+        } else {
             error!(target: LOG, "park.failed_with_dropped_cqes error={err}: {lost}");
         }
         lost
@@ -4423,6 +4430,13 @@ mod tests {
             driver.handle().health_error().unwrap().to_string(),
             err.to_string()
         );
+
+        // Once failed, later errors (shutdown retries) keep their errno.
+        let later = driver
+            .shared
+            .lost_completions_error(io::Error::from_raw_os_error(libc::EIO));
+        assert_eq!(later.raw_os_error(), Some(libc::EIO));
+        assert_eq!(captured_error_logs("io_uring_enter.ebadr"), 1);
     }
 
     #[test]
