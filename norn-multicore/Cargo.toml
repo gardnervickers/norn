@@ -3,10 +3,16 @@ name = "norn-multicore"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# Capture a stalled worker's stack with a signal; Linux only. See `Stall::stack`.
+stall-stacks = ["dep:backtrace", "dep:libc"]
+
 [dependencies]
 norn-channel = { path = "../norn-channel" }
 norn-executor = { path = "../norn-executor" }
 norn-metrics = { path = "../norn-metrics" }
+backtrace = { version = "0.3.77", optional = true }
+libc = { version = "0.2.149", optional = true }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 io-uring = "0.7.15"

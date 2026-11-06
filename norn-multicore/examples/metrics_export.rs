@@ -6,8 +6,8 @@
 //!
 //! Two workers, each an `io_uring` driver under a timer wheel, run noops and
 //! sleeps for three seconds. After one second, worker 1 runs a poll that
-//! blocks its thread for 300 ms. A watchdog thread samples every 25 ms and
-//! reports the stall without any help from the stuck worker. At the end the
+//! blocks its thread for 300 ms. The group's stall watchdog reports it
+//! without any help from the stuck worker. At the end the
 //! example prints the final counts, which stay readable after the workers
 //! have exited.
 #[cfg(target_os = "linux")]
@@ -25,8 +25,6 @@ mod linux {
     use std::collections::BTreeMap;
     use std::fmt::Write as _;
     use std::io;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     use norn_executor::ExecutorMetrics;
@@ -35,7 +33,6 @@ mod linux {
     use norn_uring::RingMetrics;
 
     const STALL_THRESHOLD: Duration = Duration::from_millis(100);
-    const SAMPLE_EVERY: Duration = Duration::from_millis(25);
 
     pub(super) fn main() {
         let mut builder = RuntimeGroup::builder(2);
@@ -54,19 +51,22 @@ mod linux {
                 )
                 .unwrap();
         }
+        // The watchdog samples every worker's executor from its own thread.
+        builder.stall_watchdog(STALL_THRESHOLD, |stall| {
+            println!(
+                "watchdog: worker {} has run for at least {} ms without parking \
+                 (after {} ticks, {} polls)",
+                stall.worker,
+                stall.running_for.as_millis(),
+                stall.executor.ticks,
+                stall.executor.polls
+            );
+        });
         let group = builder.start().unwrap();
-        // Executor, timer and ring views of every worker, collected at startup.
+        // Executor, channel, timer and ring views of every worker, collected
+        // at startup.
         let workers = group.metrics();
-
-        let done = Arc::new(AtomicBool::new(false));
-        let watchdog = {
-            let workers = workers.clone();
-            let done = Arc::clone(&done);
-            std::thread::spawn(move || watch(&workers, &done))
-        };
         group.join().unwrap();
-        done.store(true, Ordering::Relaxed);
-        watchdog.join().unwrap();
 
         // Typed views for a summary, then every value for Prometheus.
         for (id, sources) in &workers {
@@ -99,57 +99,6 @@ mod linux {
                 // A poll that blocks the worker thread, as a synchronous call
                 // hidden in async code would.
                 std::thread::sleep(Duration::from_millis(300));
-            }
-        }
-    }
-
-    /// What the watchdog last saw from one worker.
-    struct Watch {
-        activity: u64,
-        since: Instant,
-        reported: bool,
-    }
-
-    /// Report any worker that runs without parking for longer than the
-    /// threshold.
-    ///
-    /// The executor's activity word changes whenever it starts or stops
-    /// running, so if two samples show the same value and the executor is
-    /// running, it has run without parking ever since the first of them.
-    fn watch(workers: &[(WorkerId, Sources)], done: &AtomicBool) {
-        let now = Instant::now();
-        let mut watches: Vec<Watch> = workers
-            .iter()
-            .map(|_| Watch {
-                activity: u64::MAX,
-                since: now,
-                reported: false,
-            })
-            .collect();
-        while !done.load(Ordering::Relaxed) {
-            std::thread::sleep(SAMPLE_EVERY);
-            let now = Instant::now();
-            for ((id, sources), watch) in workers.iter().zip(&mut watches) {
-                let snapshot = sources.get::<ExecutorMetrics>().unwrap().snapshot();
-                if snapshot.running && snapshot.activity == watch.activity {
-                    let stuck_for = now - watch.since;
-                    if stuck_for >= STALL_THRESHOLD && !watch.reported {
-                        watch.reported = true;
-                        println!(
-                            "watchdog: worker {id} has run for at least {} ms without \
-                             parking (after {} ticks, {} polls)",
-                            stuck_for.as_millis(),
-                            snapshot.ticks,
-                            snapshot.polls
-                        );
-                    }
-                } else {
-                    *watch = Watch {
-                        activity: snapshot.activity,
-                        since: now,
-                        reported: false,
-                    };
-                }
             }
         }
     }

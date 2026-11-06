@@ -74,6 +74,11 @@ use norn_channel::{mpsc as channel, DriverBuilder, Endpoint};
 use norn_executor::park::{Park, ThreadPark};
 use norn_executor::LocalExecutor;
 
+mod stacks;
+mod watchdog;
+
+pub use watchdog::Stall;
+
 /// A boxed worker error that is safe to return to the group owner.
 pub type BoxError = Box<dyn Error + Send + Sync + 'static>;
 
@@ -236,6 +241,12 @@ struct GroupControl {
     /// Each worker's metric sources, set on its thread before it reports
     /// startup.
     metrics: Vec<OnceLock<norn_metrics::Sources>>,
+    /// Each worker's thread, for stack capture, set before it reports startup.
+    #[cfg_attr(
+        not(all(feature = "stall-stacks", target_os = "linux")),
+        allow(dead_code)
+    )]
+    threads: Vec<OnceLock<u64>>,
 }
 
 impl GroupControl {
@@ -459,6 +470,8 @@ pub enum StartError {
     Worker(JoinError),
     /// The configured thread name prefix contains a NUL byte.
     InvalidThreadName,
+    /// The operating system refused to create the stall watchdog thread.
+    Watchdog(io::Error),
 }
 
 impl fmt::Display for StartError {
@@ -472,6 +485,7 @@ impl fmt::Display for StartError {
             }
             Self::Worker(error) => write!(f, "worker startup failed: {error}"),
             Self::InvalidThreadName => f.write_str("thread name prefix contains a NUL byte"),
+            Self::Watchdog(source) => write!(f, "failed to spawn the stall watchdog: {source}"),
         }
     }
 }
@@ -481,6 +495,7 @@ impl Error for StartError {
         match self {
             Self::Spawn { source, .. } => Some(source),
             Self::Worker(source) => Some(source),
+            Self::Watchdog(source) => Some(source),
             Self::Unconfigured(_) | Self::InvalidThreadName => None,
         }
     }
@@ -560,6 +575,7 @@ pub struct Builder {
     thread_name_prefix: String,
     stack_size: Option<usize>,
     poll_timing: bool,
+    watchdog: Option<watchdog::WatchdogConfig>,
 }
 
 impl fmt::Debug for Builder {
@@ -569,6 +585,10 @@ impl fmt::Debug for Builder {
             .field("thread_name_prefix", &self.thread_name_prefix)
             .field("stack_size", &self.stack_size)
             .field("poll_timing", &self.poll_timing)
+            .field(
+                "watchdog",
+                &self.watchdog.as_ref().map(|config| config.threshold),
+            )
             .finish()
     }
 }
@@ -603,6 +623,7 @@ impl Builder {
         let control = Arc::new(GroupControl {
             workers: shutdown_controls,
             metrics: (0..worker_count).map(|_| OnceLock::new()).collect(),
+            threads: (0..worker_count).map(|_| OnceLock::new()).collect(),
         });
 
         Self {
@@ -611,6 +632,7 @@ impl Builder {
             thread_name_prefix: "norn-worker".to_owned(),
             stack_size: None,
             poll_timing: false,
+            watchdog: None,
         }
     }
 
@@ -676,6 +698,26 @@ impl Builder {
         self
     }
 
+    /// Watch every worker from a separate thread, and call `on_stall` on that
+    /// thread once each time a worker runs for at least `threshold` without
+    /// parking.
+    ///
+    /// The watchdog samples each worker's executor metrics about four times
+    /// per threshold and costs the workers nothing. A run between one and two
+    /// thresholds long may be missed; any longer run is reported. A panic in
+    /// `on_stall` is caught. With the `stall-stacks` feature on Linux, each
+    /// report also carries the stuck thread's stack: see [`Stall::stack`].
+    pub fn stall_watchdog<F>(&mut self, threshold: std::time::Duration, on_stall: F) -> &mut Self
+    where
+        F: Fn(&Stall) + Send + 'static,
+    {
+        self.watchdog = Some(watchdog::WatchdogConfig {
+            threshold,
+            on_stall: Box::new(on_stall),
+        });
+        self
+    }
+
     /// Configure one worker with a custom fallible [`Park`] factory.
     ///
     /// The factory and `main` closure are moved to the destination thread. The
@@ -737,6 +779,7 @@ impl Builder {
             }
             let metrics = executor.metric_sources();
             let _ = control.metrics[id.index()].set(metrics.clone());
+            stacks::register_worker(&control, id);
             startup_reported.store(true, Ordering::Release);
             let _ = startup.send(StartEvent::Ready);
             if !gate.wait() {
@@ -871,10 +914,24 @@ impl Builder {
             return Err(StartError::Worker(JoinError { failures }));
         }
 
+        // Every worker has set its sources, so the watchdog can find them.
+        let watchdog = match self.watchdog.take() {
+            Some(config) => match watchdog::Watchdog::spawn(config, Arc::clone(&self.control)) {
+                Ok(watchdog) => Some(watchdog),
+                Err(source) => {
+                    gate.decide(StartDecision::Abort);
+                    self.control.request_all();
+                    join_worker_threads(threads);
+                    return Err(StartError::Watchdog(source));
+                }
+            },
+            None => None,
+        };
         gate.decide(StartDecision::Run);
         Ok(RuntimeGroup {
             control: self.control,
             workers: threads,
+            _watchdog: watchdog,
         })
     }
 }
@@ -932,6 +989,8 @@ struct WorkerThread {
 pub struct RuntimeGroup {
     control: Arc<GroupControl>,
     workers: Vec<WorkerThread>,
+    // Dropped after the workers are joined, so it watches until then.
+    _watchdog: Option<watchdog::Watchdog>,
 }
 
 impl fmt::Debug for RuntimeGroup {

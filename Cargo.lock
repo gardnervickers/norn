@@ -1232,7 +1232,9 @@ version = "0.1.0"
 name = "norn-multicore"
 version = "0.1.0"
 dependencies = [
+ "backtrace",
  "io-uring",
+ "libc",
  "norn-channel",
  "norn-executor",
  "norn-metrics",
