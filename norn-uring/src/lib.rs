@@ -57,6 +57,7 @@
 //! - [`fixedbuf`]: caller-owned buffers registered for fixed I/O.
 //! - [`fs`]: asynchronous filesystem operations.
 //! - [`net`]: asynchronous TCP and UDP networking.
+//! - [`ring`]: which `io_uring` opcodes the kernel implements.
 //! - [`uring_cmd`]: the low-level device-command extension contract.
 //!
 //! # Low-level extension APIs
@@ -110,6 +111,8 @@ pub mod fixedbuf;
 pub mod fs;
 /// Asynchronous TCP and UDP networking.
 pub mod net;
+/// Which `io_uring` opcodes the kernel implements.
+pub mod ring;
 /// Device-specific commands submitted through `IORING_OP_URING_CMD`.
 pub mod uring_cmd;
 

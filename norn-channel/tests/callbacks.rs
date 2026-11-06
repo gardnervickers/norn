@@ -2,16 +2,18 @@
 //! `Park::shutdown`. They may re-enter the channel driver, and a panicking
 //! waker must not lose other receivers' wakeups or leave channels open.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::future::Future;
+use std::io;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::pin::pin;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
 
 use norn_channel::{mpsc, Driver};
-use norn_executor::park::{Park, ParkMode, SpinPark};
+use norn_executor::park::{Park, ParkMode, SpinPark, Unpark};
 
 thread_local! {
     static OTHER_RECEIVER: RefCell<Option<mpsc::Receiver<u32>>> = const { RefCell::new(None) };
@@ -208,4 +210,64 @@ fn wake_callback_can_attach_a_receiver() {
 #[test]
 fn shutdown_callback_can_attach_a_receiver() {
     attach_from_waker(true);
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NoopUnpark;
+
+impl Unpark for NoopUnpark {
+    fn unpark(&self) {}
+}
+
+/// An inner park that records whether it was shut down.
+#[derive(Debug)]
+struct RecordShutdown(Rc<Cell<bool>>);
+
+impl Park for RecordShutdown {
+    type Unparker = NoopUnpark;
+    type Guard = ();
+
+    fn park(&mut self, _: ParkMode) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn enter(&self) -> Self::Guard {}
+
+    fn unparker(&self) -> Self::Unparker {
+        NoopUnpark
+    }
+
+    fn needs_park(&self) -> bool {
+        false
+    }
+
+    fn shutdown(&mut self) {
+        self.0.set(true);
+    }
+}
+
+/// A panicking receiver waker must not skip the inner park's shutdown.
+#[test]
+fn shutdown_wake_panic_still_shuts_down_the_inner_park() {
+    let shut_down = Rc::new(Cell::new(false));
+    let mut driver = Driver::new(RecordShutdown(Rc::clone(&shut_down)));
+    let handle = driver.handle();
+    let (_sender, receiver) = mpsc::bounded::<u32>(&driver.endpoint(), 1);
+    let mut receiver = receiver.attach(&handle);
+    let waker = Waker::from(Arc::new(PanicThenCount {
+        panics: 1,
+        calls: AtomicUsize::new(0),
+        woken: AtomicUsize::new(0),
+    }));
+    let mut recv = pin!(receiver.recv());
+    assert!(recv
+        .as_mut()
+        .poll(&mut Context::from_waker(&waker))
+        .is_pending());
+
+    assert!(catch_unwind(AssertUnwindSafe(|| driver.shutdown())).is_err());
+    assert!(
+        shut_down.get(),
+        "channel Park::shutdown skipped inner.shutdown after a receiver waker panicked"
+    );
 }

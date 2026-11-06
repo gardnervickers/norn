@@ -116,9 +116,13 @@ impl UringFd {
     /// requests still waiting for submission-queue space, which are submitted
     /// ahead of it. Prepared requests that have not been polled, requests
     /// submitted afterwards, and linked requests the kernel has not issued yet
-    /// (`b` in `a.then(b)` while `a` runs) are not matched. Canceling the head
-    /// of a linked chain also fails the requests linked after it, whatever
-    /// their descriptor.
+    /// (`b` in `a.then(b)` while `a` runs) are not matched. Canceling a
+    /// request linked with [`Request::then`](crate::Request::then) also fails
+    /// the requests linked after it, whatever their descriptor. A request
+    /// hard-linked with [`Request::then_always`](crate::Request::then_always)
+    /// is issued instead once its predecessor ends, so it can still be running
+    /// on this descriptor afterwards. To cancel such chains too, repeat the
+    /// cancellation until it reports zero.
     ///
     /// Streams that re-arm themselves, such as
     /// [`TcpListener::incoming`](crate::net::TcpListener::incoming) and
