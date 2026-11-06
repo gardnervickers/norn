@@ -265,8 +265,8 @@ fn linked_timeout_can_be_reset_after_submission() -> Result<(), Box<dyn std::err
 }
 
 #[test]
-#[should_panic(expected = "cannot link an operation that was already polled")]
-fn then_panics_on_an_already_polled_request() {
+#[should_panic(expected = "cannot link an operation that was already submitted")]
+fn then_panics_on_an_already_submitted_request() {
     let _ = util::with_test_env(|| async {
         let dir = util::ThreadNameTestDir::new();
         let mut opts = fs::OpenOptions::new();
@@ -282,8 +282,8 @@ fn then_panics_on_an_already_polled_request() {
 }
 
 #[test]
-#[should_panic(expected = "cannot link an operation that was already polled")]
-fn then_always_panics_on_an_already_polled_request() {
+#[should_panic(expected = "cannot link an operation that was already submitted")]
+fn then_always_panics_on_an_already_submitted_request() {
     let _ = util::with_test_env(|| async {
         let dir = util::ThreadNameTestDir::new();
         let mut opts = fs::OpenOptions::new();
