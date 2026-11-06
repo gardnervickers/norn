@@ -1174,6 +1174,7 @@ version = "0.1.0"
 dependencies = [
  "crossbeam-queue",
  "norn-executor",
+ "norn-metrics",
 ]
 
 [[package]]
@@ -1181,6 +1182,7 @@ name = "norn-executor"
 version = "0.1.0"
 dependencies = [
  "futures-test",
+ "norn-metrics",
  "norn-task",
 ]
 
@@ -1223,11 +1225,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "norn-metrics"
+version = "0.1.0"
+
+[[package]]
 name = "norn-multicore"
 version = "0.1.0"
 dependencies = [
  "norn-channel",
  "norn-executor",
+ "norn-metrics",
 ]
 
 [[package]]
@@ -1246,6 +1253,7 @@ dependencies = [
  "bitflags 2.13.2",
  "cordyceps",
  "futures",
+ "norn-metrics",
 ]
 
 [[package]]

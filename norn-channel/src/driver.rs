@@ -385,6 +385,10 @@ where
             resume_unwind(payload);
         }
     }
+
+    fn metric_sources(&self, sources: &mut norn_metrics::Sources) {
+        self.inner.metric_sources(sources);
+    }
 }
 
 impl<P> Drop for Driver<P> {

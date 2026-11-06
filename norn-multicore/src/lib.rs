@@ -66,7 +66,7 @@ use std::io;
 use std::pin::{pin, Pin};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::task::{Context, Poll, Waker};
 use std::thread::{self, JoinHandle};
 
@@ -233,6 +233,9 @@ impl ShutdownState {
 #[derive(Debug)]
 struct GroupControl {
     workers: Vec<Arc<ShutdownRemote>>,
+    /// Each worker's metric sources, set on its thread before it reports
+    /// startup.
+    metrics: Vec<OnceLock<norn_metrics::Sources>>,
 }
 
 impl GroupControl {
@@ -276,6 +279,7 @@ pub struct WorkerContext {
     channels: norn_channel::Handle,
     control: Arc<GroupControl>,
     shutdown: Rc<ShutdownState>,
+    metrics: norn_metrics::Sources,
 }
 
 impl WorkerContext {
@@ -305,6 +309,12 @@ impl WorkerContext {
     /// Request cooperative shutdown of every worker in the group.
     pub fn request_shutdown(&self) {
         self.control.request_all();
+    }
+
+    /// This worker's metric sources: its executor's, then every layer of its
+    /// park stack. See [`LocalExecutor::metric_sources`].
+    pub fn metrics(&self) -> &norn_metrics::Sources {
+        &self.metrics
     }
 }
 
@@ -589,6 +599,7 @@ impl Builder {
             .collect();
         let control = Arc::new(GroupControl {
             workers: shutdown_controls,
+            metrics: (0..worker_count).map(|_| OnceLock::new()).collect(),
         });
 
         Self {
@@ -708,6 +719,8 @@ impl Builder {
             let shutdown_state =
                 Rc::new(ShutdownState::new(Arc::clone(&control.workers[id.index()])));
             let mut executor = LocalExecutor::new(driver);
+            let metrics = executor.metric_sources();
+            let _ = control.metrics[id.index()].set(metrics.clone());
             startup_reported.store(true, Ordering::Release);
             let _ = startup.send(StartEvent::Ready);
             if !gate.wait() {
@@ -719,6 +732,7 @@ impl Builder {
                 channels,
                 control: Arc::clone(&control),
                 shutdown: Rc::clone(&shutdown_state),
+                metrics,
             };
             let worker_main = run_worker_main(main(context), shutdown, shutdown_state);
             let result = match executor.try_block_on(worker_main) {
@@ -932,6 +946,21 @@ impl RuntimeGroup {
     /// Return the number of runtime workers in this group.
     pub fn worker_count(&self) -> usize {
         self.workers.len()
+    }
+
+    /// Every worker's metric sources, in worker order.
+    ///
+    /// Each worker collects its sources on its own thread before reporting
+    /// startup, so every started worker is present. The sources are read-only
+    /// views: they can be read from any thread at any time, including after
+    /// the workers exit. See [`LocalExecutor::metric_sources`].
+    pub fn metrics(&self) -> Vec<(WorkerId, norn_metrics::Sources)> {
+        self.control
+            .metrics
+            .iter()
+            .enumerate()
+            .filter_map(|(index, sources)| Some((WorkerId::new(index), sources.get()?.clone())))
+            .collect()
     }
 
     /// Request cooperative shutdown of every worker.
