@@ -1,13 +1,15 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::future::Future;
+use std::io;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::pin::Pin;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
 
-use norn_executor::park::{Park, ParkMode, SpinPark};
+use norn_executor::park::{Park, ParkMode, SpinPark, Unpark};
 use norn_timer::{Clock, Driver, Error, Sleep};
 
 thread_local! {
@@ -130,4 +132,57 @@ fn expiration_wake_panic_still_notifies_other_completed_timers() {
 #[test]
 fn shutdown_wake_panic_still_notifies_other_completed_timers() {
     panic_preserves_other_wakes(true);
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NoopUnpark;
+
+impl Unpark for NoopUnpark {
+    fn unpark(&self) {}
+}
+
+/// An inner park that records whether it was shut down.
+#[derive(Debug)]
+struct RecordShutdown(Rc<Cell<bool>>);
+
+impl Park for RecordShutdown {
+    type Unparker = NoopUnpark;
+    type Guard = ();
+
+    fn park(&mut self, _: ParkMode) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn enter(&self) -> Self::Guard {}
+
+    fn unparker(&self) -> Self::Unparker {
+        NoopUnpark
+    }
+
+    fn needs_park(&self) -> bool {
+        false
+    }
+
+    fn shutdown(&mut self) {
+        self.0.set(true);
+    }
+}
+
+/// A panicking sleeper waker must not skip the inner park's shutdown.
+#[test]
+fn shutdown_wake_panic_still_shuts_down_the_inner_park() {
+    let shut_down = Rc::new(Cell::new(false));
+    let mut driver = Driver::new(RecordShutdown(Rc::clone(&shut_down)), Clock::simulated());
+    let mut sleep = std::pin::pin!(driver.handle().sleep(Duration::from_millis(1)));
+    let panic_waker = Waker::from(Arc::new(PanicWake));
+    assert!(sleep
+        .as_mut()
+        .poll(&mut Context::from_waker(&panic_waker))
+        .is_pending());
+
+    assert!(catch_unwind(AssertUnwindSafe(|| driver.shutdown())).is_err());
+    assert!(
+        shut_down.get(),
+        "timer Park::shutdown skipped inner.shutdown after a sleep waker panicked"
+    );
 }

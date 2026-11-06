@@ -389,6 +389,9 @@ previous logical length. `WriteFixed` submits only the logical length. Both
 operations own and return the fixed buffer, so it remains unavailable while an
 operation is unpolled, queued, submitted, cancelled, or completion-pending.
 
+Both accept per-operation `ReadOptions` and `WriteOptions` (`RWF_*` flags
+and, for writes, a write stream) through `WithOptions::options`.
+
 The internal operation is based on `NornFd`, keeping the lifecycle reusable if
 fixed operations are later exposed for pipes or sockets.
 

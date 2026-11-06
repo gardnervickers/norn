@@ -21,7 +21,7 @@ The project is intentionally not general-purpose today; APIs are still in flux i
 - `norn-task/`: local-only task runtime primitives (`TaskQueue`, `TaskSet`, `JoinHandle`, `Runnable`, `Schedule`).
 - `norn-executor/`: single-thread executor and `Park` abstraction (`SpinPark`, `ThreadPark`).
 - `norn-timer/`: timer wheel + `Clock::{system, simulated}` as a `Park` wrapper.
-- `norn-uring/`: `io_uring` reactor, operation lifecycle, stable buffers, bufring, fs, tcp/udp.
+- `norn-uring/`: `io_uring` reactor, operation lifecycle, stable buffers, bufring, fs, tcp/udp/unix sockets.
 - `benches/`: `bencher` harness (`schedule_task`, `noop_submit`, `timers`, `hyper`).
 - `examples/norn-kv-bench/`: end-to-end mixed-workload benchmark driver for `norn-kv-server` (independent epoll client; Linux only).
 - `hack/`: helper scripts (`miri.sh`, `coverage.sh`).
@@ -48,7 +48,8 @@ The project is intentionally not general-purpose today; APIs are still in flux i
 - `try_block_on` propagates park errors; `block_on` panics on them.
 - `Drop` installs its context via `Park::enter_for_shutdown` (restoring any
   existing context; tolerating destroyed TLS), shuts down `TaskQueue`, then
-  calls `Park::shutdown`.
+  calls `Park::shutdown`. A join-waker panic from the `TaskQueue` shutdown is
+  caught so `Park::shutdown` still runs, then resumed.
 
 ### `norn-timer` model
 
@@ -57,6 +58,7 @@ The project is intentionally not general-purpose today; APIs are still in flux i
 - `Sleep` futures resolve to `Result<(), norn_timer::Error>`; shutdown path returns shutdown errors.
 - Simulated clock is heavily used in tests/benchmarks.
 - Dropping the timer driver or calling `Park::shutdown` completes every outstanding sleeper with `Error::Shutdown`.
+- `Interval` ticks on a fixed schedule computed from deadlines (no drift). A tick is missed only when the next deadline has already passed at delivery; `MissedTickBehavior` (`Skip` default, `Burst`, `Delay`) decides the next deadline. After shutdown, every tick not already due returns `Error::Shutdown`.
 
 ### `norn-uring` model
 
@@ -78,6 +80,11 @@ The project is intentionally not general-purpose today; APIs are still in flux i
   steady signal stream cannot restart the full timeout (callers re-check their
   deadlines). Other enter errors are recorded as a health error and close the
   driver.
+- Dropped CQEs are fatal. `EBADR` from `io_uring_enter` (or a non-zero kernel
+  dropped counter, checked around each park) becomes an error naming the drop
+  and `setup_cqsize`, marks accounting broken, and makes every later park fail
+  with it. The driver logs, at error level, the transition into CQ overflow and
+  each increase of the dropped counter.
 - Remote unpark is eventfd-based (`driver/unpark.rs`).
 - A `NoPark` park with an empty SQ skips `io_uring_enter` only while the SQ
   flags report neither CQ overflow nor pending task work; otherwise it calls
@@ -220,6 +227,7 @@ The project is intentionally not general-purpose today; APIs are still in flux i
   - file open/read/write,
   - tcp accept/echo,
   - udp send/recv, bufring usage, exhaustion, close behavior.
+  - unix stream and datagram sockets: paths, abstract names, unnamed peers, options.
 
 ## Coding and Documentation Standards
 
