@@ -2366,8 +2366,20 @@ async fn probe_ring(ctx: &Ctx, ring: &RecvBufRing) {
             }
             // Only a datagram the kernel itself dropped (full receive queue,
             // memory pressure) explains missing buffers; an unrelated
-            // environment issue elsewhere in the seed does not.
-            Err(e) if udp_drops(addr.port()) > 0 => {
+            // environment issue elsewhere in the seed does not. A timeout is
+            // env only if the kernel dropped every datagram not yet received
+            // (`cnt + 1 - i` were still due), so a lost completion for a
+            // delivered datagram still fails the seed.
+            Err(e)
+                if {
+                    let drops = udp_drops(addr.port());
+                    if e.kind() == io::ErrorKind::TimedOut {
+                        drops >= (cnt + 1 - i) as u64
+                    } else {
+                        drops > 0
+                    }
+                } =>
+            {
                 return ctx.env(format!(
                     "probe: {i} of {cnt} (kernel dropped datagrams): {e}"
                 ));
