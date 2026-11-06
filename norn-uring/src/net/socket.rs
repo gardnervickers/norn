@@ -65,6 +65,9 @@ impl MultishotBacklog {
 
     /// Count the items of one reaped completion, and pause the operation
     /// once its backlog reaches the limit while the kernel keeps it armed.
+    /// The count is what userspace has reaped, so the limit does not bound
+    /// what the kernel has produced: an accept can have taken the whole queue,
+    /// and every arrival since, before the cancellation takes effect.
     /// If the backlog still grows to twice the limit, request the
     /// cancellation again. `pause` must queue the cancellation without
     /// submitting it.
@@ -2033,6 +2036,16 @@ impl<K: AddrKind> Singleshot for Accept<K> {
 
 /// A multishot accept. The kernel keeps accepting while nothing consumes its
 /// connections, so it cancels itself once a limit of them wait to be yielded.
+///
+/// The limit is not a bound on held descriptors. The pause is requested when
+/// a completion is reaped and takes effect only once the driver submits the
+/// cancellation. Until then the kernel's multishot accept takes every
+/// connection it can: the whole queue in one issue (at submit, or in a
+/// poll-triggered task-work run), and each later arrival in its own pass. The
+/// listen backlog does not bound this. An arm ends when the completion queue
+/// cannot take another entry, on kernels that end it then (an older one may
+/// let the completions overflow instead), or when descriptors run out. A
+/// re-arm after a pause can take the same again.
 pub(crate) struct AcceptMulti {
     fd: NornFd,
     // The driver the accept is submitted to, which queues its pause.

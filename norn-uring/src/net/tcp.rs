@@ -308,8 +308,28 @@ impl TcpListener {
     ///
     /// The kernel keeps accepting while the stream is not polled, and each
     /// accepted connection holds a descriptor until it is yielded. Once 64
-    /// wait, the stream pauses its accept, and later connections stay in the
-    /// listen backlog until the consumer catches up.
+    /// wait, the stream pauses its accept, so connections that arrive after
+    /// the pause takes effect stay in the listen backlog until the consumer
+    /// catches up.
+    ///
+    /// The limit does not bound the descriptors the stream holds. The pause
+    /// is a cancellation that takes effect only after the driver reaps the
+    /// completions and submits it, and the kernel's multishot accept takes
+    /// every connection it can until then. The stream holds the limit plus
+    /// every connection accepted before the pause takes effect: the whole
+    /// queue at arm time, and every arrival until the driver next reaps and
+    /// submits the cancellation. That window is about one executor turn, as
+    /// every turn ends in a park, which reaps and submits before any wait,
+    /// but it grows if a task blocks the thread or the executor does not
+    /// reach the driver. The listen backlog does not bound this (it may never hold
+    /// more than one connection). Beyond that, an arm ends when descriptors
+    /// run out (`EMFILE`/`ENFILE`, yielded as an error), or when the
+    /// completion queue is full, at about its size in descriptors; the
+    /// latter depends on the kernel, and an older one may let the
+    /// completions overflow instead of ending the arm. Each
+    /// re-arm after a pause can take the same again. A caller that needs a
+    /// hard bound on descriptors should use [`accept`](Self::accept), which
+    /// takes one connection per request.
     /// [`incoming_with_limit`](Self::incoming_with_limit) sets another limit.
     ///
     /// An error is yielded as an item and does not end the stream; the next
@@ -327,9 +347,20 @@ impl TcpListener {
     /// pauses, so a consumer that falls behind holds a descriptor for every
     /// connection the kernel accepts.
     ///
-    /// Connections the kernel accepted before a pause took effect are still
-    /// yielded, so the stream can briefly hold more than `limit`. Otherwise
-    /// it behaves like [`incoming`](Self::incoming).
+    /// `limit` is when the pause is requested, not a bound on the descriptors
+    /// held. The pause takes effect only after the driver reaps the
+    /// completions and submits the cancellation, and the kernel's multishot
+    /// accept takes every connection it can until then. The stream holds
+    /// `limit` plus every connection accepted before the pause takes effect:
+    /// the whole queue at arm time, and every arrival until the driver next
+    /// reaps and submits the cancellation, a window of about one executor
+    /// turn, longer if a task blocks the thread or the executor does not
+    /// reach the driver. The listen backlog does not bound this. An arm ends
+    /// when descriptors run out, or when the completion queue is full (at
+    /// about its size in descriptors), which depends on the kernel: an older
+    /// one may let the completions overflow instead. For a hard bound, use
+    /// [`accept`](Self::accept). Otherwise it behaves like
+    /// [`incoming`](Self::incoming).
     pub fn incoming_with_limit(
         &self,
         limit: Option<NonZeroUsize>,

@@ -273,6 +273,112 @@ fn incoming_pauses_its_accept_at_the_limit() -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
+/// The limit does not bound the descriptors an `incoming()` stream holds. The
+/// kernel's multishot accept takes every connection queued when it is armed
+/// before userspace reaps the first completion, so the stream holds all of
+/// them, past the limit. The pause still takes effect after that burst:
+/// connections that arrive later stay in the listen backlog until the
+/// consumer catches up.
+#[test]
+fn incoming_limit_holds_the_queue_at_arm_time_then_pauses() -> Result<(), Box<dyn std::error::Error>>
+{
+    const LIMIT: usize = 2;
+    const QUEUED: usize = 40;
+    const LATER: usize = 10;
+    let driver = norn_uring::Driver::new(io_uring::IoUring::builder(), 256)?;
+    let mut executor = norn_executor::LocalExecutor::new(driver);
+    executor.block_on(async {
+        let listener = TcpListener::bind("127.0.0.1:0".parse()?, 128).await?;
+        let addr = listener.local_addr()?;
+        // These queue in the listen backlog before the accept is armed.
+        let mut clients = Vec::new();
+        for _ in 0..QUEUED {
+            clients.push(std::net::TcpStream::connect(addr)?);
+        }
+        let mut incoming = pin!(listener.incoming_with_limit(NonZeroUsize::new(LIMIT)));
+        assert!(futures_util::poll!(incoming.next()).is_pending());
+        for _ in 0..8 {
+            norn_uring::noop().await?;
+        }
+        // The accept has paused after the burst; these stay in the backlog.
+        for _ in 0..LATER {
+            clients.push(std::net::TcpStream::connect(addr)?);
+        }
+        for _ in 0..8 {
+            norn_uring::noop().await?;
+        }
+
+        let mut accepted = Vec::new();
+        while let Poll::Ready(next) = futures_util::poll!(incoming.next()) {
+            accepted.push(next.expect("accept stream ended")?);
+        }
+        assert_eq!(
+            accepted.len(),
+            QUEUED,
+            "the whole queue at arm time is held, past the limit {LIMIT}, \
+             and the connections that arrived after the pause are not"
+        );
+
+        // The consumer catches up, and every connection is eventually yielded.
+        while accepted.len() < clients.len() {
+            accepted.push(incoming.next().await.expect("accept stream ended")?);
+        }
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })
+}
+
+/// The listen backlog does not bound what `incoming()` holds either. Armed on
+/// an empty queue with a listen backlog of 1, connections that arrive while
+/// the executor does not reach the driver are each accepted in their own
+/// kernel pass, so the queue never holds more than one, yet the stream holds
+/// them all. A small ring keeps this to a dozen descriptors, so the test also
+/// runs under a low `ulimit -n`. Every connect must succeed: with a backlog of
+/// 1, a connect the kernel did not accept promptly would time out, which
+/// fails the test rather than being skipped. The connects run on the executor
+/// thread, so nothing here depends on scheduling.
+#[test]
+fn incoming_limit_is_not_bounded_by_the_listen_backlog() -> Result<(), Box<dyn std::error::Error>> {
+    const LIMIT: usize = 2;
+    const SQ_ENTRIES: u32 = 8;
+    // The default completion queue holds twice the submission queue. The
+    // clients stay below it so that no accept completion is lost.
+    const CQ_ENTRIES: usize = 2 * SQ_ENTRIES as usize;
+    const CLIENTS: usize = CQ_ENTRIES - 4;
+    let driver = norn_uring::Driver::new(io_uring::IoUring::builder(), SQ_ENTRIES)?;
+    let mut executor = norn_executor::LocalExecutor::new(driver);
+    executor.block_on(async {
+        let listener = TcpListener::bind("127.0.0.1:0".parse()?, 1).await?;
+        let addr = listener.local_addr()?;
+        let mut incoming = pin!(listener.incoming_with_limit(NonZeroUsize::new(LIMIT)));
+        assert!(futures_util::poll!(incoming.next()).is_pending());
+        // The accept is armed on an empty queue.
+        norn_uring::noop().await?;
+
+        let mut clients = Vec::new();
+        for i in 0..CLIENTS {
+            let client =
+                std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(5))
+                    .map_err(|err| format!("connect {i} of {CLIENTS} failed: {err}"))?;
+            clients.push(client);
+        }
+        for _ in 0..8 {
+            norn_uring::noop().await?;
+        }
+
+        let mut held = 0;
+        while let Poll::Ready(next) = futures_util::poll!(incoming.next()) {
+            next.expect("accept stream ended")?;
+            held += 1;
+        }
+        assert_eq!(
+            held, CLIENTS,
+            "held {held} of {CLIENTS} connections, bounded by the limit {LIMIT} \
+             and a listen backlog of 1"
+        );
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })
+}
+
 #[test]
 fn single_accept_connection() -> Result<(), Box<dyn std::error::Error>> {
     util::with_test_env(|| async {
