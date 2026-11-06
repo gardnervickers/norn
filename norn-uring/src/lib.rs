@@ -113,7 +113,7 @@ pub mod net;
 /// Device-specific commands submitted through `IORING_OP_URING_CMD`.
 pub mod uring_cmd;
 
-pub use buf_result::{BufError, BufResult};
+pub use buf_result::BufResult;
 pub use driver::{Driver, DriverOptions, Handle};
 pub use fd::UringFd;
 pub use operation::{CQEResult, Multishot, Op, Operation, Singleshot};

@@ -1,6 +1,6 @@
 //! The result of an operation that owns a buffer.
 
-use std::{error, fmt, io};
+use std::{fmt, io};
 
 /// The output of an operation that takes ownership of a buffer.
 ///
@@ -18,7 +18,7 @@ use std::{error, fmt, io};
 ///
 /// Use [`BufResult::buf_ok`] to propagate errors with `?` while keeping the
 /// buffer on success, or [`BufResult::drop_buf`] when the buffer is no longer
-/// needed:
+/// needed. Both drop the buffer on failure:
 ///
 /// ```no_run
 /// # async fn f(
@@ -32,24 +32,21 @@ use std::{error, fmt, io};
 /// # }
 /// ```
 #[must_use = "this `BufResult` may hold an error, and holds the operation's buffer"]
-#[derive(Debug)]
 pub struct BufResult<T, B>(pub io::Result<T>, pub B);
 
 impl<T, B> BufResult<T, B> {
-    /// Convert into a `Result` that carries the buffer on both paths.
+    /// Return the value and the buffer on success.
     ///
-    /// The error converts into [`io::Error`], so `?` works in functions that
-    /// return [`io::Result`]. Match on [`BufError`] to recover the buffer
-    /// from a failure.
+    /// On failure the buffer is dropped, so `?` releases it right away, as
+    /// it would for any other `io::Result`. Destructure the `BufResult`
+    /// instead when the buffer is needed after a failure.
     ///
     /// # Errors
     ///
-    /// Returns the operation's error, with the buffer, if it failed.
-    pub fn buf_ok(self) -> Result<(T, B), BufError<B>> {
-        match self.0 {
-            Ok(value) => Ok((value, self.1)),
-            Err(error) => Err(BufError { error, buf: self.1 }),
-        }
+    /// Returns the operation's error if it failed.
+    pub fn buf_ok(self) -> io::Result<(T, B)> {
+        let BufResult(result, buf) = self;
+        result.map(|value| (value, buf))
     }
 
     /// Drop the buffer and return the operation's result.
@@ -95,73 +92,13 @@ impl<T, B> From<(io::Result<T>, B)> for BufResult<T, B> {
     }
 }
 
-/// An operation's error, together with the buffer the operation returned.
-///
-/// Produced by [`BufResult::buf_ok`]. It converts into [`io::Error`] by
-/// dropping the buffer, so `?` propagates it from functions that return
-/// [`io::Result`].
-pub struct BufError<B> {
-    error: io::Error,
-    buf: B,
-}
-
-impl<B> BufError<B> {
-    /// Return the error.
-    pub fn error(&self) -> &io::Error {
-        &self.error
-    }
-
-    /// Return the buffer.
-    pub fn buf(&self) -> &B {
-        &self.buf
-    }
-
-    /// Return a mutable reference to the buffer.
-    pub fn buf_mut(&mut self) -> &mut B {
-        &mut self.buf
-    }
-
-    /// Drop the buffer and return the error.
-    pub fn into_error(self) -> io::Error {
-        self.error
-    }
-
-    /// Drop the error and return the buffer.
-    pub fn into_buf(self) -> B {
-        self.buf
-    }
-
-    /// Split into the error and the buffer.
-    pub fn into_parts(self) -> (io::Error, B) {
-        (self.error, self.buf)
-    }
-}
-
-impl<B> From<BufError<B>> for io::Error {
-    fn from(error: BufError<B>) -> Self {
-        error.error
-    }
-}
-
-// The buffer is left out so that `BufError` is `Debug` and `Error` for any
-// buffer type, and so that a failure does not print the buffer's contents.
-impl<B> fmt::Debug for BufError<B> {
+// The buffer is left out, so `BufResult` is `Debug` for any buffer type and
+// does not print the buffer's contents.
+impl<T: fmt::Debug, B> fmt::Debug for BufResult<T, B> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BufError")
-            .field("error", &self.error)
+        f.debug_tuple("BufResult")
+            .field(&self.0)
             .finish_non_exhaustive()
-    }
-}
-
-impl<B> fmt::Display for BufError<B> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&self.error, f)
-    }
-}
-
-impl<B> error::Error for BufError<B> {
-    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
-        Some(&self.error)
     }
 }
 
@@ -182,28 +119,40 @@ mod tests {
     }
 
     #[test]
-    fn question_mark_converts_to_io_error() {
+    fn question_mark_keeps_the_error() {
         let err = propagate(BufResult(
-            Err(io::Error::from(io::ErrorKind::ConnectionReset)),
+            Err(io::Error::from_raw_os_error(libc::ECONNRESET)),
             vec![1],
         ))
         .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::ConnectionReset);
+        assert_eq!(err.raw_os_error(), Some(libc::ECONNRESET));
     }
 
     #[test]
-    fn buf_error_returns_the_buffer() {
-        let err = BufResult::<(), _>(Err(io::Error::from_raw_os_error(libc::EAGAIN)), vec![7])
-            .buf_ok()
-            .unwrap_err();
-        assert_eq!(err.error().raw_os_error(), Some(libc::EAGAIN));
-        let (error, buf) = err.into_parts();
-        assert_eq!(error.raw_os_error(), Some(libc::EAGAIN));
+    fn buf_ok_drops_the_buffer_on_failure() {
+        let buf = std::rc::Rc::new(());
+        let result = BufResult::<(), _>(Err(io::Error::other("failed")), buf.clone()).buf_ok();
+        assert!(result.is_err());
+        assert_eq!(std::rc::Rc::strong_count(&buf), 1);
+    }
+
+    #[test]
+    fn destructuring_recovers_the_buffer_on_failure() {
+        let BufResult(res, buf) = BufResult::<(), _>(Err(io::Error::other("failed")), vec![7]);
+        assert!(res.is_err());
         assert_eq!(buf, [7]);
     }
 
     #[test]
     fn drop_buf_returns_the_result() {
         assert_eq!(BufResult(Ok(5), vec![0u8]).drop_buf().unwrap(), 5);
+    }
+
+    #[test]
+    fn debug_omits_the_buffer() {
+        struct NotDebug;
+        let shown = format!("{:?}", BufResult(Ok::<_, io::Error>(1), NotDebug));
+        assert_eq!(shown, "BufResult(Ok(1), ..)");
     }
 }

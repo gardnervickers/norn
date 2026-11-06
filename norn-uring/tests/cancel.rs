@@ -46,7 +46,7 @@ fn cancel_pending_cancels_only_requests_on_descriptor() -> Result<(), Box<dyn st
         sender
             .send_to(b"still armed".to_vec(), other.local_addr()?)
             .await
-            .0?;
+            .drop_buf()?;
         let BufResult(result, buf) = unrelated.await;
         assert_eq!(result?, (11, sender.local_addr()?));
         assert_eq!(&buf[..], b"still armed");
@@ -163,11 +163,11 @@ fn cancel_pending_skips_link_successors_not_yet_issued() -> Result<(), Box<dyn s
         sender
             .send_to(b"head".to_vec(), head.local_addr()?)
             .await
-            .0?;
+            .drop_buf()?;
         sender
             .send_to(b"tail".to_vec(), tail.local_addr()?)
             .await
-            .0?;
+            .drop_buf()?;
         let (first, second) = chain.await;
         assert!(first?.is_readable());
         assert!(second?.is_readable());

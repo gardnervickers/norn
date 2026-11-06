@@ -30,7 +30,7 @@ fn pending_recv_from_initializes_vec_and_bytes_mut() -> Result<(), Box<dyn std::
         sender
             .send_to(b"hello".to_vec(), receiver.local_addr()?)
             .await
-            .0?;
+            .drop_buf()?;
         let BufResult(result, buf) = recv.await;
         let (len, addr) = result?;
         assert_eq!(addr, sender.local_addr()?);
@@ -264,7 +264,7 @@ fn recv_from_options_apply_with_and_without_waiting() -> Result<(), Box<dyn std:
         // A datagram is already queued, so the nonblocking `recvfrom` serves it.
         s1.send_to(Bytes::from_static(b"ready"), s2.local_addr()?)
             .await
-            .0?;
+            .drop_buf()?;
         let BufResult(res, buf) = s2
             .recv_from(BytesMut::with_capacity(16))
             .options(peek)
@@ -280,7 +280,7 @@ fn recv_from_options_apply_with_and_without_waiting() -> Result<(), Box<dyn std:
         assert!(poll_fn(|cx| Poll::Ready(recv.as_mut().poll(cx).is_pending())).await);
         s1.send_to(Bytes::from_static(b"later"), s2.local_addr()?)
             .await
-            .0?;
+            .drop_buf()?;
         let BufResult(res, buf) = recv.await;
         assert_eq!(res?.0, 5);
         assert_eq!(&buf[..], b"later");
@@ -302,10 +302,10 @@ fn send_with_more_joins_one_datagram() -> Result<(), Box<dyn std::error::Error>>
         s1.send_to(Bytes::from_static(b"hel"), s2.local_addr()?)
             .options(more)
             .await
-            .0?;
+            .drop_buf()?;
         s1.send_to(Bytes::from_static(b"lo"), s2.local_addr()?)
             .await
-            .0?;
+            .drop_buf()?;
         let BufResult(res, buf) = s2.recv_from(BytesMut::with_capacity(16)).await;
         assert_eq!(res?.0, 5);
         assert_eq!(&buf[..], b"hello");
@@ -333,7 +333,7 @@ fn msg_trunc_direct_recv_from_caps_vec_initialization() -> Result<(), Box<dyn st
         sender
             .send_to(Bytes::from_static(TRUNC_PAYLOAD), receiver.local_addr()?)
             .await
-            .0?;
+            .drop_buf()?;
 
         let buf = Vec::with_capacity(1);
         let submitted_len = buf.capacity();
@@ -374,7 +374,7 @@ fn msg_trunc_uring_recv_from_caps_bytes_mut_initialization(
         sender
             .send_to(Bytes::from_static(TRUNC_PAYLOAD), receiver.local_addr()?)
             .await
-            .0?;
+            .drop_buf()?;
         let BufResult(res, buf) = recv.await;
         let (reported_len, addr) = res?;
 
@@ -510,7 +510,7 @@ fn dropping_unconsumed_ring_completion_recycles_selected_buffer(
         sender
             .send_to(Bytes::from_static(b"first"), receiver_addr)
             .await
-            .0?;
+            .drop_buf()?;
         poll_fn(|cx| signal.poll(cx)).await;
 
         // The CQE has been reaped into an owned buffer, but the receive future
@@ -521,7 +521,7 @@ fn dropping_unconsumed_ring_completion_recycles_selected_buffer(
         sender
             .send_to(Bytes::from_static(b"second"), receiver_addr)
             .await
-            .0?;
+            .drop_buf()?;
         let (buf, peer) = receiver.recv_from_ring(&ring).await?;
         assert_eq!(peer, sender.local_addr()?);
         assert_eq!(&buf[..], b"second");
@@ -542,14 +542,14 @@ fn recv_ring_buf_can_be_sent_directly_and_retains_its_slot(
         client
             .send_to(Bytes::from_static(b"direct-echo"), server_addr)
             .await
-            .0?;
+            .drop_buf()?;
         let (buf, peer) = server.recv_from_ring(&ring).await?;
         let stable_ptr = buf.as_slice().as_ptr();
 
         client
             .send_to(Bytes::from_static(b"held-slot"), server_addr)
             .await
-            .0?;
+            .drop_buf()?;
         let BufResult(send_result, buf) = server.send_to(buf, peer).await;
         assert_eq!(send_result?, b"direct-echo".len());
         assert_eq!(buf.as_slice().as_ptr(), stable_ptr);
@@ -566,7 +566,7 @@ fn recv_ring_buf_can_be_sent_directly_and_retains_its_slot(
         client
             .send_to(Bytes::from_static(b"recycled"), server_addr)
             .await
-            .0?;
+            .drop_buf()?;
         let (held, held_peer) = server.recv_from_ring(&ring).await?;
         assert_eq!(held_peer, client.local_addr()?);
         assert_eq!(&held[..], b"held-slot");
@@ -598,7 +598,7 @@ fn duplicate_bgid_failure_keeps_original_ring_registered() -> Result<(), Box<dyn
         sender
             .send_to(Bytes::from_static(b"first"), receiver.local_addr()?)
             .await
-            .0?;
+            .drop_buf()?;
         let (buf, addr) = receiver.recv_from_ring(&ring).await?;
         assert_eq!(addr, sender.local_addr()?);
         assert_eq!(&buf[..], b"first");
@@ -607,7 +607,7 @@ fn duplicate_bgid_failure_keeps_original_ring_registered() -> Result<(), Box<dyn
         sender
             .send_to(Bytes::from_static(b"second"), receiver.local_addr()?)
             .await
-            .0?;
+            .drop_buf()?;
         let (buf, addr) = receiver.recv_from_ring(&ring).await?;
         assert_eq!(addr, sender.local_addr()?);
         assert_eq!(&buf[..], b"second");
@@ -648,7 +648,7 @@ fn recv_msg_ring_buf_can_be_sent_directly() -> Result<(), Box<dyn std::error::Er
         client
             .send_to(Bytes::from_static(b"echo"), server.local_addr()?)
             .await
-            .0?;
+            .drop_buf()?;
 
         let mut recv = pin!(server.recv_from_ring_multi(&ring));
         let (buf, peer): (norn_uring::net::RecvMsgRingBuf, std::net::SocketAddr) =
@@ -990,7 +990,7 @@ fn poll_readiness_smoke() -> Result<(), Box<dyn std::error::Error>> {
 
         s1.send_to(Bytes::from_static(b"x"), s2.local_addr()?)
             .await
-            .0?;
+            .drop_buf()?;
         let readable = s2.poll_readiness(libc::POLLIN as u32).await?;
         assert!(readable.is_readable());
 
@@ -998,7 +998,7 @@ fn poll_readiness_smoke() -> Result<(), Box<dyn std::error::Error>> {
 
         s1.send_to(Bytes::from_static(b"y"), s2.local_addr()?)
             .await
-            .0?;
+            .drop_buf()?;
         let mut readiness = pin!(s2.poll_readiness_multi(libc::POLLIN as u32));
         let readable = readiness
             .next()
