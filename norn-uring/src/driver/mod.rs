@@ -792,13 +792,20 @@ impl Driver {
     /// # Sizing the completion queue
     ///
     /// The CQ should hold every completion the kernel may post before the
-    /// driver next reaps it; a park reaps the whole CQ. The SQ size does not
-    /// bound this: entries that do not fit in the SQ wait in the driver's
-    /// overflow queue and are submitted by later parks, so any number of
-    /// operations can be in flight. Count:
+    /// driver reaps it. A normal park handles at most
+    /// [`DriverOptions::completion_drain_budget`] completions (32 by
+    /// default), so completions can wait in the CQ across several parks:
+    /// size it for everything that can be pending at once, not for one
+    /// park's worth. The SQ size does not bound this either: entries that do
+    /// not fit in the SQ wait in the driver's overflow queue and are
+    /// submitted by later parks, so any number of operations can be in
+    /// flight. Count:
     ///
     /// - one completion per in-flight single-shot operation, including the
-    ///   cancellations and closes that drops submit;
+    ///   cancellations and closes that drops submit, and two for an
+    ///   operation with a linked timeout (the operation and the timeout each
+    ///   complete) or a zero-copy send (its result and its buffer
+    ///   notification);
     /// - for each multishot receive on a
     ///   [`RecvBufRing`](crate::bufring::RecvBufRing), one completion per
     ///   buffer it fills while the thread is busy, bounded across receives by

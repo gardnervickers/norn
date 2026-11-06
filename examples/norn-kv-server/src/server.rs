@@ -200,6 +200,17 @@ impl ServerConfig {
 /// lingering-close timeout, and a cancellation from a pause or a drop.
 const CQES_PER_CONNECTION: u64 = 4;
 
+/// Completions the listener's multishot accept can have pending: twice the
+/// 64 connections at which `TcpListener::incoming` pauses, because accepts
+/// the kernel completes before the pause takes effect still post, plus the
+/// accept's final completion. The pause applies only once the worker reaps
+/// accepts, so a larger connect storm while the worker is busy relies on the
+/// `ring_entries` slack.
+const ACCEPT_CQES: u64 = 2 * 64 + 1;
+
+/// The most CQ entries the kernel allows (`IORING_MAX_CQ_ENTRIES`).
+const MAX_CQ_ENTRIES: u32 = 65_536;
+
 /// Create a worker's `io_uring` driver with `ring_entries` submission queue
 /// entries and a completion queue (CQ) with room for everything `config`
 /// lets the worker have pending.
@@ -208,24 +219,36 @@ const CQES_PER_CONNECTION: u64 = 4;
 /// them only later. The CQ needs room for every buffer of the multishot
 /// receive ring (one completion per buffer filled), for
 /// [`CQES_PER_CONNECTION`] per connection up to `config.max_connections`,
-/// and for `ring_entries` more as slack for the accept, timers, closes and
-/// the driver's eventfd read. Without that, completions overflow the CQ (a
+/// for [`ACCEPT_CQES`] from the multishot accept, and for `ring_entries`
+/// more as slack for timers, closes, rejected connections and the driver's
+/// eventfd read. Without that, completions overflow the CQ (a
 /// full CQ also ends multishot receives), and the kernel may drop an
 /// overflowed completion when it cannot allocate the overflow entry, which
 /// fails the driver.
 ///
 /// The kernel rounds the CQ up to a power of two, and clamps it at its
-/// limit (65536 entries) rather than failing.
+/// limit (65536 entries) rather than failing. In multishot mode that limit
+/// is reached at about 14000 `max_connections`; a larger request is still
+/// clamped, and this prints a warning with the effective size.
 ///
 /// # Errors
 ///
 /// Returns an error when the kernel cannot create the ring.
 pub fn driver(ring_entries: u32, config: &ServerConfig) -> io::Result<norn_uring::Driver> {
+    let requested = cq_entries(ring_entries, config);
     let mut builder = io_uring::IoUring::builder();
-    builder
-        .setup_clamp()
-        .setup_cqsize(cq_entries(ring_entries, config));
-    norn_uring::Driver::new(builder, ring_entries)
+    builder.setup_clamp().setup_cqsize(requested);
+    let driver = norn_uring::Driver::new(builder, ring_entries)?;
+    if requested > MAX_CQ_ENTRIES {
+        eprintln!(
+            "warning: the completion queue needs {requested} entries for \
+             max_connections={}, but the kernel limit clamps it to {}; \
+             completions that overflow it can be dropped",
+            config.max_connections,
+            driver.handle().cq_entries(),
+        );
+    }
+    Ok(driver)
 }
 
 /// The CQ size [`driver`] requests; see there.
@@ -236,6 +259,7 @@ fn cq_entries(ring_entries: u32, config: &ServerConfig) -> u32 {
     };
     let connections = (config.max_connections as u64).saturating_mul(CQES_PER_CONNECTION);
     let total = u64::from(ring_entries)
+        .saturating_add(ACCEPT_CQES)
         .saturating_add(recv_buffers)
         .saturating_add(connections);
     u32::try_from(total).unwrap_or(u32::MAX)
@@ -912,21 +936,22 @@ mod tests {
         let multishot = ServerConfig::default();
         assert_eq!(
             cq_entries(256, &multishot),
-            256 + u32::from(RECV_RING_BUFFERS) + 4 * 4_096
+            256 + 129 + u32::from(RECV_RING_BUFFERS) + 4 * 4_096
         );
         let exact = ServerConfig {
             recv_mode: RecvMode::Exact,
             max_connections: 10,
             ..ServerConfig::default()
         };
-        assert_eq!(cq_entries(256, &exact), 256 + 40);
+        assert_eq!(cq_entries(256, &exact), 256 + 129 + 40);
         let huge = ServerConfig {
             max_connections: usize::MAX,
             ..ServerConfig::default()
         };
         assert_eq!(cq_entries(256, &huge), u32::MAX);
         // The kernel clamps rather than rejects an oversized CQ.
-        drop(driver(256, &huge).unwrap());
+        let clamped = driver(256, &huge).unwrap();
+        assert_eq!(clamped.handle().cq_entries(), MAX_CQ_ENTRIES);
     }
 
     #[test]
