@@ -79,9 +79,17 @@ pub trait Request: Future + Sized + private::Chainable {
     /// `then_always`. When a request linked with [`Request::then`] fails, the
     /// kernel cancels every request linked after it, hard links included, so
     /// after such a chain `next` would not always run. Write
-    /// `x.then(a.then_always(b))` to run `b` after `a` whenever `x` succeeds,
-    /// or submit `next` after awaiting the chain to run it however the chain
-    /// ends.
+    /// `x.then(a.then_always(b))` to run `b` after `a` whenever the kernel
+    /// completes `x` without failing it (for reads and writes, a short
+    /// transfer counts as failing here), or submit `next` after awaiting the
+    /// chain to run it however the chain ends.
+    ///
+    /// A hard link does not survive the kernel rejecting a request of the
+    /// chain when it is submitted, for example with `EINVAL` for an invalid
+    /// argument or an opcode the kernel lacks. The kernel then fails the whole
+    /// chain without issuing any of it: `next` completes with `ECANCELED` when
+    /// `self` is rejected, and `self` does when `next` is. Cleanup that must
+    /// run even then, such as a close, belongs after awaiting the request.
     ///
     /// # Panics
     ///
@@ -99,7 +107,6 @@ pub trait Request: Future + Sized + private::Chainable {
              cancels every request linked after a failed soft link, so `next` would not \
              always run; link it inside the chain, as in x.then(a.then_always(b))"
         );
-        self.reactor().note_hard_link();
         Then::new_linked(self, next, true)
     }
 
@@ -171,6 +178,7 @@ where
         if batch.len() > before {
             if let Some(last) = batch.last() {
                 last.set_hard_link();
+                left.reactor().note_hard_link();
             }
         }
         return right.as_mut().prepare_batch(batch);
@@ -985,6 +993,64 @@ mod tests {
         assert!(head.is_err());
         assert_eq!(failed.unwrap_err().kind(), io::ErrorKind::InvalidInput);
         assert_canceled(&unconfigured);
+    }
+
+    /// A request the kernel rejects while preparing its SQE: a timeout that
+    /// names two clocks.
+    struct KernelRejects;
+
+    static REJECTED_TIMEOUT: io_uring::types::Timespec = io_uring::types::Timespec::new().sec(1);
+
+    unsafe impl Operation for KernelRejects {
+        type Completion = CQEResult;
+
+        fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+            Ok(io_uring::opcode::Timeout::new(&REJECTED_TIMEOUT)
+                .flags(
+                    io_uring::types::TimeoutFlags::BOOTTIME
+                        | io_uring::types::TimeoutFlags::REALTIME,
+                )
+                .build())
+        }
+
+        unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+            result
+        }
+    }
+
+    impl Singleshot for KernelRejects {
+        type Output = std::io::Result<u32>;
+
+        fn complete(self, completion: Self::Completion) -> Self::Output {
+            completion.into_result()
+        }
+    }
+
+    /// A rejection at submission fails the whole chain, hard links included,
+    /// in both directions. The `then_always` docs promise no more than this.
+    #[test]
+    fn a_kernel_rejection_fails_the_whole_hard_linked_chain() {
+        let driver = crate::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let handle = driver.handle();
+        let mut ex = LocalExecutor::new(driver);
+
+        let (rejected, next) = ex.block_on(async {
+            handle
+                .submit(KernelRejects)
+                .then_always(handle.submit(TaggedNop(2)))
+                .await
+        });
+        assert_eq!(rejected.unwrap_err().raw_os_error(), Some(libc::EINVAL));
+        assert_canceled(&next);
+
+        let (first, rejected) = ex.block_on(async {
+            handle
+                .submit(TaggedNop(1))
+                .then_always(handle.submit(KernelRejects))
+                .await
+        });
+        assert_canceled(&first);
+        assert_eq!(rejected.unwrap_err().raw_os_error(), Some(libc::EINVAL));
     }
 
     #[test]
