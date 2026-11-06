@@ -297,8 +297,9 @@ impl TcpListener {
     ///
     /// # Errors
     ///
-    /// Returns the `setsockopt` error, for example when the listener was not
-    /// created with [`TcpListenerOptions::reuse_port`]. Steering only affects
+    /// Returns the `setsockopt` error: `EINVAL` when the listener was not
+    /// created with [`TcpListenerOptions::reuse_port`], or `ENOMEM` when the
+    /// program exceeds `net.core.optmem_max`. Steering only affects
     /// locality, so callers may continue with hash selection.
     ///
     /// [`ReuseportCpuMap`]: crate::net::ReuseportCpuMap

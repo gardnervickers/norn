@@ -168,6 +168,7 @@ pub enum ConnectionSteering {
     Cpu,
     /// Like [`Self::Cpu`], and also route each worker CPU's SMT siblings to
     /// it, so receive processing on a sibling stays on the worker's core.
+    /// A sibling shared by several workers' cores goes to the last of them.
     Core,
 }
 
@@ -221,13 +222,17 @@ fn parse_cpu_list(list: &str) -> Option<Vec<usize>> {
 /// Per-worker counts of where accepted connections were received.
 ///
 /// A connection's receive CPU is read from `SO_INCOMING_CPU` when it is
-/// accepted, which is the CPU that completed its handshake.
+/// accepted, which is the CPU that completed its handshake. Every accepted
+/// connection counts, including ones then refused by `max_connections`,
+/// since the counts measure placement rather than admission.
 #[derive(Debug)]
 pub struct RxLocality {
     workers: Vec<RxCounts>,
 }
 
+// Each worker writes only its own counts; keep them off shared cache lines.
 #[derive(Debug, Default)]
+#[repr(align(128))]
 struct RxCounts {
     same_cpu: AtomicU64,
     same_core: AtomicU64,
@@ -3436,10 +3441,19 @@ mod tests {
         let map = ConnectionSteering::Core.map(&workers)?.unwrap();
         assert_eq!(map.slot(workers[0]), Some(0));
         assert_eq!(map.slot(workers[1]), Some(1));
+        // Siblings shared with worker 1's core go to worker 1, the last
+        // worker listing them; the rest of worker 0's core goes to worker 0.
+        let second_core = core_siblings(second)?;
         for sibling in siblings {
             if !workers.contains(&sibling) {
-                assert_eq!(map.slot(sibling), Some(0));
+                let owner = if second_core.contains(&sibling) { 1 } else { 0 };
+                assert_eq!(map.slot(sibling), Some(owner));
             }
+        }
+        // A lone worker receives its whole core.
+        let map = ConnectionSteering::Core.map(&[cpus[0]])?.unwrap();
+        for sibling in core_siblings(cpus[0])? {
+            assert_eq!(map.slot(sibling), Some(0));
         }
         let map = ConnectionSteering::Cpu.map(&workers)?.unwrap();
         assert_eq!(map.len(), 2);

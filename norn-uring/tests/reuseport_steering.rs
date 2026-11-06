@@ -72,8 +72,12 @@ async fn bind_group(count: usize) -> io::Result<Vec<TcpListener>> {
 
 /// Accept one connection, failing instead of hanging if none was queued.
 async fn accept(listener: &TcpListener) -> io::Result<TcpSocket> {
+    accept_within(listener, Duration::from_secs(5)).await
+}
+
+async fn accept_within(listener: &TcpListener, wait: Duration) -> io::Result<TcpSocket> {
     let accept = pin!(listener.accept());
-    let deadline = pin!(Handle::current().timeout(Duration::from_secs(5)));
+    let deadline = pin!(Handle::current().timeout(wait));
     match select(accept, deadline).await {
         Either::Left((accepted, _)) => Ok(accepted?.0),
         Either::Right(_) => Err(io::Error::new(
@@ -124,23 +128,37 @@ fn connections_land_on_the_listener_routed_for_their_syn_cpu(
 #[test]
 fn unrouted_cpus_and_missing_slots_fall_back_to_hash_selection(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let cpu = allowed_cpus()[0];
+    const CONNECTIONS: usize = 32;
+    let allowed = allowed_cpus();
     util::with_test_env(|| async move {
-        let listeners = bind_group(1).await?;
+        let listeners = bind_group(2).await?;
         let mut map = ReuseportCpuMap::new();
-        // The group has one slot, so this route names a listener that does
-        // not exist yet; every other CPU has no route at all.
-        map.route(cpu, 3)?;
+        // The group has two slots, so this route names a listener that does
+        // not exist; every other CPU has no route at all.
+        map.route(allowed[0], 5)?;
         listeners[0].attach_reuseport_cpu_map(&map)?;
 
         let address = listeners[0].local_addr()?;
-        let mut clients = connect_from(cpu, address, 2);
-        if let Some(&other) = allowed_cpus().iter().find(|&&other| other != cpu) {
-            clients.extend(connect_from(other, address, 2));
+        let mut clients = connect_from(allowed[0], address, CONNECTIONS / 2);
+        let other = allowed.get(1).copied().unwrap_or(allowed[0]);
+        clients.extend(connect_from(other, address, CONNECTIONS / 2));
+
+        // Every connection is queued once its handshake completes, so drain
+        // each listener until it stays empty.
+        let mut accepted = [0; 2];
+        for (listener, count) in listeners.iter().zip(&mut accepted) {
+            while accept_within(listener, Duration::from_millis(200))
+                .await
+                .is_ok()
+            {
+                *count += 1;
+            }
         }
-        for _ in 0..clients.len() {
-            accept(&listeners[0]).await?;
-        }
+        assert_eq!(accepted.iter().sum::<usize>(), CONNECTIONS);
+        // Hash selection spreads them; all 32 on one listener has odds of
+        // about 2^-31, which is what a program returning a fixed slot does.
+        assert!(accepted.iter().all(|&count| count > 0), "{accepted:?}");
+        drop(clients);
         Ok(())
     })
 }

@@ -31,7 +31,16 @@ const MAX_ROUTES: usize = (4096 - 2) / 2;
 /// A slot is a listener's position in its group: the *n*-th listener to start
 /// listening is slot *n - 1*. Closing a listener moves the group's last
 /// listener into the closed slot, so a group whose membership changes must
-/// attach a rebuilt map.
+/// attach a rebuilt map. A group is shared by every socket with the same
+/// owner that binds the address with `SO_REUSEPORT`, including other
+/// processes, and attaching replaces the program for all of them.
+///
+/// # Size
+///
+/// Besides the classic BPF limit of 2,047 routes, the kernel charges the
+/// converted program, about 24 bytes per route, against
+/// `net.core.optmem_max`. The old 20 KiB default fits roughly 840 routes;
+/// a larger map makes the attach fail with `ENOMEM`.
 ///
 /// [`TcpListener::attach_reuseport_cpu_map`]: crate::net::TcpListener::attach_reuseport_cpu_map
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -54,7 +63,8 @@ impl ReuseportCpuMap {
     ///
     /// Returns [`io::ErrorKind::InvalidInput`] if `cpu` or `slot` does not
     /// fit the kernel's 32-bit values, or if the map would exceed the classic
-    /// BPF program limit of 2,047 routes.
+    /// BPF program limit of 2,047 routes. See the type's size notes for
+    /// the `optmem_max` limit, which the attach enforces.
     pub fn route(&mut self, cpu: usize, slot: usize) -> io::Result<&mut Self> {
         let cpu = u32::try_from(cpu).map_err(|_| invalid("CPU index exceeds u32"))?;
         let slot = u32::try_from(slot)
