@@ -56,6 +56,14 @@ struct Shared {
     runqueue: UnsafeCell<VecDeque<Runnable>>,
     taskset: TaskSet,
     external_handles: Cell<usize>,
+    stats: norn_stats_shim::Block<TaskStats>,
+}
+
+struct TaskStats {
+    spawned: norn_stats_shim::Counter,
+    completed: norn_stats_shim::Counter,
+    scheduled: norn_stats_shim::Counter,
+    polled: norn_stats_shim::Counter,
 }
 
 impl TaskQueue {
@@ -65,6 +73,12 @@ impl TaskQueue {
             runqueue: UnsafeCell::new(VecDeque::with_capacity(1024)),
             taskset: TaskSet::default(),
             external_handles: Cell::new(1),
+            stats: norn_stats_shim::Block::new(TaskStats {
+                spawned: norn_stats_shim::Counter::new("norn_tasks_spawned"),
+                completed: norn_stats_shim::Counter::new("norn_tasks_completed"),
+                scheduled: norn_stats_shim::Counter::new("norn_tasks_scheduled"),
+                polled: norn_stats_shim::Counter::new("norn_tasks_polled"),
+            }),
         };
         Self {
             shared: Rc::new(shared),
@@ -101,6 +115,7 @@ impl TaskQueue {
         //         all references it captures.
         let (runnable, handle) = unsafe { self.shared.taskset.bind(future, sched) };
         if let Some(runnable) = runnable {
+            self.shared.stats.spawned.incr();
             self.shared.push_runnable(runnable);
         }
         handle
@@ -109,7 +124,11 @@ impl TaskQueue {
     /// Returns the next [`Runnable`] to be executed.
     #[inline]
     pub fn next(&self) -> Option<Runnable> {
-        self.shared.pop_runnable()
+        let next = self.shared.pop_runnable();
+        if next.is_some() {
+            self.shared.stats.polled.incr();
+        }
+        next
     }
 
     /// Returns the number of [`Runnable`]s in the queue.
@@ -141,10 +160,12 @@ impl Drop for TaskQueue {
 impl Schedule for Rc<Shared> {
     #[inline]
     fn schedule(&self, runnable: Runnable) {
+        self.stats.scheduled.incr();
         self.push_runnable(runnable);
     }
 
     fn unbind(&self, registered: &crate::RegisteredTask) {
+        self.stats.completed.incr();
         unsafe { self.taskset.remove(registered) };
     }
 }

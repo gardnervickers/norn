@@ -207,6 +207,14 @@ struct Shared {
     // order, so retained registered storage is released only after the ring.
     registered_buf_rings: RegisteredBufRings,
     registered_buffers: RegisteredBuffers,
+    stats: norn_stats_shim::Block<RingStats>,
+}
+
+struct RingStats {
+    sqes: norn_stats_shim::Counter,
+    cqes: norn_stats_shim::Counter,
+    parks: norn_stats_shim::Counter,
+    enters: norn_stats_shim::Counter,
 }
 
 #[cfg(test)]
@@ -812,6 +820,12 @@ impl Driver {
                 shutdown_test: ShutdownTest::default(),
                 registered_buf_rings: RegisteredBufRings::new(),
                 registered_buffers: RegisteredBuffers::new(),
+                stats: norn_stats_shim::Block::new(RingStats {
+                    sqes: norn_stats_shim::Counter::new("norn_uring_sqes"),
+                    cqes: norn_stats_shim::Counter::new("norn_uring_cqes"),
+                    parks: norn_stats_shim::Counter::new("norn_uring_parks"),
+                    enters: norn_stats_shim::Counter::new("norn_uring_enters"),
+                }),
             }),
             unparker: Arc::new(unpark::Unparker::new()?),
             unparker_buf: mem::ManuallyDrop::new(UnparkerBuffer::new()),
@@ -976,6 +990,7 @@ impl Driver {
         if !cqueue::more(cqe.flags()) {
             self.shared.complete_in_flight();
         }
+        self.shared.stats.cqes.incr();
         // Safety: This is being called on a completion queue entry which has been generated
         // by a prior submission.
         unsafe { reap_operation(cqe) }
@@ -1083,6 +1098,7 @@ impl Driver {
         mut mode: ParkMode,
         mut remaining: Option<usize>,
     ) -> Result<(), io::Error> {
+        self.shared.stats.parks.incr();
         self.shared.retry_buf_ring_releases();
         let drained = self.drain_normal(&mut remaining);
         if drained > 0 {
@@ -1406,6 +1422,7 @@ impl Shared {
                 // which keeps what it points to alive until its terminal CQE.
                 unsafe { sq.push(&entry) }.unwrap();
                 self.in_flight.set(self.in_flight.get() + 1);
+                self.stats.sqes.incr();
                 return;
             }
         }
@@ -1483,6 +1500,7 @@ impl Shared {
                         unsafe { sq.push(&entry) }.unwrap();
                     }
                     self.in_flight.set(self.in_flight.get() + len);
+                    self.stats.sqes.add(len as u64);
                 }
             }
             if cancelled.is_empty() {
@@ -1521,6 +1539,7 @@ impl Shared {
             let entry = entry.into_entry_with_flags(Flags::empty());
             unsafe { sq.push(&entry) }.unwrap();
             self.in_flight.set(self.in_flight.get() + 1);
+            self.stats.sqes.incr();
             Ok(())
         }
     }
@@ -1541,6 +1560,7 @@ impl Shared {
             let entry = entry.into_entry_with_flags(Flags::empty());
             unsafe { sq.push(&entry) }.unwrap();
             self.in_flight.set(self.in_flight.get() + 1);
+            self.stats.sqes.incr();
             return true;
         }
 
@@ -1556,6 +1576,7 @@ impl Shared {
         }
         unsafe { sq.push_multiple(raw_entries.as_slice()) }.unwrap();
         self.in_flight.set(self.in_flight.get() + len);
+        self.stats.sqes.add(len as u64);
         true
     }
 
@@ -1570,6 +1591,7 @@ impl Shared {
         let mut sq = ring.submission();
         sq.push(entry)?;
         self.in_flight.set(self.in_flight.get() + 1);
+        self.stats.sqes.incr();
         Ok(())
     }
 
@@ -1656,11 +1678,13 @@ impl Shared {
         let mut ring = self.ring.borrow_mut();
         Ok(match mode {
             ParkMode::Timeout(duration) => {
+                self.stats.enters.incr();
                 let ts = crate::util::timespec(duration);
                 let args = SubmitArgs::new().timespec(&ts);
                 ring.submitter().submit_with_args(1, &args)?
             }
             ParkMode::NextCompletion => {
+                self.stats.enters.incr();
                 let args = SubmitArgs::new();
                 ring.submitter().submit_with_args(1, &args)?
             }
@@ -1676,6 +1700,7 @@ impl Shared {
                 let empty = sq.is_empty();
                 drop(sq);
                 if kernel_pending || !empty {
+                    self.stats.enters.incr();
                     ring.submitter().submit()?
                 } else {
                     0

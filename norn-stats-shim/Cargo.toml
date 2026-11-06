@@ -1,0 +1,26 @@
+[package]
+name = "norn-stats-shim"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Swappable counter backends for measuring metrics overhead on norn's hot paths"
+
+[features]
+# Exactly one backend; with none, counters are zero-sized no-ops.
+sw = []
+cell = []
+# Diagnostics: the same counters with the other storage placement.
+sw-inline = []
+cell-arc = []
+rmw = []
+facade = ["dep:metrics", "dep:metrics-exporter-prometheus"]
+facade-cached = ["dep:metrics", "dep:metrics-exporter-prometheus"]
+otel = ["dep:opentelemetry", "dep:opentelemetry_sdk"]
+otel-attr = ["dep:opentelemetry", "dep:opentelemetry_sdk"]
+otel-bound = ["dep:opentelemetry", "dep:opentelemetry_sdk"]
+
+[dependencies]
+metrics = { version = "0.24.6", optional = true }
+metrics-exporter-prometheus = { version = "0.18.3", default-features = false, optional = true }
+opentelemetry = { version = "0.33", default-features = false, features = ["metrics", "experimental_metrics_bound_instruments"], optional = true }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["metrics", "experimental_metrics_custom_reader", "experimental_metrics_bound_instruments"], optional = true }
