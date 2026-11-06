@@ -6,20 +6,38 @@ use io_uring::opcode;
 use norn_uring::Driver;
 
 #[test]
-fn capabilities_report_supported_opcodes_and_setup() -> io::Result<()> {
+fn capabilities_match_a_raw_probe_for_every_opcode() -> io::Result<()> {
     let driver = Driver::new(io_uring::IoUring::builder(), 8)?;
-    let capabilities = driver.handle().capabilities()?;
+    let capabilities = driver.handle().capabilities().clone();
 
-    // Every kernel with a probe supports these, and none supports the last
-    // opcode code.
-    for code in [opcode::Nop::CODE, opcode::Read::CODE, opcode::Write::CODE] {
-        assert!(capabilities.supports_opcode(code), "opcode {code}");
+    let ring = io_uring::IoUring::new(2)?;
+    let mut probe = io_uring::Probe::new();
+    ring.submitter().register_probe(&mut probe)?;
+    for code in 0..=u8::MAX {
+        assert_eq!(
+            capabilities.supports_opcode(code),
+            probe.is_supported(code),
+            "opcode {code}"
+        );
     }
+    let expected: Vec<u8> = (0..=u8::MAX)
+        .filter(|&code| probe.is_supported(code))
+        .collect();
+    assert_eq!(
+        capabilities.supported_opcodes().collect::<Vec<_>>(),
+        expected
+    );
+    assert!(capabilities.supports_opcode(opcode::Nop::CODE));
     assert!(!capabilities.supports_opcode(u8::MAX));
+    Ok(())
+}
 
-    let supported: Vec<u8> = capabilities.supported_opcodes().collect();
-    assert!(supported.windows(2).all(|pair| pair[0] < pair[1]));
-    assert!(supported.contains(&opcode::Nop::CODE));
-    assert_eq!(capabilities.params().sq_entries(), 8);
+#[test]
+fn capabilities_outlive_the_driver() -> io::Result<()> {
+    let driver = Driver::new(io_uring::IoUring::builder(), 8)?;
+    let handle = driver.handle();
+    let before = handle.capabilities().clone();
+    drop(driver);
+    assert_eq!(handle.capabilities(), &before);
     Ok(())
 }

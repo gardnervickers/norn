@@ -1,46 +1,47 @@
-//! Ring-wide kernel capabilities.
+//! Kernel opcode support.
 //!
-//! [`Handle::capabilities`] reports which opcodes the kernel supports, along
-//! with the ring's setup parameters and kernel feature flags. It is one
-//! synchronous `IORING_REGISTER_PROBE` call, which gives the kernel no
-//! reference to caller memory and creates no submission. It may therefore be
-//! called in any driver state while a [`Handle`] keeps the ring alive. It
-//! returns [`io::ErrorKind::WouldBlock`] if the ring is momentarily borrowed
-//! by the driver, and the kernel's error otherwise.
+//! [`Handle::capabilities`] reports which `io_uring` opcodes the running kernel
+//! implements. The driver probes once, with `IORING_REGISTER_PROBE`, when it
+//! is created, so the call costs nothing and works in any driver state while a
+//! [`Handle`] lives, including during and after shutdown.
 
 use std::fmt;
 use std::io;
 
-use io_uring::{Parameters, Probe};
+use io_uring::{IoUring, Probe};
 
 use crate::Handle;
 
-/// Opcode support and setup parameters reported by one ring.
+/// The `io_uring` opcodes the running kernel implements.
 ///
-/// Returned by [`Handle::capabilities`]. The snapshot does not change while
-/// the ring is alive.
-#[derive(Clone)]
+/// Returned by [`Handle::capabilities`]. Support is a property of the kernel,
+/// not of the ring: the kernel reports every opcode it implements, including
+/// ones that need a ring setup the driver never creates. For example,
+/// zero-copy receive (`IORING_OP_RECV_ZC`) needs 32-byte completions, so it
+/// cannot work on a Norn ring even where it is reported. A supported opcode
+/// also does not prove that every flag or argument of it is accepted.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Capabilities {
     opcodes: [u64; 4],
-    params: Parameters,
 }
 
 impl Capabilities {
-    fn new(probe: &Probe, params: Parameters) -> Self {
+    /// Probe the kernel through `ring`.
+    pub(crate) fn probe(ring: &IoUring) -> io::Result<Self> {
+        let mut probe = Probe::new();
+        ring.submitter().register_probe(&mut probe)?;
         let mut opcodes = [0u64; 4];
         for opcode in 0..=u8::MAX {
             if probe.is_supported(opcode) {
                 opcodes[usize::from(opcode / 64)] |= 1 << (opcode % 64);
             }
         }
-        Self { opcodes, params }
+        Ok(Self { opcodes })
     }
 
-    /// Return whether the kernel reports `opcode` as supported.
+    /// Return whether the kernel implements `opcode`.
     ///
-    /// Pass an opcode code such as `io_uring::opcode::Read::CODE`. Support
-    /// reflects what the kernel implements; it does not prove that every flag
-    /// or argument of that opcode is accepted.
+    /// Pass an opcode code such as `io_uring::opcode::Read::CODE`.
     pub fn supports_opcode(&self, opcode: u8) -> bool {
         self.opcodes[usize::from(opcode / 64)] & (1 << (opcode % 64)) != 0
     }
@@ -49,40 +50,22 @@ impl Capabilities {
     pub fn supported_opcodes(&self) -> impl Iterator<Item = u8> + '_ {
         (0..=u8::MAX).filter(|&opcode| self.supports_opcode(opcode))
     }
-
-    /// Return the parameters the kernel reported when the ring was created.
-    ///
-    /// These include setup flags such as SQPOLL and kernel feature flags such
-    /// as `IORING_FEAT_EXT_ARG`.
-    pub fn params(&self) -> &Parameters {
-        &self.params
-    }
 }
 
 impl fmt::Debug for Capabilities {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Capabilities")
             .field("opcodes", &self.supported_opcodes().collect::<Vec<_>>())
-            .field("params", &self.params)
             .finish()
     }
 }
 
 impl Handle {
-    /// Probe opcode support and report the ring's setup parameters.
+    /// Report which `io_uring` opcodes the running kernel implements.
     ///
-    /// Each call performs one `IORING_REGISTER_PROBE` syscall; cache the
-    /// result when checking support on a hot path. Requires Linux 5.6.
-    ///
-    /// # Errors
-    ///
-    /// Returns the probe syscall's error, or
-    /// [`io::ErrorKind::WouldBlock`] if the ring is momentarily borrowed.
-    pub fn capabilities(&self) -> io::Result<Capabilities> {
-        self.try_with_ring(|ring| {
-            let mut probe = Probe::new();
-            ring.submitter().register_probe(&mut probe)?;
-            Ok(Capabilities::new(&probe, ring.params().clone()))
-        })
+    /// The driver probed the kernel when it was created; see [`Capabilities`]
+    /// for what the result does and does not promise.
+    pub fn capabilities(&self) -> &Capabilities {
+        self.kernel_capabilities()
     }
 }

@@ -207,6 +207,8 @@ struct Shared {
     // order, so retained registered storage is released only after the ring.
     registered_buf_rings: RegisteredBufRings,
     registered_buffers: RegisteredBuffers,
+    /// The opcodes the kernel reported when the driver was created.
+    capabilities: crate::ring::Capabilities,
 }
 
 #[cfg(test)]
@@ -671,21 +673,9 @@ impl Handle {
         })
     }
 
-    /// Run a synchronous call on the ring.
-    ///
-    /// Fails with [`io::ErrorKind::WouldBlock`] instead of panicking when the
-    /// ring is already mutably borrowed by the driver.
-    pub(crate) fn try_with_ring<U>(
-        &self,
-        f: impl FnOnce(&IoUring) -> io::Result<U>,
-    ) -> io::Result<U> {
-        let ring = self.shared.ring.try_borrow().map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "io_uring is already borrowed by the driver",
-            )
-        })?;
-        f(&ring)
+    /// The opcodes the kernel reported when the driver was created.
+    pub(crate) fn kernel_capabilities(&self) -> &crate::ring::Capabilities {
+        &self.shared.capabilities
     }
 
     pub(crate) fn fixed_buf_driver(&self) -> FixedBufDriver {
@@ -810,6 +800,7 @@ impl Driver {
             ring => ring?,
         };
         Self::check_setup(&ring)?;
+        let capabilities = crate::ring::Capabilities::probe(&ring)?;
         Ok(Self {
             options,
             shared: Rc::new(Shared {
@@ -829,6 +820,7 @@ impl Driver {
                 shutdown_test: ShutdownTest::default(),
                 registered_buf_rings: RegisteredBufRings::new(),
                 registered_buffers: RegisteredBuffers::new(),
+                capabilities,
             }),
             unparker: Arc::new(unpark::Unparker::new()?),
             unparker_buf: mem::ManuallyDrop::new(UnparkerBuffer::new()),
