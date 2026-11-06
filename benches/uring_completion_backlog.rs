@@ -5,6 +5,7 @@ use std::hint::black_box;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use bencher::{Bencher, TestDesc, TestDescAndFn, TestFn};
 use futures::stream::{Stream, StreamExt};
@@ -110,11 +111,16 @@ impl bencher::TDynBenchFn for LaggedBurstBench {
             let mut cx = Context::from_waker(&waker);
             assert!(matches!(timeout.as_mut().poll_next(&mut cx), Poll::Pending));
 
-            // An IO_DRAIN submitted after the multishot timeout cannot finish
-            // until the multishot request has produced its terminal CQE. Await
-            // that fence without polling the stream so every timeout CQE
-            // accumulates in the operation-local queue.
-            norn_uring::Handle::current().submit(DrainNop).await;
+            // Operations cannot set IO_DRAIN, so there is no kernel fence on the
+            // multishot request's terminal CQE. Wait without polling the
+            // stream until the zero-interval timeout has had ample time to
+            // post every CQE, so they accumulate in the operation-local queue.
+            // The timed section still asserts that all `count` completions
+            // arrive.
+            norn_uring::Handle::current()
+                .timeout(Duration::from_millis(1000))
+                .await
+                .unwrap();
             timeout
         });
         let mut timeout = Some(timeout);
@@ -134,31 +140,6 @@ impl bencher::TDynBenchFn for LaggedBurstBench {
                 black_box(())
             });
         });
-    }
-}
-
-#[derive(Debug)]
-struct DrainNop;
-
-unsafe impl norn_uring::Operation for DrainNop {
-    type Completion = norn_uring::CQEResult;
-
-    fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
-        Ok(io_uring::opcode::Nop::new()
-            .build()
-            .flags(io_uring::squeue::Flags::IO_DRAIN))
-    }
-
-    unsafe fn reap(&mut self, result: norn_uring::CQEResult) -> Self::Completion {
-        result
-    }
-}
-
-impl norn_uring::Singleshot for DrainNop {
-    type Output = ();
-
-    fn complete(self, result: norn_uring::CQEResult) -> Self::Output {
-        result.into_result().unwrap();
     }
 }
 

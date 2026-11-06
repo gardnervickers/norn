@@ -74,12 +74,13 @@ pub unsafe trait Operation {
     /// kernel. Implementations may store pointers to fields of `self` in the entry, but must not
     /// invalidate the pointed-to storage during that period.
     ///
-    /// The runtime owns the `IOSQE_IO_LINK`, `IOSQE_IO_HARDLINK`, and
+    /// The runtime owns the `IOSQE_IO_LINK`, `IOSQE_IO_HARDLINK`, `IOSQE_IO_DRAIN`, and
     /// `IOSQE_CQE_SKIP_SUCCESS` flags. The submission queue is shared, so a link would join
-    /// the entry to whichever SQE is queued next, and a skipped success CQE would leave the
-    /// operation without its terminal completion. Use [`Request::then`](crate::Request::then)
-    /// to link requests. An entry that sets one of these flags fails configuration with
-    /// [`io::ErrorKind::InvalidInput`].
+    /// the entry to whichever SQE is queued next, a drain would hold every later SQE (including
+    /// the driver's own cancellations and wakeups) until all earlier ones complete, and a skipped
+    /// success CQE would leave the operation without its terminal completion. Use
+    /// [`Request::then`](crate::Request::then) to link requests. An entry that sets one of these
+    /// flags fails configuration with [`io::ErrorKind::InvalidInput`].
     ///
     /// # Errors
     ///
@@ -706,11 +707,15 @@ pub(crate) unsafe fn reap_operation(entry: &io_uring::cqueue::Entry) {
 ///
 /// A link joins an entry to the next SQE in the shared queue, which may belong
 /// to another task; the driver sets `IO_LINK` itself for requests submitted
-/// together. A request that skips its success CQE never releases its operation
-/// or leaves the in-flight count that driver shutdown drains to zero, and once
-/// one is submitted the kernel rejects every later `IO_DRAIN` entry.
+/// together. A drain holds every later SQE in the shared queue, including the
+/// driver's own cancellations and eventfd read, until every earlier SQE
+/// completes, so one drain behind an idle request stalls the whole runtime. A
+/// request that skips its success CQE never releases its operation or leaves
+/// the in-flight count that driver shutdown drains to zero, and once one is
+/// submitted the kernel rejects every later `IO_DRAIN` entry.
 const RESERVED_SQE_FLAGS: Flags = Flags::IO_LINK
     .union(Flags::IO_HARDLINK)
+    .union(Flags::IO_DRAIN)
     .union(Flags::SKIP_SUCCESS);
 
 /// Whether a configured SQE sets a runtime-owned flag.
@@ -724,7 +729,7 @@ fn has_reserved_flags(entry: &io_uring::squeue::Entry) -> bool {
 fn reserved_flags_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "operations may not set IO_LINK, IO_HARDLINK, or CQE_SKIP_SUCCESS; \
+        "operations may not set IO_LINK, IO_HARDLINK, IO_DRAIN, or CQE_SKIP_SUCCESS; \
          link requests with Request::then",
     )
 }
@@ -856,7 +861,12 @@ mod tests {
 
     #[test]
     fn only_runtime_owned_flags_fail_configuration() {
-        for reserved in [Flags::IO_LINK, Flags::IO_HARDLINK, Flags::SKIP_SUCCESS] {
+        for reserved in [
+            Flags::IO_LINK,
+            Flags::IO_HARDLINK,
+            Flags::IO_DRAIN,
+            Flags::SKIP_SUCCESS,
+        ] {
             let entry = io_uring::opcode::Nop::new()
                 .build()
                 .flags(reserved | Flags::ASYNC);
@@ -865,7 +875,6 @@ mod tests {
         for allowed in [
             Flags::empty(),
             Flags::FIXED_FILE,
-            Flags::IO_DRAIN,
             Flags::ASYNC,
             Flags::BUFFER_SELECT,
         ] {

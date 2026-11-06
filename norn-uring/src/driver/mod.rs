@@ -697,6 +697,22 @@ impl Handle {
         self.shared.registered_buffers.test_retained_len()
     }
 
+    /// Queue a raw `IO_DRAIN` NOP whose completion the driver ignores.
+    ///
+    /// Operations may not set `IO_DRAIN`; tests that need the kernel to defer
+    /// later SQEs behind earlier ones push the fence themselves. It is not
+    /// counted in flight, as its completion is not.
+    #[cfg(test)]
+    pub(crate) fn test_push_drain_fence(&self) {
+        let fence = opcode::Nop::new()
+            .build()
+            .flags(io_uring::squeue::Flags::IO_DRAIN)
+            .user_data(Driver::CANCELLATION_TOKEN as u64);
+        let mut ring = self.shared.ring.borrow_mut();
+        // Safety: the NOP references no memory.
+        unsafe { ring.submission().push(&fence) }.expect("submission queue is full");
+    }
+
     #[cfg(test)]
     pub(crate) fn test_with_ring_borrowed_mut(&self, f: impl FnOnce()) {
         let _ring = self.shared.ring.borrow_mut();

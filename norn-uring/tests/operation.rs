@@ -150,3 +150,23 @@ fn skipped_success_completions_are_rejected_and_shutdown_completes() {
         .expect("operation or driver shutdown did not finish");
     assert_rejected_configuration(output);
 }
+
+/// `IO_DRAIN` acts on the shared ring: every SQE submitted after it, including
+/// the driver's own cancellations and eventfd read, waits until every earlier
+/// SQE has completed. One drain entry behind an idle read would stall the whole
+/// runtime, so the runtime rejects it like the other ring-wide flags.
+#[test]
+fn io_drain_is_rejected_before_submission() -> Result<(), Box<dyn std::error::Error>> {
+    util::with_test_env(|| async {
+        let drained = Handle::current()
+            .submit(Flagged {
+                build: nop,
+                flags: io_uring::squeue::Flags::IO_DRAIN,
+            })
+            .await;
+        assert_rejected_configuration(drained);
+        // The ring is unaffected.
+        assert_eq!(Handle::current().submit(PublicNop).await?, 0);
+        Ok(())
+    })
+}
