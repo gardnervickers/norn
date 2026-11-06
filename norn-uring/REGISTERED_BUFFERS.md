@@ -311,7 +311,8 @@ impl<B: 'static> FixedBufTable<B> {
 ```
 
 `register_sparse_fixed_buffers` registers `len` vacant kernel slots
-(`IORING_REGISTER_BUFFERS2` with `IORING_RSRC_REGISTER_SPARSE`, Linux 5.13).
+(`IORING_REGISTER_BUFFERS2` with `IORING_RSRC_REGISTER_SPARSE`, Linux 5.19; earlier kernels reject it with
+`EINVAL`, reported as `RegisterErrorKind::Unsupported`).
 Vacant slots are not on the free list and cannot be acquired. Either kind of
 table occupies the driver's single fixed-buffer table, generation, and
 `Registry` state machine, so a driver holds one table at a time.

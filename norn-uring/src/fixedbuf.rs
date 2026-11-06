@@ -568,7 +568,7 @@ impl Handle {
 ///
 /// Each value is allocated separately, so its region stays put while other
 /// slots change. Slot changes are synchronous `io_uring_register(2)` calls
-/// and require Linux 5.13.
+/// and require Linux 5.13; sparse tables require Linux 5.19.
 ///
 /// The table occupies the driver's single fixed-buffer table. Dropping it
 /// performs safe best-effort release; use [`FixedBufTable::unregister`] when
@@ -765,11 +765,14 @@ impl<B: 'static> Error for UnregisterError<B> {
 impl Handle {
     /// Register an empty table of `len` replaceable fixed-buffer slots.
     ///
-    /// Install buffers with [`FixedBufTable::install`]. Requires Linux 5.13.
+    /// Install buffers with [`FixedBufTable::install`]. Requires Linux 5.19
+    /// (`IORING_RSRC_REGISTER_SPARSE`).
     ///
     /// # Errors
     ///
-    /// Returns [`RegisterErrorKind::Empty`] for `len == 0`,
+    /// Returns [`RegisterErrorKind::Unsupported`] when the kernel rejects
+    /// sparse registration with `EINVAL`, [`RegisterErrorKind::Empty`] for
+    /// `len == 0`,
     /// [`RegisterErrorKind::TooManyBuffers`] above the kernel's 16384-slot
     /// limit, and otherwise the same driver and kernel errors as
     /// [`Handle::register_fixed_buffers`].
@@ -811,7 +814,12 @@ impl Handle {
         if let Err(err) = register {
             inner.registered.set(false);
             reservation.kernel_call_failed();
-            return Err(map_register_io_error(err));
+            // Kernels before 5.19 reject the sparse flag, and kernels before
+            // 5.13 the `IORING_REGISTER_BUFFERS2` opcode, with EINVAL.
+            return Err(match err.raw_os_error() {
+                Some(libc::EINVAL) => RegisterErrorKind::Unsupported(err),
+                _ => map_register_io_error(err),
+            });
         }
         let _ = reservation.commit();
 
@@ -828,8 +836,9 @@ impl<B: 'static> FixedBufTable<B> {
     ///
     /// # Errors
     ///
-    /// Returns [`SlotError`] for an invalid or occupied slot, an invalid or
-    /// overlapping region, a stopped or borrowed driver, or a kernel failure.
+    /// Returns [`SlotError`] for an invalid or occupied slot (including one
+    /// whose install is in progress, as seen from inside
+    /// [`FixedBuffer::fixed_region`]), an invalid or overlapping region, a stopped or borrowed driver, or a kernel failure.
     pub fn install(&self, index: usize, buffer: B) -> Result<(), SlotError<B>>
     where
         B: FixedBuffer,
@@ -843,8 +852,10 @@ impl<B: 'static> FixedBufTable<B> {
             });
         };
         // The storage check also covers a value left behind by an install
-        // whose kernel update unwound.
-        if slot.len.get() != 0 || Storage::is_occupied(&storage.slots[index]) {
+        // whose kernel update unwound. A vacant slot is acquired only while
+        // another install of it is projecting or updating the kernel.
+        if slot.len.get() != 0 || slot.acquired.get() || Storage::is_occupied(&storage.slots[index])
+        {
             return Err(SlotError {
                 kind: SlotErrorKind::Occupied { index },
                 buffer,
@@ -858,27 +869,41 @@ impl<B: 'static> FixedBufTable<B> {
         }
 
         let mut value = SlotValue::new(buffer);
+        // `fixed_region` may call back into this table. Hold the slot so such
+        // calls cannot install, replace, or remove it before this install
+        // stores its value.
+        slot.acquired.set(true);
+        let hold = HeldSlot {
+            inner,
+            index,
+            installed: false,
+        };
         let (ptr, len) = match self.project(index, &mut value) {
             Ok(region) => region,
             Err(kind) => {
+                drop(hold);
                 return Err(SlotError {
                     kind,
                     buffer: value.into_inner(),
-                })
+                });
             }
         };
+        // The slot stays held through the kernel call; if the call unwinds,
+        // the slot stays unavailable.
+        mem::forget(hold);
 
         // Keep the value in table storage across the kernel call, so an
         // unwind cannot free a region the kernel may already reference.
-        storage.slots[index].set(Some(value));
+        store_vacant(&storage.slots[index], value);
         // Safety: `FixedBuffer` guarantees the region, which table storage
         // owns until this slot is updated again or the table is released. The
-        // slot is vacant, so no operation uses it.
+        // slot is vacant and held, so no operation uses it.
         let result = unsafe {
             inner
                 .driver
                 .update_slot(inner.generation, index as u32, &region_iovec(ptr, len))
         };
+        slot.acquired.set(false);
         match result {
             Ok(()) => {
                 slot.ptr.set(ptr);
@@ -931,24 +956,42 @@ impl<B: 'static> FixedBufTable<B> {
             });
         }
 
-        let mut value = SlotValue::new(buffer);
-        let (ptr, len) = match self.project(index, &mut value) {
-            Ok(region) => region,
-            Err(kind) => {
-                return Err(SlotError {
-                    kind,
-                    buffer: value.into_inner(),
-                })
-            }
-        };
-
-        // Hold the slot out of circulation during the kernel call. If the call
-        // unwinds, the slot stays unavailable and both values stay owned by
-        // table storage until the table is released.
+        // Hold the slot out of circulation while the new region is projected
+        // and during the kernel call. `fixed_region` may call back into this
+        // table, and a held slot cannot be acquired, replaced, or removed. If
+        // the kernel call unwinds, the slot stays unavailable and both values
+        // stay owned by table storage until the table is released.
         let slot = &inner.slots[index];
         inner.unlink_free(index);
         slot.acquired.set(true);
-        storage.staged.set(Some(value));
+        let hold = HeldSlot {
+            inner,
+            index,
+            installed: true,
+        };
+
+        let mut value = SlotValue::new(buffer);
+        let projected = self.project(index, &mut value).and_then(|region| {
+            // A reentrant replacement of another slot may have unwound and
+            // left its value staged.
+            if Storage::is_occupied(&storage.staged) {
+                Err(SlotErrorKind::StateMismatch)
+            } else {
+                Ok(region)
+            }
+        });
+        let (ptr, len) = match projected {
+            Ok(region) => region,
+            Err(kind) => {
+                drop(hold);
+                return Err(SlotError {
+                    kind,
+                    buffer: value.into_inner(),
+                });
+            }
+        };
+        mem::forget(hold);
+        store_vacant(&storage.staged, value);
         // Safety: as for `install`; the slot is held unacquirable, so no
         // operation uses it.
         let result = unsafe {
@@ -1186,6 +1229,36 @@ fn map_update_error(err: FixedBufUpdateError) -> SlotErrorKind {
             Some(libc::ENOMEM | libc::EPERM) => SlotErrorKind::ResourceExhausted(err),
             _ => SlotErrorKind::Io(err),
         },
+    }
+}
+
+/// Store `value` in a storage cell which must be empty.
+///
+/// A value already there may be referenced by the kernel, so it is leaked
+/// rather than dropped before panicking.
+fn store_vacant<B>(cell: &Cell<Option<SlotValue<B>>>, value: SlotValue<B>) {
+    if let Some(stale) = cell.replace(Some(value)) {
+        mem::forget(stale);
+        panic!("fixed-buffer storage cell was already occupied");
+    }
+}
+
+/// A slot held acquired while a new value's region is projected.
+///
+/// Dropping it, on a projection error or unwind, returns the slot to
+/// circulation: unacquired, and on the free list if it is installed.
+struct HeldSlot<'a, B: 'static> {
+    inner: &'a Inner<B>,
+    index: usize,
+    installed: bool,
+}
+
+impl<B: 'static> Drop for HeldSlot<'_, B> {
+    fn drop(&mut self) {
+        self.inner.slots[self.index].acquired.set(false);
+        if self.installed {
+            self.inner.push_free(self.index);
+        }
     }
 }
 
