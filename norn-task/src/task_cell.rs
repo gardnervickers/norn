@@ -243,6 +243,10 @@ where
         drop(guard);
     }
 
+    // Runs once per task, while `poll` runs on every wakeup. Inlined into
+    // `poll`, the join waker and `catch_unwind` state that stay live across
+    // `unbind` make every poll save and restore extra callee-saved registers.
+    #[inline(never)]
     unsafe fn complete_task(ptr: NonNull<header::Header>) {
         let this = Self::from_raw_header(ptr);
         let state = this.as_ref().state();
