@@ -31,23 +31,107 @@ const LINGER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 /// Most input a failed connection discards before it is closed.
 const LINGER_MAX_BYTES: usize = 16 * 1024 * 1024;
 
-/// Decide whether an accept failure should stop the listener.
+/// How the listener reacts to a failed accept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcceptRecovery {
+    /// A load condition: wait briefly, then accept again.
+    BackOff,
+    /// Concerns only the connection being accepted: accept again at once.
+    Skip,
+    /// Not recoverable: stop the listener.
+    Stop,
+}
+
+/// Most consecutive skipped accept errors tolerated without a successful
+/// accept in between.
 ///
-/// Descriptor and memory exhaustion are load conditions: back off briefly so
-/// pending connections can drain instead of retrying in a hot loop. Errors
-/// that concern only the connection being accepted are skipped. Anything else
-/// is returned to the caller.
-pub(crate) async fn recover_from_accept_error(error: io::Error) -> io::Result<()> {
-    match error.raw_os_error() {
-        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM) => {
-            eprintln!("accept failed: {error}; backing off");
-            norn_uring::Handle::current()
-                .timeout(ACCEPT_BACKOFF)
-                .await?;
-            Ok(())
+/// Skipping retries immediately, so an error that is really sticky (a security
+/// module that denies every accept with `EPERM`, say) would otherwise spin the
+/// listener at full CPU forever and silently.
+const MAX_CONSECUTIVE_SKIPPED_ACCEPTS: u32 = 64;
+
+/// Classify the `errno` of a failed accept.
+///
+/// accept(2) documents that Linux passes the pending network errors of the new
+/// connection through accept and that they should be treated like `EAGAIN`:
+/// `ENETDOWN`, `EPROTO`, `ENOPROTOOPT`, `EHOSTDOWN`, `ENONET`, `EHOSTUNREACH`
+/// and `ENETUNREACH` are skipped. `ECONNABORTED` is a connection that died
+/// before it was accepted, and `EPERM` ("Firewall rules forbid connection")
+/// and `EINTR` are likewise skipped.
+///
+/// `EOPNOTSUPP` is on accept(2)'s retry list but is also what accept returns
+/// for a listener that is not `SOCK_STREAM`, and `EACCES` is what a security
+/// module returns from a check that sees only the listener. Both would repeat
+/// on every accept, so they stop the listener rather than spin it.
+fn classify_accept_error(errno: Option<i32>) -> AcceptRecovery {
+    match errno {
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM) => AcceptRecovery::BackOff,
+        Some(
+            libc::ECONNABORTED
+            | libc::EPROTO
+            | libc::EPERM
+            | libc::EINTR
+            | libc::ENETDOWN
+            | libc::ENOPROTOOPT
+            | libc::EHOSTDOWN
+            | libc::ENONET
+            | libc::EHOSTUNREACH
+            | libc::ENETUNREACH,
+        ) => AcceptRecovery::Skip,
+        _ => AcceptRecovery::Stop,
+    }
+}
+
+/// Tracks accept failures so the listener can recover from transient ones.
+#[derive(Debug, Default)]
+pub(crate) struct AcceptErrors {
+    consecutive_skips: u32,
+}
+
+impl AcceptErrors {
+    /// Record a successful accept, ending any run of skipped errors.
+    pub(crate) fn accepted(&mut self) {
+        self.consecutive_skips = 0;
+    }
+
+    /// Decide what to do about a failed accept without waiting.
+    fn classify(&mut self, error: &io::Error) -> AcceptRecovery {
+        match classify_accept_error(error.raw_os_error()) {
+            AcceptRecovery::Skip => {
+                self.consecutive_skips += 1;
+                if self.consecutive_skips > MAX_CONSECUTIVE_SKIPPED_ACCEPTS {
+                    eprintln!(
+                        "accept failed {} times in a row: {error}; stopping",
+                        self.consecutive_skips
+                    );
+                    AcceptRecovery::Stop
+                } else {
+                    AcceptRecovery::Skip
+                }
+            }
+            other => other,
         }
-        Some(libc::ECONNABORTED | libc::EPROTO | libc::EPERM | libc::EINTR) => Ok(()),
-        _ => Err(error),
+    }
+
+    /// Decide whether an accept failure should stop the listener.
+    ///
+    /// Descriptor and memory exhaustion are load conditions: back off briefly
+    /// so pending connections can drain instead of retrying in a hot loop.
+    /// Errors that concern only the connection being accepted are skipped,
+    /// unless more than [`MAX_CONSECUTIVE_SKIPPED_ACCEPTS`] arrive without a
+    /// successful accept. Anything else is returned to the caller.
+    pub(crate) async fn recover(&mut self, error: io::Error) -> io::Result<()> {
+        match self.classify(&error) {
+            AcceptRecovery::BackOff => {
+                eprintln!("accept failed: {error}; backing off");
+                norn_uring::Handle::current()
+                    .timeout(ACCEPT_BACKOFF)
+                    .await?;
+                Ok(())
+            }
+            AcceptRecovery::Skip => Ok(()),
+            AcceptRecovery::Stop => Err(error),
+        }
     }
 }
 
@@ -227,11 +311,15 @@ pub async fn serve(
         RecvMode::Multishot => Some(recv_ring(RECV_RING_BUFFERS)?),
     };
     let mut incoming = pin!(listener.incoming());
+    let mut accept_errors = AcceptErrors::default();
     while let Some(next) = incoming.next().await {
         let socket = match next {
-            Ok(socket) => socket,
+            Ok(socket) => {
+                accept_errors.accepted();
+                socket
+            }
             Err(error) => {
-                recover_from_accept_error(error).await?;
+                accept_errors.recover(error).await?;
                 continue;
             }
         };
@@ -671,19 +759,140 @@ mod tests {
     };
 
     #[test]
+    fn accept_errors_are_classified() {
+        for errno in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
+            assert_eq!(
+                classify_accept_error(Some(errno)),
+                AcceptRecovery::BackOff,
+                "errno {errno}"
+            );
+        }
+        // Pending network errors of the new connection (accept(2) says to
+        // retry them like EAGAIN) and the other connection-local errors.
+        for errno in [
+            libc::ENETDOWN,
+            libc::EPROTO,
+            libc::ENOPROTOOPT,
+            libc::EHOSTDOWN,
+            libc::ENONET,
+            libc::EHOSTUNREACH,
+            libc::ENETUNREACH,
+            libc::ECONNABORTED,
+            libc::EPERM,
+            libc::EINTR,
+        ] {
+            assert_eq!(
+                classify_accept_error(Some(errno)),
+                AcceptRecovery::Skip,
+                "errno {errno}"
+            );
+        }
+        // EOPNOTSUPP and EACCES depend on the listener, so they repeat on
+        // every accept and must stop it instead of spinning.
+        for errno in [
+            libc::EOPNOTSUPP,
+            libc::EACCES,
+            libc::EBADF,
+            libc::EINVAL,
+            libc::ENOTSOCK,
+            libc::EFAULT,
+        ] {
+            assert_eq!(
+                classify_accept_error(Some(errno)),
+                AcceptRecovery::Stop,
+                "errno {errno}"
+            );
+        }
+        assert_eq!(classify_accept_error(None), AcceptRecovery::Stop);
+    }
+
+    #[test]
     fn accept_errors_back_off_skip_or_stop_the_listener() {
         use norn_executor::LocalExecutor;
 
         let driver = norn_uring::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
         let mut executor = LocalExecutor::new(driver);
         executor.block_on(async {
-            for errno in [libc::EMFILE, libc::ENFILE, libc::ECONNABORTED, libc::EPROTO] {
-                recover_from_accept_error(io::Error::from_raw_os_error(errno))
+            let mut accept_errors = AcceptErrors::default();
+            for errno in [
+                libc::EMFILE,
+                libc::ENFILE,
+                libc::ECONNABORTED,
+                libc::EPROTO,
+                libc::ENETDOWN,
+            ] {
+                accept_errors
+                    .recover(io::Error::from_raw_os_error(errno))
                     .await
                     .unwrap_or_else(|error| panic!("errno {errno} stopped the listener: {error}"));
             }
-            let fatal = recover_from_accept_error(io::Error::from_raw_os_error(libc::EBADF)).await;
-            assert_eq!(fatal.unwrap_err().raw_os_error(), Some(libc::EBADF));
+            for errno in [libc::EBADF, libc::EACCES, libc::EOPNOTSUPP] {
+                let fatal = accept_errors
+                    .recover(io::Error::from_raw_os_error(errno))
+                    .await;
+                assert_eq!(fatal.unwrap_err().raw_os_error(), Some(errno));
+            }
+        });
+    }
+
+    #[test]
+    fn sticky_skipped_accept_errors_stop_the_listener() {
+        let mut accept_errors = AcceptErrors::default();
+        let sticky = io::Error::from_raw_os_error(libc::EPERM);
+        for attempt in 1..=MAX_CONSECUTIVE_SKIPPED_ACCEPTS {
+            assert_eq!(
+                accept_errors.classify(&sticky),
+                AcceptRecovery::Skip,
+                "skip {attempt}"
+            );
+        }
+        assert_eq!(accept_errors.classify(&sticky), AcceptRecovery::Stop);
+        assert_eq!(accept_errors.classify(&sticky), AcceptRecovery::Stop);
+
+        // A successful accept in between ends the run, so isolated errors
+        // never accumulate toward the limit.
+        accept_errors.accepted();
+        for _ in 0..MAX_CONSECUTIVE_SKIPPED_ACCEPTS {
+            assert_eq!(accept_errors.classify(&sticky), AcceptRecovery::Skip);
+        }
+        accept_errors.accepted();
+        assert_eq!(accept_errors.classify(&sticky), AcceptRecovery::Skip);
+
+        // Back-off errors are paced by their timeout and are not counted.
+        let mut accept_errors = AcceptErrors::default();
+        let load = io::Error::from_raw_os_error(libc::EMFILE);
+        for _ in 0..=MAX_CONSECUTIVE_SKIPPED_ACCEPTS {
+            assert_eq!(accept_errors.classify(&load), AcceptRecovery::BackOff);
+        }
+    }
+
+    #[test]
+    fn listener_level_eopnotsupp_stops_serve_instead_of_spinning() {
+        use norn_executor::LocalExecutor;
+        use norn_uring::net::UdpSocket;
+
+        let driver = norn_uring::Driver::new(io_uring::IoUring::builder(), 64).unwrap();
+        let mut executor = LocalExecutor::new(driver);
+        executor.block_on(async {
+            // A "listener" whose every accept fails with EOPNOTSUPP: the
+            // socket is not SOCK_STREAM (accept(2) ERRORS).
+            let udp = UdpSocket::bind("127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap();
+            let listener = TcpListener::from_uring_fd(udp.into_uring_fd());
+            let handler = MemoryHandler::new(MemoryStore::new());
+            let serve = pin!(serve(listener, handler, ServerConfig::default()));
+            let timeout =
+                pin!(norn_uring::Handle::current().timeout(std::time::Duration::from_secs(5)));
+            match futures_util::future::select(serve, timeout).await {
+                futures_util::future::Either::Left((result, _)) => {
+                    let error = result.expect_err("serve on a non-stream socket must fail");
+                    assert_eq!(error.raw_os_error(), Some(libc::EOPNOTSUPP));
+                }
+                futures_util::future::Either::Right(_) => {
+                    panic!("serve kept running on a listener whose accept always fails")
+                }
+            }
         });
     }
 

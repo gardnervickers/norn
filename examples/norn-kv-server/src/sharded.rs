@@ -36,8 +36,7 @@ use crate::handler::{ConnectionAction, HandlerConfig, MemoryHandler};
 use crate::memory::OutOfMemory;
 use crate::protocol::{Command, EncodeError, RequestHeader, Status, HEADER_LEN};
 use crate::server::{
-    close_rejected, discard_multishot, lingering_close, recover_from_accept_error, RecvMode,
-    ServerConfig,
+    close_rejected, discard_multishot, lingering_close, AcceptErrors, RecvMode, ServerConfig,
 };
 
 const INLINE_KEY_LEN: usize = 32;
@@ -772,6 +771,7 @@ async fn serve_worker(
     next_connection: Arc<AtomicU64>,
 ) -> io::Result<()> {
     let mut incoming = Box::pin(listener.incoming());
+    let mut accept_errors = AcceptErrors::default();
     loop {
         futures_util::select_biased! {
             command = control.recv().fuse() => match command {
@@ -796,9 +796,12 @@ async fn serve_worker(
                     ));
                 };
                 let socket = match next {
-                    Ok(socket) => socket,
+                    Ok(socket) => {
+                        accept_errors.accepted();
+                        socket
+                    }
                     Err(error) => {
-                        recover_from_accept_error(error).await?;
+                        accept_errors.recover(error).await?;
                         continue;
                     }
                 };
