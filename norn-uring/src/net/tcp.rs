@@ -286,6 +286,27 @@ impl TcpListener {
         self.socket.set_reuse_address(reuse).await
     }
 
+    /// Steer new connections on this listener's reuse-port group by the CPU
+    /// that processed their SYN.
+    ///
+    /// The map applies to the whole group, whichever member attaches it, and
+    /// replaces any program attached before. Attaching it before every
+    /// listener has joined is fine: a route to a slot the group does not have
+    /// yet falls back to hash selection. See [`ReuseportCpuMap`] for how
+    /// slots are numbered.
+    ///
+    /// # Errors
+    ///
+    /// Returns the `setsockopt` error: `EINVAL` when the listener was not
+    /// created with [`TcpListenerOptions::reuse_port`], or `ENOMEM` when the
+    /// program exceeds `net.core.optmem_max`. Steering only affects
+    /// locality, so callers may continue with hash selection.
+    ///
+    /// [`ReuseportCpuMap`]: crate::net::ReuseportCpuMap
+    pub fn attach_reuseport_cpu_map(&self, map: &super::ReuseportCpuMap) -> io::Result<()> {
+        map.attach(self.socket.as_uring_fd().fd().0)
+    }
+
     /// Returns the local address that this listener is bound to.
     ///
     /// # Errors
@@ -489,6 +510,35 @@ impl TcpSocket {
     /// Returns an error if the peer address cannot be read from the socket.
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
         self.socket.peer_addr()
+    }
+
+    /// Return the CPU that last processed a packet received on this socket.
+    ///
+    /// This reads `SO_INCOMING_CPU`. It returns `None` before the kernel has
+    /// recorded a CPU. For a freshly accepted socket it is the CPU that
+    /// completed the handshake, which with RSS is the connection's receive
+    /// queue CPU.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the socket option cannot be read.
+    pub fn incoming_cpu(&self) -> io::Result<Option<usize>> {
+        let mut cpu: libc::c_int = -1;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: `cpu` and `len` are valid for writes of the sizes given.
+        let result = unsafe {
+            libc::getsockopt(
+                self.socket.as_uring_fd().fd().0,
+                libc::SOL_SOCKET,
+                libc::SO_INCOMING_CPU,
+                std::ptr::from_mut(&mut cpu).cast(),
+                &mut len,
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(usize::try_from(cpu).ok())
     }
 
     /// Shuts down the read, write, or both halves of this connection.

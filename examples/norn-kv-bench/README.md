@@ -258,6 +258,23 @@ Recommended practice:
   than an idle one. Work that displaces the holder counts toward the sibling
   check. The held CPUs are recorded in `provenance`.
 
+## Connection steering
+
+`norn-kv-server --steer-connections cpu|core` (sharded mode, requires
+`--worker-cpus`) attaches a classic BPF program to the reuse-port group that
+sends each connection to the worker pinned to the CPU, or the core, that
+processed its SYN. `--rx-locality-stats` prints, once a second on stderr,
+how many accepted connections each worker received on its own CPU, on an
+SMT sibling, or elsewhere.
+
+On loopback the SYN and every later packet are processed on the *sending*
+CPU, so steering can only place a connection near its client. To proxy NIC
+receive locality, put the client threads on the workers' SMT siblings and
+use `core` mode, for example workers on 8-11 and `--client-cpus 24-27` with
+a four-thread copy of `mixed-4w`. The runner rejects clients on server cores,
+so start the server yourself and use `--address`. Real RSS and IRQ effects
+need a multi-queue NIC.
+
 ## External servers
 
 `--server-kind generic` starts any memcached-binary server. `{port}` and
@@ -280,7 +297,7 @@ counters.
 - Loopback only. Part of the kernel network cost of the server's sends is
   charged to the receiving (client) CPUs, and NIC effects are absent.
 - In `mixed-4w`, `SO_REUSEPORT` places connections on workers by hash, which
-  varies from run to run. Check `cpu_ns_by_thread` in `result.json` for
+  varies from run to run (see Connection steering for deterministic placement). Check `cpu_ns_by_thread` in `result.json` for
   imbalance before trusting a 4-worker time metric.
 - The offered rates are calibrated for the development workstation (quiet
   Ryzen 9 5950X): about 10%, 40%, and 80% of the *open-loop* knee, the rate
