@@ -9,6 +9,9 @@ use std::task::Waker;
 use std::{fmt, mem, thread};
 
 use norn_executor::park::{Park, ParkMode, Unpark};
+use norn_metrics::Padded;
+
+use crate::metrics::{ChannelCounters, ChannelMetrics};
 
 /// A receiver registered with a channel driver.
 ///
@@ -56,7 +59,8 @@ impl Registry {
         self.receivers.borrow_mut().remove(&id);
     }
 
-    fn wake_ready(&self) {
+    /// Wake every ready receiver, returning how many were woken.
+    fn wake_ready(&self) -> usize {
         let mut wakers = self.wake_storage.take();
         wakers.extend(
             self.receivers
@@ -64,7 +68,9 @@ impl Registry {
                 .values()
                 .filter_map(|receiver| receiver.take_ready_waker()),
         );
+        let woken = wakers.len();
         self.wake_all(wakers);
+        woken
     }
 
     fn shutdown(&self) {
@@ -286,6 +292,7 @@ pub struct Driver<P> {
     inner: P,
     registry: Rc<Registry>,
     remote: Arc<Remote>,
+    counters: Arc<Padded<ChannelCounters>>,
 }
 
 impl<P> fmt::Debug for Driver<P>
@@ -316,7 +323,20 @@ where
             inner,
             registry,
             remote,
+            counters: Arc::default(),
         }
+    }
+
+    /// A view of this driver's counters that any thread can read.
+    pub fn metrics(&self) -> ChannelMetrics {
+        ChannelMetrics(Arc::clone(&self.counters))
+    }
+
+    /// Wake the receivers of messages that other threads sent, and count it.
+    fn deliver_remote(&self) {
+        self.counters.remote_wakeups.incr();
+        let woken = self.registry.wake_ready();
+        self.counters.receivers_woken.add(woken as u64);
     }
 
     /// Return the sendable endpoint used to construct channels for this driver.
@@ -347,14 +367,14 @@ where
 
     fn park(&mut self, mut mode: ParkMode) -> Result<(), std::io::Error> {
         if self.remote.take_pending() {
-            self.registry.wake_ready();
+            self.deliver_remote();
             mode = ParkMode::NoPark;
         }
 
         let result = self.inner.park(mode);
 
         if self.remote.take_pending() {
-            self.registry.wake_ready();
+            self.deliver_remote();
         }
 
         result
@@ -387,6 +407,7 @@ where
     }
 
     fn metric_sources(&self, sources: &mut norn_metrics::Sources) {
+        sources.push(self.metrics());
         self.inner.metric_sources(sources);
     }
 }

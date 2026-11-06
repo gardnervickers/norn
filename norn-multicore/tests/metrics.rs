@@ -139,3 +139,46 @@ fn poll_timing_reaches_every_worker() {
         assert!(times.count() >= 1, "{times:?}");
     }
 }
+
+/// Messages from another worker are delivered through counted wakeups.
+#[test]
+fn channel_deliveries_are_counted() {
+    let mut builder = RuntimeGroup::builder(2);
+    let (tx, rx) = norn_channel::mpsc::bounded(builder.endpoint(WorkerId::new(1)).unwrap(), 8);
+    builder
+        .worker(WorkerId::new(0), move |_| async move {
+            for value in 0..100u32 {
+                // Pause before every tenth message, so the receiver runs dry
+                // and parks, and each burst arrives as a remote delivery.
+                if value % 10 == 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                while tx.try_send(value).is_err() {
+                    std::thread::yield_now();
+                }
+            }
+        })
+        .unwrap();
+    builder
+        .worker(WorkerId::new(1), move |context| async move {
+            let mut rx = rx.attach(context.channels());
+            for expected in 0..100u32 {
+                assert_eq!(rx.recv().await, Some(expected));
+            }
+        })
+        .unwrap();
+    let group = builder.start().unwrap();
+    let metrics = group.metrics();
+    group.join().unwrap();
+    let channel = metrics[1]
+        .1
+        .get::<norn_channel::ChannelMetrics>()
+        .unwrap()
+        .snapshot();
+    assert!(channel.remote_wakeups >= 1, "{channel:?}");
+    assert!(channel.receivers_woken >= 1, "{channel:?}");
+    assert!(
+        channel.receivers_woken <= channel.remote_wakeups,
+        "{channel:?}"
+    );
+}

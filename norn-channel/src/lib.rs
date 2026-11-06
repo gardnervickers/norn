@@ -108,6 +108,8 @@
 )]
 
 mod driver;
+mod metrics;
 pub mod mpsc;
 
 pub use driver::{Driver, DriverBuilder, Endpoint, Handle};
+pub use metrics::{ChannelMetrics, ChannelSnapshot};
