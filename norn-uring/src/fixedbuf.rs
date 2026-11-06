@@ -265,6 +265,9 @@ pub enum AcquireError {
         len: usize,
     },
     /// The requested table index is already acquired.
+    ///
+    /// A slot whose install or replacement is in progress, as seen from
+    /// inside [`FixedBuffer::fixed_region`], also counts as acquired.
     #[error("fixed-buffer index {index} is already acquired")]
     InUse {
         /// Requested index.
@@ -598,6 +601,9 @@ pub enum SlotErrorKind {
         index: usize,
     },
     /// The slot is acquired by a [`FixedBuf`], possibly owned by an operation.
+    ///
+    /// A slot whose install or replacement is in progress, as seen from
+    /// inside [`FixedBuffer::fixed_region`], also counts as acquired.
     InUse {
         /// Requested index.
         index: usize,
@@ -933,7 +939,7 @@ impl<B: 'static> FixedBufTable<B> {
     ///
     /// Returns [`SlotError`] for an invalid, vacant, or acquired slot, an
     /// invalid or overlapping region, a stopped or borrowed driver, or a
-    /// kernel failure.
+    /// kernel failure. A slot being installed or replaced counts as acquired.
     pub fn replace(&self, index: usize, buffer: B) -> Result<B, SlotError<B>>
     where
         B: FixedBuffer,
@@ -1032,7 +1038,9 @@ impl<B: 'static> FixedBufTable<B> {
     /// # Errors
     ///
     /// Returns [`SlotErrorKind`] for an invalid, vacant, or acquired slot, a
-    /// borrowed driver, or a kernel failure. The buffer stays installed.
+    /// borrowed driver, or a kernel failure. The buffer stays installed. A
+    /// slot being installed or replaced counts as acquired
+    /// ([`SlotErrorKind::InUse`]), not vacant.
     pub fn remove(&self, index: usize) -> Result<B, SlotErrorKind> {
         let inner = &*self.inner;
         self.check_releasable(index)?;
@@ -1085,7 +1093,9 @@ impl<B: 'static> FixedBufTable<B> {
     ///
     /// Returns [`AcquireError::InvalidIndex`] for an unknown index,
     /// [`AcquireError::Vacant`] for a slot without a buffer, or
-    /// [`AcquireError::InUse`] when that slot is already acquired.
+    /// [`AcquireError::InUse`] when that slot is already acquired. A slot
+    /// being installed or replaced, as seen from inside
+    /// [`FixedBuffer::fixed_region`], counts as acquired, not vacant.
     pub fn try_acquire_at(&self, index: usize) -> Result<FixedBuf<B>, AcquireError> {
         self.inner.try_acquire_at(index)
     }
