@@ -292,9 +292,11 @@ impl WorkerContext {
         self.id
     }
 
-    /// Return the CPU this worker's thread is pinned to, if any.
+    /// Return the CPU this worker's thread was pinned to at startup, if any.
     ///
-    /// See [`Builder::pin_worker`].
+    /// This is the configured CPU, not a live affinity query: it does not
+    /// change if the thread's affinity changes later. See
+    /// [`Builder::pin_worker`].
     pub const fn cpu(&self) -> Option<usize> {
         self.cpu
     }
@@ -435,7 +437,11 @@ pub enum ConfigureError {
     UnknownWorker(WorkerId),
     /// The worker already has an async main function.
     AlreadyConfigured(WorkerId),
-    /// The CPU index cannot be represented in a Linux CPU set.
+    /// The worker cannot be pinned to this CPU index.
+    ///
+    /// On Linux the index must be below the fixed `cpu_set_t` size,
+    /// `CPU_SETSIZE` (1024). Other platforms do not support pinning, so every
+    /// index is rejected there.
     InvalidCpu {
         /// The worker that was being pinned.
         worker: WorkerId,
@@ -661,17 +667,25 @@ impl Builder {
     /// Pin `worker`'s OS thread to `cpu`.
     ///
     /// The thread sets its affinity before it runs the park factory, so the
-    /// park stack (for example an `io_uring` driver and its io-wq threads) is
-    /// created on the pinned CPU. Pinning more than one worker to a CPU is
-    /// allowed. If Linux rejects the affinity, for example because the CPU is
-    /// offline or outside the process's allowed set, that worker fails with
-    /// [`WorkerFailureKind::Startup`] and [`Builder::start`] returns an error.
-    /// Calling this again for the same worker replaces its CPU.
+    /// park stack (for example an `io_uring` driver) is created on the pinned
+    /// CPU. Recent kernels also restrict a ring's io-wq threads to the
+    /// creating thread's affinity, so blocking work offloaded to io-wq runs on
+    /// the same CPU unless the ring registers its own io-wq affinity.
+    ///
+    /// Pinning more than one worker to a CPU is allowed. Calling this again
+    /// for the same worker replaces its CPU. The pin replaces any affinity the
+    /// thread would inherit, so it may name a CPU outside the mask of the
+    /// thread calling [`Builder::start`], for example one excluded by
+    /// `taskset`. Linux rejects only CPUs that are offline or outside the
+    /// process's cgroup cpuset; then that worker fails with
+    /// [`WorkerFailureKind::Startup`], whose source chain holds the OS error,
+    /// and [`Builder::start`] returns an error.
     ///
     /// # Errors
     ///
-    /// Returns an error if `worker` is outside this topology or `cpu` is not
-    /// below `CPU_SETSIZE`.
+    /// Returns an error if `worker` is outside this topology, or
+    /// [`ConfigureError::InvalidCpu`] if `cpu` cannot be pinned on this
+    /// platform.
     pub fn pin_worker(
         &mut self,
         worker: WorkerId,
@@ -680,7 +694,7 @@ impl Builder {
         let Some(slot) = self.workers.get_mut(worker.index()) else {
             return Err(ConfigureError::UnknownWorker(worker));
         };
-        if cpu >= affinity::MAX_CPUS {
+        if !affinity::can_pin(cpu) {
             return Err(ConfigureError::InvalidCpu { worker, cpu });
         }
         slot.cpu = Some(cpu);
@@ -756,12 +770,12 @@ impl Builder {
                 WorkerExit::Failed(failure)
             };
             if let Some(cpu) = cpu {
-                if let Err(error) = affinity::pin_current_thread(cpu) {
-                    let error = io::Error::new(
-                        error.kind(),
-                        format!("pin worker {worker} to CPU {cpu}: {error}"),
-                    );
-                    return fail_startup(Box::new(error));
+                if let Err(source) = affinity::pin_current_thread(cpu) {
+                    return fail_startup(Box::new(affinity::PinError {
+                        worker,
+                        cpu,
+                        source,
+                    }));
                 }
             }
             let park = match park_factory() {
@@ -1097,17 +1111,50 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 mod affinity {
-    use std::io;
+    use std::error::Error;
+    use std::{fmt, io};
 
+    use super::WorkerId;
+
+    /// A worker whose thread could not be pinned.
+    #[derive(Debug)]
+    pub(crate) struct PinError {
+        pub(crate) worker: WorkerId,
+        pub(crate) cpu: usize,
+        pub(crate) source: io::Error,
+    }
+
+    impl fmt::Display for PinError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                f,
+                "pin worker {} to CPU {}: {}",
+                self.worker, self.cpu, self.source
+            )
+        }
+    }
+
+    impl Error for PinError {
+        fn source(&self) -> Option<&(dyn Error + 'static)> {
+            Some(&self.source)
+        }
+    }
+
+    /// Return whether `cpu` can be passed to [`pin_current_thread`].
     #[cfg(target_os = "linux")]
-    pub(crate) const MAX_CPUS: usize = libc::CPU_SETSIZE as usize;
+    pub(crate) fn can_pin(cpu: usize) -> bool {
+        cpu < libc::CPU_SETSIZE as usize
+    }
+
     #[cfg(not(target_os = "linux"))]
-    pub(crate) const MAX_CPUS: usize = usize::MAX;
+    pub(crate) fn can_pin(_cpu: usize) -> bool {
+        false
+    }
 
     /// Restrict the calling thread to one CPU.
     #[cfg(target_os = "linux")]
     pub(crate) fn pin_current_thread(cpu: usize) -> io::Result<()> {
-        debug_assert!(cpu < MAX_CPUS);
+        debug_assert!(can_pin(cpu));
         // SAFETY: the set is zero-initialized before use, `cpu` was checked
         // against CPU_SETSIZE when it was configured, and pid zero names the
         // calling thread.
@@ -1125,10 +1172,7 @@ mod affinity {
 
     #[cfg(not(target_os = "linux"))]
     pub(crate) fn pin_current_thread(_cpu: usize) -> io::Result<()> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "CPU pinning is only implemented on Linux",
-        ))
+        unreachable!("pin_worker rejects every CPU on this platform")
     }
 }
 
@@ -1609,8 +1653,11 @@ mod tests {
             builder.pin_worker(WorkerId::new(1), 0).unwrap_err(),
             ConfigureError::UnknownWorker(WorkerId::new(1))
         );
-        if affinity::MAX_CPUS != usize::MAX {
-            let cpu = affinity::MAX_CPUS;
+        #[cfg(target_os = "linux")]
+        let cpu = libc::CPU_SETSIZE as usize;
+        #[cfg(not(target_os = "linux"))]
+        let cpu = 0;
+        {
             assert_eq!(
                 builder.pin_worker(WorkerId::new(0), cpu).unwrap_err(),
                 ConfigureError::InvalidCpu {
@@ -1624,13 +1671,26 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn rejected_affinity_fails_startup_before_the_park_factory_runs() {
-        let allowed = allowed_cpus();
-        let Some(unavailable) = (0..libc::CPU_SETSIZE as usize)
-            .rev()
-            .find(|cpu| !allowed.contains(cpu))
-        else {
-            return;
+        // Only CPUs the kernel does not have are rejected regardless of the
+        // test's own mask: use the first index past the possible CPUs. Miri's
+        // isolation hides sysfs, and it emulates only a few CPUs.
+        let possible = if cfg!(miri) {
+            None
+        } else {
+            std::fs::read_to_string("/sys/devices/system/cpu/possible").ok()
         };
+        let unavailable = possible
+            .and_then(|possible| {
+                possible
+                    .trim()
+                    .rsplit([',', '-'])
+                    .next()
+                    .and_then(|cpu| cpu.parse::<usize>().ok())
+            })
+            .map_or(libc::CPU_SETSIZE as usize - 1, |last| last + 1);
+        if !affinity::can_pin(unavailable) {
+            return;
+        }
         let factory_ran = Arc::new(AtomicBool::new(false));
         let factory_ran_by_worker = Arc::clone(&factory_ran);
         let mut builder = Builder::new(2);
@@ -1659,5 +1719,11 @@ mod tests {
             failure.to_string().contains(&format!("CPU {unavailable}")),
             "{failure}"
         );
+        let os_error = failure
+            .source()
+            .and_then(Error::source)
+            .and_then(|source| source.downcast_ref::<io::Error>())
+            .and_then(io::Error::raw_os_error);
+        assert_eq!(os_error, Some(libc::EINVAL));
     }
 }
