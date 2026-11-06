@@ -157,7 +157,6 @@ impl ChanStats {
 
 struct Msg {
     stats: Arc<ChanStats>,
-    seq: u64,
     state: Cell<u8>,
 }
 
@@ -166,11 +165,10 @@ const MSG_RECEIVED: u8 = 1;
 const MSG_REJECTED: u8 = 2;
 
 impl Msg {
-    fn new(stats: &Arc<ChanStats>, seq: u64) -> Self {
+    fn new(stats: &Arc<ChanStats>) -> Self {
         MSG_CREATED.fetch_add(1, SeqCst);
         Msg {
             stats: Arc::clone(stats),
-            seq,
             state: Cell::new(MSG_INFLIGHT),
         }
     }
@@ -188,7 +186,6 @@ impl Drop for Msg {
         if self.state.get() == MSG_INFLIGHT {
             self.stats.discarded.fetch_add(1, SeqCst);
         }
-        let _ = self.seq;
         MSG_DROPPED.fetch_add(1, SeqCst);
     }
 }
@@ -357,11 +354,11 @@ enum SendOutcome {
 }
 
 impl Outbox {
-    /// Send up to `n` messages starting at `seq`.
-    fn send(&self, stats: &Arc<ChanStats>, seq: u64, n: usize, many: bool) -> SendOutcome {
+    /// Send up to `n` messages.
+    fn send(&self, stats: &Arc<ChanStats>, n: usize, many: bool) -> SendOutcome {
         match self {
             Outbox::Plain(tx) if many && n > 1 => {
-                let mut values = (seq..seq + n as u64).map(|s| Msg::new(stats, s));
+                let mut values = (0..n).map(|_| Msg::new(stats));
                 match tx.try_send_many(&mut values) {
                     Ok(sent) => {
                         stats.sent_ok.fetch_add(sent, SeqCst);
@@ -385,8 +382,8 @@ impl Outbox {
             }
             _ => {
                 let mut sent = 0;
-                for s in seq..seq + n as u64 {
-                    let msg = Msg::new(stats, s);
+                for _ in 0..n {
+                    let msg = Msg::new(stats);
                     let res = match self {
                         Outbox::Plain(tx) => tx.try_send(msg),
                         Outbox::Sharded(tx) => tx.try_send(msg),
@@ -596,7 +593,7 @@ async fn producer(plan: OutboxPlan, mut rng: Rng, strict: bool, me: usize) {
         let remaining = quota - seq as usize;
         let n = (rng.range(1, 8) as usize).min(remaining);
         let many = rng.chance(50);
-        match tx.send(&stats, seq, n, many) {
+        match tx.send(&stats, n, many) {
             SendOutcome::Sent(k) => {
                 seq += k as u64;
                 full_retries = 0;
@@ -878,13 +875,7 @@ async fn echo_conn(sock: TcpSocket, ring: RecvBufRing, mut rng: Rng) -> io::Resu
     Ok(())
 }
 
-async fn tcp_listener(
-    addr_txs: Vec<Sender<SocketAddr>>,
-    rounds_done: Arc<AtomicUsize>,
-    mut rng: Rng,
-    strict: bool,
-) {
-    let _ = rounds_done;
+async fn tcp_listener(addr_txs: Vec<Sender<SocketAddr>>, mut rng: Rng, strict: bool) {
     let listener = match TcpListener::bind("127.0.0.1:0".parse().unwrap(), 64).await {
         Ok(l) => l,
         Err(e) => return fail(format!("bind failed: {e}")),
@@ -1128,17 +1119,22 @@ async fn spawn_abort(mut rng: Rng, count: usize, panics: usize) {
             other => fail(format!("panicking task returned {:?}", other.err())),
         }
     }
-    for h in &handles {
+    let mut aborted = vec![false; handles.len()];
+    for (h, was_aborted) in handles.iter().zip(&mut aborted) {
         if rng.chance(50) {
             sleep(rng.ms(0, 2)).await;
             h.abort();
+            *was_aborted = true;
         }
     }
-    for h in handles {
+    for (h, was_aborted) in handles.into_iter().zip(aborted) {
         match h.await {
             Ok(_) => {}
-            Err(e) if e.is_cancelled() => {}
-            Err(e) => fail(format!("aborted task returned unexpected error {e:?}")),
+            // Only a handle that was aborted may report cancellation.
+            Err(e) if was_aborted && e.is_cancelled() => {}
+            Err(e) => fail(format!(
+                "task (aborted: {was_aborted}) returned unexpected error {e:?}"
+            )),
         }
     }
 }
@@ -1188,12 +1184,7 @@ async fn work(ctx: WorkerContext, s: &mut WorkerSetup) {
     }
     if !s.tcp_listen.is_empty() {
         let txs = std::mem::take(&mut s.tcp_listen);
-        handles.push(tspawn(tcp_listener(
-            txs,
-            Arc::clone(&s.tcp_done),
-            rng.fork(),
-            strict,
-        )));
+        handles.push(tspawn(tcp_listener(txs, rng.fork(), strict)));
     }
     for rx in s.tcp_connect.drain(..) {
         let rx = rx.attach(ctx.channels());
@@ -1545,7 +1536,7 @@ fn run_ext_producer(p: ExtProducer, strict: bool, hold: bool, stop: Arc<AtomicBo
         } else {
             (rng.range(1, 8) as usize).min(quota - seq as usize)
         };
-        match tx.send(&stats, seq, n, rng.chance(50)) {
+        match tx.send(&stats, n, rng.chance(50)) {
             SendOutcome::Sent(k) => {
                 seq += k as u64;
                 full = 0;
@@ -2128,7 +2119,7 @@ fn lifecycle_stress() {
             if stop_on_failure {
                 break;
             }
-        } else if single || ran % 200 == 0 {
+        } else if single || ran.is_multiple_of(200) {
             eprintln!(
                 "seed={seed} ok {summary:?} in {:?} (ran {ran}, elapsed {:?})",
                 t.elapsed(),
