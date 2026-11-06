@@ -279,16 +279,104 @@ fn get_request(key: &[u8], opaque: u32) -> Vec<u8> {
     request
 }
 
-/// Store `stored` (the first entry is read back), leaving too little room to
-/// buffer its reply, then pipeline a GET for it behind misses (which, in sharded mode,
-/// queue the big replies behind remote ones). Growing a response buffer or
-/// batch can then only fail that connection.
+/// The server's virtual memory size in bytes, from `/proc/<pid>/status`.
+fn vm_size(pid: u32) -> usize {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+    let kib: usize = status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmSize:"))
+        .and_then(|rest| rest.trim().strip_suffix("kB"))
+        .and_then(|kib| kib.trim().parse().ok())
+        .expect("VmSize in /proc status");
+    kib * 1024
+}
+
+/// Wait until the server's virtual memory size stops changing, so that memory
+/// freed by earlier connections does not skew a later measurement.
+fn settled_vm_size(pid: u32) -> usize {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut last = vm_size(pid);
+    loop {
+        std::thread::sleep(Duration::from_millis(100));
+        let now = vm_size(pid);
+        if now == last || Instant::now() >= deadline {
+            return now;
+        }
+        last = now;
+    }
+}
+
+/// How a pipelined GET connection ended.
+#[derive(Debug, PartialEq, Eq)]
+enum PipelineEnd {
+    /// Every reply, up to the final NOOP's, arrived.
+    Complete,
+    /// The server closed the connection before the final reply.
+    Closed,
+}
+
+/// Read replies until the one for `last_opaque` arrives (checking that the
+/// GET of `get_opaque` carries a `value_len` value if it is answered) or the
+/// connection ends.
+fn read_pipeline(
+    stream: &mut TcpStream,
+    get_opaque: u32,
+    value_len: usize,
+    last_opaque: u32,
+) -> PipelineEnd {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    let mut sink = vec![0; 1024 * 1024];
+    loop {
+        let mut header = [0; HEADER_LEN];
+        match stream.read_exact(&mut header) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return PipelineEnd::Closed
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {
+                return PipelineEnd::Closed
+            }
+            Err(error) => panic!("connection neither answered nor closed: {error}"),
+        }
+        let opaque = u32::from_be_bytes(header[12..16].try_into().unwrap());
+        let mut body_len = u32::from_be_bytes(header[8..12].try_into().unwrap()) as usize;
+        if opaque == get_opaque {
+            assert_eq!(body_len, 4 + value_len, "GET reply length");
+        }
+        while body_len != 0 {
+            let want = body_len.min(sink.len());
+            match stream.read(&mut sink[..want]) {
+                Ok(0) => return PipelineEnd::Closed,
+                Ok(n) => body_len -= n,
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {
+                    return PipelineEnd::Closed
+                }
+                Err(error) => panic!("connection neither answered nor closed: {error}"),
+            }
+        }
+        if opaque == last_opaque {
+            return PipelineEnd::Complete;
+        }
+    }
+}
+
+/// Store `stored` (the first entry is read back), then pipeline a GET for it
+/// behind six misses (which, in sharded mode, queue the big reply behind
+/// remote ones) and a final NOOP. `held_body` bytes of an unfinished SET on
+/// another connection take up memory meanwhile. The server must survive and
+/// keep answering whichever way the GET ends: with every reply, or, if the
+/// reply cannot be buffered, with only that connection closed.
+///
+/// Returns how the GET connection ended.
 fn large_get_fails_only_its_connection(
     mode: &str,
     stored: &[(&str, usize)],
     held_body: usize,
-    gets: u32,
-) {
+) -> PipelineEnd {
+    const GET_OPAQUE: u32 = 100;
+    const NOOP_OPAQUE: u32 = 999;
     let (mut child, address) = spawn_limited(mode);
     for (key, len) in stored {
         assert_eq!(
@@ -298,9 +386,12 @@ fn large_get_fails_only_its_connection(
         );
     }
 
-    // Another connection holds `held_body` bytes of an unfinished SET.
+    // Another connection holds `held_body` bytes of an unfinished SET. Wait
+    // until the server has reserved them rather than guessing how long that
+    // takes.
     let mut holder = TcpStream::connect(address).unwrap();
     if held_body != 0 {
+        let before = settled_vm_size(child.id());
         let mut header = [0_u8; HEADER_LEN];
         header[0] = 0x80;
         header[1] = 0x01;
@@ -311,31 +402,29 @@ fn large_get_fails_only_its_connection(
         holder.write_all(&header).unwrap();
         holder.write_all(&[0; 8]).unwrap();
         holder.write_all(b"h").unwrap();
-        std::thread::sleep(Duration::from_millis(300));
-    }
-    {
-        let mut stream = TcpStream::connect(address).unwrap();
-        let mut pipeline = Vec::new();
-        for (opaque, key) in [b"a", b"b", b"c", b"d", b"e", b"f"].iter().enumerate() {
-            pipeline.extend_from_slice(&get_request(*key, 10 + opaque as u32));
-        }
-        for opaque in 0..gets {
-            pipeline.extend_from_slice(&get_request(stored[0].0.as_bytes(), 100 + opaque));
-        }
-        stream.write_all(&pipeline).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(20)))
-            .unwrap();
-        // Read until the server answers everything or fails this connection.
-        let mut sink = vec![0; 1024 * 1024];
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while Instant::now() < deadline {
-            match stream.read(&mut sink) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {}
-            }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while vm_size(child.id()) < before + held_body * 9 / 10 {
+            assert!(
+                Instant::now() < deadline,
+                "server never reserved the held SET body"
+            );
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
+
+    let mut stream = TcpStream::connect(address).unwrap();
+    let mut pipeline = Vec::new();
+    for (opaque, key) in [b"a", b"b", b"c", b"d", b"e", b"f"].iter().enumerate() {
+        pipeline.extend_from_slice(&get_request(*key, 10 + opaque as u32));
+    }
+    pipeline.extend_from_slice(&get_request(stored[0].0.as_bytes(), GET_OPAQUE));
+    let mut noop = noop_request();
+    noop[12..16].copy_from_slice(&NOOP_OPAQUE.to_be_bytes());
+    pipeline.extend_from_slice(&noop);
+    stream.write_all(&pipeline).unwrap();
+    let end = read_pipeline(&mut stream, GET_OPAQUE, stored[0].1, NOOP_OPAQUE);
+    drop(stream);
+
     std::thread::sleep(Duration::from_millis(300));
     drop(holder);
     assert!(
@@ -345,6 +434,7 @@ fn large_get_fails_only_its_connection(
     assert_noop_round_trips(address);
     let _ = child.kill();
     let _ = child.wait();
+    end
 }
 
 #[test]
@@ -355,13 +445,17 @@ fn large_get_fails_only_its_connection_exact() {
         .into_iter()
         .map(|key| (key, 150_000_000))
         .collect();
-    large_get_fails_only_its_connection("--recv-mode=exact", &stored, 350_000_000, 1);
+    let end = large_get_fails_only_its_connection("--recv-mode=exact", &stored, 350_000_000);
+    assert_eq!(end, PipelineEnd::Closed, "the reply cannot have fit");
 }
 
 #[test]
 fn large_get_fails_only_its_connection_sharded() {
-    // The reply fits on the owning worker, but copying it into the
-    // connection's batch behind the misses does not.
+    // The reply fits on the owning worker. Behind the misses it is either
+    // handed over to the connection's batch without a copy, so the GET is
+    // answered, or the copy does not fit and only this connection is closed.
+    // Which one happens depends on how the replies interleave; the server
+    // must survive both.
     let mut stored = vec![("big", 200_000_000)];
     stored.extend(
         [
@@ -370,5 +464,5 @@ fn large_get_fails_only_its_connection_sharded() {
         .into_iter()
         .map(|key| (key, 50_000_000)),
     );
-    large_get_fails_only_its_connection("--workers=2", &stored, 0, 1);
+    large_get_fails_only_its_connection("--workers=2", &stored, 0);
 }
