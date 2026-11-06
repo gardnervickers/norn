@@ -1,0 +1,22 @@
+[package]
+name = "metrics-cost"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Per-increment cost of counter mechanisms considered for norn runtime metrics"
+
+# Standalone so its dependencies never enter norn's lockfile.
+[workspace]
+
+[dependencies]
+libc = "0.2"
+metrics = "0.24.6"
+metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
+opentelemetry = { version = "0.33", default-features = false, features = ["metrics", "experimental_metrics_bound_instruments"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["metrics", "experimental_metrics_custom_reader", "experimental_metrics_bound_instruments"] }
+
+# Same as norn's release profile: one codegen unit, no LTO.
+[profile.release]
+codegen-units = 1
+incremental = false
+debug = "line-tables-only"

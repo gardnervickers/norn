@@ -43,6 +43,7 @@ use std::time::{Duration, Instant};
 pub use clock::Clock;
 pub use entry::Sleep;
 pub use error::Error;
+pub use metrics::{TimerMetrics, TimerSnapshot};
 use norn_executor::park::{Park, ParkMode};
 
 mod clock;
@@ -50,6 +51,7 @@ mod context;
 mod entry;
 mod error;
 mod level;
+mod metrics;
 #[cfg(test)]
 mod tests;
 mod wheels;
@@ -117,6 +119,11 @@ impl Handle {
     /// Get the clock used by the timer.
     pub fn clock(&self) -> &Clock {
         self.wheels.clock()
+    }
+
+    /// A view of this timer wheel's counters that any thread can read.
+    pub fn metrics(&self) -> TimerMetrics {
+        self.wheels.metrics()
     }
 
     /// Get a handle to the current timer.

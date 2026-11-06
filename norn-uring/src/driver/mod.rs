@@ -12,6 +12,7 @@ use io_uring::types::{self, CancelBuilder, SubmitArgs, Timespec};
 use io_uring::{cqueue, opcode, IoUring, Submitter};
 use log::{debug, trace, warn};
 use norn_executor::park::{Park, ParkMode};
+use norn_metrics::Padded;
 use smallvec::SmallVec;
 
 use crate::bufring::{
@@ -32,7 +33,10 @@ use crate::util::notify::Notify;
 use crate::registered_buffers::State as FixedBufState;
 
 mod context;
+mod metrics;
 mod unpark;
+
+pub use metrics::{RingMetrics, RingSnapshot, RingStatus};
 
 const LOG: &str = "norn_uring::driver";
 
@@ -207,6 +211,8 @@ struct Shared {
     // order, so retained registered storage is released only after the ring.
     registered_buf_rings: RegisteredBufRings,
     registered_buffers: RegisteredBuffers,
+    /// Counters readers on other threads see through [`RingMetrics`].
+    counters: Arc<Padded<metrics::RingCounters>>,
 }
 
 #[cfg(test)]
@@ -725,6 +731,11 @@ impl Handle {
         self.shared.health_error()
     }
 
+    /// A view of this ring's counters that any thread can read.
+    pub fn metrics(&self) -> RingMetrics {
+        RingMetrics(Arc::clone(&self.shared.counters))
+    }
+
     pub(crate) fn same_driver(&self, other: &Self) -> bool {
         Rc::ptr_eq(&self.shared, &other.shared)
     }
@@ -812,6 +823,7 @@ impl Driver {
                 shutdown_test: ShutdownTest::default(),
                 registered_buf_rings: RegisteredBufRings::new(),
                 registered_buffers: RegisteredBuffers::new(),
+                counters: Arc::default(),
             }),
             unparker: Arc::new(unpark::Unparker::new()?),
             unparker_buf: mem::ManuallyDrop::new(UnparkerBuffer::new()),
@@ -848,6 +860,11 @@ impl Driver {
         Handle {
             shared: Rc::clone(&self.shared),
         }
+    }
+
+    /// A view of this ring's counters that any thread can read.
+    pub fn metrics(&self) -> RingMetrics {
+        RingMetrics(Arc::clone(&self.shared.counters))
     }
 
     /// Prepare the ring for parking.
@@ -1005,6 +1022,7 @@ impl Driver {
         }
         if user_data == Self::UNPARKER_WAKE_TOKEN {
             trace!(target: LOG, "unparker.token");
+            self.shared.counters.unparks.incr();
             self.shared.complete_in_flight();
             self.unparker.reset();
             return;
@@ -1089,6 +1107,7 @@ impl Driver {
             trace!(target: LOG, "park.drained {}", drained);
             mode = ParkMode::NoPark;
         }
+        self.shared.publish_in_flight();
         self.shared.retry_cancels();
         self.shared.flush_deferred_cancels();
         self.shared.flush_overflow();
@@ -1098,6 +1117,7 @@ impl Driver {
                 Ok(_) => return Ok(()),
                 Err(err) if Shared::is_transient_submit_error(&err) => {
                     trace!(target: LOG, "park.transient {err}");
+                    self.shared.counters.enter_retries.incr();
                     let drained = self.drain_normal(&mut remaining);
                     trace!(target: LOG, "park.drained {}", drained);
                     let ebusy = err.raw_os_error() == Some(libc::EBUSY);
@@ -1350,6 +1370,7 @@ impl Shared {
         if self.shutdown_outcome.get().is_none() {
             self.shutdown_outcome.set(Some(outcome));
         }
+        self.publish_in_flight();
         self.set_status(Status::Shutdown);
     }
 
@@ -1377,6 +1398,12 @@ impl Shared {
     fn set_status(&self, status: Status) {
         debug!(target: LOG, "status.change {:?} => {:?}", self.status.get(), status);
         let previous = self.status.replace(status);
+        self.counters.status.set(match status {
+            Status::Running => 0,
+            Status::Closing => 1,
+            Status::Draining => 2,
+            Status::Shutdown => 3,
+        });
         if status != previous {
             // Commit the state before callbacks. A waker may panic, but the
             // CQE that caused this transition has already been consumed and
@@ -1415,11 +1442,14 @@ impl Shared {
     #[cold]
     #[inline(never)]
     fn queue(&self, entry: ConfiguredEntry) {
+        self.counters.sq_backlogged.incr();
         entry.mark_queued();
-        self.overflow.borrow_mut().push_back(Queued {
+        let mut overflow = self.overflow.borrow_mut();
+        overflow.push_back(Queued {
             entry,
             linked: false,
         });
+        self.counters.sq_backlog.set(overflow.len() as u64);
     }
 
     /// Push a linked batch into the SQ whole, or queue it whole.
@@ -1428,6 +1458,7 @@ impl Shared {
             return;
         }
         let len = entries.len();
+        self.counters.sq_backlogged.add(len as u64);
         let mut overflow = self.overflow.borrow_mut();
         for (idx, entry) in entries.into_iter().enumerate() {
             entry.mark_queued();
@@ -1436,6 +1467,7 @@ impl Shared {
                 linked: idx + 1 < len,
             });
         }
+        self.counters.sq_backlog.set(overflow.len() as u64);
     }
 
     /// Move queued entries into the SQ, in order, while they fit.
@@ -1484,6 +1516,7 @@ impl Shared {
                     }
                     self.in_flight.set(self.in_flight.get() + len);
                 }
+                self.counters.sq_backlog.set(overflow.len() as u64);
             }
             if cancelled.is_empty() {
                 return;
@@ -1501,6 +1534,7 @@ impl Shared {
     fn fail_overflow(&self) {
         loop {
             let Some(queued) = self.overflow.borrow_mut().pop_front() else {
+                self.counters.sq_backlog.set(0);
                 return;
             };
             queued
@@ -1654,13 +1688,18 @@ impl Shared {
         }
 
         let mut ring = self.ring.borrow_mut();
+        let counters = &*self.counters;
         Ok(match mode {
             ParkMode::Timeout(duration) => {
+                counters.enters.incr();
+                counters.waiting_enters.incr();
                 let ts = crate::util::timespec(duration);
                 let args = SubmitArgs::new().timespec(&ts);
                 ring.submitter().submit_with_args(1, &args)?
             }
             ParkMode::NextCompletion => {
+                counters.enters.incr();
+                counters.waiting_enters.incr();
                 let args = SubmitArgs::new();
                 ring.submitter().submit_with_args(1, &args)?
             }
@@ -1672,10 +1711,17 @@ impl Shared {
                 // must still make one; `Submitter::submit` adds GETEVENTS when
                 // either flag is set. Without either flag, an empty SQ needs no
                 // syscall.
-                let kernel_pending = sq.cq_overflow() || sq.taskrun();
+                // Every park that drained completions submits this way, so an
+                // overflowed completion queue is noticed here.
+                let cq_overflow = sq.cq_overflow();
+                let kernel_pending = cq_overflow || sq.taskrun();
                 let empty = sq.is_empty();
                 drop(sq);
+                if cq_overflow {
+                    Self::note_cq_overflow(counters, &mut ring);
+                }
                 if kernel_pending || !empty {
+                    counters.enters.incr();
                     ring.submitter().submit()?
                 } else {
                     0
@@ -1694,7 +1740,10 @@ impl Shared {
         let mut ebusy_retries = 0usize;
         loop {
             match self.submit_once(mode) {
-                Ok(submitted) => return Ok(submitted),
+                Ok(submitted) => {
+                    self.counters.sqes_submitted.add(submitted as u64);
+                    return Ok(submitted);
+                }
                 Err(err)
                     if matches!(mode, ParkMode::Timeout(_))
                         && err.raw_os_error() == Some(libc::ETIME) =>
@@ -1717,10 +1766,12 @@ impl Shared {
                 }
                 Err(err) if err.raw_os_error() == Some(libc::EINTR) => {
                     trace!(target: LOG, "submit.eintr");
+                    self.counters.enter_retries.incr();
                     continue;
                 }
                 Err(err) if err.raw_os_error() == Some(libc::EBUSY) && ebusy_retries < 8 => {
                     ebusy_retries += 1;
+                    self.counters.enter_retries.incr();
                     trace!(target: LOG, "submit.ebusy retry={}", ebusy_retries);
                     continue;
                 }
@@ -2132,7 +2183,27 @@ impl Shared {
         let mut ring = self.ring.borrow_mut();
         let mut cq = ring.completion();
         let has_more = cq.len() > entries.len();
-        (cq.fill(entries), has_more)
+        let filled = cq.fill(entries);
+        // Counted as they leave the kernel ring, so a batch deferred by an
+        // unwinding callback is not counted twice.
+        self.counters.cqes.add(filled.len() as u64);
+        (filled, has_more)
+    }
+
+    /// Publish the in-flight count, which changes on every push and
+    /// completion, once per park instead.
+    #[inline]
+    fn publish_in_flight(&self) {
+        self.counters.in_flight.set(self.in_flight.get() as u64);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn note_cq_overflow(counters: &metrics::RingCounters, ring: &mut IoUring) {
+        counters.cq_overflows.incr();
+        counters
+            .cqes_dropped
+            .set(u64::from(ring.completion().overflow()));
     }
 }
 

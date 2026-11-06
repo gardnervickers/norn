@@ -25,6 +25,50 @@ fn smoke() {
     });
 }
 
+/// Fired, cancelled and shut-down sleeps are each counted once.
+#[test]
+fn metrics_count_sleeps() {
+    use std::future::Future;
+    use std::task::Poll;
+
+    let clock = Clock::simulated();
+    let park = FastPark(clock.clone());
+    let timer = Driver::new(park, clock);
+    let metrics = timer.handle().metrics();
+    let mut executor = LocalExecutor::new(timer);
+
+    let stranded = executor.block_on(async {
+        let handle = Handle::current();
+        for _ in 0..3 {
+            handle.sleep(Duration::from_secs(1)).await.unwrap();
+        }
+        // A first poll registers each sleep with the wheel.
+        let mut cancelled = Box::pin(handle.sleep(Duration::from_secs(60)));
+        let mut stranded = Box::pin(handle.sleep(Duration::from_secs(60)));
+        std::future::poll_fn(|cx| {
+            assert!(cancelled.as_mut().poll(cx).is_pending());
+            assert!(stranded.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        drop(cancelled);
+        // Wrapped so the block does not yield a future.
+        Some(stranded)
+    });
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.registered, 5);
+    assert_eq!(snapshot.fired, 3);
+    assert_eq!(snapshot.cancelled, 1);
+    assert_eq!(snapshot.pending(), 1);
+
+    // Dropping the driver completes the stranded sleep with a shutdown error.
+    drop(executor);
+    drop(stranded);
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.shut_down, 1);
+    assert_eq!(snapshot.pending(), 0);
+}
+
 #[test]
 fn zero_duration() {
     let clock = Clock::simulated();

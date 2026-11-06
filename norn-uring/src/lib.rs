@@ -111,7 +111,7 @@ pub mod net;
 /// Device-specific commands submitted through `IORING_OP_URING_CMD`.
 pub mod uring_cmd;
 
-pub use driver::{Driver, DriverOptions, Handle};
+pub use driver::{Driver, DriverOptions, Handle, RingMetrics, RingSnapshot, RingStatus};
 pub use fd::UringFd;
 pub use operation::{CQEResult, Multishot, Op, Operation, Singleshot};
 pub use request::{
