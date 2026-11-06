@@ -78,6 +78,11 @@ The project is intentionally not general-purpose today; APIs are still in flux i
   steady signal stream cannot restart the full timeout (callers re-check their
   deadlines). Other enter errors are recorded as a health error and close the
   driver.
+- Dropped CQEs are fatal. `EBADR` from `io_uring_enter` (or a non-zero kernel
+  dropped counter, checked around each park) becomes an error naming the drop
+  and `setup_cqsize`, marks accounting broken, and makes every later park fail
+  with it. The driver logs, at error level, the transition into CQ overflow and
+  each increase of the dropped counter.
 - Remote unpark is eventfd-based (`driver/unpark.rs`).
 - A `NoPark` park with an empty SQ skips `io_uring_enter` only while the SQ
   flags report neither CQ overflow nor pending task work; otherwise it calls
