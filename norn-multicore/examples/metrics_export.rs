@@ -105,24 +105,23 @@ mod linux {
 
     /// What the watchdog last saw from one worker.
     struct Watch {
-        ticks: u64,
-        parked: bool,
+        activity: u64,
         since: Instant,
         reported: bool,
     }
 
-    /// Report any worker that runs one tick for longer than the threshold.
+    /// Report any worker that runs without parking for longer than the
+    /// threshold.
     ///
-    /// A tick counts itself before it parks, so if two samples show the same
-    /// tick count and neither shows the executor parked, one tick has been
-    /// running ever since the first of them.
+    /// The executor's activity word changes whenever it starts or stops
+    /// running, so if two samples show the same value and the executor is
+    /// running, it has run without parking ever since the first of them.
     fn watch(workers: &[(WorkerId, Sources)], done: &AtomicBool) {
         let now = Instant::now();
         let mut watches: Vec<Watch> = workers
             .iter()
             .map(|_| Watch {
-                ticks: u64::MAX,
-                parked: true,
+                activity: u64::MAX,
                 since: now,
                 reported: false,
             })
@@ -132,22 +131,21 @@ mod linux {
             let now = Instant::now();
             for ((id, sources), watch) in workers.iter().zip(&mut watches) {
                 let snapshot = sources.get::<ExecutorMetrics>().unwrap().snapshot();
-                if snapshot.ticks == watch.ticks && !snapshot.parked && !watch.parked {
+                if snapshot.running && snapshot.activity == watch.activity {
                     let stuck_for = now - watch.since;
                     if stuck_for >= STALL_THRESHOLD && !watch.reported {
                         watch.reported = true;
                         println!(
-                            "watchdog: worker {id} has run one tick for at least {} ms \
-                             (tick {}, {} polls so far)",
+                            "watchdog: worker {id} has run for at least {} ms without \
+                             parking (after {} ticks, {} polls)",
                             stuck_for.as_millis(),
-                            snapshot.ticks + 1,
+                            snapshot.ticks,
                             snapshot.polls
                         );
                     }
                 } else {
                     *watch = Watch {
-                        ticks: snapshot.ticks,
-                        parked: snapshot.parked,
+                        activity: snapshot.activity,
                         since: now,
                         reported: false,
                     };
