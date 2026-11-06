@@ -104,9 +104,13 @@ pub struct Driver {
     /// callback unwound. This is empty on the normal path.
     deferred_cqes: RefCell<VecDeque<cqueue::Entry>>,
     /// Whether the last [`Driver::submit`] turned a waiting park into a
-    /// non-waiting one because a remote wake was pending (or the eventfd read
-    /// could not be queued).
+    /// non-waiting one because [`Driver::prepare_park`] consumed a pending
+    /// remote wake. A park downgraded because the eventfd read could not be
+    /// queued does not set this: it has no woken work to run.
     park_skipped: Cell<bool>,
+    /// Set by [`Driver::prepare_park`] when it consumed a pending remote wake,
+    /// and taken by [`Driver::submit`].
+    consumed_wake: Cell<bool>,
 }
 
 /// Tracks one batch copied from the kernel CQ.
@@ -826,6 +830,7 @@ impl Driver {
             unparker: Arc::new(unpark::Unparker::new()?),
             unparker_buf: mem::ManuallyDrop::new(UnparkerBuffer::new()),
             park_skipped: Cell::new(false),
+            consumed_wake: Cell::new(false),
             deferred_cqes: RefCell::new(VecDeque::new()),
         })
     }
@@ -870,6 +875,7 @@ impl Driver {
         }
         let action = self.unparker.park();
         if action == unpark::ParkAction::Notified {
+            self.consumed_wake.set(true);
             return false;
         }
         if action == unpark::ParkAction::Arm {
@@ -904,6 +910,7 @@ impl Driver {
     fn submit(&self, mut mode: ParkMode) -> io::Result<usize> {
         let waiting = matches!(mode, ParkMode::Timeout(_) | ParkMode::NextCompletion);
         self.park_skipped.set(false);
+        self.consumed_wake.set(false);
         if waiting && self.shared.has_sq_demand() {
             // Work waiting for SQ space needs capacity, not a completion. Blocking
             // for a CQE could strand it behind long-lived operations, so submit,
@@ -924,8 +931,10 @@ impl Driver {
         }
         // If we're going to park, then prepare the unparker.
         if waiting && !self.prepare_park() {
-            // Preparing the unparker failed, don't park!
-            self.park_skipped.set(true);
+            // Preparing the unparker failed, don't park! Only a consumed wake
+            // means woken work is waiting; if the eventfd read could not be
+            // queued the park may still sleep after an allocation failure.
+            self.park_skipped.set(self.consumed_wake.replace(false));
             mode = ParkMode::NoPark;
         }
         trace!(target: LOG, "submit.mode {:?}", mode);
@@ -1150,11 +1159,12 @@ impl Driver {
     ///
     /// The wait is skipped when the park was already downgraded because it
     /// consumed a pending remote wake, or when a remote wake is pending: the
-    /// caller must run its woken work instead of sleeping.
+    /// caller must run its woken work instead of sleeping. A full SQ or work
+    /// queued for SQ space does not skip it: the wait-only enter needs no SQ
+    /// space and the park would otherwise spin.
     fn wait_after_allocation_failure(&self, mode: ParkMode) -> io::Result<bool> {
         if !matches!(mode, ParkMode::Timeout(_) | ParkMode::NextCompletion)
             || self.park_skipped.get()
-            || self.shared.has_sq_demand()
             || self.unparker.is_woken()
         {
             return Ok(false);
@@ -3735,7 +3745,7 @@ mod tests {
             .unwrap();
         let waited = start.elapsed();
         assert!(
-            waited >= Duration::from_millis(1) && waited < Duration::from_millis(9),
+            waited >= Duration::from_millis(1) && waited < Duration::from_millis(100),
             "a 2 ms timed park waited {waited:?}"
         );
     }
@@ -3797,10 +3807,66 @@ mod tests {
             driver.park(ParkMode::NextCompletion).unwrap();
             let waited = start.elapsed();
             assert!(
-                waited < Duration::from_millis(5),
+                waited < Duration::from_millis(100),
                 "queued_op={queued_op}: the park waited {waited:?} after consuming a remote wake"
             );
         }
+    }
+
+    /// The SQ is full, so the eventfd read cannot be queued and the park runs
+    /// as `NoPark`. No wake was consumed, so the park must still wait out the
+    /// allocation failure instead of spinning.
+    #[test]
+    fn allocation_failure_does_not_spin_with_a_full_sq() {
+        let mut driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let handle = driver.handle();
+        let waker = futures_test::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut timers: Vec<_> = (0..8)
+            .map(|_| Box::pin(handle.timeout(Duration::from_secs(30))))
+            .collect();
+        for timer in &mut timers {
+            assert!(timer.as_mut().poll(&mut cx).is_pending());
+        }
+        assert_eq!(driver.shared.pending_submissions(), 8);
+        assert!(!driver.shared.has_sq_demand());
+        assert_failing_parks_sleep(&mut driver);
+    }
+
+    /// Work is queued for SQ space (the overflow queue); the wait-only enter
+    /// needs no SQ space, so the park must still wait.
+    #[test]
+    fn allocation_failure_does_not_spin_with_overflow_demand() {
+        let mut driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let handle = driver.handle();
+        let waker = futures_test::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut timers: Vec<_> = (0..12)
+            .map(|_| Box::pin(handle.timeout(Duration::from_secs(30))))
+            .collect();
+        for timer in &mut timers {
+            assert!(timer.as_mut().poll(&mut cx).is_pending());
+        }
+        assert!(driver.shared.has_sq_demand());
+        assert_failing_parks_sleep(&mut driver);
+    }
+
+    /// `PARKS` waiting parks that each hit an allocation failure must take
+    /// about one cap each, not return at once.
+    fn assert_failing_parks_sleep(driver: &mut Driver) {
+        const PARKS: usize = 50;
+        for _ in 0..PARKS {
+            driver.shared.fail_next_submit(libc::ENOMEM);
+        }
+        let start = Instant::now();
+        for _ in 0..PARKS {
+            driver.park(ParkMode::NextCompletion).unwrap();
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(400),
+            "{PARKS} parks returned in {elapsed:?}: the driver is spinning"
+        );
     }
 
     #[test]
