@@ -48,6 +48,11 @@ const DEFAULT_COMPLETION_DRAIN_BUDGET: NonZeroUsize = NonZeroUsize::new(32).unwr
 /// entering one unbounded syscall when a request cannot be cancelled.
 const SHUTDOWN_CANCEL_TIMEOUT: Duration = Duration::from_millis(100);
 
+/// Longest wait-only enter after an allocation failure while queued entries
+/// (possibly the unparker's eventfd read) never reached the kernel. A remote
+/// wake cannot end such a wait, so it is bounded to keep wake latency low.
+const ALLOCATION_FAILURE_WAIT_CAP: Duration = Duration::from_millis(10);
+
 /// Options controlling normal [`Driver`] operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DriverOptions {
@@ -1131,7 +1136,13 @@ impl Driver {
     ///
     /// The wait is skipped when it could never end or could not be woken:
     /// nothing is in the kernel (queued entries are not), or a remote wake is
-    /// already pending (its eventfd read may be among the unsubmitted entries).
+    /// already pending.
+    ///
+    /// While entries are still queued in the userspace SQ, the unparker's
+    /// eventfd read may be among them, and then a remote wake cannot end the
+    /// wait. That wait is capped at [`ALLOCATION_FAILURE_WAIT_CAP`] (or the
+    /// park's timeout if shorter) so wake latency stays bounded; with an empty
+    /// SQ the read is armed in the kernel and the park's own timeout applies.
     fn wait_after_allocation_failure(&self, mode: ParkMode) -> io::Result<bool> {
         if !matches!(mode, ParkMode::Timeout(_) | ParkMode::NextCompletion)
             || self.shared.has_sq_demand()
@@ -1140,6 +1151,16 @@ impl Driver {
         {
             return Ok(false);
         }
+        let mode = if self.shared.pending_submissions() > 0 {
+            match mode {
+                ParkMode::Timeout(duration) => {
+                    ParkMode::Timeout(duration.min(ALLOCATION_FAILURE_WAIT_CAP))
+                }
+                _ => ParkMode::Timeout(ALLOCATION_FAILURE_WAIT_CAP),
+            }
+        } else {
+            mode
+        };
         trace!(target: LOG, "park.wait_only {:?}", mode);
         self.shared.wait_only(mode)?;
         Ok(true)
@@ -3638,7 +3659,8 @@ mod tests {
         }
     }
 
-    /// The wait after an allocation failure honors a timed park's timeout.
+    /// With the unparker's eventfd read armed in the kernel, the wait after an
+    /// allocation failure honors a timed park's full timeout.
     #[test]
     fn allocation_failure_wait_honors_the_park_timeout() {
         let mut driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
@@ -3647,7 +3669,11 @@ mod tests {
         let waker = futures_test::task::noop_waker();
         let mut cx = Context::from_waker(&waker);
         assert!(timer.as_mut().poll(&mut cx).is_pending());
-        driver.park(ParkMode::NoPark).unwrap();
+        // A short real park submits the timer and arms the eventfd read.
+        driver
+            .park(ParkMode::Timeout(Duration::from_millis(1)))
+            .unwrap();
+        assert_eq!(driver.shared.pending_submissions(), 0);
 
         driver.shared.fail_next_submit(libc::ENOMEM);
         let start = Instant::now();
@@ -3659,6 +3685,38 @@ mod tests {
             waited >= Duration::from_millis(80) && waited < Duration::from_secs(5),
             "the timed park waited {waited:?}, not about 100 ms"
         );
+    }
+
+    /// While the eventfd read is still queued, a remote wake cannot end the
+    /// wait after an allocation failure, so the wait is capped.
+    #[test]
+    fn allocation_failure_wait_is_capped_when_the_eventfd_read_is_not_armed() {
+        let mut driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let handle = driver.handle();
+        let mut timer = pin!(handle.timeout(Duration::from_secs(5)));
+        let waker = futures_test::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(timer.as_mut().poll(&mut cx).is_pending());
+        driver.park(ParkMode::NoPark).unwrap();
+
+        // The failed enter leaves the freshly queued eventfd read unsubmitted.
+        driver.shared.fail_next_submit(libc::ENOMEM);
+        let unparker = Arc::clone(&driver.unparker);
+        let remote = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(5));
+            unparker.wake();
+        });
+        let start = Instant::now();
+        driver.park(ParkMode::NextCompletion).unwrap();
+        let waited = start.elapsed();
+        remote.join().unwrap();
+        assert!(
+            waited >= Duration::from_millis(5) && waited < Duration::from_secs(1),
+            "the park waited {waited:?}; the remote wake could not end it and the cap should have"
+        );
+
+        // The pending wake is then observed by the next park.
+        driver.park(ParkMode::NextCompletion).unwrap();
     }
 
     /// With only queued entries (nothing in the kernel) there is nothing the

@@ -77,6 +77,8 @@ The project is intentionally not general-purpose today; APIs are still in flux i
   A waiting park that fails with `EAGAIN`/`ENOMEM` and has nothing to reap, but
   entries in the kernel, first does a wait-only enter (no submissions, honoring
   the park's timeout) so a persistent allocation failure cannot spin idle waits.
+  While entries are still queued in the SQ (the eventfd read may be one), that
+  wait is capped at 10 ms because a remote wake could not end it.
   `EINTR` retries the enter, except in a timed park, which returns early so a
   steady signal stream cannot restart the full timeout (callers re-check their
   deadlines). Other enter errors are recorded as a health error and close the
