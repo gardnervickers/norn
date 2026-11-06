@@ -172,18 +172,26 @@ where
     A: Request,
     B: Request,
 {
-    let before = batch.len();
-    let left_configured = left.as_mut().prepare_batch(batch);
     if hard {
-        if batch.len() > before {
-            if let Some(last) = batch.last() {
-                last.set_hard_link();
-                left.reactor().note_hard_link();
-            }
+        // `left` pushes its entries at the end, but it can also remove an
+        // earlier one, such as a timeout it cancels in the same batch. So the
+        // length does not say whether it pushed anything: its last entry is
+        // the batch's last only if that entry was not there before.
+        let earlier: SmallVec<[u64; 4]> = batch
+            .iter()
+            .map(ConfiguredEntry::target_user_data)
+            .collect();
+        left.as_mut().prepare_batch(batch);
+        if let Some(last) = batch
+            .last()
+            .filter(|last| !earlier.contains(&last.target_user_data()))
+        {
+            last.set_hard_link();
+            left.reactor().note_hard_link();
         }
         return right.as_mut().prepare_batch(batch);
     }
-    if left_configured {
+    if left.as_mut().prepare_batch(batch) {
         right.as_mut().prepare_batch(batch)
     } else {
         right.as_mut().cancel_unsubmitted();
@@ -1024,6 +1032,32 @@ mod tests {
         fn complete(self, completion: Self::Completion) -> Self::Output {
             completion.into_result()
         }
+    }
+
+    /// `left` removes an earlier entry (a timeout it cancels in the same batch)
+    /// and pushes one, so the batch length does not change. The hard link must
+    /// still land on the entry `left` pushed.
+    #[test]
+    fn then_always_hard_links_after_a_same_batch_timeout_cancel() {
+        let driver = crate::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let handle = driver.handle();
+        let timeout = handle.timeout(Duration::from_secs(60));
+        let control = timeout.control();
+        let mut ex = LocalExecutor::new(driver);
+
+        let (_timeout, ((canceled, failed), next)) = ex.block_on(async {
+            timeout
+                .then(
+                    control
+                        .cancel()
+                        .then_always(handle.submit(KernelFails))
+                        .then_always(handle.submit(TaggedNop(3))),
+                )
+                .await
+        });
+        assert!(canceled.unwrap());
+        assert_eq!(failed.unwrap_err().raw_os_error(), Some(libc::EBADF));
+        assert_eq!(next.unwrap(), 3, "a hard link runs after a failure");
     }
 
     /// A rejection at submission fails the whole chain, hard links included,

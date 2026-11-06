@@ -3818,6 +3818,19 @@ mod tests {
         }
     }
 
+    /// Only a submitted hard link makes shutdown cancel after every reap.
+    #[test]
+    fn building_a_then_always_does_not_mark_the_driver() {
+        let driver = Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let handle = driver.handle();
+        let (first, second) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        drop(long_lived_read(&handle, &first).then_always(long_lived_read(&handle, &second)));
+        assert!(!driver.shared.hard_links.get());
+    }
+
     #[test]
     fn dropping_a_queued_then_always_chain_cancels_both_requests() {
         for always in [true, false] {
