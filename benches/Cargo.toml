@@ -48,6 +48,11 @@ path = "noop_submit.rs"
 harness = false
 
 [[bench]]
+name = "park_noop"
+path = "park_noop.rs"
+harness = false
+
+[[bench]]
 name = "timers"
 path = "timers.rs"
 harness = false
