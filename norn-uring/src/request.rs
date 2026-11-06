@@ -41,6 +41,67 @@ mod private {
         fn finish_submit(self: Pin<&mut Self>);
         fn fail_submit(self: Pin<&mut Self>, err: &SubmitError);
     }
+
+    // Public solely so `WithOptions` can name it.
+    #[allow(unnameable_types)]
+    pub trait AcceptsOptions<O> {
+        fn set_options(&mut self, opts: O);
+    }
+
+    // Public solely so it can seal `WithOptions`.
+    #[allow(unnameable_types)]
+    pub trait OptionsSealed {}
+}
+
+pub(crate) use private::{AcceptsOptions, OptionsSealed};
+
+/// A request or future that accepts per-operation options before it is
+/// first polled.
+///
+/// Each operation family has one options type, such as
+/// [`fs::ReadOptions`](crate::fs::ReadOptions) for positional file reads.
+/// Options apply to this request only. A request whose options are never set
+/// behaves the same as one given default options. Most implementors are
+/// [`Request`]s; a few operations that first try a synchronous system call,
+/// such as [`UdpSocket::recv_from`](crate::net::UdpSocket::recv_from), are plain
+/// futures.
+///
+/// Set options before linking the request or adding a timeout, since those
+/// return a different request type:
+///
+/// ```no_run
+/// # async fn f(file: &norn_uring::fs::File) {
+/// use std::time::Duration;
+/// use norn_uring::{fs::WriteOptions, Request, WithOptions};
+///
+/// const DURABLE: WriteOptions = WriteOptions::new().dsync(true);
+/// let (res, buf) = file
+///     .write_at(b"record".to_vec(), 0)
+///     .options(DURABLE)
+///     .timeout(Duration::from_secs(1))
+///     .await;
+/// # }
+/// ```
+pub trait WithOptions<O>: private::OptionsSealed + Sized {
+    /// Replace this request's options.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the request has already been polled.
+    #[must_use]
+    fn options(self, opts: O) -> Self;
+}
+
+impl<T: 'static> private::OptionsSealed for Op<T> {}
+
+impl<T, O> WithOptions<O> for Op<T>
+where
+    T: Singleshot + private::AcceptsOptions<O> + 'static,
+{
+    #[track_caller]
+    fn options(self, opts: O) -> Self {
+        self.modify_prepared(|op| op.set_options(opts))
+    }
 }
 
 /// A lazy request that can be linked with other requests before submission.
@@ -50,6 +111,11 @@ pub trait Request: Future + Sized + private::Chainable {
     /// If an operation fails during configuration, earlier configured operations are still
     /// submitted, while that operation reports its configuration error and later linked
     /// operations complete with `ECANCELED` without reaching the kernel.
+    ///
+    /// `io_uring` also breaks the link when `self` completes short: a read or
+    /// write that transfers fewer bytes than requested returns its byte count,
+    /// but `next` completes with `ECANCELED`. Use [`Request::then_always`] to
+    /// run `next` regardless.
     ///
     /// # Panics
     ///

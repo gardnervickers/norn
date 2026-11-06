@@ -15,7 +15,7 @@ use std::task::Poll;
 use norn_uring::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncRead, ReadBuf};
 
-const TCP_LOG_TARGET: &str = "norn_uring::net::tcp";
+const TCP_LOG_TARGET: &str = "norn_uring::net::ready";
 static WOULD_BLOCK: AtomicUsize = AtomicUsize::new(0);
 
 struct WouldBlockCounter;
