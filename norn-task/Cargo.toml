@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 bitflags = "2.4.1"
 cordyceps.workspace = true
+norn-metrics = { path = "../norn-metrics" }
 
 [dev-dependencies]
 futures.workspace = true

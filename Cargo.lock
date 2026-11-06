@@ -1174,6 +1174,7 @@ version = "0.1.0"
 dependencies = [
  "crossbeam-queue",
  "norn-executor",
+ "norn-metrics",
 ]
 
 [[package]]
@@ -1181,6 +1182,7 @@ name = "norn-executor"
 version = "0.1.0"
 dependencies = [
  "futures-test",
+ "norn-metrics",
  "norn-task",
 ]
 
@@ -1223,11 +1225,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "norn-metrics"
+version = "0.1.0"
+
+[[package]]
 name = "norn-multicore"
 version = "0.1.0"
 dependencies = [
+ "io-uring",
  "norn-channel",
  "norn-executor",
+ "norn-metrics",
+ "norn-timer",
+ "norn-uring",
 ]
 
 [[package]]
@@ -1246,6 +1256,7 @@ dependencies = [
  "bitflags 2.13.2",
  "cordyceps",
  "futures",
+ "norn-metrics",
 ]
 
 [[package]]
@@ -1255,6 +1266,7 @@ dependencies = [
  "cordyceps",
  "futures-test",
  "norn-executor",
+ "norn-metrics",
  "pin-project-lite",
  "proptest",
  "thiserror",
@@ -1274,6 +1286,7 @@ dependencies = [
  "libc",
  "log",
  "norn-executor",
+ "norn-metrics",
  "norn-timer",
  "pin-project-lite",
  "smallvec",

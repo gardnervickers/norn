@@ -6,8 +6,12 @@ use std::pin::Pin;
 use std::task::Waker;
 use std::{mem, ptr, thread};
 
-use cordyceps::List;
+use std::sync::Arc;
 
+use cordyceps::List;
+use norn_metrics::Padded;
+
+use crate::metrics::{TimerCounters, TimerMetrics};
 use crate::{entry, error, level, Clock, MAX_DURATION, NUM_LEVELS};
 
 pub(crate) struct Wheels {
@@ -19,6 +23,7 @@ pub(crate) struct Wheels {
     next_expiration_dirty: Cell<bool>,
     // Reuse wake storage without retaining a borrow across user callbacks.
     wake_storage: RefCell<VecDeque<Waker>>,
+    counters: Arc<Padded<TimerCounters>>,
 }
 
 impl Wheels {
@@ -34,6 +39,7 @@ impl Wheels {
             return;
         }
         entry.set_registered(expiration);
+        self.counters.registered.incr();
         let entry = unsafe { ptr::NonNull::from(entry.get_unchecked_mut()) };
         Wheels::insert(self, entry);
     }
@@ -47,7 +53,12 @@ impl Wheels {
             next_expiration_hint: Cell::new(None),
             next_expiration_dirty: Cell::new(false),
             wake_storage: RefCell::new(VecDeque::new()),
+            counters: Arc::default(),
         }
+    }
+
+    pub(crate) fn metrics(&self) -> TimerMetrics {
+        TimerMetrics(Arc::clone(&self.counters))
     }
 
     pub(crate) fn clock(&self) -> &Clock {
@@ -94,6 +105,7 @@ impl Wheels {
             next_expiration = self.next_expiration();
         }
         self.set_elapsed(now);
+        self.counters.fired.add(fired as u64);
         for entry in pending.into_iter() {
             self.insert(entry);
         }
@@ -142,6 +154,7 @@ impl Wheels {
         // Safety: See `insert`; removal performs no user callbacks.
         let removed = unsafe { (&mut *self.levels.get())[wheel].remove_entry(entry) };
         if removed.is_some() {
+            self.counters.cancelled.incr();
             if let Some(next) = self.next_expiration_hint.get() {
                 if next.level() == wheel && next.slot() == slot {
                     self.next_expiration_dirty.set(true);
@@ -219,6 +232,7 @@ impl Wheels {
         while let Some(exp) = self.next_expiration() {
             let entries = self.take_entries(&exp);
             for entry in entries {
+                self.counters.shut_down.incr();
                 if let Some(waker) = unsafe { entry.as_ref().complete(Err(error::Error::Shutdown)) }
                 {
                     wakers.push_back(waker);

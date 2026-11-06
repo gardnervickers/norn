@@ -45,6 +45,7 @@ pub use clock::Clock;
 pub use entry::Sleep;
 pub use error::Error;
 pub use interval::{Interval, MissedTickBehavior};
+pub use metrics::{TimerMetrics, TimerSnapshot};
 use norn_executor::park::{Park, ParkMode};
 
 mod clock;
@@ -53,6 +54,7 @@ mod entry;
 mod error;
 mod interval;
 mod level;
+mod metrics;
 #[cfg(test)]
 mod tests;
 mod wheels;
@@ -147,6 +149,11 @@ impl Handle {
         self.wheels.clock()
     }
 
+    /// A view of this timer wheel's counters that any thread can read.
+    pub fn metrics(&self) -> TimerMetrics {
+        self.wheels.metrics()
+    }
+
     /// Get a handle to the current timer.
     ///
     /// ### Panics
@@ -232,6 +239,11 @@ where
 
     fn needs_park(&self) -> bool {
         self.inner.needs_park()
+    }
+
+    fn metric_sources(&self, sources: &mut norn_metrics::Sources) {
+        sources.push(self.wheels.metrics());
+        self.inner.metric_sources(sources);
     }
 
     fn shutdown(&mut self) {
