@@ -16,7 +16,7 @@ use std::task::Poll;
 use norn_uring::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-const TCP_LOG_TARGET: &str = "norn_uring::net::tcp";
+const TCP_LOG_TARGET: &str = "norn_uring::net::ready";
 
 thread_local! {
     static COUNTS: RefCell<HashMap<String, usize>> = RefCell::new(HashMap::new());
@@ -287,8 +287,9 @@ async fn read_once_await<R: AsyncRead>(
     Ok(buf.filled().len())
 }
 
-/// Dropping a stream while its read waits must release the descriptor once
-/// the poll's cancellation completes, so the peer observes end of stream.
+/// Dropping a stream while its read and write both wait must release the
+/// descriptor once the polls' cancellations complete, so the peer observes
+/// end of stream after the data the stream had already queued.
 #[test]
 fn drop_while_waiting_closes_the_socket() -> TestResult {
     run(io_uring::IoUring::builder(), 32, || async {
@@ -296,21 +297,50 @@ fn drop_while_waiting_closes_the_socket() -> TestResult {
         let mut stream = Box::pin(stream);
         let mut storage = [0_u8; 16];
         assert!(read_once(stream.as_mut(), &mut storage).await.is_pending());
-        // The writer half waits too, so both polls are armed at the drop.
         peer.write_all(b"ping")?;
         assert_eq!(
             within(1000, "read", read_once_await(stream.as_mut(), &mut storage)).await?,
             4
         );
         assert!(read_once(stream.as_mut(), &mut storage).await.is_pending());
+
+        // Fill the send buffer, since the peer does not read, until a write
+        // waits for room. Now the writer's poll is armed as well.
+        let arms = count("poll_op.ready.stream_arm");
+        let chunk = [7_u8; 64 * 1024];
+        let mut written = 0_usize;
+        loop {
+            let polled = poll_fn(|cx| Poll::Ready(stream.as_mut().poll_write(cx, &chunk))).await;
+            match polled {
+                Poll::Ready(n) => written += n?,
+                Poll::Pending => break,
+            }
+            assert!(written < 1 << 30, "the send buffer never filled");
+        }
+        assert!(
+            count("poll_op.ready.stream_arm") > arms,
+            "the writer did not arm a readiness poll, so only the read waits at the drop"
+        );
+
+        // The write's poll is only queued so far. Let the driver submit it,
+        // so that both polls are armed in the kernel at the drop.
+        turn().await;
         drop(stream);
         peer.set_nonblocking(true)?;
-        let mut buf = [0_u8; 1];
-        for _ in 0..1000 {
+        let mut buf = vec![0_u8; 1 << 20];
+        let mut drained = 0_usize;
+        for _ in 0..10_000 {
             match peer.read(&mut buf) {
-                Ok(0) => return Ok(()),
-                Ok(_) => panic!("unexpected data"),
+                Ok(0) => {
+                    assert_eq!(drained, written, "queued data was lost before the close");
+                    return Ok(());
+                }
+                Ok(n) => {
+                    assert!(buf[..n].iter().all(|b| *b == 7), "unexpected data");
+                    drained += n;
+                }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => turn().await,
+                Err(err) if err.kind() == std::io::ErrorKind::ConnectionReset => return Ok(()),
                 Err(err) => return Err(err.into()),
             }
         }

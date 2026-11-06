@@ -377,8 +377,13 @@ where
     }
 
     fn shutdown(&mut self) {
-        self.registry.shutdown();
+        // A receiver's waker may panic. Still shut the inner park down, then
+        // resume the panic.
+        let registry = catch_unwind(AssertUnwindSafe(|| self.registry.shutdown()));
         self.inner.shutdown();
+        if let Err(payload) = registry {
+            resume_unwind(payload);
+        }
     }
 }
 

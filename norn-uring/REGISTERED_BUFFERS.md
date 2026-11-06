@@ -311,7 +311,8 @@ impl<B: 'static> FixedBufTable<B> {
 ```
 
 `register_sparse_fixed_buffers` registers `len` vacant kernel slots
-(`IORING_REGISTER_BUFFERS2` with `IORING_RSRC_REGISTER_SPARSE`, Linux 5.13).
+(`IORING_REGISTER_BUFFERS2` with `IORING_RSRC_REGISTER_SPARSE`, Linux 5.19; earlier kernels reject it with
+`EINVAL`, reported as `RegisterErrorKind::Unsupported`).
 Vacant slots are not on the free list and cannot be acquired. Either kind of
 table occupies the driver's single fixed-buffer table, generation, and
 `Registry` state machine, so a driver holds one table at a time.
@@ -388,6 +389,9 @@ the logical length with the validated CQE byte count. An error preserves the
 previous logical length. `WriteFixed` submits only the logical length. Both
 operations own and return the fixed buffer, so it remains unavailable while an
 operation is unpolled, queued, submitted, cancelled, or completion-pending.
+
+Both accept per-operation `ReadOptions` and `WriteOptions` (`RWF_*` flags
+and, for writes, a write stream) through `WithOptions::options`.
 
 The internal operation is based on `NornFd`, keeping the lifecycle reusable if
 fixed operations are later exposed for pipes or sockets.

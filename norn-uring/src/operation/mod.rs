@@ -74,12 +74,13 @@ pub unsafe trait Operation {
     /// kernel. Implementations may store pointers to fields of `self` in the entry, but must not
     /// invalidate the pointed-to storage during that period.
     ///
-    /// The runtime owns the `IOSQE_IO_LINK`, `IOSQE_IO_HARDLINK`, and
+    /// The runtime owns the `IOSQE_IO_LINK`, `IOSQE_IO_HARDLINK`, `IOSQE_IO_DRAIN`, and
     /// `IOSQE_CQE_SKIP_SUCCESS` flags. The submission queue is shared, so a link would join
-    /// the entry to whichever SQE is queued next, and a skipped success CQE would leave the
-    /// operation without its terminal completion. Use [`Request::then`](crate::Request::then)
-    /// to link requests. An entry that sets one of these flags fails configuration with
-    /// [`io::ErrorKind::InvalidInput`].
+    /// the entry to whichever SQE is queued next, a drain would hold every later SQE (including
+    /// the driver's own cancellations and wakeups) until all earlier ones complete, and a skipped
+    /// success CQE would leave the operation without its terminal completion. Use
+    /// [`Request::then`](crate::Request::then) to link requests. An entry that sets one of these
+    /// flags fails configuration with [`io::ErrorKind::InvalidInput`].
     ///
     /// # Errors
     ///
@@ -397,7 +398,27 @@ where
         }
     }
 
+    /// Panic unless the operation is still prepared.
+    ///
+    /// A linked batch can only hold operations it submits itself. One that was
+    /// polled first has already been submitted on its own, so the link could
+    /// not be honored.
+    fn assert_prepared_for_link(&self) {
+        assert!(
+            matches!(self, State::Prepared { .. }),
+            "cannot link an operation that was already submitted: polling an operation submits it \
+             on its own"
+        );
+    }
+
+    /// Configure a prepared operation into `batch`, and return whether requests
+    /// linked after it may be submitted.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the operation was already submitted.
     fn prepare_batch(&mut self, batch: &mut SmallVec<[ConfiguredEntry; 4]>) -> bool {
+        self.assert_prepared_for_link();
         match self.configure() {
             Some(entry) => {
                 batch.push(entry);
@@ -407,15 +428,18 @@ where
         }
     }
 
-    fn cancel_unsubmitted(&mut self) -> bool {
-        if !matches!(self, State::Prepared { .. }) {
-            return false;
-        }
+    /// Cancel a prepared operation without the kernel, because a request it
+    /// is soft-linked behind failed configuration.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the operation was already submitted.
+    fn cancel_unsubmitted(&mut self) {
+        self.assert_prepared_for_link();
         let State::Prepared { handle } = mem::replace(self, State::Done) else {
             unreachable!("operation state changed during cancellation");
         };
         Self::complete_synthetic(self, handle, io::Error::from_raw_os_error(libc::ECANCELED));
-        true
     }
 
     fn finish_submit(&mut self) {
@@ -481,6 +505,21 @@ where
         &self.reactor
     }
 
+    /// Change this request's operation before it is first polled.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the request has already been polled or linked: its entry
+    /// may already be on its way to the kernel.
+    #[track_caller]
+    pub(crate) fn modify_prepared(self, f: impl FnOnce(&mut T)) -> Self {
+        let State::Prepared { handle } = &self.state else {
+            panic!("request options must be set before the request is first polled");
+        };
+        f(&mut handle.data_mut().expect("prepared operation has data"));
+        self
+    }
+
     pub(crate) fn prepare_batch(
         mut self: Pin<&mut Self>,
         batch: &mut SmallVec<[ConfiguredEntry; 4]>,
@@ -499,7 +538,7 @@ where
 
     pub(crate) fn cancel_unsubmitted(mut self: Pin<&mut Self>) {
         let this = self.as_mut().project();
-        let _ = this.state.cancel_unsubmitted();
+        this.state.cancel_unsubmitted();
     }
 
     pub(crate) fn finish_submit(mut self: Pin<&mut Self>) {
@@ -706,11 +745,15 @@ pub(crate) unsafe fn reap_operation(entry: &io_uring::cqueue::Entry) {
 ///
 /// A link joins an entry to the next SQE in the shared queue, which may belong
 /// to another task; the driver sets `IO_LINK` itself for requests submitted
-/// together. A request that skips its success CQE never releases its operation
-/// or leaves the in-flight count that driver shutdown drains to zero, and once
-/// one is submitted the kernel rejects every later `IO_DRAIN` entry.
+/// together. A drain holds every later SQE in the shared queue, including the
+/// driver's own cancellations and eventfd read, until every earlier SQE
+/// completes, so one drain behind an idle request stalls the whole runtime. A
+/// request that skips its success CQE never releases its operation or leaves
+/// the in-flight count that driver shutdown drains to zero, and once one is
+/// submitted the kernel rejects every later `IO_DRAIN` entry.
 const RESERVED_SQE_FLAGS: Flags = Flags::IO_LINK
     .union(Flags::IO_HARDLINK)
+    .union(Flags::IO_DRAIN)
     .union(Flags::SKIP_SUCCESS);
 
 /// Whether a configured SQE sets a runtime-owned flag.
@@ -724,7 +767,7 @@ fn has_reserved_flags(entry: &io_uring::squeue::Entry) -> bool {
 fn reserved_flags_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "operations may not set IO_LINK, IO_HARDLINK, or CQE_SKIP_SUCCESS; \
+        "operations may not set IO_LINK, IO_HARDLINK, IO_DRAIN, or CQE_SKIP_SUCCESS; \
          link requests with Request::then",
     )
 }
@@ -856,7 +899,12 @@ mod tests {
 
     #[test]
     fn only_runtime_owned_flags_fail_configuration() {
-        for reserved in [Flags::IO_LINK, Flags::IO_HARDLINK, Flags::SKIP_SUCCESS] {
+        for reserved in [
+            Flags::IO_LINK,
+            Flags::IO_HARDLINK,
+            Flags::IO_DRAIN,
+            Flags::SKIP_SUCCESS,
+        ] {
             let entry = io_uring::opcode::Nop::new()
                 .build()
                 .flags(reserved | Flags::ASYNC);
@@ -865,7 +913,6 @@ mod tests {
         for allowed in [
             Flags::empty(),
             Flags::FIXED_FILE,
-            Flags::IO_DRAIN,
             Flags::ASYNC,
             Flags::BUFFER_SELECT,
         ] {

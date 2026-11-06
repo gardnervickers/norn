@@ -11,8 +11,14 @@
 //! `DEFER_TASKRUN`. `OP_STRESS_SEED=<seed>` (with optional
 //! `OP_STRESS_ENTRIES=<n>`) replays one run instead. The two modes never run
 //! together, because they share the `LIVE` count.
+//!
+//! A linked batch must fit the submission queue or it is rejected before it
+//! reaches the kernel, so the scenario sizes its chains to the ring: three
+//! linked operations need 3 entries, a timeout-bounded operation needs 2, and
+//! a 1-entry ring only sees single operations. Every output is checked, and
+//! each run must see linked requests complete through the kernel.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -26,6 +32,17 @@ use norn_uring::{CQEResult, Handle, Operation, Request, Singleshot};
 
 static LIVE: AtomicIsize = AtomicIsize::new(0);
 static COMPLETED: AtomicUsize = AtomicUsize::new(0);
+/// Linked chains of NOPs that completed successfully through the kernel.
+static LINKED_OK: AtomicUsize = AtomicUsize::new(0);
+/// Requests the kernel cancelled because a soft-linked predecessor failed in
+/// the kernel.
+static KERNEL_CANCELLED: AtomicUsize = AtomicUsize::new(0);
+/// Timeout-bounded blocked reads that the linked timeout cancelled.
+static TIMED_OUT: AtomicUsize = AtomicUsize::new(0);
+
+/// Unexpected outputs, reported by the scenario because tasks that panic are
+/// aborted and joined silently.
+type Failures = Rc<RefCell<Vec<String>>>;
 
 struct Live;
 
@@ -46,6 +63,9 @@ impl Drop for Live {
 enum Kind {
     Nop,
     FailConfigure,
+    /// A read from a bad descriptor: the kernel fails it with `EBADF`, which
+    /// cancels whatever is soft-linked after it.
+    FailKernel,
     /// A read from a pipe nobody writes: completes only by cancellation.
     Blocked(i32),
 }
@@ -80,6 +100,12 @@ unsafe impl Operation for Tracked {
         match self.kind {
             Kind::Nop => Ok(io_uring::opcode::Nop::new().build()),
             Kind::FailConfigure => Err(io::Error::from_raw_os_error(libc::EINVAL)),
+            Kind::FailKernel => {
+                Ok(
+                    io_uring::opcode::Read::new(io_uring::types::Fd(-1), self.buf.as_mut_ptr(), 8)
+                        .build(),
+                )
+            }
             Kind::Blocked(fd) => {
                 Ok(
                     io_uring::opcode::Read::new(io_uring::types::Fd(fd), self.buf.as_mut_ptr(), 8)
@@ -147,53 +173,224 @@ impl Future for YieldNow {
     }
 }
 
+fn rejected_as_too_large(err: &io::Error) -> bool {
+    err.kind() == io::ErrorKind::InvalidInput
+        && err.to_string().contains("exceeds submission queue")
+}
+
+/// Why `result` is not an output a `kind` operation can produce, if so. A
+/// request cancelled by a failed or cancelled predecessor, or by its linked
+/// timeout, completes with `ECANCELED`. Nothing may be rejected for its size.
+fn unexpected(kind: Kind, result: &io::Result<u32>) -> Option<String> {
+    let cancelled_or_failed = |err: &io::Error| {
+        matches!(
+            (kind, err.raw_os_error()),
+            (_, Some(libc::ECANCELED))
+                | (Kind::FailConfigure, Some(libc::EINVAL))
+                | (Kind::FailKernel, Some(libc::EBADF))
+        )
+    };
+    match result {
+        Ok(0) if matches!(kind, Kind::Nop) => None,
+        Err(err) if rejected_as_too_large(err) => Some(format!(
+            "a {} never reached the kernel: {err}",
+            kind_name(kind)
+        )),
+        Err(err) if cancelled_or_failed(err) => None,
+        other => Some(format!("{other:?} from a {}", kind_name(kind))),
+    }
+}
+
+fn kind_name(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Nop => "Nop",
+        Kind::FailConfigure => "FailConfigure",
+        Kind::FailKernel => "FailKernel",
+        Kind::Blocked(_) => "Blocked",
+    }
+}
+
+/// Check the outputs of requests submitted together, each `(kind, output)`
+/// in submission order, and return whether every one succeeded. `soft` marks
+/// them soft-linked: once one fails, every later one is cancelled. A chain of
+/// NOPs on a running driver must succeed.
+fn check_chain(
+    what: &str,
+    soft: bool,
+    outputs: &[(Kind, &io::Result<u32>)],
+    failures: &Failures,
+) -> bool {
+    let mut failures = failures.borrow_mut();
+    let mut failed = false;
+    let mut kernel_failed = false;
+    for (kind, output) in outputs {
+        if soft
+            && kernel_failed
+            && output
+                .as_ref()
+                .is_err_and(|e| e.raw_os_error() == Some(libc::ECANCELED))
+        {
+            KERNEL_CANCELLED.fetch_add(1, Ordering::SeqCst);
+        }
+        kernel_failed |= matches!(kind, Kind::FailKernel) && output.is_err();
+        if let Some(message) = unexpected(*kind, output) {
+            failures.push(format!("{what}: {message}"));
+        } else if soft
+            && failed
+            && !matches!(kind, Kind::FailConfigure)
+            && !output
+                .as_ref()
+                .is_err_and(|e| e.raw_os_error() == Some(libc::ECANCELED))
+        {
+            // The kernel cancels what follows a failed soft link, and the
+            // driver does the same when configuration fails.
+            failures.push(format!(
+                "{what}: a {} after a failed link was not cancelled: {output:?}",
+                kind_name(*kind)
+            ));
+        }
+        failed |= output.is_err();
+    }
+    if failed && outputs.iter().all(|(kind, _)| matches!(kind, Kind::Nop)) {
+        failures.push(format!("{what}: a chain of NOPs failed"));
+    }
+    !failed
+}
+
+/// A lone operation has no predecessor to cancel it: a NOP succeeds, and a
+/// failed configuration reports its own error.
+fn check_single(kind: Kind, output: &io::Result<u32>, failures: &Failures) {
+    let expected = match kind {
+        Kind::Nop => output.as_ref().is_ok_and(|n| *n == 0),
+        Kind::FailConfigure => output
+            .as_ref()
+            .is_err_and(|e| e.raw_os_error() == Some(libc::EINVAL)),
+        Kind::FailKernel => output
+            .as_ref()
+            .is_err_and(|e| e.raw_os_error() == Some(libc::EBADF)),
+        // Cancelled by its linked timeout, when it has one.
+        Kind::Blocked(_) => output
+            .as_ref()
+            .is_err_and(|e| e.raw_os_error() == Some(libc::ECANCELED)),
+    };
+    if !expected {
+        let message = unexpected(kind, output).unwrap_or_else(|| format!("{output:?}"));
+        failures.borrow_mut().push(format!("single: {message}"));
+    }
+}
+
 fn kind(rng: &mut Rng, pipe: i32) -> Kind {
     match rng.below(10) {
         0 => Kind::FailConfigure,
         1 | 2 => Kind::Blocked(pipe),
+        3 => Kind::FailKernel,
         _ => Kind::Nop,
     }
 }
 
-async fn run_scenario(seed: u64, iterations: usize, pipe: i32) {
+async fn run_scenario(seed: u64, iterations: usize, pipe: i32, entries: u32) {
     let handle = Handle::current();
     let mut rng = Rng(seed | 1);
     let mut tasks = Vec::new();
     let mut parked_ops: Vec<Pin<Box<dyn Future<Output = io::Result<u32>>>>> = Vec::new();
     let in_flight = Rc::new(Cell::new(0usize));
+    let failures = Failures::default();
 
     for _ in 0..iterations {
         match rng.below(12) {
             0..=2 => {
-                let op = handle.submit(Tracked::new(kind(&mut rng, pipe)));
+                let kind = kind(&mut rng, pipe);
+                let op = handle.submit(Tracked::new(kind));
                 let in_flight = Rc::clone(&in_flight);
+                let failures = Rc::clone(&failures);
                 in_flight.set(in_flight.get() + 1);
                 tasks.push(norn_executor::spawn(async move {
-                    let _ = op.await;
+                    let output = op.await;
+                    check_single(kind, &output, &failures);
                     in_flight.set(in_flight.get() - 1);
                 }));
             }
             3 => {
-                let first = handle.submit(Tracked::new(kind(&mut rng, pipe)));
-                let second = handle.submit(Tracked::new(kind(&mut rng, pipe)));
-                // Half the chains hard-link their first pair.
-                let pair = if rng.below(2) == 0 {
-                    first.then(second)
-                } else {
-                    first.then_always(second)
-                };
-                let chain = pair.then(handle.submit(Tracked::new(kind(&mut rng, pipe))));
-                tasks.push(norn_executor::spawn(async move {
-                    let _ = chain.await;
-                }));
+                // At most as many linked operations as the ring has entries.
+                let kinds = [
+                    kind(&mut rng, pipe),
+                    kind(&mut rng, pipe),
+                    kind(&mut rng, pipe),
+                ];
+                let hard = rng.below(2) == 0;
+                let failures = Rc::clone(&failures);
+                let [k0, k1, k2] = kinds;
+                match entries.min(3) {
+                    1 => {
+                        let op = handle.submit(Tracked::new(k0));
+                        tasks.push(norn_executor::spawn(async move {
+                            check_single(k0, &op.await, &failures);
+                        }));
+                    }
+                    2 => {
+                        let (first, second) = (
+                            handle.submit(Tracked::new(k0)),
+                            handle.submit(Tracked::new(k1)),
+                        );
+                        // Half the chains hard-link their first pair.
+                        let pair = if hard {
+                            first.then_always(second)
+                        } else {
+                            first.then(second)
+                        };
+                        tasks.push(norn_executor::spawn(async move {
+                            let (a, b) = pair.await;
+                            let outputs = [(k0, &a), (k1, &b)];
+                            if check_chain("pair", !hard, &outputs, &failures) {
+                                LINKED_OK.fetch_add(1, Ordering::SeqCst);
+                            }
+                        }));
+                    }
+                    _ => {
+                        let first = handle.submit(Tracked::new(k0));
+                        let second = handle.submit(Tracked::new(k1));
+                        let pair = if hard {
+                            first.then_always(second)
+                        } else {
+                            first.then(second)
+                        };
+                        let chain = pair.then(handle.submit(Tracked::new(k2)));
+                        tasks.push(norn_executor::spawn(async move {
+                            let ((a, b), c) = chain.await;
+                            let outputs = [(k0, &a), (k1, &b), (k2, &c)];
+                            if check_chain("chain", !hard, &outputs, &failures) {
+                                LINKED_OK.fetch_add(1, Ordering::SeqCst);
+                            }
+                        }));
+                    }
+                }
             }
             4 => {
-                let req = handle
-                    .submit(Tracked::new(kind(&mut rng, pipe)))
-                    .timeout(Duration::from_micros(rng.below(2000)));
-                tasks.push(norn_executor::spawn(async move {
-                    let _ = req.await;
-                }));
+                let kind = kind(&mut rng, pipe);
+                let micros = rng.below(2000);
+                let failures = Rc::clone(&failures);
+                let op = handle.submit(Tracked::new(kind));
+                if entries >= 2 {
+                    // The operation and its linked timeout are two entries.
+                    let req = op.timeout(Duration::from_micros(micros));
+                    tasks.push(norn_executor::spawn(async move {
+                        let output = req.await;
+                        if matches!(kind, Kind::Blocked(_)) {
+                            // Only the timeout can end a read of an idle pipe.
+                            if output
+                                .as_ref()
+                                .is_err_and(|e| e.raw_os_error() == Some(libc::ECANCELED))
+                            {
+                                TIMED_OUT.fetch_add(1, Ordering::SeqCst);
+                            }
+                        }
+                        check_single(kind, &output, &failures);
+                    }));
+                } else {
+                    tasks.push(norn_executor::spawn(async move {
+                        check_single(kind, &op.await, &failures);
+                    }));
+                }
             }
             5 => {
                 // Poll once, then keep it around to drop later (cancel path).
@@ -224,27 +421,43 @@ async fn run_scenario(seed: u64, iterations: usize, pipe: i32) {
                 let control = timeout.control();
                 let action = rng.below(3);
                 let reset = Duration::from_micros(rng.below(3000));
+                let failures = Rc::clone(&failures);
                 tasks.push(norn_executor::spawn(async move {
                     let mut timeout = std::pin::pin!(timeout);
                     let _ = PollOnce(timeout.as_mut()).await;
-                    match action {
-                        0 => {
-                            let _ = control.cancel().await;
+                    let controlled = match action {
+                        0 => Some(("cancel", control.cancel().await)),
+                        1 => Some(("reset", control.reset(reset).await)),
+                        _ => None,
+                    };
+                    if let Some((what, Err(err))) = controlled {
+                        if rejected_as_too_large(&err)
+                            || err.raw_os_error() != Some(libc::ECANCELED)
+                        {
+                            failures.borrow_mut().push(format!("timeout {what}: {err}"));
                         }
-                        1 => {
-                            let _ = control.reset(reset).await;
-                        }
-                        _ => {}
                     }
-                    let _ = timeout.await;
+                    match timeout.await {
+                        Ok(_) => {}
+                        Err(err) if err.raw_os_error() == Some(libc::ECANCELED) => {}
+                        Err(err) => failures.borrow_mut().push(format!("timeout: {err}")),
+                    }
                 }));
             }
             10 => YieldNow(false).await,
             _ => {
-                let _ = handle.timeout(Duration::from_micros(50)).await;
+                if let Err(err) = handle.timeout(Duration::from_micros(50)).await {
+                    failures.borrow_mut().push(format!("timeout: {err}"));
+                }
             }
         }
     }
+    let failures = failures.borrow();
+    assert!(
+        failures.is_empty(),
+        "seed {seed} entries {entries}: {failures:#?}"
+    );
+    drop(failures);
     // Abandon everything still pending; shutdown must reclaim it.
     drop(parked_ops);
     for task in tasks {
@@ -260,19 +473,32 @@ fn run(seed: u64, builder: io_uring::Builder, entries: u32) {
         assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
         let driver = norn_uring::Driver::new(builder, entries).unwrap();
         let mut ex = norn_executor::LocalExecutor::new(driver);
-        ex.block_on(run_scenario(seed, 3000, fds[0]));
+        let linked_before = LINKED_OK.load(Ordering::SeqCst);
+        ex.block_on(run_scenario(seed, 3000, fds[0], entries));
+        let linked = LINKED_OK.load(Ordering::SeqCst) - linked_before;
         drop(ex);
         // Safety: shutdown reclaimed every read, and nothing else owns these.
         unsafe {
             libc::close(fds[0]);
             libc::close(fds[1]);
         }
-        tx.send(LIVE.load(Ordering::SeqCst)).unwrap();
+        tx.send((LIVE.load(Ordering::SeqCst), linked)).unwrap();
     });
-    let live = rx
+    let (live, linked) = rx
         .recv_timeout(Duration::from_secs(60))
-        .unwrap_or_else(|_| panic!("seed {seed} entries {entries}: scenario or shutdown stalled"));
-    assert_eq!(live, 0, "seed {seed}: leaked or double-dropped op data");
+        .unwrap_or_else(|_| {
+            panic!("seed {seed} entries {entries}: scenario panicked, or it or shutdown stalled")
+        });
+    assert_eq!(
+        live, 0,
+        "seed {seed} entries {entries}: leaked or double-dropped op data"
+    );
+    // A 1-entry ring has no room to link; larger rings must have run chains.
+    assert_eq!(
+        linked > 0,
+        entries >= 2,
+        "seed {seed} entries {entries}: {linked} linked chains completed"
+    );
 }
 
 #[test]
@@ -320,5 +546,19 @@ fn op_lifecycle_stress() {
             run(seed * 4 + 3, defer, entries);
         }
     }
-    eprintln!("completed {} ops", COMPLETED.load(Ordering::SeqCst));
+    assert!(
+        KERNEL_CANCELLED.load(Ordering::SeqCst) > 0,
+        "no kernel failure ever cancelled a soft-linked request"
+    );
+    assert!(
+        TIMED_OUT.load(Ordering::SeqCst) > 0,
+        "no linked timeout ever cancelled a blocked read"
+    );
+    eprintln!(
+        "completed {} ops, {} linked chains, {} kernel cancellations, {} timeouts",
+        COMPLETED.load(Ordering::SeqCst),
+        LINKED_OK.load(Ordering::SeqCst),
+        KERNEL_CANCELLED.load(Ordering::SeqCst),
+        TIMED_OUT.load(Ordering::SeqCst)
+    );
 }

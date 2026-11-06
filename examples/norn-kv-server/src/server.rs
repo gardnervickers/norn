@@ -15,9 +15,9 @@ use norn_uring::net::{TcpListener, TcpSocket};
 
 use crate::codec::{decode_body, DecodeStatus, FrameDecoder, ResponseEncoder};
 use crate::handler::{ConnectionAction, MemoryHandler};
-use crate::protocol::{EncodeError, RequestHeader, HEADER_LEN};
+use crate::protocol::{RequestHeader, HEADER_LEN};
 
-const RECV_RING_BUFFERS: u16 = 8_192;
+pub(crate) const RECV_RING_BUFFERS: u16 = 8_192;
 const RECV_BUFFER_LEN: usize = 8 * 1024;
 /// Buffers one connection's receive may hold before it pauses. This sits
 /// above the backlog a polling connection builds up between polls in the
@@ -31,23 +31,107 @@ const LINGER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 /// Most input a failed connection discards before it is closed.
 const LINGER_MAX_BYTES: usize = 16 * 1024 * 1024;
 
-/// Decide whether an accept failure should stop the listener.
+/// How the listener reacts to a failed accept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcceptRecovery {
+    /// A load condition: wait briefly, then accept again.
+    BackOff,
+    /// Concerns only the connection being accepted: accept again at once.
+    Skip,
+    /// Not recoverable: stop the listener.
+    Stop,
+}
+
+/// Most consecutive skipped accept errors tolerated without a successful
+/// accept in between.
 ///
-/// Descriptor and memory exhaustion are load conditions: back off briefly so
-/// pending connections can drain instead of retrying in a hot loop. Errors
-/// that concern only the connection being accepted are skipped. Anything else
-/// is returned to the caller.
-pub(crate) async fn recover_from_accept_error(error: io::Error) -> io::Result<()> {
-    match error.raw_os_error() {
-        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM) => {
-            eprintln!("accept failed: {error}; backing off");
-            norn_uring::Handle::current()
-                .timeout(ACCEPT_BACKOFF)
-                .await?;
-            Ok(())
+/// Skipping retries immediately, so an error that is really sticky (a security
+/// module that denies every accept with `EPERM`, say) would otherwise spin the
+/// listener at full CPU forever and silently.
+const MAX_CONSECUTIVE_SKIPPED_ACCEPTS: u32 = 64;
+
+/// Classify the `errno` of a failed accept.
+///
+/// accept(2) documents that Linux passes the pending network errors of the new
+/// connection through accept and that they should be treated like `EAGAIN`:
+/// `ENETDOWN`, `EPROTO`, `ENOPROTOOPT`, `EHOSTDOWN`, `ENONET`, `EHOSTUNREACH`
+/// and `ENETUNREACH` are skipped. `ECONNABORTED` is a connection that died
+/// before it was accepted, and `EPERM` ("Firewall rules forbid connection")
+/// and `EINTR` are likewise skipped.
+///
+/// `EOPNOTSUPP` is on accept(2)'s retry list but is also what accept returns
+/// for a listener that is not `SOCK_STREAM`, and `EACCES` is what a security
+/// module returns from a check that sees only the listener. Both would repeat
+/// on every accept, so they stop the listener rather than spin it.
+fn classify_accept_error(errno: Option<i32>) -> AcceptRecovery {
+    match errno {
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM) => AcceptRecovery::BackOff,
+        Some(
+            libc::ECONNABORTED
+            | libc::EPROTO
+            | libc::EPERM
+            | libc::EINTR
+            | libc::ENETDOWN
+            | libc::ENOPROTOOPT
+            | libc::EHOSTDOWN
+            | libc::ENONET
+            | libc::EHOSTUNREACH
+            | libc::ENETUNREACH,
+        ) => AcceptRecovery::Skip,
+        _ => AcceptRecovery::Stop,
+    }
+}
+
+/// Tracks accept failures so the listener can recover from transient ones.
+#[derive(Debug, Default)]
+pub(crate) struct AcceptErrors {
+    consecutive_skips: u32,
+}
+
+impl AcceptErrors {
+    /// Record a successful accept, ending any run of skipped errors.
+    pub(crate) fn accepted(&mut self) {
+        self.consecutive_skips = 0;
+    }
+
+    /// Decide what to do about a failed accept without waiting.
+    fn classify(&mut self, error: &io::Error) -> AcceptRecovery {
+        match classify_accept_error(error.raw_os_error()) {
+            AcceptRecovery::Skip => {
+                self.consecutive_skips += 1;
+                if self.consecutive_skips > MAX_CONSECUTIVE_SKIPPED_ACCEPTS {
+                    eprintln!(
+                        "accept failed {} times in a row: {error}; stopping",
+                        self.consecutive_skips
+                    );
+                    AcceptRecovery::Stop
+                } else {
+                    AcceptRecovery::Skip
+                }
+            }
+            other => other,
         }
-        Some(libc::ECONNABORTED | libc::EPROTO | libc::EPERM | libc::EINTR) => Ok(()),
-        _ => Err(error),
+    }
+
+    /// Decide whether an accept failure should stop the listener.
+    ///
+    /// Descriptor and memory exhaustion are load conditions: back off briefly
+    /// so pending connections can drain instead of retrying in a hot loop.
+    /// Errors that concern only the connection being accepted are skipped,
+    /// unless more than [`MAX_CONSECUTIVE_SKIPPED_ACCEPTS`] arrive without a
+    /// successful accept. Anything else is returned to the caller.
+    pub(crate) async fn recover(&mut self, error: io::Error) -> io::Result<()> {
+        match self.classify(&error) {
+            AcceptRecovery::BackOff => {
+                eprintln!("accept failed: {error}; backing off");
+                norn_uring::Handle::current()
+                    .timeout(ACCEPT_BACKOFF)
+                    .await?;
+                Ok(())
+            }
+            AcceptRecovery::Skip => Ok(()),
+            AcceptRecovery::Stop => Err(error),
+        }
     }
 }
 
@@ -195,6 +279,79 @@ impl ServerConfig {
     }
 }
 
+/// Completions one connection can have pending at once: its receive (a
+/// multishot receive's final completion, or an exact receive), a send, the
+/// lingering-close timeout, and a cancellation from a pause or a drop.
+/// A closed connection's slot is reused as soon as its task returns, while
+/// its close and cancellation completions may still be pending; those rely
+/// on the slack from rounding up to a power of two and `ring_entries`.
+const CQES_PER_CONNECTION: u64 = 4;
+
+/// Completions the listener's multishot accept can have pending: twice the
+/// 64 connections at which `TcpListener::incoming` pauses, because accepts
+/// the kernel completes before the pause takes effect still post, plus the
+/// accept's final completion. The pause applies only once the worker reaps
+/// accepts, so a larger connect storm while the worker is busy relies on the
+/// `ring_entries` slack.
+const ACCEPT_CQES: u64 = 2 * 64 + 1;
+
+/// The most CQ entries the kernel allows (`IORING_MAX_CQ_ENTRIES`).
+const MAX_CQ_ENTRIES: u32 = 65_536;
+
+/// Create a worker's `io_uring` driver with `ring_entries` submission queue
+/// entries and a completion queue (CQ) with room for everything `config`
+/// lets the worker have pending.
+///
+/// The kernel posts completions while the worker is busy, and a park reaps
+/// them only later. The CQ needs room for every buffer of the multishot
+/// receive ring (one completion per buffer filled), for
+/// `CQES_PER_CONNECTION` per connection up to `config.max_connections`,
+/// for `ACCEPT_CQES` from the multishot accept, and for `ring_entries`
+/// more as slack for timers, closes, rejected connections and the driver's
+/// eventfd read. Without that, completions overflow the CQ (a
+/// full CQ also ends multishot receives), and the kernel may drop an
+/// overflowed completion when it cannot allocate the overflow entry, which
+/// fails the driver.
+///
+/// The kernel rounds the CQ up to a power of two, and clamps it at its
+/// limit (65536 entries) rather than failing. In multishot mode that limit
+/// is reached at about 14000 `max_connections`; a larger request is still
+/// clamped, and this prints a warning with the effective size.
+///
+/// # Errors
+///
+/// Returns an error when the kernel cannot create the ring.
+pub fn driver(ring_entries: u32, config: &ServerConfig) -> io::Result<norn_uring::Driver> {
+    let requested = cq_entries(ring_entries, config);
+    let mut builder = io_uring::IoUring::builder();
+    builder.setup_clamp().setup_cqsize(requested);
+    let driver = norn_uring::Driver::new(builder, ring_entries)?;
+    if requested > MAX_CQ_ENTRIES {
+        eprintln!(
+            "warning: the completion queue needs {requested} entries for \
+             max_connections={}, but the kernel limit clamps it to {}; \
+             completions that overflow it can be dropped",
+            config.max_connections,
+            driver.handle().cq_entries(),
+        );
+    }
+    Ok(driver)
+}
+
+/// The CQ size [`driver`] requests; see there.
+fn cq_entries(ring_entries: u32, config: &ServerConfig) -> u32 {
+    let recv_buffers = match config.recv_mode {
+        RecvMode::Exact => 0,
+        RecvMode::Multishot => u64::from(RECV_RING_BUFFERS),
+    };
+    let connections = (config.max_connections as u64).saturating_mul(CQES_PER_CONNECTION);
+    let total = u64::from(ring_entries)
+        .saturating_add(ACCEPT_CQES)
+        .saturating_add(recv_buffers)
+        .saturating_add(connections);
+    u32::try_from(total).unwrap_or(u32::MAX)
+}
+
 /// Build the provided-buffer ring that every multishot connection on a worker
 /// shares.
 ///
@@ -227,11 +384,15 @@ pub async fn serve(
         RecvMode::Multishot => Some(recv_ring(RECV_RING_BUFFERS)?),
     };
     let mut incoming = pin!(listener.incoming());
+    let mut accept_errors = AcceptErrors::default();
     while let Some(next) = incoming.next().await {
         let socket = match next {
-            Ok(socket) => socket,
+            Ok(socket) => {
+                accept_errors.accepted();
+                socket
+            }
             Err(error) => {
-                recover_from_accept_error(error).await?;
+                accept_errors.recover(error).await?;
                 continue;
             }
         };
@@ -457,7 +618,7 @@ fn process_available_frames(
 
         let action = handler
             .handle(frame, &mut ResponseEncoder::new(response))
-            .map_err(encode_error)?;
+            .map_err(io::Error::from)?;
         consumed += frame_len;
         *commands += 1;
 
@@ -551,7 +712,7 @@ async fn serve_exact_frames(
                 decode_body(header, body_buf.filled_slice()),
                 &mut ResponseEncoder::new(&mut response),
             )
-            .map_err(encode_error)?;
+            .map_err(io::Error::from)?;
 
         if !response.is_empty() {
             response = send_all(socket, response).await?;
@@ -592,10 +753,6 @@ async fn send_all(socket: &TcpSocket, buffer: Vec<u8>) -> io::Result<Vec<u8>> {
 }
 
 fn invalid_data(error: impl std::error::Error + Send + Sync + 'static) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, error)
-}
-
-fn encode_error(error: EncodeError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error)
 }
 
@@ -674,6 +831,271 @@ mod tests {
         Status, OP_GET, OP_NOOP, OP_QUIT, OP_SET, REQUEST_MAGIC, RESPONSE_MAGIC,
     };
 
+    /// Block the worker, without reaping, until `peer` finishes, and fail as
+    /// soon as a completion overflows the CQ or the kernel drops one. A
+    /// dropped completion can strand the peer (a multishot receive that
+    /// ended without telling anyone stops draining its socket), so this does
+    /// not wait for the peer once one is seen.
+    fn assert_no_cq_overflow_while_busy<T>(peer: &std::thread::JoinHandle<T>, what: &str) {
+        use std::time::{Duration, Instant};
+
+        let handle = norn_uring::Handle::current();
+        let check = || {
+            assert!(
+                !handle.cq_overflow_pending() && handle.cqes_dropped() == 0,
+                "{what} overflowed the {}-entry CQ ({} completions dropped)",
+                handle.cq_entries(),
+                handle.cqes_dropped(),
+            );
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !peer.is_finished() {
+            check();
+            assert!(Instant::now() < deadline, "the peer did not finish sending");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Let the kernel complete receives for the last data it accepted.
+        std::thread::sleep(Duration::from_millis(500));
+        check();
+    }
+
+    /// A multishot receive keeps filling ring buffers while the worker is
+    /// busy, posting a completion for each. The worker's completion queue
+    /// must hold all of them: when it is full the kernel ends the receive and
+    /// overflows its final completion, which the kernel can drop, after which
+    /// the driver fails with `EBADR`.
+    #[test]
+    fn multishot_burst_fits_in_the_completion_queue() {
+        use std::io::Write;
+        use std::net::TcpStream;
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        use norn_executor::LocalExecutor;
+
+        // Twice the default 512-entry CQ of the server's default 256-entry SQ.
+        const BURST_BUFFERS: usize = 1_024;
+        const BURST: usize = BURST_BUFFERS * RECV_BUFFER_LEN;
+
+        // The server's default `--ring-entries`. One connection keeps the
+        // per-connection term small, so the CQ is big enough only because it
+        // counts the receive ring's buffers (16384 entries with them, 512
+        // without).
+        let config = ServerConfig {
+            max_connections: 1,
+            ..ServerConfig::default()
+        };
+        let driver = driver(256, &config).unwrap();
+        let mut executor = LocalExecutor::new(driver);
+        executor.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap(), 8)
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            let ring = recv_ring(RECV_RING_BUFFERS).unwrap();
+            let (start_tx, start_rx) = mpsc::channel::<()>();
+            let peer = thread::spawn(move || {
+                let mut stream = TcpStream::connect(address).unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                start_rx.recv().unwrap();
+                let sent = stream.write_all(&vec![7_u8; BURST]);
+                (stream, sent)
+            });
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut incoming = pin!(socket.recv_ring_multi(&ring));
+
+            // Arm the receive and let a park submit it.
+            assert!(futures_util::poll!(incoming.next()).is_pending());
+            let mut yielded = false;
+            std::future::poll_fn(|cx| {
+                if std::mem::replace(&mut yielded, true) {
+                    std::task::Poll::Ready(())
+                } else {
+                    cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                }
+            })
+            .await;
+
+            // The kernel completes the receive from task work while the
+            // worker is busy.
+            start_tx.send(()).unwrap();
+            assert_no_cq_overflow_while_busy(
+                &peer,
+                &format!("a {BURST_BUFFERS}-buffer multishot burst"),
+            );
+            let (peer_stream, sent) = peer.join().unwrap();
+            sent.unwrap();
+
+            let mut received = 0;
+            let mut buffers = 0;
+            while received < BURST {
+                let buffer = incoming.next().await.unwrap().unwrap();
+                received += buffer.len();
+                buffers += 1;
+            }
+            assert_eq!(received, BURST);
+            assert!(buffers >= BURST_BUFFERS);
+            drop(peer_stream);
+        });
+    }
+
+    /// Every exact-mode connection has a receive in flight, so the CQ needs
+    /// room for one completion per connection, not only for the SQ.
+    #[test]
+    fn exact_mode_many_connections_fit_in_the_completion_queue() {
+        use std::io::Write;
+        use std::net::TcpStream;
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        use norn_executor::LocalExecutor;
+
+        // More than the default 512-entry CQ of the default 256-entry SQ.
+        const CONNECTIONS: usize = 768;
+        raise_open_file_limit(4 * CONNECTIONS as u64);
+
+        let config = ServerConfig {
+            recv_mode: RecvMode::Exact,
+            ..ServerConfig::default()
+        };
+        let driver = driver(256, &config).unwrap();
+        let mut executor = LocalExecutor::new(driver);
+        executor.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap(), 1024)
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            let (start_tx, start_rx) = mpsc::channel::<()>();
+            let peer = thread::spawn(move || {
+                let mut streams: Vec<_> = (0..CONNECTIONS)
+                    .map(|_| TcpStream::connect(address).unwrap())
+                    .collect();
+                start_rx.recv().unwrap();
+                for stream in &mut streams {
+                    stream.write_all(&[1]).unwrap();
+                }
+                streams
+            });
+            let mut tasks = Vec::new();
+            for _ in 0..CONNECTIONS {
+                let (socket, _) = listener.accept().await.unwrap();
+                tasks.push(norn_executor::spawn(async move {
+                    let (result, _) = socket.recv(Vec::with_capacity(64)).await;
+                    result.unwrap()
+                }));
+            }
+            // Let parks submit every receive.
+            for _ in 0..8 {
+                norn_uring::Handle::current()
+                    .timeout(Duration::from_millis(5))
+                    .await
+                    .ok();
+            }
+            start_tx.send(()).unwrap();
+            assert_no_cq_overflow_while_busy(&peer, &format!("{CONNECTIONS} exact receives"));
+            let streams = peer.join().unwrap();
+            for task in tasks {
+                assert_eq!(task.await.unwrap(), 1);
+            }
+            drop(streams);
+        });
+    }
+
+    /// Raise the soft open-file limit to at least `wanted`, as far as the hard
+    /// limit allows.
+    fn raise_open_file_limit(wanted: u64) {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `limit` is a valid rlimit for getrlimit to fill.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        if limit.rlim_cur < wanted as libc::rlim_t {
+            limit.rlim_cur = limit.rlim_max.min(wanted as libc::rlim_t);
+            // SAFETY: `limit` is a valid rlimit.
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) };
+        }
+    }
+
+    #[test]
+    fn cq_covers_the_receive_ring_and_every_connection() {
+        let multishot = ServerConfig::default();
+        assert_eq!(
+            cq_entries(256, &multishot),
+            256 + 129 + u32::from(RECV_RING_BUFFERS) + 4 * 4_096
+        );
+        let exact = ServerConfig {
+            recv_mode: RecvMode::Exact,
+            max_connections: 10,
+            ..ServerConfig::default()
+        };
+        assert_eq!(cq_entries(256, &exact), 256 + 129 + 40);
+        let huge = ServerConfig {
+            max_connections: usize::MAX,
+            ..ServerConfig::default()
+        };
+        assert_eq!(cq_entries(256, &huge), u32::MAX);
+        // The kernel clamps rather than rejects an oversized CQ.
+        let clamped = driver(256, &huge).unwrap();
+        assert_eq!(clamped.handle().cq_entries(), MAX_CQ_ENTRIES);
+    }
+
+    #[test]
+    fn accept_errors_are_classified() {
+        for errno in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
+            assert_eq!(
+                classify_accept_error(Some(errno)),
+                AcceptRecovery::BackOff,
+                "errno {errno}"
+            );
+        }
+        // Pending network errors of the new connection (accept(2) says to
+        // retry them like EAGAIN) and the other connection-local errors.
+        for errno in [
+            libc::ENETDOWN,
+            libc::EPROTO,
+            libc::ENOPROTOOPT,
+            libc::EHOSTDOWN,
+            libc::ENONET,
+            libc::EHOSTUNREACH,
+            libc::ENETUNREACH,
+            libc::ECONNABORTED,
+            libc::EPERM,
+            libc::EINTR,
+        ] {
+            assert_eq!(
+                classify_accept_error(Some(errno)),
+                AcceptRecovery::Skip,
+                "errno {errno}"
+            );
+        }
+        // EOPNOTSUPP and EACCES depend on the listener, so they repeat on
+        // every accept and must stop it instead of spinning.
+        for errno in [
+            libc::EOPNOTSUPP,
+            libc::EACCES,
+            libc::EBADF,
+            libc::EINVAL,
+            libc::ENOTSOCK,
+            libc::EFAULT,
+        ] {
+            assert_eq!(
+                classify_accept_error(Some(errno)),
+                AcceptRecovery::Stop,
+                "errno {errno}"
+            );
+        }
+        assert_eq!(classify_accept_error(None), AcceptRecovery::Stop);
+    }
+
     #[test]
     fn accept_errors_back_off_skip_or_stop_the_listener() {
         use norn_executor::LocalExecutor;
@@ -681,13 +1103,86 @@ mod tests {
         let driver = norn_uring::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
         let mut executor = LocalExecutor::new(driver);
         executor.block_on(async {
-            for errno in [libc::EMFILE, libc::ENFILE, libc::ECONNABORTED, libc::EPROTO] {
-                recover_from_accept_error(io::Error::from_raw_os_error(errno))
+            let mut accept_errors = AcceptErrors::default();
+            for errno in [
+                libc::EMFILE,
+                libc::ENFILE,
+                libc::ECONNABORTED,
+                libc::EPROTO,
+                libc::ENETDOWN,
+            ] {
+                accept_errors
+                    .recover(io::Error::from_raw_os_error(errno))
                     .await
                     .unwrap_or_else(|error| panic!("errno {errno} stopped the listener: {error}"));
             }
-            let fatal = recover_from_accept_error(io::Error::from_raw_os_error(libc::EBADF)).await;
-            assert_eq!(fatal.unwrap_err().raw_os_error(), Some(libc::EBADF));
+            for errno in [libc::EBADF, libc::EACCES, libc::EOPNOTSUPP] {
+                let fatal = accept_errors
+                    .recover(io::Error::from_raw_os_error(errno))
+                    .await;
+                assert_eq!(fatal.unwrap_err().raw_os_error(), Some(errno));
+            }
+        });
+    }
+
+    #[test]
+    fn sticky_skipped_accept_errors_stop_the_listener() {
+        let mut accept_errors = AcceptErrors::default();
+        let sticky = io::Error::from_raw_os_error(libc::EPERM);
+        for attempt in 1..=MAX_CONSECUTIVE_SKIPPED_ACCEPTS {
+            assert_eq!(
+                accept_errors.classify(&sticky),
+                AcceptRecovery::Skip,
+                "skip {attempt}"
+            );
+        }
+        assert_eq!(accept_errors.classify(&sticky), AcceptRecovery::Stop);
+        assert_eq!(accept_errors.classify(&sticky), AcceptRecovery::Stop);
+
+        // A successful accept in between ends the run, so isolated errors
+        // never accumulate toward the limit.
+        accept_errors.accepted();
+        for _ in 0..MAX_CONSECUTIVE_SKIPPED_ACCEPTS {
+            assert_eq!(accept_errors.classify(&sticky), AcceptRecovery::Skip);
+        }
+        accept_errors.accepted();
+        assert_eq!(accept_errors.classify(&sticky), AcceptRecovery::Skip);
+
+        // Back-off errors are paced by their timeout and are not counted.
+        let mut accept_errors = AcceptErrors::default();
+        let load = io::Error::from_raw_os_error(libc::EMFILE);
+        for _ in 0..=MAX_CONSECUTIVE_SKIPPED_ACCEPTS {
+            assert_eq!(accept_errors.classify(&load), AcceptRecovery::BackOff);
+        }
+    }
+
+    #[test]
+    fn listener_level_eopnotsupp_stops_serve_instead_of_spinning() {
+        use norn_executor::LocalExecutor;
+        use norn_uring::net::UdpSocket;
+
+        let driver = norn_uring::Driver::new(io_uring::IoUring::builder(), 64).unwrap();
+        let mut executor = LocalExecutor::new(driver);
+        executor.block_on(async {
+            // A "listener" whose every accept fails with EOPNOTSUPP: the
+            // socket is not SOCK_STREAM (accept(2) ERRORS).
+            let udp = UdpSocket::bind("127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap();
+            let listener = TcpListener::from_uring_fd(udp.into_uring_fd());
+            let handler = MemoryHandler::new(MemoryStore::new());
+            let serve = pin!(serve(listener, handler, ServerConfig::default()));
+            let timeout =
+                pin!(norn_uring::Handle::current().timeout(std::time::Duration::from_secs(5)));
+            match futures_util::future::select(serve, timeout).await {
+                futures_util::future::Either::Left((result, _)) => {
+                    let error = result.expect_err("serve on a non-stream socket must fail");
+                    assert_eq!(error.raw_os_error(), Some(libc::EOPNOTSUPP));
+                }
+                futures_util::future::Either::Right(_) => {
+                    panic!("serve kept running on a listener whose accept always fails")
+                }
+            }
         });
     }
 

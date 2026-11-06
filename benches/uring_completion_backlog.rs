@@ -1,10 +1,13 @@
 #![cfg(target_os = "linux")]
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::hint::black_box;
 use std::io;
 use std::pin::Pin;
+use std::rc::Rc;
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 use bencher::{Bencher, TestDesc, TestDescAndFn, TestFn};
 use futures::stream::{Stream, StreamExt};
@@ -104,17 +107,32 @@ impl bencher::TDynBenchFn for LaggedBurstBench {
         let count = self.0;
         let mut executor = executor();
         let timeout = executor.block_on(async {
-            let mut timeout =
-                Box::pin(norn_uring::Handle::current().submit(MultishotTimeout::new(count)));
+            let op = MultishotTimeout::new(count);
+            let reaped = Rc::clone(&op.reaped);
+            let mut timeout = Box::pin(norn_uring::Handle::current().submit(op));
             let waker = noop_waker();
             let mut cx = Context::from_waker(&waker);
             assert!(matches!(timeout.as_mut().poll_next(&mut cx), Poll::Pending));
 
-            // An IO_DRAIN submitted after the multishot timeout cannot finish
-            // until the multishot request has produced its terminal CQE. Await
-            // that fence without polling the stream so every timeout CQE
-            // accumulates in the operation-local queue.
-            norn_uring::Handle::current().submit(DrainNop).await;
+            // Operations cannot set IO_DRAIN, so there is no kernel fence on the
+            // multishot request's terminal CQE. Wait without polling the
+            // stream, in short sleeps, until the driver has reaped every CQE
+            // into the operation-local queue, then check that the backlog is
+            // complete so a slow host fails loudly instead of measuring a
+            // partial backlog.
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while reaped.get() < count {
+                assert!(
+                    Instant::now() < deadline,
+                    "only {} of {count} timeout CQEs arrived",
+                    reaped.get()
+                );
+                norn_uring::Handle::current()
+                    .timeout(Duration::from_millis(10))
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(reaped.get(), count, "the backlog is not complete");
             timeout
         });
         let mut timeout = Some(timeout);
@@ -134,31 +152,6 @@ impl bencher::TDynBenchFn for LaggedBurstBench {
                 black_box(())
             });
         });
-    }
-}
-
-#[derive(Debug)]
-struct DrainNop;
-
-unsafe impl norn_uring::Operation for DrainNop {
-    type Completion = norn_uring::CQEResult;
-
-    fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
-        Ok(io_uring::opcode::Nop::new()
-            .build()
-            .flags(io_uring::squeue::Flags::IO_DRAIN))
-    }
-
-    unsafe fn reap(&mut self, result: norn_uring::CQEResult) -> Self::Completion {
-        result
-    }
-}
-
-impl norn_uring::Singleshot for DrainNop {
-    type Output = ();
-
-    fn complete(self, result: norn_uring::CQEResult) -> Self::Output {
-        result.into_result().unwrap();
     }
 }
 
@@ -185,6 +178,8 @@ impl bencher::TDynBenchFn for BurstBench {
 struct MultishotTimeout {
     interval: Box<io_uring::types::Timespec>,
     repeats: u32,
+    /// CQEs the driver has reaped for this request so far.
+    reaped: Rc<Cell<usize>>,
 }
 
 impl MultishotTimeout {
@@ -192,6 +187,7 @@ impl MultishotTimeout {
         Self {
             interval: Box::new(io_uring::types::Timespec::new()),
             repeats: repeats.try_into().unwrap(),
+            reaped: Rc::new(Cell::new(0)),
         }
     }
 }
@@ -207,6 +203,7 @@ unsafe impl norn_uring::Operation for MultishotTimeout {
     }
 
     unsafe fn reap(&mut self, result: norn_uring::CQEResult) -> Self::Completion {
+        self.reaped.set(self.reaped.get() + 1);
         result
     }
 }

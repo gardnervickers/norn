@@ -11,6 +11,8 @@ use crate::buf::{StableBuf, StableBufMut};
 use crate::bufring::{BufRingBuf, BufRingBufBundle, RecvBufRing};
 use crate::fd::UringFd;
 use crate::net::socket::{self, Event, RecvMsgRingBuf, SendZcResult};
+use crate::net::{RecvOptions, SendOptions};
+use crate::WithOptions;
 
 /// A UDP socket.
 ///
@@ -190,7 +192,7 @@ impl UdpSocket {
     ///
     /// Returns an error if the socket cannot be connected to `addr`.
     pub async fn connect(&self, addr: SocketAddr) -> io::Result<()> {
-        self.inner.connect(addr).await
+        self.inner.connect(addr.into()).await
     }
 
     /// Returns the socket address that this socket was created from.
@@ -218,22 +220,33 @@ impl UdpSocket {
     ///
     /// This takes ownership of the buffer provided and will return it back
     /// once the operation has completed.
-    pub async fn send_to<B>(&self, buf: B, addr: SocketAddr) -> (io::Result<usize>, B)
+    ///
+    /// Set per-operation [`SendOptions`] with [`WithOptions::options`].
+    pub fn send_to<B>(
+        &self,
+        buf: B,
+        addr: SocketAddr,
+    ) -> impl std::future::Future<Output = (io::Result<usize>, B)> + WithOptions<SendOptions> + '_
     where
         B: StableBuf + 'static,
     {
-        self.inner.send_to(buf, addr).await
+        self.inner.send_to(buf, addr)
     }
 
     /// Sends a single datagram message on a connected socket.
     ///
     /// This takes ownership of the buffer provided and will return it back
     /// once the operation has completed.
-    pub async fn send<B>(&self, buf: B) -> (io::Result<usize>, B)
+    ///
+    /// Set per-operation [`SendOptions`] with [`WithOptions::options`].
+    pub fn send<B>(
+        &self,
+        buf: B,
+    ) -> impl crate::Request<Output = (io::Result<usize>, B)> + WithOptions<SendOptions>
     where
         B: StableBuf + 'static,
     {
-        self.inner.send(buf).await
+        self.inner.send(buf)
     }
 
     /// Sends a single datagram on a connected socket using `io_uring` zerocopy send.
@@ -244,11 +257,16 @@ impl UdpSocket {
     ///
     /// This method does not fall back to regular send if zerocopy is unsupported.
     /// Callers should enable `SO_ZEROCOPY` with [`UdpSocket::set_zerocopy`] first.
-    pub async fn send_zc<B>(&self, buf: B) -> (io::Result<SendZcResult>, B)
+    ///
+    /// Set per-operation [`SendOptions`] with [`WithOptions::options`].
+    pub fn send_zc<B>(
+        &self,
+        buf: B,
+    ) -> impl crate::Request<Output = (io::Result<SendZcResult>, B)> + WithOptions<SendOptions>
     where
         B: StableBuf + 'static,
     {
-        self.inner.send_zc(buf).await
+        self.inner.send_zc(buf)
     }
 
     /// Receives a single datagram message on the socket. On success, returns the number
@@ -256,49 +274,34 @@ impl UdpSocket {
     ///
     /// This must be called with a buf of sufficient size to hold the message. If a message
     /// is too long to fit in the supplied, buffer, excess bytes may be discarded.
-    pub async fn recv_from<B>(&self, buf: B) -> (io::Result<(usize, SocketAddr)>, B)
-    where
-        B: StableBufMut + 'static,
-    {
-        self.inner.recv_from(buf).await
-    }
-
-    /// Receives a single datagram message on the socket with the provided recv flags.
     ///
-    /// With `MSG_TRUNC`, the returned byte count is the full datagram length and may
-    /// exceed the initialized length of the returned buffer.
-    pub async fn recv_from_with_flags<B>(
+    /// Set per-operation [`RecvOptions`] with [`WithOptions::options`].
+    pub fn recv_from<B>(
         &self,
         buf: B,
-        flags: i32,
-    ) -> (io::Result<(usize, SocketAddr)>, B)
+    ) -> impl std::future::Future<Output = (io::Result<(usize, SocketAddr)>, B)>
+           + WithOptions<RecvOptions>
+           + '_
     where
         B: StableBufMut + 'static,
     {
-        self.inner.recv_from_with_flags(buf, flags).await
+        self.inner.recv_from::<socket::Inet, B>(buf)
     }
 
     /// Receives a single datagram message on a connected socket.
     ///
     /// This must be called with a buffer of sufficient size to hold the message. If a message
     /// is too long to fit in the supplied buffer, excess bytes may be discarded.
-    pub async fn recv<B>(&self, buf: B) -> (io::Result<usize>, B)
-    where
-        B: StableBufMut + 'static,
-    {
-        self.inner.recv(buf).await
-    }
-
-    /// Receives a single datagram message on a connected socket with the provided
-    /// recv flags.
     ///
-    /// With `MSG_TRUNC`, the returned byte count is the full datagram length and may
-    /// exceed the initialized length of the returned buffer.
-    pub async fn recv_with_flags<B>(&self, buf: B, flags: i32) -> (io::Result<usize>, B)
+    /// Set per-operation [`RecvOptions`] with [`WithOptions::options`].
+    pub fn recv<B>(
+        &self,
+        buf: B,
+    ) -> impl crate::Request<Output = (io::Result<usize>, B)> + WithOptions<RecvOptions>
     where
         B: StableBufMut + 'static,
     {
-        self.inner.recv_with_flags(buf, flags).await
+        self.inner.recv(buf)
     }
 
     /// Sends a message on a connected socket using `io_uring` zerocopy sendmsg.
@@ -309,19 +312,16 @@ impl UdpSocket {
     ///
     /// This method does not fall back to regular sendmsg if zerocopy is unsupported.
     /// Callers should enable `SO_ZEROCOPY` with [`UdpSocket::set_zerocopy`] first.
-    pub async fn send_msg_zc<B>(&self, buf: B) -> (io::Result<SendZcResult>, B)
+    ///
+    /// Set per-operation [`SendOptions`] with [`WithOptions::options`].
+    pub fn send_msg_zc<B>(
+        &self,
+        buf: B,
+    ) -> impl crate::Request<Output = (io::Result<SendZcResult>, B)> + WithOptions<SendOptions>
     where
         B: StableBuf + 'static,
     {
-        self.inner.send_msg_zc(buf).await
-    }
-
-    /// Receive a message from this socket using message-style flags.
-    pub async fn recv_msg<B>(&self, buf: B, flags: i32) -> (io::Result<(usize, SocketAddr)>, B)
-    where
-        B: StableBufMut + 'static,
-    {
-        self.recv_from_with_flags(buf, flags).await
+        self.inner.send_msg_zc(buf)
     }
 
     /// Receives a single datagram message on the socket using a buffer
@@ -410,28 +410,6 @@ impl UdpSocket {
         self.inner.recv_ring_bundle(ring)
     }
 
-    /// Receives data from a connected socket using a single-shot recv bundle operation with flags.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the buffer ring was registered with another driver.
-    ///
-    /// # Errors
-    ///
-    /// The request resolves with [`io::ErrorKind::InvalidInput`] when `flags`
-    /// contains `MSG_TRUNC`, `MSG_PEEK` or `MSG_WAITALL`. `MSG_TRUNC` does not
-    /// identify the number of buffers selected by a bundle receive, a kernel
-    /// bundle retry peeks the start of the queue again under `MSG_PEEK`, and a
-    /// partial `MSG_WAITALL` retry can commit buffers that the completion does
-    /// not report.
-    pub fn recv_bundle_with_flags(
-        &self,
-        ring: &RecvBufRing,
-        flags: i32,
-    ) -> impl crate::Request<Output = io::Result<BufRingBufBundle>> {
-        self.inner.recv_ring_bundle_with_flags(ring, flags)
-    }
-
     /// Receives data from a connected socket using a multishot recv bundle operation.
     ///
     /// Empty datagrams are yielded as empty bundles and the underlying
@@ -442,30 +420,6 @@ impl UdpSocket {
     /// Panics when the buffer ring was registered with another driver.
     pub fn recv_bundle_multi(&self, ring: &RecvBufRing) -> UdpRecvBundleMulti {
         UdpRecvBundleMulti::new(&self.inner, ring, 0)
-    }
-
-    /// Receives data from a connected socket using a multishot recv bundle operation with flags.
-    ///
-    /// Empty datagrams are yielded as empty bundles and the underlying
-    /// multishot operation is transparently rearmed.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the buffer ring was registered with another driver.
-    ///
-    /// # Errors
-    ///
-    /// The stream yields [`io::ErrorKind::InvalidInput`] and terminates when
-    /// `flags` contains `MSG_TRUNC`, `MSG_PEEK`, or `MSG_WAITALL`. `MSG_TRUNC`
-    /// does not identify the number of selected buffers, a kernel bundle retry
-    /// peeks the start of the queue again, and multishot receives do not
-    /// support `MSG_WAITALL`.
-    pub fn recv_bundle_multi_with_flags(
-        &self,
-        ring: &RecvBufRing,
-        flags: i32,
-    ) -> UdpRecvBundleMulti {
-        UdpRecvBundleMulti::new(&self.inner, ring, flags)
     }
 
     /// Close the socket.

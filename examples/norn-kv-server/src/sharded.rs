@@ -33,16 +33,15 @@ use smallvec::SmallVec;
 
 use crate::codec::{DecodeStatus, DecodedFrame, FrameDecoder, ResponseEncoder};
 use crate::handler::{ConnectionAction, HandlerConfig, MemoryHandler};
+use crate::memory::OutOfMemory;
 use crate::protocol::{Command, EncodeError, RequestHeader, Status, HEADER_LEN};
 use crate::server::{
-    close_rejected, discard_multishot, lingering_close, recover_from_accept_error, RecvMode,
-    ServerConfig,
+    close_rejected, discard_multishot, lingering_close, AcceptErrors, RecvMode, ServerConfig,
 };
 
 const INLINE_KEY_LEN: usize = 32;
 const DEFAULT_PAIR_CAPACITY: usize = 1_024;
 const PUMP_BATCH: usize = 64;
-const RECV_RING_BUFFERS: u16 = 8_192;
 const RECV_BUFFER_LEN: usize = 8 * 1024;
 const MAX_IN_FLIGHT_PER_CONNECTION: usize = 32;
 // Reply buffers are recycled per worker. Larger buffers (rare large GETs) are
@@ -446,13 +445,12 @@ fn run_worker(
         })?;
     }
 
-    let uring =
-        norn_uring::Driver::new(io_uring::IoUring::builder(), ring_entries).map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!("create worker {index} io_uring driver: {error}"),
-            )
-        })?;
+    let uring = crate::server::driver(ring_entries, &server).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("create worker {index} io_uring driver: {error}"),
+        )
+    })?;
     let WorkerChannels {
         driver,
         request_txs,
@@ -522,7 +520,7 @@ async fn worker_main(
                 )
             })?;
     let address = listener.local_addr()?;
-    let recv_ring = crate::server::recv_ring(RECV_RING_BUFFERS)?;
+    let recv_ring = crate::server::recv_ring(crate::server::RECV_RING_BUFFERS)?;
     startup.ready(address);
 
     match control_rx.recv().await {
@@ -723,7 +721,10 @@ fn execute_remote(worker: usize, handler: &MemoryHandler, request: ShardRequest)
             &mut ResponseEncoder::new(&mut bytes),
         )
         .map(|action| CommandResponse { action, bytes })
-        .map_err(|error| RemoteError::Encoding(error.to_string()));
+        .map_err(|error| match error {
+            EncodeError::OutOfMemory(_) => RemoteError::OutOfMemory(error.to_string()),
+            _ => RemoteError::Encoding(error.to_string()),
+        });
     // Every admitted request produces exactly one reverse envelope, even when
     // a quiet command deliberately encodes zero wire bytes.
     ShardResponse {
@@ -768,6 +769,7 @@ async fn serve_worker(
     next_connection: Arc<AtomicU64>,
 ) -> io::Result<()> {
     let mut incoming = Box::pin(listener.incoming());
+    let mut accept_errors = AcceptErrors::default();
     loop {
         futures_util::select_biased! {
             command = control.recv().fuse() => match command {
@@ -792,9 +794,12 @@ async fn serve_worker(
                     ));
                 };
                 let socket = match next {
-                    Ok(socket) => socket,
+                    Ok(socket) => {
+                        accept_errors.accepted();
+                        socket
+                    }
                     Err(error) => {
-                        recover_from_accept_error(error).await?;
+                        accept_errors.recover(error).await?;
                         continue;
                     }
                 };
@@ -953,8 +958,7 @@ async fn serve_sharded_connection(
             };
             let response = result?;
             close_ready |= response.action == ConnectionAction::Close;
-            output.extend_from_slice(&response.bytes);
-            replies.recycle(response.bytes);
+            replies.append_to(&mut output, response.bytes)?;
             completed += 1;
         }
 
@@ -1034,8 +1038,7 @@ async fn serve_sharded_connection(
             Event::Response(response) => {
                 let response = response?;
                 close_ready |= response.action == ConnectionAction::Close;
-                output.extend_from_slice(&response.bytes);
-                replies.recycle(response.bytes);
+                replies.append_to(&mut output, response.bytes)?;
             }
         }
     }
@@ -1092,7 +1095,19 @@ async fn dispatch_frame(
     // buffers of the worker's ring (`max_unconsumed_per_receive`), so a
     // connection waiting here cannot take the whole ring.
     let permit = router.acquire(owner).await?;
-    let command = OwnedCommand::copy_from(command).expect("keyed command must be ownable");
+    let command = match OwnedCommand::copy_from(command).expect("keyed command must be ownable") {
+        Ok(command) => command,
+        Err(OutOfMemory) => {
+            // Nothing was submitted, so dropping the permit returns its
+            // credit. Fail this request, not the connection or the process.
+            drop(permit);
+            reply_local(replies, output, close_ready, |out| {
+                out.append_empty(header, Status::OutOfMemory)?;
+                Ok(ConnectionAction::Continue)
+            })?;
+            return Ok(closes);
+        }
+    };
     router.submit_remote(replies, permit, worker, owner, header, command)?;
     Ok(closes)
 }
@@ -1110,14 +1125,12 @@ fn reply_local(
     encode: impl FnOnce(&mut ResponseEncoder<'_>) -> Result<ConnectionAction, EncodeError>,
 ) -> io::Result<()> {
     if replies.at_head()? {
-        let action = encode(&mut ResponseEncoder::new(output))
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let action = encode(&mut ResponseEncoder::new(output)).map_err(io::Error::from)?;
         *close_ready |= action == ConnectionAction::Close;
         return Ok(());
     }
     let mut bytes = replies.take_buffer();
-    let action = encode(&mut ResponseEncoder::new(&mut bytes))
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let action = encode(&mut ResponseEncoder::new(&mut bytes)).map_err(io::Error::from)?;
     replies.push_ready(CommandResponse { action, bytes })
 }
 
@@ -1225,6 +1238,8 @@ struct ShardResponse {
 enum RemoteError {
     ChannelClosed,
     Encoding(String),
+    /// The owner could not allocate the reply.
+    OutOfMemory(String),
 }
 
 impl std::fmt::Display for RemoteError {
@@ -1234,6 +1249,9 @@ impl std::fmt::Display for RemoteError {
             Self::Encoding(message) => {
                 write!(formatter, "shard response encoding failed: {message}")
             }
+            Self::OutOfMemory(message) => {
+                write!(formatter, "shard response allocation failed: {message}")
+            }
         }
     }
 }
@@ -1242,7 +1260,11 @@ impl std::error::Error for RemoteError {}
 
 impl From<RemoteError> for io::Error {
     fn from(error: RemoteError) -> Self {
-        io::Error::new(io::ErrorKind::BrokenPipe, error)
+        let kind = match error {
+            RemoteError::OutOfMemory(_) => io::ErrorKind::OutOfMemory,
+            RemoteError::ChannelClosed | RemoteError::Encoding(_) => io::ErrorKind::BrokenPipe,
+        };
+        io::Error::new(kind, error)
     }
 }
 
@@ -1630,6 +1652,29 @@ impl ConnectionReplies {
 
     fn recycle(&self, bytes: Vec<u8>) {
         self.router.recycle(bytes);
+    }
+
+    /// Append a reply that waited in the window to the connection batch and
+    /// recycle its buffer.
+    ///
+    /// A reply can hold a whole GET value, so the batch grows fallibly: on
+    /// failure only this connection fails, not the process. When the batch is
+    /// empty and too small for the reply, the reply's buffer becomes the batch
+    /// and no copy is made.
+    fn append_to(&self, output: &mut Vec<u8>, mut bytes: Vec<u8>) -> io::Result<()> {
+        if output.is_empty() && bytes.len() > output.capacity() {
+            std::mem::swap(output, &mut bytes);
+        } else {
+            output.try_reserve(bytes.len()).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    "cannot grow the connection's response batch",
+                )
+            })?;
+            output.extend_from_slice(&bytes);
+        }
+        self.recycle(bytes);
+        Ok(())
     }
 
     fn reserve_remote(&self, owner: usize) -> io::Result<RequestId> {
@@ -2020,27 +2065,38 @@ impl Drop for CreditPermit {
 }
 
 impl OwnedCommand {
-    fn copy_from(command: Command<'_>) -> Option<Self> {
+    /// Copy a keyed command so it can cross to its owning worker.
+    ///
+    /// Returns `None` for a command without a key, and an error if the value
+    /// cannot be allocated.
+    fn copy_from(command: Command<'_>) -> Option<Result<Self, OutOfMemory>> {
         match command {
-            Command::Get { key, quiet } => Some(Self::Get {
+            Command::Get { key, quiet } => Some(Ok(Self::Get {
                 key: SmallVec::from_slice(key),
                 quiet,
-            }),
+            })),
             Command::Set {
                 key,
                 flags,
                 value,
                 quiet,
-            } => Some(Self::Set {
+            } => {
+                let mut copy = Vec::new();
+                if copy.try_reserve_exact(value.len()).is_err() {
+                    return Some(Err(OutOfMemory));
+                }
+                copy.extend_from_slice(value);
+                Some(Ok(Self::Set {
+                    key: SmallVec::from_slice(key),
+                    flags,
+                    value: copy,
+                    quiet,
+                }))
+            }
+            Command::Delete { key, quiet } => Some(Ok(Self::Delete {
                 key: SmallVec::from_slice(key),
-                flags,
-                value: value.to_vec(),
                 quiet,
-            }),
-            Command::Delete { key, quiet } => Some(Self::Delete {
-                key: SmallVec::from_slice(key),
-                quiet,
-            }),
+            })),
             Command::Noop
             | Command::Version
             | Command::Stat { .. }
@@ -2233,6 +2289,7 @@ mod tests {
             key: b"memtier-0000000000000042",
             quiet: false,
         })
+        .unwrap()
         .unwrap();
         let OwnedCommand::Get { key, .. } = command else {
             unreachable!();
@@ -2248,6 +2305,7 @@ mod tests {
             value: b"value",
             quiet: true,
         })
+        .unwrap()
         .unwrap();
         assert_eq!(command.key(), b"key");
         assert_eq!(
@@ -2384,6 +2442,24 @@ mod tests {
         router.complete(response(1, 0, Vec::new())).unwrap();
         assert!(replies.try_next().unwrap().is_ok());
         assert_eq!(router.credits[0].borrow().available, 1);
+    }
+
+    #[test]
+    fn queued_reply_is_appended_without_copying_into_an_empty_batch() {
+        let (router, _requests, _fatal, _driver) = router_fixture(1);
+        let replies = router.register_connection(7).unwrap();
+
+        let reply = vec![7_u8; 4096];
+        let reply_ptr = reply.as_ptr();
+        let mut output = Vec::with_capacity(16);
+        replies.append_to(&mut output, reply).unwrap();
+        assert_eq!(output.as_ptr(), reply_ptr);
+        assert_eq!(output, vec![7_u8; 4096]);
+
+        // A non-empty batch grows and keeps its earlier bytes in order.
+        replies.append_to(&mut output, vec![8_u8; 4]).unwrap();
+        assert_eq!(output.len(), 4100);
+        assert_eq!(&output[4094..4100], &[7, 7, 8, 8, 8, 8]);
     }
 
     #[test]
@@ -3032,7 +3108,7 @@ mod tests {
         const GETS: usize = 256;
         let response_len = HEADER_LEN + 4 + 4096;
         let mut store = crate::memory::MemoryStore::new();
-        store.set(b"a", 0, &[42; 4096]);
+        store.set(b"a", 0, &[42; 4096]).unwrap();
         let handler = MemoryHandler::new(store);
         let (router, _requests, _fatal, _driver) = router_fixture(1);
         let replies = router.register_connection(7).unwrap();
@@ -3072,7 +3148,7 @@ mod tests {
     fn replies_behind_remote_head_reuse_pooled_buffers_in_order() {
         const ROUNDS: usize = 256;
         let mut store = crate::memory::MemoryStore::new();
-        store.set(b"local", 0, &[42; 4096]);
+        store.set(b"local", 0, &[42; 4096]).unwrap();
         let handler = MemoryHandler::new(store);
         let (router, requests, _fatal, driver) = router_fixture(1);
         let driver = driver.build(SpinPark);
@@ -3100,6 +3176,7 @@ mod tests {
                         key: b"remote",
                         quiet: false,
                     })
+                    .unwrap()
                     .unwrap(),
                 )
                 .unwrap();
