@@ -235,7 +235,14 @@ where
     }
 
     fn shutdown(&mut self) {
-        self.wheels.shutdown();
-        self.inner.shutdown()
+        // A sleeper's waker may panic. Still shut the inner park down, then
+        // resume the panic.
+        let wheels = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.wheels.shutdown();
+        }));
+        self.inner.shutdown();
+        if let Err(payload) = wheels {
+            std::panic::resume_unwind(payload);
+        }
     }
 }
