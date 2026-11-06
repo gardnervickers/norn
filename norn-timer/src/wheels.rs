@@ -1,8 +1,10 @@
+use std::any::Any;
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::VecDeque;
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::pin::Pin;
-use std::ptr;
 use std::task::Waker;
+use std::{mem, ptr, thread};
 
 use cordyceps::List;
 
@@ -17,23 +19,6 @@ pub(crate) struct Wheels {
     next_expiration_dirty: Cell<bool>,
     // Reuse wake storage without retaining a borrow across user callbacks.
     wake_storage: RefCell<VecDeque<Waker>>,
-}
-
-struct WakeBatch(VecDeque<Waker>);
-
-impl WakeBatch {
-    fn wake_all(&mut self) {
-        while let Some(waker) = self.0.pop_front() {
-            waker.wake();
-        }
-    }
-}
-
-impl Drop for WakeBatch {
-    fn drop(&mut self) {
-        // If one callback unwinds, still notify the remaining completed timers.
-        self.wake_all();
-    }
 }
 
 impl Wheels {
@@ -243,12 +228,34 @@ impl Wheels {
         self.wake_all(wakers);
     }
 
-    fn wake_all(&self, wakers: VecDeque<Waker>) {
-        let mut batch = WakeBatch(wakers);
-        batch.wake_all();
+    /// Wake every waker in `wakers`, then resume the first panic, if any,
+    /// unless the thread is already unwinding.
+    ///
+    /// Each waker runs under `catch_unwind`, so a panicking callback cannot
+    /// lose the remaining timers' wakeups, and a second panic does not unwind
+    /// during another and abort the process.
+    fn wake_all(&self, mut wakers: VecDeque<Waker>) {
+        let mut panic = None;
+        while let Some(waker) = wakers.pop_front() {
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| waker.wake())) {
+                match panic {
+                    None => panic = Some(payload),
+                    Some(_) => drop_payload(payload),
+                }
+            }
+        }
         // Reentrant advancement may have populated its own empty storage. No
         // wakers are dropped while this cache is borrowed.
-        self.wake_storage.replace(std::mem::take(&mut batch.0));
+        self.wake_storage.replace(wakers);
+        if let Some(payload) = panic {
+            // Resuming while the thread already unwinds, for example when the
+            // driver is dropped during an unrelated panic, would abort.
+            if thread::panicking() {
+                drop_payload(payload);
+            } else {
+                resume_unwind(payload);
+            }
+        }
     }
 }
 
@@ -271,6 +278,15 @@ const fn wheel_for(elapsed: u64, when: u64) -> usize {
     let significant = 63 - leading_zeros;
 
     significant / NUM_LEVELS
+}
+
+/// Drop a waker's panic payload without letting a panicking payload
+/// destructor escape, which would skip the remaining wakers. A payload whose
+/// destructor panics is leaked.
+fn drop_payload(payload: Box<dyn Any + Send>) {
+    if let Err(nested) = catch_unwind(AssertUnwindSafe(|| drop(payload))) {
+        mem::forget(nested);
+    }
 }
 
 #[cfg(test)]

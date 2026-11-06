@@ -1000,6 +1000,12 @@ impl RuntimeGroup {
 
 impl Drop for RuntimeGroup {
     fn drop(&mut self) {
+        // `join` and `shutdown` already took the workers. A group always has
+        // at least one, so an empty list means only that `join` must not be
+        // turned into a shutdown request here.
+        if self.workers.is_empty() {
+            return;
+        }
         self.request_shutdown();
         // Detached workers could outlive the owner and be killed mid-I/O at
         // process exit. A group dropped on one of its own workers cannot join
