@@ -207,6 +207,8 @@ struct Shared {
     // order, so retained registered storage is released only after the ring.
     registered_buf_rings: RegisteredBufRings,
     registered_buffers: RegisteredBuffers,
+    /// The opcodes the kernel reported when the driver was created.
+    capabilities: crate::ring::Capabilities,
 }
 
 #[cfg(test)]
@@ -671,6 +673,11 @@ impl Handle {
         })
     }
 
+    /// The opcodes the kernel reported when the driver was created.
+    pub(crate) fn kernel_capabilities(&self) -> &crate::ring::Capabilities {
+        &self.shared.capabilities
+    }
+
     pub(crate) fn fixed_buf_driver(&self) -> FixedBufDriver {
         FixedBufDriver {
             shared: Rc::downgrade(&self.shared),
@@ -793,6 +800,7 @@ impl Driver {
             ring => ring?,
         };
         Self::check_setup(&ring)?;
+        let capabilities = crate::ring::Capabilities::probe(&ring)?;
         Ok(Self {
             options,
             shared: Rc::new(Shared {
@@ -812,6 +820,7 @@ impl Driver {
                 shutdown_test: ShutdownTest::default(),
                 registered_buf_rings: RegisteredBufRings::new(),
                 registered_buffers: RegisteredBuffers::new(),
+                capabilities,
             }),
             unparker: Arc::new(unpark::Unparker::new()?),
             unparker_buf: mem::ManuallyDrop::new(UnparkerBuffer::new()),
