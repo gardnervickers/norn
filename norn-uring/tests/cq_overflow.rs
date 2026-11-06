@@ -8,7 +8,15 @@ use std::time::Duration;
 
 use norn_executor::park::{Park, Unpark};
 use norn_executor::{spawn, LocalExecutor};
-use norn_uring::{Driver, TimeoutOutcome};
+use norn_uring::{Driver, DriverOptions, TimeoutOutcome};
+
+/// Keep the kernel's default CQ, twice the SQ, so these tests can overflow it.
+fn small_cq() -> DriverOptions {
+    DriverOptions {
+        cq_entries: None,
+        ..DriverOptions::default()
+    }
+}
 
 /// A burst of completions overflows the CQ while the runtime thread is busy,
 /// and another thread then unparks the runtime. The eventfd read's completion
@@ -20,7 +28,7 @@ fn remote_wake_during_cq_overflow_does_not_livelock_the_executor() {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         // One SQ entry, two CQ entries.
-        let driver = Driver::new(io_uring::IoUring::builder(), 1).unwrap();
+        let driver = Driver::new_with_options(io_uring::IoUring::builder(), 1, small_cq()).unwrap();
         let unparker = driver.unparker();
         let handle = driver.handle();
         let mut executor = LocalExecutor::new(driver);
@@ -66,7 +74,7 @@ fn remote_wake_with_defer_taskrun_does_not_livelock_the_executor() {
             .setup_defer_taskrun()
             .setup_single_issuer()
             .setup_submit_all();
-        let driver = Driver::new(builder, 8).unwrap();
+        let driver = Driver::new_with_options(builder, 8, small_cq()).unwrap();
         let unparker = driver.unparker();
         let handle = driver.handle();
         let mut executor = LocalExecutor::new(driver);
@@ -119,7 +127,7 @@ impl std::future::Future for YieldNow {
 fn cq_overflow_does_not_starve_completions_while_tasks_are_runnable() {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let driver = Driver::new(io_uring::IoUring::builder(), 1).unwrap();
+        let driver = Driver::new_with_options(io_uring::IoUring::builder(), 1, small_cq()).unwrap();
         let handle = driver.handle();
         let mut executor = LocalExecutor::new(driver);
         let completed = executor.block_on(async move {
@@ -170,7 +178,7 @@ fn defer_taskrun_does_not_starve_completions_while_tasks_are_runnable() {
             .setup_defer_taskrun()
             .setup_single_issuer()
             .setup_submit_all();
-        let driver = Driver::new(builder, 64).unwrap();
+        let driver = Driver::new_with_options(builder, 64, small_cq()).unwrap();
         let handle = driver.handle();
         let mut executor = LocalExecutor::new(driver);
         let completed = executor.block_on(async move {
@@ -215,7 +223,7 @@ fn sqpoll_overflow_with_remote_wakes_does_not_livelock_the_executor() {
         for _ in 0..5 {
             let mut builder = io_uring::IoUring::builder();
             builder.setup_sqpoll(10);
-            let driver = Driver::new(builder, 4).unwrap();
+            let driver = Driver::new_with_options(builder, 4, small_cq()).unwrap();
             let unparker = driver.unparker();
             let stop = Arc::new(AtomicBool::new(false));
             let waker = {

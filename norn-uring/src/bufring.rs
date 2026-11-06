@@ -956,7 +956,8 @@ impl Builder {
                 target: "norn_uring::bufring",
                 "buf_ring.exceeds_cq bgid={} buf_cnt={} ring_buffers_total={buffers} \
                  cq_entries={cq_entries}: multishot receives can fill the completion queue, \
-                 and completions that overflow it may be dropped; size it with setup_cqsize",
+                 and completions that overflow it may be dropped; size it with \
+                 DriverOptions::cq_entries",
                 b.bgid,
                 b.buf_cnt,
             );

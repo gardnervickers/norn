@@ -58,7 +58,12 @@ where
     F: std::future::Future<Output = TestResult>,
 {
     install_logger();
-    let driver = norn_uring::Driver::new(builder, entries)?;
+    // Keep the builder's CQ size: some tests need a CQ small enough to fill.
+    let options = norn_uring::DriverOptions {
+        cq_entries: None,
+        ..norn_uring::DriverOptions::default()
+    };
+    let driver = norn_uring::Driver::new_with_options(builder, entries, options)?;
     let mut executor = norn_executor::LocalExecutor::new(driver);
     executor.block_on(f())
 }

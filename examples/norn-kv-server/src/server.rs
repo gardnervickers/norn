@@ -3,7 +3,7 @@
 use std::cell::Cell;
 use std::future::Future;
 use std::io;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::pin::pin;
 use std::rc::Rc;
 
@@ -313,19 +313,53 @@ const MAX_CQ_ENTRIES: u32 = 65_536;
 /// overflowed completion when it cannot allocate the overflow entry, which
 /// fails the driver.
 ///
-/// The kernel rounds the CQ up to a power of two, and clamps it at its
-/// limit (65536 entries) rather than failing. In multishot mode that limit
-/// is reached at about 14000 `max_connections`; a larger request is still
-/// clamped, and this prints a warning with the effective size.
+/// The ring uses `IORING_SETUP_DEFER_TASKRUN` (with `COOP_TASKRUN` and
+/// `SINGLE_ISSUER`, which it requires): each worker creates and runs its ring
+/// on one thread. On such a ring the kernel allocates an overflowed
+/// completion with an allocation that can reclaim memory instead of one that
+/// fails at once, so memory-cgroup pressure drops completions only when
+/// reclaim fails too. In norn-kv-bench's mixed-1w profile it also cut CPU
+/// per request by about 3% and p99 latency at 240k requests/s by about 20%.
+/// Kernels before Linux 6.1 lack it, and get a ring with the default setup.
+///
+/// The kernel rounds the CQ up to a power of two, and the driver caps it at
+/// the kernel's limit (65536 entries) rather than failing. In multishot mode
+/// that limit is reached at about 14000 `max_connections`; a larger request
+/// is still capped, and this prints a warning with the effective size.
 ///
 /// # Errors
 ///
 /// Returns an error when the kernel cannot create the ring.
 pub fn driver(ring_entries: u32, config: &ServerConfig) -> io::Result<norn_uring::Driver> {
+    let mut deferred = io_uring::IoUring::builder();
+    deferred
+        .setup_coop_taskrun()
+        .setup_defer_taskrun()
+        .setup_single_issuer();
+    match driver_with(deferred, ring_entries, config) {
+        // Kernels before 6.1 reject DEFER_TASKRUN.
+        Err(error) if error.raw_os_error() == Some(libc::EINVAL) => {
+            driver_with(io_uring::IoUring::builder(), ring_entries, config)
+        }
+        result => result,
+    }
+}
+
+/// Create a driver from `builder` with the CQ [`driver`] sizes.
+fn driver_with(
+    mut builder: io_uring::Builder,
+    ring_entries: u32,
+    config: &ServerConfig,
+) -> io::Result<norn_uring::Driver> {
+    // An oversized `ring_entries` gets the kernel's largest SQ rather than an
+    // error.
+    builder.setup_clamp();
     let requested = cq_entries(ring_entries, config);
-    let mut builder = io_uring::IoUring::builder();
-    builder.setup_clamp().setup_cqsize(requested);
-    let driver = norn_uring::Driver::new(builder, ring_entries)?;
+    let options = norn_uring::DriverOptions {
+        cq_entries: NonZeroU32::new(requested),
+        ..norn_uring::DriverOptions::default()
+    };
+    let driver = norn_uring::Driver::new_with_options(builder, ring_entries, options)?;
     if requested > MAX_CQ_ENTRIES {
         eprintln!(
             "warning: the completion queue needs {requested} entries for \
@@ -878,15 +912,21 @@ mod tests {
         const BURST_BUFFERS: usize = 1_024;
         const BURST: usize = BURST_BUFFERS * RECV_BUFFER_LEN;
 
-        // The server's default `--ring-entries`. One connection keeps the
-        // per-connection term small, so the CQ is big enough only because it
-        // counts the receive ring's buffers (16384 entries with them, 512
-        // without).
+        // The server's default `--ring-entries`, on the default ring setup
+        // the server falls back to without DEFER_TASKRUN. Only there does the
+        // kernel complete receives from task work while the worker is busy;
+        // a DEFER_TASKRUN ring posts them when the worker next enters the
+        // kernel. That is the worst case for the CQ: either way each receive
+        // completion holds a ring buffer until the worker consumes it, so the
+        // ring's buffers bound the completions waiting to be reaped. One
+        // connection keeps the per-connection term small, so the CQ is big
+        // enough only because it counts the receive ring's buffers (16384
+        // entries with them, 512 without).
         let config = ServerConfig {
             max_connections: 1,
             ..ServerConfig::default()
         };
-        let driver = driver(256, &config).unwrap();
+        let driver = driver_with(io_uring::IoUring::builder(), 256, &config).unwrap();
         let mut executor = LocalExecutor::new(driver);
         executor.block_on(async {
             let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap(), 8)
@@ -963,7 +1003,9 @@ mod tests {
             recv_mode: RecvMode::Exact,
             ..ServerConfig::default()
         };
-        let driver = driver(256, &config).unwrap();
+        // The default ring setup, as in `multishot_burst_fits_in_the_completion_queue`:
+        // a DEFER_TASKRUN ring completes nothing while the worker is busy.
+        let driver = driver_with(io_uring::IoUring::builder(), 256, &config).unwrap();
         let mut executor = LocalExecutor::new(driver);
         executor.block_on(async {
             let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap(), 1024)
@@ -1043,8 +1085,16 @@ mod tests {
             ..ServerConfig::default()
         };
         assert_eq!(cq_entries(256, &huge), u32::MAX);
-        // The kernel clamps rather than rejects an oversized CQ.
+        // The driver caps an oversized CQ at the kernel's limit instead of failing.
         let clamped = driver(256, &huge).unwrap();
+        assert_eq!(clamped.handle().cq_entries(), MAX_CQ_ENTRIES);
+    }
+
+    /// `--ring-entries` above the kernel's SQ limit gets the largest SQ
+    /// rather than an error.
+    #[test]
+    fn oversized_ring_entries_are_clamped() {
+        let clamped = driver(40_000, &ServerConfig::default()).unwrap();
         assert_eq!(clamped.handle().cq_entries(), MAX_CQ_ENTRIES);
     }
 

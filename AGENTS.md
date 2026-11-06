@@ -87,9 +87,14 @@ The project is intentionally not general-purpose today; APIs are still in flux i
   driver.
 - Dropped CQEs are fatal. `EBADR` from `io_uring_enter` (or a non-zero kernel
   dropped counter, checked around each park) becomes an error naming the drop
-  and `setup_cqsize`, marks accounting broken, and makes every later park fail
-  with it. The driver logs, at error level, the transition into CQ overflow and
-  each increase of the dropped counter.
+  and `DriverOptions::cq_entries`, marks accounting broken, and makes every
+  later park fail with it. The driver logs, at error level, the transition into
+  CQ overflow and each increase of the dropped counter.
+- The driver requests `DriverOptions::cq_entries` CQ entries (4096 by default,
+  at least twice the SQ, capped at 65536), replacing any `setup_cqsize` on the
+  builder unless the option is `None`. A park that finds more operations in
+  flight than the CQ holds warns once, and again only after they drain to half
+  of it; the check is per park, not per submission.
 - Remote unpark is eventfd-based (`driver/unpark.rs`).
 - A `NoPark` park with an empty SQ skips `io_uring_enter` only while the SQ
   flags report neither CQ overflow nor pending task work; otherwise it calls

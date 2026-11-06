@@ -1,7 +1,7 @@
 use std::any::Any;
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::VecDeque;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,6 +41,12 @@ const COMPLETION_DRAIN_BATCH: usize = 32;
 
 const DEFAULT_COMPLETION_DRAIN_BUDGET: NonZeroUsize = NonZeroUsize::new(32).unwrap();
 
+/// The default minimum completion queue size; see [`DriverOptions::cq_entries`].
+const DEFAULT_CQ_ENTRIES: NonZeroU32 = NonZeroU32::new(4096).unwrap();
+
+/// The most completion queue entries the kernel allows (`IORING_MAX_CQ_ENTRIES`).
+const MAX_CQ_ENTRIES: u32 = 65_536;
+
 /// Maximum time each shutdown cancellation attempt, and each wait for
 /// outstanding requests to complete, waits for the kernel.
 ///
@@ -65,14 +71,40 @@ pub struct DriverOptions {
     /// Shutdown always drains completions exhaustively, regardless of this
     /// option.
     pub completion_drain_budget: Option<NonZeroUsize>,
+    /// Number of completion queue (CQ) entries to request.
+    ///
+    /// The driver requests this many with `IORING_SETUP_CQSIZE`, or twice the
+    /// submission queue size if that is larger, capped at the kernel's limit
+    /// of 65536; the kernel rounds the size up to a power of two. The default
+    /// is 4096, which takes about 128 KiB of kernel memory per ring, charged
+    /// to the memory cgroup. The kernel's own default, twice the submission
+    /// queue, is easy to overflow, because the submission queue does not
+    /// bound how many operations are in flight; see [`Driver::new`] for how
+    /// to size the CQ.
+    ///
+    /// This replaces a CQ size set with [`io_uring::Builder::setup_cqsize`],
+    /// which the driver cannot read back, so set the size here instead.
+    /// `None` keeps the builder's setting, which is the kernel default unless
+    /// the builder sets one.
+    pub cq_entries: Option<NonZeroU32>,
 }
 
 impl Default for DriverOptions {
     fn default() -> Self {
         Self {
             completion_drain_budget: Some(DEFAULT_COMPLETION_DRAIN_BUDGET),
+            cq_entries: Some(DEFAULT_CQ_ENTRIES),
         }
     }
+}
+
+/// The CQ size to request for at least `minimum` entries with `sq_entries`
+/// submission queue entries.
+fn cq_size(minimum: NonZeroU32, sq_entries: u32) -> u32 {
+    minimum
+        .get()
+        .max(sq_entries.saturating_mul(2))
+        .min(MAX_CQ_ENTRIES)
 }
 
 /// [`Driver`] provides a [`Park`] implementation which will drive
@@ -239,6 +271,14 @@ struct Shared {
     registered_buffers: RegisteredBuffers,
     /// The opcodes the kernel reported when the driver was created.
     capabilities: crate::ring::Capabilities,
+    /// The number of CQ entries, against which in-flight operations are
+    /// checked.
+    cq_capacity: usize,
+    /// Set once in-flight operations exceed `cq_capacity`, until they drain to
+    /// half of it.
+    in_flight_above_cq: Cell<bool>,
+    /// Limits the in-flight warning to one line per interval.
+    in_flight_limiter: LogLimiter,
 }
 
 /// Admits at most one log line per interval and counts the ones it refused,
@@ -881,9 +921,11 @@ impl Driver {
 
     /// Create a new [`Driver`] with the provided size from the provided [`io_uring::Builder`].
     ///
-    /// `size` is the number of submission queue (SQ) entries. By default the
-    /// kernel gives the completion queue (CQ) twice as many entries;
-    /// [`io_uring::Builder::setup_cqsize`] sets a larger CQ.
+    /// `size` is the number of submission queue (SQ) entries. The completion
+    /// queue (CQ) gets [`DriverOptions::cq_entries`] entries, 4096 by default,
+    /// or twice the SQ if that is larger. That replaces a CQ size set with
+    /// [`io_uring::Builder::setup_cqsize`]; to keep it, pass `cq_entries:
+    /// None` to [`Driver::new_with_options`].
     ///
     /// This uses [`DriverOptions::default`]. Use
     /// [`Driver::new_with_options`] to customize driver behavior.
@@ -922,7 +964,8 @@ impl Driver {
     /// to the memory cgroup), and when the allocation fails it drops the
     /// completion. The next `io_uring_enter` then fails with `EBADR`, which
     /// the driver currently treats as fatal. Registering buffer rings with
-    /// more buffers in total than the CQ has entries logs a warning.
+    /// more buffers in total than the CQ has entries logs a warning, and so
+    /// does having more operations in flight than the CQ has entries.
     ///
     /// # Errors
     ///
@@ -959,6 +1002,9 @@ impl Driver {
         options: DriverOptions,
     ) -> io::Result<Self> {
         builder.dontfork();
+        if let Some(minimum) = options.cq_entries {
+            builder.setup_cqsize(cq_size(minimum, size));
+        }
         // Request `IORING_SQ_TASKRUN` so a park can see deferred task work
         // (see `Shared::submit_once`). The kernel accepts the flag only with
         // `COOP_TASKRUN` or `DEFER_TASKRUN` and without `SQPOLL`; otherwise
@@ -969,6 +1015,7 @@ impl Driver {
         };
         Self::check_setup(&ring)?;
         let capabilities = crate::ring::Capabilities::probe(&ring)?;
+        let cq_capacity = ring.params().cq_entries() as usize;
         Ok(Self {
             options,
             shared: Rc::new(Shared {
@@ -995,6 +1042,9 @@ impl Driver {
                 registered_buf_rings: RegisteredBufRings::new(),
                 registered_buffers: RegisteredBuffers::new(),
                 capabilities,
+                cq_capacity,
+                in_flight_above_cq: Cell::new(false),
+                in_flight_limiter: LogLimiter::new(),
             }),
             unparker: Arc::new(unpark::Unparker::new()?),
             unparker_buf: mem::ManuallyDrop::new(UnparkerBuffer::new()),
@@ -1356,6 +1406,7 @@ impl Park for Driver {
     type Guard = context::DriverContextGuard;
 
     fn park(&mut self, mode: ParkMode) -> Result<(), io::Error> {
+        self.shared.check_in_flight();
         self.shared.check_cqes_dropped()?;
         let budget = self.options.completion_drain_budget.map(NonZeroUsize::get);
         self.park_with_completion_budget(mode, budget)
@@ -1851,6 +1902,45 @@ impl Shared {
         self.in_flight.set(count.wrapping_sub(1));
     }
 
+    /// Warn when more operations are in flight than the CQ holds, so that
+    /// completing them all before a reap would overflow it.
+    ///
+    /// Each park checks once, before it reaps, rather than each submission,
+    /// which keeps the check off the per-operation path. The warning fires
+    /// once per excess and re-arms when the count drains to half the CQ, so
+    /// a count hovering at the limit does not log on every crossing. It
+    /// counts operations, not completions: a multishot operation or a
+    /// zero-copy send can post several completions for one count, and buffer
+    /// rings have their own warning.
+    #[inline]
+    fn check_in_flight(&self) {
+        let in_flight = self.in_flight.get();
+        if self.in_flight_above_cq.get() {
+            if in_flight <= self.cq_capacity / 2 {
+                self.in_flight_above_cq.set(false);
+            }
+        } else if in_flight > self.cq_capacity {
+            self.warn_in_flight_above_cq(in_flight);
+        }
+    }
+
+    /// A line the limiter suppresses still counts as this excess's warning:
+    /// one was logged less than an interval ago.
+    #[cold]
+    #[inline(never)]
+    fn warn_in_flight_above_cq(&self, in_flight: usize) {
+        self.in_flight_above_cq.set(true);
+        if let Some(suppressed) = self.in_flight_limiter.admit() {
+            warn!(
+                target: LOG,
+                "in_flight.exceeds_cq in_flight={in_flight} cq_size={} suppressed={suppressed}: \
+                 completions that arrive together can overflow the completion queue; \
+                 size it with DriverOptions::cq_entries",
+                self.cq_capacity
+            );
+        }
+    }
+
     /// Whether the in-flight count can no longer prove reclamation.
     ///
     /// The count wraps if it missed an entry, and an entry whose CQE the kernel
@@ -2122,7 +2212,7 @@ impl Shared {
                     target: LOG,
                     "cq.overflow cq_size={cq_size} in_flight={} suppressed={suppressed}; \
                      completions are parked in the kernel's overflow list, size the CQ \
-                     larger with setup_cqsize",
+                     larger with DriverOptions::cq_entries",
                     self.in_flight.get()
                 );
             }
@@ -2160,7 +2250,7 @@ impl Shared {
             "io_uring {count} were dropped by the kernel because the completion queue \
              overflowed and the overflow entry could not be allocated (EBADR); \
              pending operations may never complete. Size the completion queue larger \
-             with IoUring::builder().setup_cqsize(..)"
+             with DriverOptions::cq_entries"
         ));
         *self.submit_error.borrow_mut() = Some((err.kind(), err.to_string()));
         if self.status() == Status::Running {
@@ -3166,6 +3256,7 @@ mod tests {
 
         let options = DriverOptions {
             completion_drain_budget: None,
+            ..DriverOptions::default()
         };
         let mut unbounded =
             Driver::new_with_options(io_uring::IoUring::builder(), 4, options).unwrap();
@@ -3304,6 +3395,7 @@ mod tests {
     fn shutdown_drain_is_exhaustive_past_normal_budget() {
         let options = DriverOptions {
             completion_drain_budget: NonZeroUsize::new(2),
+            ..DriverOptions::default()
         };
         let mut driver =
             Driver::new_with_options(io_uring::IoUring::builder(), 4, options).unwrap();
@@ -3912,7 +4004,7 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::Other);
         let message = err.to_string();
         assert!(
-            message.contains("dropped by the kernel") && message.contains("setup_cqsize"),
+            message.contains("dropped by the kernel") && message.contains("cq_entries"),
             "unexpected message: {message}"
         );
         assert!(
@@ -4752,6 +4844,16 @@ mod tests {
         assert_eq!(Rc::strong_count(&driver.shared), 1);
     }
 
+    /// A driver with the kernel's default CQ, twice the SQ, so tests can
+    /// overflow it quickly.
+    fn small_cq_driver(size: u32) -> Driver {
+        let options = DriverOptions {
+            cq_entries: None,
+            ..DriverOptions::default()
+        };
+        Driver::new_with_options(io_uring::IoUring::builder(), size, options).unwrap()
+    }
+
     /// Fill the kernel CQ ring and push `extra` further completions into the
     /// kernel's overflow list (`IORING_FEAT_NODROP`).
     fn overflow_cq(driver: &Driver, extra: usize) {
@@ -4787,7 +4889,7 @@ mod tests {
 
     impl log::Log for ErrorCapture {
         fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-            metadata.level() <= log::Level::Error
+            metadata.level() <= log::Level::Warn
         }
 
         fn log(&self, record: &log::Record<'_>) {
@@ -4803,7 +4905,7 @@ mod tests {
         static INIT: std::sync::Once = std::sync::Once::new();
         INIT.call_once(|| {
             log::set_logger(&ErrorCapture).expect("no other logger in unit tests");
-            log::set_max_level(log::LevelFilter::Error);
+            log::set_max_level(log::LevelFilter::Warn);
         });
         ERROR_LOGS.with(|logs| logs.borrow_mut().clear());
     }
@@ -4813,9 +4915,111 @@ mod tests {
     }
 
     #[test]
+    fn default_cq_is_larger_than_the_kernel_default() {
+        let cq = |size, cq_entries| {
+            let options = DriverOptions {
+                cq_entries,
+                ..DriverOptions::default()
+            };
+            Driver::new_with_options(io_uring::IoUring::builder(), size, options)
+                .unwrap()
+                .handle()
+                .cq_entries()
+        };
+        assert_eq!(cq(8, DriverOptions::default().cq_entries), 4096);
+        // Never below twice the SQ, the kernel's default.
+        assert_eq!(cq(4096, DriverOptions::default().cq_entries), 8192);
+        assert_eq!(cq(8, NonZeroU32::new(100)), 128);
+        // Capped at the kernel's limit instead of failing.
+        assert_eq!(cq(8, NonZeroU32::new(u32::MAX)), MAX_CQ_ENTRIES);
+        // `None` keeps the builder's setting.
+        assert_eq!(cq(8, None), 16);
+    }
+
+    #[test]
+    fn exceeding_the_cq_with_in_flight_ops_warns_until_they_drain() {
+        capture_error_logs();
+        let mut driver = small_cq_driver(4);
+        let handle = driver.handle();
+        let cq = handle.cq_entries() as usize;
+        driver.shared.in_flight_limiter.interval.set(Duration::ZERO);
+        let waker = futures_test::task::noop_waker();
+        let submit = |count: usize| {
+            let ended: Vec<_> = (0..count)
+                .map(|_| Arc::new(AtomicBool::new(false)))
+                .collect();
+            let mut reads: Vec<_> = ended
+                .iter()
+                .map(|ended| Box::pin(long_lived_read(&handle, ended)))
+                .collect();
+            for read in &mut reads {
+                assert!(read
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending());
+            }
+            (reads, ended)
+        };
+        // A park checks the count before it submits, so park once more after
+        // the reads are all in the kernel.
+        let push_all = |driver: &mut Driver| {
+            for _ in 0..64 {
+                driver.park(ParkMode::NoPark).unwrap();
+                if driver.shared.in_flight() > cq {
+                    driver.park(ParkMode::NoPark).unwrap();
+                    return;
+                }
+            }
+            panic!("the reads never all reached the kernel");
+        };
+        let shared = Rc::clone(&driver.shared);
+        // Drop all but `keep` reads, and park until they and their
+        // cancellations have completed.
+        let drain_to = |driver: &mut Driver, reads: &mut Vec<_>, ended: &mut Vec<_>, keep| {
+            reads.truncate(keep);
+            let dropped: Vec<Arc<AtomicBool>> = ended.split_off(keep);
+            let drained = || {
+                dropped.iter().all(|e| e.load(Ordering::Acquire)) && shared.in_flight() <= keep + 1
+            };
+            assert!(park_until(driver, 100, drained));
+            driver.park(ParkMode::NoPark).unwrap();
+        };
+        let warnings = || captured_error_logs("in_flight.exceeds_cq");
+
+        let (mut reads, mut ended) = submit(cq + 1);
+        push_all(&mut driver);
+        assert_eq!(warnings(), 1);
+        // Staying above the CQ does not warn again.
+        let (more, more_ended) = submit(2);
+        reads.extend(more);
+        ended.extend(more_ended);
+        push_all(&mut driver);
+        assert_eq!(warnings(), 1);
+
+        // Neither does exceeding it again after draining to above half of it.
+        drain_to(&mut driver, &mut reads, &mut ended, cq / 2 + 1);
+        assert!(shared.in_flight() > cq / 2 && shared.in_flight() <= cq);
+        let (more, more_ended) = submit(cq / 2);
+        reads.extend(more);
+        ended.extend(more_ended);
+        push_all(&mut driver);
+        assert_eq!(warnings(), 1);
+
+        // Once the count drains to half the CQ, a new excess warns again.
+        drain_to(&mut driver, &mut reads, &mut ended, 0);
+        assert!(shared.in_flight() <= cq / 2);
+        let (more, more_ended) = submit(cq + 1);
+        reads.extend(more);
+        ended.extend(more_ended);
+        push_all(&mut driver);
+        assert_eq!(warnings(), 2);
+        drop(reads);
+    }
+
+    #[test]
     fn cq_overflow_is_logged_once_per_transition() {
         capture_error_logs();
-        let mut driver = Driver::new(io_uring::IoUring::builder(), 2).unwrap();
+        let mut driver = small_cq_driver(2);
         driver.park(ParkMode::NoPark).unwrap();
         assert_eq!(captured_error_logs("cq.overflow"), 0);
 
@@ -4966,7 +5170,7 @@ mod tests {
     #[test]
     fn cq_overflow_log_is_rate_limited() {
         capture_error_logs();
-        let mut driver = Driver::new(io_uring::IoUring::builder(), 2).unwrap();
+        let mut driver = small_cq_driver(2);
         // The flag rises and clears on every iteration: one transition each.
         for _ in 0..200 {
             overflow_cq(&driver, 1);
@@ -5009,7 +5213,7 @@ mod tests {
             .shared
             .lost_completions_error(io::Error::from_raw_os_error(libc::EBADR));
         assert_eq!(err.kind(), io::ErrorKind::Other);
-        assert!(err.to_string().contains("setup_cqsize"), "{err}");
+        assert!(err.to_string().contains("cq_entries"), "{err}");
         assert!(driver.shared.accounting_broken.get());
         assert_eq!(captured_error_logs("io_uring_enter.ebadr"), 1);
         assert_eq!(
@@ -5069,7 +5273,7 @@ mod tests {
             .park(ParkMode::NextCompletion)
             .expect_err("EBADR from the wait-only enter is fatal");
         assert!(err.to_string().contains("dropped by the kernel"), "{err}");
-        assert!(err.to_string().contains("setup_cqsize"), "{err}");
+        assert!(err.to_string().contains("cq_entries"), "{err}");
         assert!(driver.shared.accounting_broken.get());
         assert_eq!(
             handle.health_error().unwrap().to_string(),
@@ -5115,7 +5319,7 @@ mod tests {
         // kernel to flush the overflow list.
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let mut driver = Driver::new(io_uring::IoUring::builder(), 2).unwrap();
+            let mut driver = small_cq_driver(2);
             // Arm the eventfd read, as any idle park does.
             driver
                 .park(ParkMode::Timeout(Duration::from_millis(1)))
