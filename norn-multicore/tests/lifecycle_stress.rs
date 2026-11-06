@@ -14,8 +14,13 @@
 //! STRESS_SECS=600 nix develop -c cargo test -p norn-multicore --test lifecycle_stress -- --ignored --nocapture
 //! ```
 //!
-//! A failing seed is printed; replay it with `STRESS_SEED=<n>`. Environment
-//! variables:
+//! A failing seed is printed; `STRESS_SEED=<n>` replays the same plan, but
+//! thread and kernel interleavings differ between runs, so loop a seed to
+//! reproduce a race. The harness opens many loopback connections; on a host
+//! with many `TIME_WAIT` sockets, run it in a private network namespace, for
+//! example `unshare -rn bash -c 'ip link set lo up && exec "$@"' _ <command>`.
+//! The summary prints how many SQPOLL rings fell back to regular rings.
+//! Environment variables:
 //!
 //! - `STRESS_SEED=<n>`: run exactly one seed.
 //! - `STRESS_SEED_START=<n>` and `STRESS_SECS=<s>`: run consecutive seeds
@@ -155,9 +160,6 @@ struct Msg {
     seq: u64,
     state: Cell<u8>,
 }
-
-// The cell is only touched by whichever thread currently owns the message.
-unsafe impl Sync for Msg {}
 
 const MSG_INFLIGHT: u8 = 0;
 const MSG_RECEIVED: u8 = 1;
@@ -540,23 +542,39 @@ fn build_park(cfg: RingCfg) -> io::Result<Stack> {
         Ok(norn_timer::Driver::new(uring, norn_timer::Clock::system()))
     };
     match build(cfg) {
-        // SQPOLL can be refused (for example without the needed privileges);
-        // run that worker on a regular ring instead of failing the seed.
-        Err(_) if cfg.sqpoll => build(RingCfg {
-            sqpoll: false,
-            ..cfg
-        }),
+        // SQPOLL can be refused without the needed privileges; run that worker
+        // on a regular ring instead of failing the seed, and count it so a
+        // host that never gets SQPOLL shows up in the summary. Any other error
+        // is a real failure.
+        Err(e)
+            if cfg.sqpoll && matches!(e.raw_os_error(), Some(libc::EPERM) | Some(libc::EACCES)) =>
+        {
+            SQPOLL_FALLBACKS.fetch_add(1, SeqCst);
+            build(RingCfg {
+                sqpoll: false,
+                ..cfg
+            })
+        }
         result => result,
     }
 }
+
+/// Rings that asked for SQPOLL but fell back to a regular ring.
+static SQPOLL_FALLBACKS: AtomicUsize = AtomicUsize::new(0);
 
 /// Whether the kernel supports receive bundles, probed once.
 fn bundles_supported() -> bool {
     static SUPPORTED: OnceLock<bool> = OnceLock::new();
     *SUPPORTED.get_or_init(|| {
-        io_uring::IoUring::new(2)
-            .map(|ring| ring.params().is_feature_recvsend_bundle())
-            .unwrap_or(false)
+        let supported = match io_uring::IoUring::new(2) {
+            Ok(ring) => ring.params().is_feature_recvsend_bundle(),
+            Err(e) => {
+                eprintln!("STRESS bundle probe failed ({e}); bundle coverage is off");
+                false
+            }
+        };
+        eprintln!("STRESS bundles supported: {supported}");
+        supported
     })
 }
 
@@ -1642,7 +1660,6 @@ fn run_seed(seed: u64, timeout: Duration) -> SeedSummary {
     let mut inboxes: Vec<Option<(DetachedInbox, Arc<ChanStats>, InboxFate)>> = Vec::new();
     let mut ext: Vec<ExtProducer> = Vec::new();
     let mut pings = Vec::new();
-    let mut planned_total = 0usize;
     for dst in 0..workers {
         let endpoint = builder.endpoint(WorkerId::new(dst)).unwrap().clone();
         let stats = ChanStats::new(format!("inbox-{dst}"));
@@ -1688,7 +1705,6 @@ fn run_seed(seed: u64, timeout: Duration) -> SeedSummary {
         }
         for (producer, tx) in producers.into_iter().zip(senders) {
             let quota = rng.range(0, 400) as usize;
-            planned_total += quota;
             stats.planned.fetch_add(quota, SeqCst);
             match producer {
                 Some(src) => outboxes[src].push(OutboxPlan {
@@ -1717,7 +1733,6 @@ fn run_seed(seed: u64, timeout: Duration) -> SeedSummary {
             let (ptx, prx) = mpsc::bounded::<Msg>(&endpoint, 1);
             let quota = rng.range(100, 3000) as usize;
             pstats.planned.fetch_add(quota, SeqCst);
-            planned_total += quota;
             ext.push(ExtProducer {
                 tx: Outbox::Plain(ptx),
                 stats: Arc::clone(&pstats),
@@ -1873,7 +1888,6 @@ fn run_seed(seed: u64, timeout: Duration) -> SeedSummary {
         );
     }
 
-    let mut group_given_away = false;
     match builder.start() {
         Err(StartError::Worker(e)) => {
             if !startup_failure {
@@ -1893,11 +1907,24 @@ fn run_seed(seed: u64, timeout: Duration) -> SeedSummary {
                 fail("start succeeded despite a failing park factory");
             }
             trace(format!("group started, outside={outside:?}"));
+            // After an outside join, shutdown or drop returns, every worker
+            // thread must already be gone: thread-local destructors run before
+            // the thread join completes. (An in-worker action detaches its own
+            // worker, so that case is polled below instead.)
+            let workers_gone = |what: &str| {
+                let live = LIVE_WORKERS.load(SeqCst);
+                if live != 0 {
+                    fail(format!(
+                        "{what} returned while {live} workers were still running"
+                    ));
+                }
+            };
             match outside {
                 Outside::NaturalJoin => {
                     if let Err(e) = group.join() {
                         check_join_error("join", &e);
                     }
+                    workers_gone("join");
                 }
                 Outside::ShutdownAfter(d) => {
                     thread::sleep(d);
@@ -1907,12 +1934,14 @@ fn run_seed(seed: u64, timeout: Duration) -> SeedSummary {
                     if let Err(e) = r {
                         check_join_error("shutdown", &e);
                     }
+                    workers_gone("shutdown");
                 }
                 Outside::DropAfter(d) => {
                     thread::sleep(d);
                     let t = Instant::now();
                     drop(group);
                     summary.shutdown_time = Some(t.elapsed());
+                    workers_gone("drop");
                 }
                 Outside::RequestStorm(d) => {
                     thread::sleep(d);
@@ -1932,11 +1961,12 @@ fn run_seed(seed: u64, timeout: Duration) -> SeedSummary {
                     if let Err(e) = r {
                         check_join_error("storm join", &e);
                     }
+                    workers_gone("storm join");
                 }
                 Outside::InWorker { .. } => {
                     let tx = group_tx.take().unwrap();
                     match tx.try_send(group) {
-                        Ok(()) => group_given_away = true,
+                        Ok(()) => {}
                         Err(TrySendError::Closed(g)) | Err(TrySendError::Full(g)) => {
                             trace("group channel refused the group");
                             if let Err(e) = g.shutdown() {
@@ -1955,11 +1985,15 @@ fn run_seed(seed: u64, timeout: Duration) -> SeedSummary {
     // in-worker join, and for external producers to finish.
     let exit_limit = Duration::from_secs(10);
     if !wait_until(exit_limit, || LIVE_WORKERS.load(SeqCst) == 0) {
-        fail(format!(
+        // `LIVE_WORKERS` is process-wide, so a stuck worker would fail every
+        // later seed too. Stop instead of reporting them all.
+        eprintln!(
             "{} worker threads still running after {exit_limit:?}:\n{}",
             LIVE_WORKERS.load(SeqCst),
             dump_threads()
-        ));
+        );
+        eprintln!("STRESS-HANG seed={seed}");
+        std::process::abort();
     }
     if !wait_until(exit_limit, || {
         count_user_threads()
@@ -1979,7 +2013,6 @@ fn run_seed(seed: u64, timeout: Duration) -> SeedSummary {
     if !wait_until(exit_limit, || count_user_threads() <= base_threads) {
         fail(format!("threads leaked:\n{}", dump_threads()));
     }
-    let _ = group_given_away;
     for line in report_rx.try_iter() {
         trace(line);
     }
@@ -2011,7 +2044,6 @@ fn run_seed(seed: u64, timeout: Duration) -> SeedSummary {
             }
         }
     }
-    let _ = planned_total;
     if strict && tcp_done.load(SeqCst) != tcp_expected {
         fail(format!(
             "tcp: {} of {tcp_expected} echo rounds completed",
@@ -2109,7 +2141,8 @@ fn lifecycle_stress() {
         }
     }
     eprintln!(
-        "STRESS-DONE ran={ran} seeds {first}..{seed} failed={failed:?} elapsed={:?}",
+        "STRESS-DONE ran={ran} seeds {first}..{seed} failed={failed:?} sqpoll_fallbacks={} elapsed={:?}",
+        SQPOLL_FALLBACKS.load(SeqCst),
         started.elapsed()
     );
     assert!(failed.is_empty(), "failing seeds: {failed:?}");
