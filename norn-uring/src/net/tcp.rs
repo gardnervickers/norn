@@ -329,7 +329,8 @@ impl TcpListener {
     /// submits the cancellation, which lasts as long as the executor runs
     /// without parking. The listen backlog does not bound this (it may never
     /// hold more than one connection), and the kernel ends an arm only when
-    /// the completion queue is full, at about its size in descriptors. Each
+    /// the completion queue is full (at about its size in descriptors) or
+    /// descriptors run out (`EMFILE`/`ENFILE`, yielded as an error). Each
     /// re-arm after a pause can take the same again. A caller that needs a
     /// hard bound on descriptors should use [`accept`](Self::accept), which
     /// takes one connection per request.
@@ -358,8 +359,9 @@ impl TcpListener {
     /// the whole queue at arm time, and every arrival until the driver next
     /// reaps and submits the cancellation, which lasts as long as the
     /// executor runs without parking. The listen backlog does not bound this,
-    /// and the kernel ends an arm only when the completion queue is full, at
-    /// about its size in descriptors. For a hard bound, use
+    /// and the kernel ends an arm only when the completion queue is full (at
+    /// about its size in descriptors) or descriptors run out. For a hard
+    /// bound, use
     /// [`accept`](Self::accept). Otherwise it behaves like
     /// [`incoming`](Self::incoming).
     pub fn incoming_with_limit(
