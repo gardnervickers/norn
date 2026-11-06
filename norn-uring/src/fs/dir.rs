@@ -1,3 +1,4 @@
+use crate::BufResult;
 use io_uring::{opcode, types};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
@@ -154,7 +155,7 @@ pub async fn metadata<P: AsRef<Path>>(path: P) -> io::Result<libc::statx> {
 /// # Panics
 ///
 /// Panics if called outside an active [`Driver`](crate::Driver) context.
-pub async fn get_xattr<P, N, B>(path: P, name: N, buf: B) -> (io::Result<usize>, B)
+pub async fn get_xattr<P, N, B>(path: P, name: N, buf: B) -> BufResult<usize, B>
 where
     P: AsRef<Path>,
     N: AsRef<[u8]>,
@@ -164,7 +165,7 @@ where
     let handle = Handle::current();
     let op = match PathGetXattr::new(&path, name.as_ref(), buf) {
         Ok(op) => op,
-        Err((err, buf)) => return (Err(err), buf),
+        Err((err, buf)) => return BufResult(Err(err), buf),
     };
     handle.submit(op).await
 }
@@ -174,7 +175,7 @@ where
 /// # Panics
 ///
 /// Panics if called outside an active [`Driver`](crate::Driver) context.
-pub async fn set_xattr<P, N, B>(path: P, name: N, value: B, flags: i32) -> (io::Result<()>, B)
+pub async fn set_xattr<P, N, B>(path: P, name: N, value: B, flags: i32) -> BufResult<(), B>
 where
     P: AsRef<Path>,
     N: AsRef<[u8]>,
@@ -184,7 +185,7 @@ where
     let handle = Handle::current();
     let op = match PathSetXattr::new(&path, name.as_ref(), value, flags) {
         Ok(op) => op,
-        Err((err, value)) => return (Err(err), value),
+        Err((err, value)) => return BufResult(Err(err), value),
     };
     handle.submit(op).await
 }
@@ -510,15 +511,15 @@ impl<B> Singleshot for PathGetXattr<B>
 where
     B: crate::buf::StableBufMut,
 {
-    type Output = (io::Result<usize>, B);
+    type Output = BufResult<usize, B>;
 
     fn complete(mut self, result: crate::operation::CQEResult) -> Self::Output {
         match result.result {
-            Ok(n) => (
+            Ok(n) => BufResult(
                 super::complete_get_xattr(&mut self.buf, self.len, n),
                 self.buf,
             ),
-            Err(err) => (Err(err), self.buf),
+            Err(err) => BufResult(Err(err), self.buf),
         }
     }
 }
@@ -584,10 +585,10 @@ impl<B> Singleshot for PathSetXattr<B>
 where
     B: crate::buf::StableBuf,
 {
-    type Output = (io::Result<()>, B);
+    type Output = BufResult<(), B>;
 
     fn complete(self, result: crate::operation::CQEResult) -> Self::Output {
-        (result.result.map(|_| ()), self.value)
+        BufResult(result.result.map(|_| ()), self.value)
     }
 }
 

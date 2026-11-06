@@ -8,6 +8,7 @@ use std::rc::Rc;
 
 use norn_uring::fixedbuf::{AcquireError, FixedBufTable, FixedBuffer, SlotErrorKind};
 use norn_uring::fs;
+use norn_uring::BufResult;
 
 mod util;
 
@@ -29,7 +30,7 @@ fn sparse_fixed_buffer_slots_are_replaced_in_the_kernel() -> Result<(), Box<dyn 
         // An unpolled operation already owns the slot.
         let err = table.replace(0, vec![0u8; 8]).unwrap_err();
         assert!(matches!(err.kind(), SlotErrorKind::InUse { index: 0 }));
-        let (result, buffer) = op.await;
+        let BufResult(result, buffer) = op.await;
         assert_eq!(result?, 26);
         assert_eq!(&*buffer, b"kernel-visible replacement");
         drop(buffer);
@@ -38,7 +39,7 @@ fn sparse_fixed_buffer_slots_are_replaced_in_the_kernel() -> Result<(), Box<dyn 
         // now describes the replacement region; the old one would be EFAULT.
         let previous = table.replace(0, vec![0u8; 8])?;
         assert_eq!(&previous[..26], b"kernel-visible replacement");
-        let (result, buffer) = file.read_fixed_at(table.try_acquire_at(0)?, 0).await;
+        let BufResult(result, buffer) = file.read_fixed_at(table.try_acquire_at(0)?, 0).await;
         assert_eq!(result?, 8);
         assert_eq!(&*buffer, b"kernel-v");
         drop(buffer);
@@ -46,7 +47,7 @@ fn sparse_fixed_buffer_slots_are_replaced_in_the_kernel() -> Result<(), Box<dyn 
         table.install(1, b"SPARSE".to_vec())?;
         let mut buffer = table.try_acquire_at(1)?;
         buffer.set_len(6)?;
-        let (result, buffer) = file.write_fixed_at(buffer, 0).await;
+        let BufResult(result, buffer) = file.write_fixed_at(buffer, 0).await;
         assert_eq!(result?, 6);
         drop(buffer);
         assert_eq!(&std::fs::read(&path)?[..8], b"SPARSE-v");
@@ -78,7 +79,7 @@ fn dense_table_slots_can_be_replaced_and_removed() -> Result<(), Box<dyn std::er
 
         let previous = table.replace(0, vec![0u8; 5])?;
         assert_eq!(previous.len(), 32);
-        let (result, buffer) = file.read_fixed_at(table.try_acquire_at(0)?, 0).await;
+        let BufResult(result, buffer) = file.read_fixed_at(table.try_acquire_at(0)?, 0).await;
         assert_eq!(result?, 5);
         assert_eq!(&*buffer, b"dense");
         drop(buffer);
@@ -89,7 +90,7 @@ fn dense_table_slots_can_be_replaced_and_removed() -> Result<(), Box<dyn std::er
             AcquireError::Vacant { index: 1 }
         );
         table.install(1, vec![0u8; 4])?;
-        let (result, buffer) = file.read_fixed_at(table.try_acquire_at(1)?, 6).await;
+        let BufResult(result, buffer) = file.read_fixed_at(table.try_acquire_at(1)?, 6).await;
         assert_eq!(result?, 4);
         assert_eq!(&*buffer, b"tabl");
         drop(buffer);
@@ -218,7 +219,7 @@ fn reentrant_install_into_a_projecting_slot_is_rejected() -> Result<(), Box<dyn 
 
         // The slot is still usable, and the kernel describes the new value.
         table.install(0, Box::new(vec![0u8; 64]) as DynBuffer)?;
-        let (result, buffer) = file.read_fixed_at(table.try_acquire_at(0)?, 0).await;
+        let BufResult(result, buffer) = file.read_fixed_at(table.try_acquire_at(0)?, 0).await;
         assert_eq!(result?, 64);
         assert_eq!(&*buffer, &[0xEEu8; 64][..]);
         drop(buffer);
@@ -274,7 +275,7 @@ fn reentrant_remove_of_a_replacing_slot_is_rejected() -> Result<(), Box<dyn std:
         );
         assert!(table.is_installed(0));
 
-        let (result, buffer) = file.read_fixed_at(table.try_acquire()?, 0).await;
+        let BufResult(result, buffer) = file.read_fixed_at(table.try_acquire()?, 0).await;
         assert_eq!(result?, 11);
         assert_eq!(&*buffer, b"replacement");
         assert_eq!(table.try_acquire().unwrap_err(), AcquireError::Exhausted);

@@ -32,6 +32,7 @@
 //! `STRESS_TRACE_SEND`, `STRESS_VERBOSE`.
 #![cfg(target_os = "linux")]
 
+use norn_uring::BufResult;
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::future::Future;
@@ -915,7 +916,7 @@ async fn file_actor(ctx: Rc<Ctx>, mut rng: Rng, id: usize) {
         Err(e) => return ctx.fail(format!("file actor {id}: open {e}")),
     };
     // Preallocate so every in-range read has a fully known model.
-    let (r, _) = file
+    let BufResult(r, _) = file
         .write_at(TrackedBuf::from_vec(vec![0; FILE_SIZE]), 0)
         .await;
     match r {
@@ -968,7 +969,7 @@ async fn file_actor(ctx: Rc<Ctx>, mut rng: Rng, id: usize) {
         futures_util::future::join_all(futs).await;
     }
     // Final full verification.
-    let (r, buf) = file.read_at(TrackedBuf::with_capacity(FILE_SIZE), 0).await;
+    let BufResult(r, buf) = file.read_at(TrackedBuf::with_capacity(FILE_SIZE), 0).await;
     match r {
         Ok(n) if n == FILE_SIZE => {
             model
@@ -1017,12 +1018,12 @@ async fn file_one_op(
         0 | 1 => {
             let data = rng.bytes(len);
             match maybe_timeout!(file.write_at(TrackedBuf::from_vec(data.clone()), off as u64)) {
-                Some((Ok(n), _)) if n == len => model.borrow_mut().set(off, &data),
-                Some((Ok(n), _)) => {
+                Some(BufResult(Ok(n), _)) if n == len => model.borrow_mut().set(off, &data),
+                Some(BufResult(Ok(n), _)) => {
                     model.borrow_mut().forget(off, len);
                     ctx.fail(format!("{what}: short write {n}"));
                 }
-                Some((Err(e), _)) => {
+                Some(BufResult(Err(e), _)) => {
                     model.borrow_mut().forget(off, len);
                     file_op_error(ctx, &what, &e);
                 }
@@ -1034,7 +1035,7 @@ async fn file_one_op(
             }
         }
         2 | 3 => match maybe_timeout!(file.read_at(TrackedBuf::with_capacity(len), off as u64)) {
-            Some((Ok(n), buf)) => {
+            Some(BufResult(Ok(n), buf)) => {
                 if n != len || buf.0.len() != n {
                     ctx.fail(format!("{what}: short read {n} buf {}", buf.0.len()));
                 }
@@ -1042,7 +1043,7 @@ async fn file_one_op(
                     .borrow()
                     .check(ctx, &what, off, &buf.0[..n.min(buf.0.len())]);
             }
-            Some((Err(e), _)) => file_op_error(ctx, &what, &e),
+            Some(BufResult(Err(e), _)) => file_op_error(ctx, &what, &e),
             None => {}
         },
         4 => {
@@ -1060,12 +1061,12 @@ async fn file_one_op(
                 start = end;
             }
             match Chaos::new(file.writev_at(bufs, off as u64), plan).await {
-                Some((Ok(n), _)) if n == len => model.borrow_mut().set(off, &data),
-                Some((Ok(n), _)) => {
+                Some(BufResult(Ok(n), _)) if n == len => model.borrow_mut().set(off, &data),
+                Some(BufResult(Ok(n), _)) => {
                     model.borrow_mut().forget(off, len);
                     ctx.fail(format!("{what}: short writev {n}"));
                 }
-                Some((Err(e), _)) => {
+                Some(BufResult(Err(e), _)) => {
                     model.borrow_mut().forget(off, len);
                     file_op_error(ctx, &what, &e);
                 }
@@ -1094,14 +1095,14 @@ async fn file_one_op(
                 .map(|s| TrackedBuf::with_capacity(*s))
                 .collect();
             match Chaos::new(file.readv_at(bufs, off as u64), plan).await {
-                Some((Ok(n), bufs)) => {
+                Some(BufResult(Ok(n), bufs)) => {
                     let data: Vec<u8> = bufs.iter().flat_map(|b| b.0.iter().copied()).collect();
                     if n != len || data.len() != n {
                         ctx.fail(format!("{what}: short readv {n} data {}", data.len()));
                     }
                     model.borrow().check(ctx, &what, off, &data);
                 }
-                Some((Err(e), _)) => file_op_error(ctx, &what, &e),
+                Some(BufResult(Err(e), _)) => file_op_error(ctx, &what, &e),
                 None => {}
             }
         }
@@ -1112,7 +1113,7 @@ async fn file_one_op(
                 .write_at(TrackedBuf::from_vec(data.clone()), off as u64)
                 .then(file.read_at(TrackedBuf::with_capacity(len), off as u64));
             match maybe_timeout!(req) {
-                Some(((Ok(w), _), (Ok(r), rbuf))) => {
+                Some((BufResult(Ok(w), _), BufResult(Ok(r), rbuf))) => {
                     if w != len || r != len {
                         ctx.fail(format!("{what}: linked short w={w} r={r}"));
                         model.borrow_mut().forget(off, len);
@@ -1123,7 +1124,7 @@ async fn file_one_op(
                         model.borrow_mut().set(off, &data);
                     }
                 }
-                Some(((w, _), (r, _))) => {
+                Some((BufResult(w, _), BufResult(r, _))) => {
                     model.borrow_mut().forget(off, len);
                     for e in [w.err(), r.err()].into_iter().flatten() {
                         file_op_error(ctx, &format!("{what} linked"), &e);
@@ -1149,12 +1150,12 @@ async fn file_one_op(
                 let wlen = data.len();
                 fb.set_payload(&data).unwrap();
                 match maybe_timeout!(file.write_fixed_at(fb, off as u64)) {
-                    Some((Ok(n), _)) if n == wlen => model.borrow_mut().set(off, &data),
-                    Some((Ok(n), _)) => {
+                    Some(BufResult(Ok(n), _)) if n == wlen => model.borrow_mut().set(off, &data),
+                    Some(BufResult(Ok(n), _)) => {
                         model.borrow_mut().forget(off, wlen);
                         ctx.fail(format!("{what}: short fixed write {n}"));
                     }
-                    Some((Err(e), _)) => {
+                    Some(BufResult(Err(e), _)) => {
                         model.borrow_mut().forget(off, wlen);
                         file_op_error(ctx, &what, &e);
                     }
@@ -1168,13 +1169,13 @@ async fn file_one_op(
                 let rlen = len.min(fb.capacity());
                 fb.set_range(0..rlen).unwrap();
                 match maybe_timeout!(file.read_fixed_at(fb, off as u64)) {
-                    Some((Ok(n), fb)) => {
+                    Some(BufResult(Ok(n), fb)) => {
                         if n != rlen || fb.len() != n {
                             ctx.fail(format!("{what}: short fixed read {n} len {}", fb.len()));
                         }
                         model.borrow().check(ctx, &what, off, fb.as_slice());
                     }
-                    Some((Err(e), _)) => file_op_error(ctx, &what, &e),
+                    Some(BufResult(Err(e), _)) => file_op_error(ctx, &what, &e),
                     None => {}
                 }
             }
@@ -1224,9 +1225,9 @@ async fn pipe_actor(ctx: Rc<Ctx>, mut rng: Rng, id: usize) {
             };
             let buf = TrackedBuf::from_vec(fill_pattern(stream, pos, len));
             match Chaos::new(writer.write_at(buf, 0), plan).await {
-                Some((Ok(n), _)) => pos += n as u64,
-                Some((Err(e), _)) if e.raw_os_error() == Some(libc::EPIPE) => break,
-                Some((Err(e), _)) => {
+                Some(BufResult(Ok(n), _)) => pos += n as u64,
+                Some(BufResult(Err(e), _)) if e.raw_os_error() == Some(libc::EPIPE) => break,
+                Some(BufResult(Err(e), _)) => {
                     wctx.fail(format!("pipe actor {id}: write {e}"));
                     break;
                 }
@@ -1262,8 +1263,8 @@ async fn pipe_actor(ctx: Rc<Ctx>, mut rng: Rng, id: usize) {
             rng.drop_plan(0.3)
         };
         match Chaos::new(reader.read_at(TrackedBuf::with_capacity(len), 0), plan).await {
-            Some((Ok(0), _)) => break,
-            Some((Ok(n), buf)) => {
+            Some(BufResult(Ok(0), _)) => break,
+            Some(BufResult(Ok(n), buf)) => {
                 if !tainted.get() {
                     let expected = fill_pattern(stream, pos, n);
                     if buf.0[..n] != expected[..] {
@@ -1275,7 +1276,7 @@ async fn pipe_actor(ctx: Rc<Ctx>, mut rng: Rng, id: usize) {
                 }
                 pos += n as u64;
             }
-            Some((Err(e), _)) => {
+            Some(BufResult(Err(e), _)) => {
                 ctx.fail(format!("pipe actor {id}: read {e}"));
                 break;
             }
@@ -1517,9 +1518,9 @@ async fn tcp_receive(
                 let len = rng.usize(1, 32 * 1024);
                 let p = plan(&mut rng);
                 match Chaos::new(sock.recv(TrackedBuf::with_capacity(len)), p).await {
-                    Some((Ok(0), _)) => break,
-                    Some((Ok(n), buf)) => rx.check(&buf.0[..n]),
-                    Some((Err(e), _)) => {
+                    Some(BufResult(Ok(0), _)) => break,
+                    Some(BufResult(Ok(n), buf)) => rx.check(&buf.0[..n]),
+                    Some(BufResult(Err(e), _)) => {
                         if rx.error("recv", &e) {
                             break;
                         }
@@ -1813,7 +1814,7 @@ async fn tcp_echo_actor(ctx: Rc<Ctx>, mut rng: Rng, id: usize) {
                 Chaos::new(
                     boxed(
                         sock.send_zc(buf)
-                            .map(|(r, b)| (r.map(|z| z.bytes_sent()), b))
+                            .map(|res| res.map(|z| z.bytes_sent()))
                             .timeout(d),
                     ),
                     plan,
@@ -1824,10 +1825,7 @@ async fn tcp_echo_actor(ctx: Rc<Ctx>, mut rng: Rng, id: usize) {
             }
         } else if zc {
             Chaos::new(
-                boxed(
-                    sock.send_zc(buf)
-                        .map(|(r, b)| (r.map(|z| z.bytes_sent()), b)),
-                ),
+                boxed(sock.send_zc(buf).map(|res| res.map(|z| z.bytes_sent()))),
                 plan,
             )
             .await
@@ -1842,8 +1840,8 @@ async fn tcp_echo_actor(ctx: Rc<Ctx>, mut rng: Rng, id: usize) {
             );
         }
         match res {
-            Some((Ok(n), _)) => pos += n as u64,
-            Some((Err(e), _)) => {
+            Some(BufResult(Ok(n), _)) => pos += n as u64,
+            Some(BufResult(Err(e), _)) => {
                 if e.raw_os_error() == Some(libc::ECANCELED) {
                     send_tainted = true;
                     shared_taint.set(true);
@@ -2104,8 +2102,8 @@ async fn udp_actor(ctx: Rc<Ctx>, mut rng: Rng, id: usize) {
             let d = make_dgram(actor_tag, seq, len);
             let plan = srng.drop_plan(0.1);
             match Chaos::new(stx.send_to(TrackedBuf::from_vec(d), rx_addr), plan).await {
-                Some((Ok(_), _)) | None => {}
-                Some((Err(e), _)) => {
+                Some(BufResult(Ok(_), _)) | None => {}
+                Some(BufResult(Err(e), _)) => {
                     if env_error(&e) {
                         sctx.env(format!("udp actor {id}: send_to {e}"));
                     } else if !benign_net_error(&e) {
@@ -2145,14 +2143,14 @@ async fn udp_actor(ctx: Rc<Ctx>, mut rng: Rng, id: usize) {
                 UdpMode::RecvFrom => {
                     let fut = rx.recv_from(TrackedBuf::with_capacity(2048));
                     match race(Chaos::new(fut, plan), sleep(quiet)).await {
-                        Either::Left(Some((Ok((n, addr)), buf))) => {
+                        Either::Left(Some(BufResult(Ok((n, addr)), buf))) => {
                             if addr != tx_addr {
                                 ctx.fail(format!("udp actor {id}: source {addr} != {tx_addr}"));
                             }
                             record(&buf.0[..n], &mut seen);
                             true
                         }
-                        Either::Left(Some((Err(e), _))) => {
+                        Either::Left(Some(BufResult(Err(e), _))) => {
                             if !benign_net_error(&e) {
                                 ctx.fail(format!("udp actor {id}: recv_from {e}"));
                             }

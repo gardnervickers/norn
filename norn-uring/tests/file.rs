@@ -4,6 +4,7 @@ use bytes::{Bytes, BytesMut};
 use futures_core::Future;
 use futures_util::future::poll_fn;
 use norn_uring::fixedbuf::{AcquireError, FixedBuffer, RegisterErrorKind, UnregisterErrorKind};
+use norn_uring::BufResult;
 use norn_uring::{fs, Request, WithOptions};
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
@@ -117,7 +118,7 @@ fn file_round_trips_through_uring_fd() -> Result<(), Box<dyn std::error::Error>>
         let file = opts.open(path).await?;
         let fd = file.into_uring_fd();
         let file = fs::File::from_uring_fd(fd);
-        let (result, buffer) = file.write_at(b"round-trip".to_vec(), 0).await;
+        let BufResult(result, buffer) = file.write_at(b"round-trip".to_vec(), 0).await;
         assert_eq!(result?, buffer.len());
         file.close().await?;
         Ok(())
@@ -154,12 +155,10 @@ fn read_write() -> Result<(), Box<dyn std::error::Error>> {
 
         let file = opts.open(path).await?;
         let buf = b"hello world";
-        let (res, _) = file.write_at(&buf[..], 0).await;
-        let n = res?;
+        let (n, _) = file.write_at(&buf[..], 0).await.buf_ok()?;
         assert_eq!(n, buf.len());
         let buf = vec![0; buf.len()];
-        let (res, buf) = file.read_at(buf, 0).await;
-        let n = res?;
+        let (n, buf) = file.read_at(buf, 0).await.buf_ok()?;
         assert_eq!(n, buf.len());
         assert_eq!(buf, b"hello world");
         Ok(())
@@ -180,28 +179,28 @@ fn positional_ops_reject_offsets_above_i64_max() -> Result<(), Box<dyn std::erro
         let file = opts.open(&path).await?;
 
         for offset in [u64::MAX, i64::MAX as u64 + 1] {
-            let (result, buf) = file.write_at(&b"XY"[..], offset).await;
+            let BufResult(result, buf) = file.write_at(&b"XY"[..], offset).await;
             assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
             assert_eq!(buf, b"XY");
 
-            let (result, buf) = file.read_at(vec![0_u8; 4], offset).await;
+            let BufResult(result, buf) = file.read_at(vec![0_u8; 4], offset).await;
             assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
             assert_eq!(buf, [0_u8; 4]);
 
-            let (result, bufs) = file.writev_at(vec![b"XY".to_vec()], offset).await;
+            let BufResult(result, bufs) = file.writev_at(vec![b"XY".to_vec()], offset).await;
             assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
             assert_eq!(bufs, [b"XY".to_vec()]);
 
-            let (result, bufs) = file.readv_at(vec![vec![0_u8; 4]], offset).await;
+            let BufResult(result, bufs) = file.readv_at(vec![vec![0_u8; 4]], offset).await;
             assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
             assert_eq!(bufs, [vec![0_u8; 4]]);
 
             let pool = norn_uring::Handle::current()
                 .register_fixed_buffers(vec![b"fixed payload".to_vec()])?;
-            let (result, buf) = file.write_fixed_at(pool.try_acquire()?, offset).await;
+            let BufResult(result, buf) = file.write_fixed_at(pool.try_acquire()?, offset).await;
             assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
             assert_eq!(&*buf, b"fixed payload");
-            let (result, buf) = file.read_fixed_at(buf, offset).await;
+            let BufResult(result, buf) = file.read_fixed_at(buf, offset).await;
             assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
             assert_eq!(&*buf, b"fixed payload");
             drop(buf);
@@ -242,13 +241,13 @@ fn fixed_buffers_support_custom_inline_storage() -> Result<(), Box<dyn std::erro
         write_buf.set_range(0..payload.len())?;
         write_buf.as_full_slice_mut().copy_from_slice(payload);
         write_buf.set_len(payload.len())?;
-        let (result, write_buf) = file.write_fixed_at(write_buf, 0).await;
+        let BufResult(result, write_buf) = file.write_fixed_at(write_buf, 0).await;
         assert_eq!(result?, payload.len());
         drop(write_buf);
 
         let mut read_buf = pool.try_acquire()?;
         read_buf.set_range(0..payload.len())?;
-        let (result, read_buf) = file.read_fixed_at(read_buf, 0).await;
+        let BufResult(result, read_buf) = file.read_fixed_at(read_buf, 0).await;
         assert_eq!(result?, payload.len());
         assert_eq!(read_buf.len(), payload.len());
         assert_eq!(&*read_buf, payload);
@@ -273,12 +272,12 @@ fn fixed_buffer_range_and_logical_len_bound_the_io() -> Result<(), Box<dyn std::
         let mut buffer = pool.try_acquire()?;
         buffer.set_range(8..24)?;
         buffer.set_payload(b"hello")?;
-        let (result, mut buffer) = file.write_fixed_at(buffer, 0).await;
+        let BufResult(result, mut buffer) = file.write_fixed_at(buffer, 0).await;
         assert_eq!(result?, 5);
         assert_eq!(std::fs::read(&path)?, b"hello");
 
         buffer.set_range(12..20)?;
-        let (result, buffer) = file.read_fixed_at(buffer, 0).await;
+        let BufResult(result, buffer) = file.read_fixed_at(buffer, 0).await;
         assert_eq!(result?, 5);
         assert_eq!(buffer.range(), 12..20);
         assert_eq!(&*buffer, b"hello");
@@ -312,7 +311,7 @@ fn fixed_buffers_support_heterogeneous_and_projected_types(
         let pool = handle.register_fixed_buffers(buffers)?;
         let mut erased = pool.try_acquire_at(0)?;
         erased.set_payload(b"erased")?;
-        let (result, erased) = file.write_fixed_at(erased, 0).await;
+        let BufResult(result, erased) = file.write_fixed_at(erased, 0).await;
         assert_eq!(result?, 6);
         drop(erased);
         let acquired = (1..pool.len())
@@ -334,7 +333,7 @@ fn fixed_buffers_support_heterogeneous_and_projected_types(
         let mut projected = pool.try_acquire()?;
         projected.set_range(8..32)?;
         projected.set_payload(b"foreign")?;
-        let (result, projected) = file.write_fixed_at(projected, 16).await;
+        let BufResult(result, projected) = file.write_fixed_at(projected, 16).await;
         assert_eq!(result?, 7);
         drop(projected);
         let recovered = pool.unregister()?;
@@ -402,7 +401,7 @@ fn fixed_read_error_preserves_payload_and_unpolled_op_holds_slot(
 
         drop(op);
         let buffer = pool.try_acquire_at(0)?;
-        let (result, buffer) = file.read_fixed_at(buffer, 0).await;
+        let BufResult(result, buffer) = file.read_fixed_at(buffer, 0).await;
         assert!(result.is_err());
         assert_eq!(&*buffer, b"existing payload");
         drop(buffer);
@@ -467,8 +466,7 @@ fn fixed_operations_reject_another_driver_but_ordinary_io_composes(
     assert!(panic.is_err());
 
     let ordinary = pool.try_acquire_at(0)?;
-    let (result, ordinary) = left_executor.block_on(file.read_at(ordinary, 0));
-    let n = result?;
+    let (n, ordinary) = left_executor.block_on(file.read_at(ordinary, 0)).buf_ok()?;
     assert_eq!(&ordinary[..n], b"cross-driver ordinary read");
     drop(ordinary);
 
@@ -489,12 +487,11 @@ fn readv_writev() -> Result<(), Box<dyn std::error::Error>> {
 
         let file = opts.open(path).await?;
         let bufs = vec![Bytes::from_static(b"hello "), Bytes::from_static(b"world")];
-        let (res, _) = file.writev_at(bufs, 0).await;
+        let BufResult(res, _) = file.writev_at(bufs, 0).await;
         assert_eq!(res?, 11);
 
         let bufs = vec![vec![0u8; 8], vec![0u8; 8]];
-        let (res, bufs) = file.readv_at(bufs, 0).await;
-        let n = res?;
+        let (n, bufs) = file.readv_at(bufs, 0).await.buf_ok()?;
         assert_eq!(n, 11);
         assert_eq!(bufs[0], b"hello wo");
         assert_eq!(bufs[1], b"rld");
@@ -513,7 +510,7 @@ fn read_write_options_round_trip() -> Result<(), Box<dyn std::error::Error>> {
         let file = opts.open(&path).await?;
 
         let dsync = fs::WriteOptions::new().dsync(true);
-        let (res, _) = file.write_at(&b"hello "[..], 0).options(dsync).await;
+        let BufResult(res, _) = file.write_at(&b"hello "[..], 0).options(dsync).await;
         assert_eq!(res?, 6);
 
         let sync = fs::WriteOptions::new().sync(true);
@@ -521,7 +518,7 @@ fn read_write_options_round_trip() -> Result<(), Box<dyn std::error::Error>> {
             Bytes::from_static(b"vectored "),
             Bytes::from_static(b"and "),
         ];
-        let (res, _) = file.writev_at(bufs, 6).options(sync).await;
+        let BufResult(res, _) = file.writev_at(bufs, 6).options(sync).await;
         assert_eq!(res?, 13);
 
         // Regular files ignore write streams, so a placement hint never
@@ -532,23 +529,23 @@ fn read_write_options_round_trip() -> Result<(), Box<dyn std::error::Error>> {
         let stream = fs::WriteOptions::new()
             .dsync(true)
             .stream(fs::WriteStream::new(1));
-        let (res, mut buffer) = file.write_fixed_at(buffer, 19).options(stream).await;
+        let BufResult(res, mut buffer) = file.write_fixed_at(buffer, 19).options(stream).await;
         assert_eq!(res?, 5);
         assert_eq!(std::fs::read(&path)?, b"hello vectored and fixed");
 
         let read_opts = fs::ReadOptions::new();
-        let (res, buf) = file.read_at(vec![0u8; 5], 0).options(read_opts).await;
+        let BufResult(res, buf) = file.read_at(vec![0u8; 5], 0).options(read_opts).await;
         assert_eq!(res?, 5);
         assert_eq!(buf, b"hello");
 
         let bufs = vec![vec![0u8; 9], vec![0u8; 4]];
-        let (res, bufs) = file.readv_at(bufs, 6).options(read_opts).await;
+        let BufResult(res, bufs) = file.readv_at(bufs, 6).options(read_opts).await;
         assert_eq!(res?, 13);
         assert_eq!(bufs[0], b"vectored ");
         assert_eq!(bufs[1], b"and ");
 
         buffer.clear();
-        let (res, buffer) = file.read_fixed_at(buffer, 19).options(read_opts).await;
+        let BufResult(res, buffer) = file.read_fixed_at(buffer, 19).options(read_opts).await;
         assert_eq!(res?, 5);
         assert_eq!(buffer.as_slice(), b"fixed");
         drop(buffer);
@@ -588,7 +585,7 @@ fn nowait_read_of_an_empty_pipe_fails_instead_of_waiting() -> Result<(), Box<dyn
 
         // The timeout only keeps a read that ignored the flag from hanging the
         // test; it cancels such a read, which then fails with `ECANCELED`.
-        let (res, buf) = reader
+        let BufResult(res, buf) = reader
             .read_at(vec![7u8; 4], 0)
             .options(nowait)
             .timeout(Duration::from_secs(5))
@@ -598,14 +595,14 @@ fn nowait_read_of_an_empty_pipe_fails_instead_of_waiting() -> Result<(), Box<dyn
 
         let mut read = std::pin::pin!(reader.read_at(vec![0u8; 4], 0));
         assert!(poll_fn(|cx| Poll::Ready(read.as_mut().poll(cx).is_pending())).await);
-        writer.write_at(&b"data"[..], 0).await.0?;
-        let (res, buf) = read.await;
+        writer.write_at(&b"data"[..], 0).await.drop_buf()?;
+        let BufResult(res, buf) = read.await;
         assert_eq!(res?, 4);
         assert_eq!(buf, b"data");
 
         // With data waiting in the pipe, the flag does not fail the read.
-        writer.write_at(&b"more"[..], 0).await.0?;
-        let (res, buf) = reader.read_at(vec![0u8; 4], 0).options(nowait).await;
+        writer.write_at(&b"more"[..], 0).await.drop_buf()?;
+        let BufResult(res, buf) = reader.read_at(vec![0u8; 4], 0).options(nowait).await;
         assert_eq!(res?, 4);
         assert_eq!(buf, b"more");
 
@@ -626,38 +623,38 @@ fn unsupported_rw_flags_fail_without_losing_buffers() -> Result<(), Box<dyn std:
         let file = opts.open("/dev/null").await?;
 
         let read_opts = fs::ReadOptions::new().dontcache(true);
-        let (res, buf) = file.read_at(vec![1u8; 4], 0).options(read_opts).await;
+        let BufResult(res, buf) = file.read_at(vec![1u8; 4], 0).options(read_opts).await;
         assert_eq!(res.unwrap_err().raw_os_error(), Some(libc::EOPNOTSUPP));
         assert_eq!(buf, [1u8; 4]);
 
         let bufs = vec![vec![1u8; 2]];
-        let (res, bufs) = file.readv_at(bufs, 0).options(read_opts).await;
+        let BufResult(res, bufs) = file.readv_at(bufs, 0).options(read_opts).await;
         assert_eq!(res.unwrap_err().raw_os_error(), Some(libc::EOPNOTSUPP));
         assert_eq!(bufs, [vec![1u8; 2]]);
 
         let write_opts = fs::WriteOptions::new().dontcache(true);
-        let (res, buf) = file.write_at(vec![2u8; 4], 0).options(write_opts).await;
+        let BufResult(res, buf) = file.write_at(vec![2u8; 4], 0).options(write_opts).await;
         assert_eq!(res.unwrap_err().raw_os_error(), Some(libc::EOPNOTSUPP));
         assert_eq!(buf, [2u8; 4]);
 
         let bufs = vec![vec![3u8; 2]];
-        let (res, bufs) = file.writev_at(bufs, 0).options(write_opts).await;
+        let BufResult(res, bufs) = file.writev_at(bufs, 0).options(write_opts).await;
         assert_eq!(res.unwrap_err().raw_os_error(), Some(libc::EOPNOTSUPP));
         assert_eq!(bufs, [vec![3u8; 2]]);
 
         let table = norn_uring::Handle::current().register_fixed_buffers(vec![[4u8; 4]])?;
         let mut buffer = table.try_acquire()?;
         buffer.set_payload(&[4u8; 4])?;
-        let (res, buffer) = file.write_fixed_at(buffer, 0).options(write_opts).await;
+        let BufResult(res, buffer) = file.write_fixed_at(buffer, 0).options(write_opts).await;
         assert_eq!(res.unwrap_err().raw_os_error(), Some(libc::EOPNOTSUPP));
-        let (res, buffer) = file.read_fixed_at(buffer, 0).options(read_opts).await;
+        let BufResult(res, buffer) = file.read_fixed_at(buffer, 0).options(read_opts).await;
         assert_eq!(res.unwrap_err().raw_os_error(), Some(libc::EOPNOTSUPP));
         assert_eq!(buffer.as_slice(), [4u8; 4]);
         drop(buffer);
         assert_eq!(table.unregister()?.len(), 1);
 
         // Default options submit the plain request, which `/dev/null` accepts.
-        let (res, _) = file
+        let BufResult(res, _) = file
             .write_at(vec![5u8; 4], 0)
             .options(fs::WriteOptions::new())
             .await;
@@ -679,13 +676,12 @@ fn set_len() -> Result<(), Box<dyn std::error::Error>> {
         let file = opts.open(&path).await?;
 
         let initial = b"hello world";
-        file.write_at(&initial[..], 0).await.0?;
+        file.write_at(&initial[..], 0).await.drop_buf()?;
 
         file.set_len(5).await?;
         assert_eq!(std::fs::metadata(&path)?.len(), 5);
 
-        let (res, buf) = file.read_at(vec![0; 16], 0).await;
-        let n = res?;
+        let (n, buf) = file.read_at(vec![0; 16], 0).await.buf_ok()?;
         assert_eq!(n, 5);
         assert_eq!(&buf[..n], b"hello");
 
@@ -708,7 +704,7 @@ fn path_and_metadata_ops() -> Result<(), Box<dyn std::error::Error>> {
         let mut opts = fs::OpenOptions::new();
         opts.create(true).write(true);
         let file = opts.open(&original).await?;
-        file.write_at(&b"abc"[..], 0).await.0?;
+        file.write_at(&b"abc"[..], 0).await.drop_buf()?;
         file.close().await?;
 
         match fs::rename(&original, &renamed).await {
@@ -834,7 +830,7 @@ fn advise_and_xattr_ops() -> Result<(), Box<dyn std::error::Error>> {
         opts.create(true).write(true).read(true);
 
         let file = opts.open(&path).await?;
-        file.write_at(&b"payload"[..], 0).await.0?;
+        file.write_at(&b"payload"[..], 0).await.drop_buf()?;
         file.advise(0, 0, libc::POSIX_FADV_SEQUENTIAL).await?;
         file.advise(0, u64::from(u32::MAX), libc::POSIX_FADV_WILLNEED)
             .await?;
@@ -847,14 +843,14 @@ fn advise_and_xattr_ops() -> Result<(), Box<dyn std::error::Error>> {
         let fd_name = b"user.norn.fd";
         let fd_expected = b"fd-value";
         let fd_value = Bytes::from_static(fd_expected);
-        let (res, _) = file.set_xattr(fd_name, fd_value, 0).await;
+        let BufResult(res, _) = file.set_xattr(fd_name, fd_value, 0).await;
         match res {
             Ok(()) => {}
             Err(err) if util::xattr_unsupported(&err) => return Ok(()),
             Err(err) => return Err(err.into()),
         }
 
-        let (res, buf) = file.get_xattr(fd_name, vec![0u8; 32]).await;
+        let BufResult(res, buf) = file.get_xattr(fd_name, vec![0u8; 32]).await;
         let n = match res {
             Ok(n) => n,
             Err(err) if util::xattr_unsupported(&err) => return Ok(()),
@@ -862,32 +858,32 @@ fn advise_and_xattr_ops() -> Result<(), Box<dyn std::error::Error>> {
         };
         assert_eq!(&buf[..n], b"fd-value");
 
-        let (res, buf) = file.get_xattr(fd_name, Vec::<u8>::new()).await;
+        let BufResult(res, buf) = file.get_xattr(fd_name, Vec::<u8>::new()).await;
         assert_eq!(res?, fd_expected.len());
         assert!(buf.is_empty());
         assert_eq!(buf.capacity(), 0);
 
         let exact = vec![0u8; fd_expected.len()].into_boxed_slice();
-        let (res, exact) = file.get_xattr(fd_name, exact).await;
+        let BufResult(res, exact) = file.get_xattr(fd_name, exact).await;
         assert_eq!(res?, fd_expected.len());
         assert_eq!(&*exact, fd_expected);
 
         let undersized = vec![0u8; fd_expected.len() - 1].into_boxed_slice();
-        let (res, undersized) = file.get_xattr(fd_name, undersized).await;
+        let BufResult(res, undersized) = file.get_xattr(fd_name, undersized).await;
         assert_eq!(res.unwrap_err().raw_os_error(), Some(libc::ERANGE));
         assert_eq!(undersized.len(), fd_expected.len() - 1);
 
         let path_name = b"user.norn.path";
         let path_expected = b"path-value";
         let path_value = Bytes::from_static(path_expected);
-        let (res, _) = fs::set_xattr(&path, path_name, path_value, 0).await;
+        let BufResult(res, _) = fs::set_xattr(&path, path_name, path_value, 0).await;
         match res {
             Ok(()) => {}
             Err(err) if util::xattr_unsupported(&err) => return Ok(()),
             Err(err) => return Err(err.into()),
         }
 
-        let (res, buf) = fs::get_xattr(&path, path_name, vec![0u8; 32]).await;
+        let BufResult(res, buf) = fs::get_xattr(&path, path_name, vec![0u8; 32]).await;
         let n = match res {
             Ok(n) => n,
             Err(err) if util::xattr_unsupported(&err) => return Ok(()),
@@ -895,18 +891,18 @@ fn advise_and_xattr_ops() -> Result<(), Box<dyn std::error::Error>> {
         };
         assert_eq!(&buf[..n], b"path-value");
 
-        let (res, buf) = fs::get_xattr(&path, path_name, Vec::<u8>::new()).await;
+        let BufResult(res, buf) = fs::get_xattr(&path, path_name, Vec::<u8>::new()).await;
         assert_eq!(res?, path_expected.len());
         assert!(buf.is_empty());
         assert_eq!(buf.capacity(), 0);
 
         let exact = vec![0u8; path_expected.len()].into_boxed_slice();
-        let (res, exact) = fs::get_xattr(&path, path_name, exact).await;
+        let BufResult(res, exact) = fs::get_xattr(&path, path_name, exact).await;
         assert_eq!(res?, path_expected.len());
         assert_eq!(&*exact, path_expected);
 
         let undersized = vec![0u8; path_expected.len() - 1].into_boxed_slice();
-        let (res, undersized) = fs::get_xattr(&path, path_name, undersized).await;
+        let BufResult(res, undersized) = fs::get_xattr(&path, path_name, undersized).await;
         assert_eq!(res.unwrap_err().raw_os_error(), Some(libc::ERANGE));
         assert_eq!(undersized.len(), path_expected.len() - 1);
 
@@ -945,7 +941,7 @@ fn splice_and_tee() -> Result<(), Box<dyn std::error::Error>> {
         opts.create(true).truncate(true).read(true).write(true);
 
         let src = opts.open(&src_path).await?;
-        src.write_at(&payload[..], 0).await.0?;
+        src.write_at(&payload[..], 0).await.drop_buf()?;
 
         let dst = opts.open(&dst_path).await?;
         let tee_left = opts.open(&tee_left_path).await?;
@@ -961,7 +957,7 @@ fn splice_and_tee() -> Result<(), Box<dyn std::error::Error>> {
             payload.len()
         );
 
-        let (res, buf) = dst.read_at(vec![0; payload.len()], 0).await;
+        let BufResult(res, buf) = dst.read_at(vec![0; payload.len()], 0).await;
         assert_eq!(res?, payload.len());
         assert_eq!(&buf[..], payload);
 
@@ -984,11 +980,11 @@ fn splice_and_tee() -> Result<(), Box<dyn std::error::Error>> {
             payload.len()
         );
 
-        let (res, buf) = tee_left.read_at(vec![0; payload.len()], 0).await;
+        let BufResult(res, buf) = tee_left.read_at(vec![0; payload.len()], 0).await;
         assert_eq!(res?, payload.len());
         assert_eq!(&buf[..], payload);
 
-        let (res, buf) = tee_right.read_at(vec![0; payload.len()], 0).await;
+        let BufResult(res, buf) = tee_right.read_at(vec![0; payload.len()], 0).await;
         assert_eq!(res?, payload.len());
         assert_eq!(&buf[..], payload);
 
@@ -1040,7 +1036,7 @@ fn pipe_test_opts() -> fs::OpenOptions {
 /// their readiness wait.
 async fn settle_pipe_ops(probe: &fs::File) -> std::io::Result<()> {
     for _ in 0..3 {
-        probe.read_at(vec![0u8; 1], 0).await.0?;
+        probe.read_at(vec![0u8; 1], 0).await.drop_buf()?;
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     Ok(())
@@ -1052,7 +1048,7 @@ fn pipe_splice_consumer_waits_for_producer() {
         util::with_test_env(|| async {
             let dir = util::ThreadNameTestDir::new();
             let src = pipe_test_opts().open(dir.join("src")).await?;
-            src.write_at(vec![7u8; 4096], 0).await.0?;
+            src.write_at(vec![7u8; 4096], 0).await.drop_buf()?;
             let dst = std::rc::Rc::new(pipe_test_opts().open(dir.join("dst")).await?);
             let (reader, writer) = fs::pipe()?;
             let reader = std::rc::Rc::new(reader);
@@ -1067,7 +1063,7 @@ fn pipe_splice_consumer_waits_for_producer() {
             assert_eq!(writer.splice_from(&src, Some(0), 4096, 0).await?, 4096);
             assert_eq!(consumer.await.unwrap()?, 4096);
 
-            let (res, buf) = dst.read_at(vec![0u8; 4096], 0).await;
+            let BufResult(res, buf) = dst.read_at(vec![0u8; 4096], 0).await;
             assert_eq!(res?, 4096);
             assert!(buf.iter().all(|&b| b == 7));
             Ok(())
@@ -1081,7 +1077,7 @@ fn pipe_splice_producer_waits_for_drain() {
         util::with_test_env(|| async {
             let dir = util::ThreadNameTestDir::new();
             let src = std::rc::Rc::new(pipe_test_opts().open(dir.join("src")).await?);
-            src.write_at(vec![3u8; 4096], 0).await.0?;
+            src.write_at(vec![3u8; 4096], 0).await.drop_buf()?;
             let sink = pipe_test_opts().open(dir.join("sink")).await?;
             let (reader, writer) = fs::pipe()?;
             let writer = std::rc::Rc::new(writer);
@@ -1124,7 +1120,7 @@ fn pipe_tee_waits_for_data() {
         util::with_test_env(|| async {
             let dir = util::ThreadNameTestDir::new();
             let src = pipe_test_opts().open(dir.join("src")).await?;
-            src.write_at(vec![5u8; 512], 0).await.0?;
+            src.write_at(vec![5u8; 512], 0).await.drop_buf()?;
             let sink = pipe_test_opts().open(dir.join("sink")).await?;
             let (reader, writer) = fs::pipe()?;
             let (dup_reader, dup_writer) = fs::pipe()?;
@@ -1256,7 +1252,7 @@ fn pipe_splice_rejects_unsupported_flags() {
         util::with_test_env(|| async {
             let dir = util::ThreadNameTestDir::new();
             let src = pipe_test_opts().open(dir.join("src")).await?;
-            src.write_at(vec![1u8; 64], 0).await.0?;
+            src.write_at(vec![1u8; 64], 0).await.drop_buf()?;
             let dst = pipe_test_opts().open(dir.join("dst")).await?;
             let (reader, writer) = fs::pipe()?;
             let (_dup_reader, dup_writer) = fs::pipe()?;

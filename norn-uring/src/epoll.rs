@@ -17,8 +17,7 @@
 //! let epoll = Epoll::new()?;
 //! epoll.add(socket.as_uring_fd(), Interest::READABLE, 1).await?;
 //!
-//! let (result, events) = epoll.wait(Events::with_capacity(16)).await;
-//! result?;
+//! let (_, events) = epoll.wait(Events::with_capacity(16)).await.buf_ok()?;
 //! for event in events.iter() {
 //!     assert_eq!(event.token(), 1);
 //!     assert!(event.readiness().is_readable());
@@ -36,6 +35,7 @@
 //! are exposed. `EPOLLEXCLUSIVE` and `EPOLLWAKEUP` are intentionally omitted.
 //! A multishot wait is not exposed.
 
+use crate::BufResult;
 use std::fmt;
 use std::io;
 use std::ops::BitOr;
@@ -166,10 +166,7 @@ impl Epoll {
     /// Returns `EINVAL` if `events` has zero capacity or the kernel does not
     /// support `IORING_OP_EPOLL_WAIT`, `ECANCELED` if the request is cancelled,
     /// or another error reported by `epoll_wait(2)`.
-    pub fn wait(
-        &self,
-        events: Events,
-    ) -> impl crate::Request<Output = (io::Result<usize>, Events)> {
+    pub fn wait(&self, events: Events) -> impl crate::Request<Output = BufResult<usize, Events>> {
         self.fd.submit(EpollWait::new(self.fd.lease(), events))
     }
 
@@ -458,14 +455,14 @@ unsafe impl Operation for EpollWait {
 }
 
 impl Singleshot for EpollWait {
-    type Output = (io::Result<usize>, Events);
+    type Output = BufResult<usize, Events>;
 
     fn complete(self, completion: Self::Completion) -> Self::Output {
         let mut events = self.events;
         if let Ok(received) = completion {
             events.len = received;
         }
-        (completion, events)
+        BufResult(completion, events)
     }
 }
 
@@ -582,7 +579,7 @@ mod tests {
         };
 
         let completion = unsafe { op.reap(CQEResult::new(Ok(1), 0)) };
-        let (result, events) = op.complete(completion);
+        let BufResult(result, events) = op.complete(completion);
 
         assert_eq!(result.unwrap(), 1);
         let received: Vec<_> = events.iter().collect();
@@ -598,7 +595,7 @@ mod tests {
         let mut op = EpollWait::new(NornFd::from_fd(epfd), Events::with_capacity(1));
 
         let completion = unsafe { op.reap(CQEResult::new(Ok(2), 0)) };
-        let (result, events) = op.complete(completion);
+        let BufResult(result, events) = op.complete(completion);
 
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
         assert!(events.is_empty());

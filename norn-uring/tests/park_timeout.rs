@@ -1,5 +1,6 @@
 #![cfg(target_os = "linux")]
 
+use norn_uring::BufResult;
 use std::time::Duration;
 
 use norn_executor::park::{Park, ParkMode};
@@ -8,7 +9,7 @@ use norn_uring::{fs::File, Driver};
 
 async fn read_after_timeout() {
     let file = File::open("/dev/zero").await.unwrap();
-    let (result, buffer) = file.read_at(vec![1; 8], 0).await;
+    let BufResult(result, buffer) = file.read_at(vec![1; 8], 0).await;
     assert_eq!(result.unwrap(), 8);
     assert_eq!(buffer, [0; 8]);
     file.close().await.unwrap();

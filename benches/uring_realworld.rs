@@ -1,5 +1,6 @@
 #![cfg(target_os = "linux")]
 
+use norn_uring::BufResult;
 use std::borrow::Cow;
 use std::cmp;
 use std::future::Future;
@@ -78,8 +79,7 @@ async fn norn_udp_echo_server_multi(
         let (buf, peer) = recv.next().await.expect("server multishot stream ended")?;
         assert_eq!(buf.len(), payload_len);
 
-        let (send_res, buf) = socket.send_to(buf, peer).await;
-        let sent = send_res?;
+        let (sent, buf) = socket.send_to(buf, peer).await.buf_ok()?;
         assert_eq!(sent, payload_len);
         drop(buf);
     }
@@ -134,12 +134,12 @@ async fn norn_udp_request_response_lane_single(
     let mut send_buf = vec![0x5A; payload_len];
     let mut recv_buf = vec![0u8; payload_len];
     for _ in 0..requests {
-        let (send_res, send) = socket.send(send_buf).await;
+        let BufResult(send_res, send) = socket.send(send_buf).await;
         send_buf = send;
         let sent = send_res?;
         assert_eq!(sent, payload_len);
 
-        let (recv_res, recv) = socket.recv(recv_buf).await;
+        let BufResult(recv_res, recv) = socket.recv(recv_buf).await;
         recv_buf = recv;
         let n = recv_res?;
         assert_eq!(n, payload_len);
@@ -156,7 +156,7 @@ async fn norn_udp_request_response_lane_multi(
     let mut send_buf = vec![0x5A; payload_len];
     let mut recv = pin!(socket.recv_ring_multi(recv_ring));
     for _ in 0..requests {
-        let (send_res, send) = socket.send(send_buf).await;
+        let BufResult(send_res, send) = socket.send(send_buf).await;
         send_buf = send;
         let sent = send_res?;
         assert_eq!(sent, payload_len);
@@ -510,7 +510,7 @@ where
 async fn norn_tcp_send_all(socket: &NornTcpSocket, buf: Vec<u8>) -> io::Result<Vec<u8>> {
     let mut cursor: BufCursor<Vec<u8>> = buf.into_cursor();
     loop {
-        let (send_res, next) = socket.send(cursor).await;
+        let BufResult(send_res, next) = socket.send(cursor).await;
         cursor = next;
         let n = send_res?;
         if n == 0 {
@@ -747,7 +747,7 @@ async fn norn_tcp_echo_connection_bufring_linked(
 ) -> io::Result<()> {
     let mut send_buf = vec![0x5A; payload_len];
     for _ in 0..requests {
-        let (recv_res, (send_res, next_send_buf)) =
+        let (recv_res, BufResult(send_res, next_send_buf)) =
             socket.recv_ring(&ring).then(socket.send(send_buf)).await;
         let buf = recv_res?;
         norn_tcp_validate_exact_ring_buf(buf, 0x5A, payload_len)?;
@@ -885,7 +885,7 @@ async fn norn_tcp_request_response_client_bufring(
         }
         TcpRecvMode::BufRingLinked => {
             for _ in 0..requests {
-                let ((send_res, next_send_buf), recv_res) =
+                let (BufResult(send_res, next_send_buf), recv_res) =
                     socket.send(send_buf).then(socket.recv_ring(&ring)).await;
                 send_buf = next_send_buf;
                 let sent = send_res?;
@@ -1193,12 +1193,12 @@ async fn file_write_read_worker(
         let offset = (slot * block_size) as u64;
 
         write_buf[0] = (round as u8).wrapping_add(worker_index as u8);
-        let (write_res, write) = file.write_at(write_buf, offset).await;
+        let BufResult(write_res, write) = file.write_at(write_buf, offset).await;
         write_buf = write;
         let written = write_res?;
         assert_eq!(written, block_size);
 
-        let (read_res, read) = file.read_at(read_buf, offset).await;
+        let BufResult(read_res, read) = file.read_at(read_buf, offset).await;
         read_buf = read;
         let read_n = read_res?;
         assert_eq!(read_n, block_size);

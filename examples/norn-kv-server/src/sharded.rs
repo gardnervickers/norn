@@ -6,6 +6,7 @@
 //! Sharded mode requires multishot receive. `STAT` returns `UnknownCommand`
 //! until cross-shard statistics aggregation is defined.
 
+use norn_uring::BufResult;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -1150,7 +1151,7 @@ fn command_key(command: Command<'_>) -> Option<&[u8]> {
 async fn send_all(socket: &TcpSocket, buffer: Vec<u8>) -> io::Result<Vec<u8>> {
     let mut cursor = BufCursor::new(buffer);
     while cursor.bytes_init() != 0 {
-        let (result, returned) = socket.send(cursor).await;
+        let BufResult(result, returned) = socket.send(cursor).await;
         cursor = returned;
         let sent = result?;
         if sent == 0 {

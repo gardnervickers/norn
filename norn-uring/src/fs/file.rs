@@ -1,3 +1,4 @@
+use crate::BufResult;
 use io_uring::types::FsyncFlags;
 use io_uring::{opcode, types};
 use std::future::Future;
@@ -224,7 +225,7 @@ impl File {
         &self,
         buf: B,
         offset: u64,
-    ) -> impl crate::Request<Output = (io::Result<usize>, B)> + WithOptions<ReadOptions>
+    ) -> impl crate::Request<Output = BufResult<usize, B>> + WithOptions<ReadOptions>
     where
         B: StableBufMut + 'static,
     {
@@ -248,7 +249,7 @@ impl File {
         &self,
         buf: B,
         offset: u64,
-    ) -> impl crate::Request<Output = (io::Result<usize>, B)> + WithOptions<WriteOptions>
+    ) -> impl crate::Request<Output = BufResult<usize, B>> + WithOptions<WriteOptions>
     where
         B: StableBuf + 'static,
     {
@@ -278,7 +279,7 @@ impl File {
         &self,
         buf: FixedBuf<B>,
         offset: u64,
-    ) -> impl crate::Request<Output = (io::Result<usize>, FixedBuf<B>)> + WithOptions<ReadOptions>
+    ) -> impl crate::Request<Output = BufResult<usize, FixedBuf<B>>> + WithOptions<ReadOptions>
     where
         B: 'static,
     {
@@ -315,7 +316,7 @@ impl File {
         &self,
         buf: FixedBuf<B>,
         offset: u64,
-    ) -> impl crate::Request<Output = (io::Result<usize>, FixedBuf<B>)> + WithOptions<WriteOptions>
+    ) -> impl crate::Request<Output = BufResult<usize, FixedBuf<B>>> + WithOptions<WriteOptions>
     where
         B: 'static,
     {
@@ -343,7 +344,7 @@ impl File {
         &self,
         bufs: Vec<B>,
         offset: u64,
-    ) -> impl crate::Request<Output = (io::Result<usize>, Vec<B>)> + WithOptions<ReadOptions>
+    ) -> impl crate::Request<Output = BufResult<usize, Vec<B>>> + WithOptions<ReadOptions>
     where
         B: StableBufMut + 'static,
     {
@@ -367,7 +368,7 @@ impl File {
         &self,
         bufs: Vec<B>,
         offset: u64,
-    ) -> impl crate::Request<Output = (io::Result<usize>, Vec<B>)> + WithOptions<WriteOptions>
+    ) -> impl crate::Request<Output = BufResult<usize, Vec<B>>> + WithOptions<WriteOptions>
     where
         B: StableBuf + 'static,
     {
@@ -471,27 +472,27 @@ impl File {
     ///
     /// On success, returns the attribute size. When the buffer has zero
     /// capacity, this performs a size query and leaves the buffer unchanged.
-    pub async fn get_xattr<N, B>(&self, name: N, buf: B) -> (io::Result<usize>, B)
+    pub async fn get_xattr<N, B>(&self, name: N, buf: B) -> BufResult<usize, B>
     where
         N: AsRef<[u8]>,
         B: StableBufMut + 'static,
     {
         let op = match FileGetXattr::new(self.fd.lease(), name.as_ref(), buf) {
             Ok(op) => op,
-            Err((err, buf)) => return (Err(err), buf),
+            Err((err, buf)) => return BufResult(Err(err), buf),
         };
         self.fd.submit(op).await
     }
 
     /// Set an extended attribute on this file from the provided buffer.
-    pub async fn set_xattr<N, B>(&self, name: N, value: B, flags: i32) -> (io::Result<()>, B)
+    pub async fn set_xattr<N, B>(&self, name: N, value: B, flags: i32) -> BufResult<(), B>
     where
         N: AsRef<[u8]>,
         B: StableBuf + 'static,
     {
         let op = match FileSetXattr::new(self.fd.lease(), name.as_ref(), value, flags) {
             Ok(op) => op,
-            Err((err, value)) => return (Err(err), value),
+            Err((err, value)) => return BufResult(Err(err), value),
         };
         self.fd.submit(op).await
     }
@@ -993,7 +994,7 @@ impl<B> Singleshot for ReadAt<B>
 where
     B: StableBufMut,
 {
-    type Output = (io::Result<usize>, B);
+    type Output = BufResult<usize, B>;
 
     fn complete(mut self, result: CQEResult) -> Self::Output {
         match result.result {
@@ -1001,11 +1002,11 @@ where
                 let n = n as usize;
                 let result =
                     set_init_checked(&mut self.buf, self.submitted_len, n, "read").map(|()| n);
-                (result, self.buf)
+                BufResult(result, self.buf)
             }
             Err(err) => {
                 let buf = self.buf;
-                (Err(err), buf)
+                BufResult(Err(err), buf)
             }
         }
     }
@@ -1062,18 +1063,18 @@ unsafe impl<B: 'static> Operation for ReadFixedAt<B> {
 }
 
 impl<B: 'static> Singleshot for ReadFixedAt<B> {
-    type Output = (io::Result<usize>, FixedBuf<B>);
+    type Output = BufResult<usize, FixedBuf<B>>;
 
     fn complete(mut self, result: CQEResult) -> Self::Output {
         match result.result {
             Ok(n) => {
                 let n = n as usize;
                 match self.buf.set_len_after_read(n) {
-                    Ok(()) => (Ok(n), self.buf),
-                    Err(err) => (Err(err), self.buf),
+                    Ok(()) => BufResult(Ok(n), self.buf),
+                    Err(err) => BufResult(Err(err), self.buf),
                 }
             }
-            Err(err) => (Err(err), self.buf),
+            Err(err) => BufResult(Err(err), self.buf),
         }
     }
 }
@@ -1134,12 +1135,12 @@ impl<B> Singleshot for WriteAt<B>
 where
     B: StableBuf,
 {
-    type Output = (io::Result<usize>, B);
+    type Output = BufResult<usize, B>;
 
     fn complete(self, result: CQEResult) -> Self::Output {
         match result.result {
-            Ok(n) => (Ok(n as usize), self.buf),
-            Err(err) => (Err(err), self.buf),
+            Ok(n) => BufResult(Ok(n as usize), self.buf),
+            Err(err) => BufResult(Err(err), self.buf),
         }
     }
 }
@@ -1196,12 +1197,12 @@ unsafe impl<B: 'static> Operation for WriteFixedAt<B> {
 }
 
 impl<B: 'static> Singleshot for WriteFixedAt<B> {
-    type Output = (io::Result<usize>, FixedBuf<B>);
+    type Output = BufResult<usize, FixedBuf<B>>;
 
     fn complete(self, result: CQEResult) -> Self::Output {
         match result.result {
-            Ok(n) => (Ok(n as usize), self.buf),
-            Err(err) => (Err(err), self.buf),
+            Ok(n) => BufResult(Ok(n as usize), self.buf),
+            Err(err) => BufResult(Err(err), self.buf),
         }
     }
 }
@@ -1273,7 +1274,7 @@ impl<B> Singleshot for ReadVectoredAt<B>
 where
     B: StableBufMut,
 {
-    type Output = (io::Result<usize>, Vec<B>);
+    type Output = BufResult<usize, Vec<B>>;
 
     fn complete(mut self, result: CQEResult) -> Self::Output {
         match result.result {
@@ -1284,7 +1285,7 @@ where
                     .iter()
                     .fold(0usize, |total, iovec| total.saturating_add(iovec.iov_len));
                 if remaining > submitted_len {
-                    return (
+                    return BufResult(
                         Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             "vectored read completion exceeded the submitted buffer length",
@@ -1296,16 +1297,16 @@ where
                 for (buf, iovec) in self.bufs.iter_mut().zip(&self.iovecs) {
                     let init = remaining.min(iovec.iov_len);
                     if let Err(err) = set_init_checked(buf, iovec.iov_len, init, "vectored read") {
-                        return (Err(err), self.bufs);
+                        return BufResult(Err(err), self.bufs);
                     }
                     remaining = remaining.saturating_sub(init);
                     if remaining == 0 {
                         break;
                     }
                 }
-                (Ok(n as usize), self.bufs)
+                BufResult(Ok(n as usize), self.bufs)
             }
-            Err(err) => (Err(err), self.bufs),
+            Err(err) => BufResult(Err(err), self.bufs),
         }
     }
 }
@@ -1378,12 +1379,12 @@ impl<B> Singleshot for WriteVectoredAt<B>
 where
     B: StableBuf,
 {
-    type Output = (io::Result<usize>, Vec<B>);
+    type Output = BufResult<usize, Vec<B>>;
 
     fn complete(self, result: CQEResult) -> Self::Output {
         match result.result {
-            Ok(n) => (Ok(n as usize), self.bufs),
-            Err(err) => (Err(err), self.bufs),
+            Ok(n) => BufResult(Ok(n as usize), self.bufs),
+            Err(err) => BufResult(Err(err), self.bufs),
         }
     }
 }
@@ -1476,15 +1477,15 @@ impl<B> Singleshot for FileGetXattr<B>
 where
     B: StableBufMut,
 {
-    type Output = (io::Result<usize>, B);
+    type Output = BufResult<usize, B>;
 
     fn complete(mut self, result: CQEResult) -> Self::Output {
         match result.result {
-            Ok(n) => (
+            Ok(n) => BufResult(
                 super::complete_get_xattr(&mut self.buf, self.len, n),
                 self.buf,
             ),
-            Err(err) => (Err(err), self.buf),
+            Err(err) => BufResult(Err(err), self.buf),
         }
     }
 }
@@ -1546,10 +1547,10 @@ impl<B> Singleshot for FileSetXattr<B>
 where
     B: StableBuf,
 {
-    type Output = (io::Result<()>, B);
+    type Output = BufResult<(), B>;
 
     fn complete(self, result: CQEResult) -> Self::Output {
-        (result.result.map(|_| ()), self.value)
+        BufResult(result.result.map(|_| ()), self.value)
     }
 }
 
@@ -1969,7 +1970,7 @@ mod layout_tests {
     fn scalar_read_rejects_completion_above_submitted_length() {
         let fd = test_fd();
         let read = ReadAt::new(fd, Vec::with_capacity(1), 0);
-        let (result, buf) = read.complete(CQEResult::new(Ok(2), 0));
+        let BufResult(result, buf) = read.complete(CQEResult::new(Ok(2), 0));
 
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
         assert!(buf.is_empty());
@@ -1980,7 +1981,7 @@ mod layout_tests {
         let fd = test_fd();
         let mut read = ReadVectoredAt::new(fd, vec![Vec::with_capacity(1)], 0);
         read.configure().unwrap();
-        let (result, bufs) = read.complete(CQEResult::new(Ok(2), 0));
+        let BufResult(result, bufs) = read.complete(CQEResult::new(Ok(2), 0));
 
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
         assert!(bufs[0].is_empty());

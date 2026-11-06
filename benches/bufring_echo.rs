@@ -1,5 +1,6 @@
 #![cfg(target_os = "linux")]
 
+use norn_uring::BufResult;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -91,7 +92,7 @@ async fn echo_copy(
         assert_eq!(buf.len(), payload_len);
         let send_buf = Bytes::copy_from_slice(buf.as_slice());
         drop(buf);
-        let (result, _) = server.send_to(send_buf, peer).await;
+        let BufResult(result, _) = server.send_to(send_buf, peer).await;
         assert_eq!(result?, payload_len);
     }
     Ok(())
@@ -106,7 +107,7 @@ async fn echo_direct(
     for _ in 0..requests {
         let (buf, peer) = server.recv_from_ring(ring).await?;
         assert_eq!(buf.len(), payload_len);
-        let (result, buf) = server.send_to(buf, peer).await;
+        let BufResult(result, buf) = server.send_to(buf, peer).await;
         assert_eq!(result?, payload_len);
         drop(buf);
     }
@@ -121,11 +122,11 @@ async fn client_round_trip(
     let mut send_buf = vec![0x5A; payload_len];
     let mut recv_buf = Vec::with_capacity(payload_len);
     for _ in 0..requests {
-        let (result, buf) = client.send(send_buf).await;
+        let BufResult(result, buf) = client.send(send_buf).await;
         send_buf = buf;
         assert_eq!(result?, payload_len);
 
-        let (result, buf) = client.recv(recv_buf).await;
+        let BufResult(result, buf) = client.recv(recv_buf).await;
         recv_buf = buf;
         assert_eq!(result?, payload_len);
         assert!(recv_buf.iter().all(|byte| *byte == 0x5A));

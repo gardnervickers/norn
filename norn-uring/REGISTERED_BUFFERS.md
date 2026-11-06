@@ -63,15 +63,13 @@ let table = handle.register_fixed_buffers(vec![
 
 let mut buf = table.try_acquire()?;
 buf.set_range(0..4096)?;
-let (result, mut buf) = file.read_fixed_at(buf, 0).await;
-let n = result?;
+let (n, mut buf) = file.read_fixed_at(buf, 0).await.buf_ok()?;
 consume(&buf[..n]);
 
 buf.set_payload(payload)?;
 let mut offset = 4096;
 while !buf.is_empty() {
-    let (result, returned) = file.write_fixed_at(buf, offset).await;
-    let written = result?;
+    let (written, returned) = file.write_fixed_at(buf, offset).await.buf_ok()?;
     buf = returned;
     if written == 0 {
         return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into());
@@ -366,7 +364,7 @@ impl File {
         &self,
         buf: FixedBuf<B>,
         offset: u64,
-    ) -> impl Request<Output = (io::Result<usize>, FixedBuf<B>)>
+    ) -> impl Request<Output = BufResult<usize, FixedBuf<B>>>
     where
         B: 'static;
 
@@ -374,7 +372,7 @@ impl File {
         &self,
         buf: FixedBuf<B>,
         offset: u64,
-    ) -> impl Request<Output = (io::Result<usize>, FixedBuf<B>)>
+    ) -> impl Request<Output = BufResult<usize, FixedBuf<B>>>
     where
         B: 'static;
 }

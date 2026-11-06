@@ -1,5 +1,6 @@
 #![cfg(target_os = "linux")]
 
+use norn_uring::BufResult;
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::hint::black_box;
@@ -88,7 +89,7 @@ async fn run_steady(
         let send = sender.send(payload);
         let mut recv_ref = recv.as_mut();
         let receive = recv_ref.next();
-        let ((sent, next_payload), received) = futures::future::join(send, receive).await;
+        let (BufResult(sent, next_payload), received) = futures::future::join(send, receive).await;
         assert_eq!(sent.unwrap(), BUFFER_LEN);
         payload = next_payload;
         let received = received

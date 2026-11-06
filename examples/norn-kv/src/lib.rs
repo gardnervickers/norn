@@ -713,8 +713,7 @@ mod block {
 
             pub(crate) async fn read_block(&self, block: usize) -> io::Result<BlockBuf> {
                 let buf = AlignedBuf::zeroed(self.block_size)?;
-                let (res, buf) = self.file.read_at(buf, self.offset(block)).await;
-                let n = res?;
+                let (n, buf) = self.file.read_at(buf, self.offset(block)).await.buf_ok()?;
                 if n != self.block_size {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
@@ -777,7 +776,8 @@ mod block {
                     return (Err(err), buf);
                 }
 
-                let (res, buf) = self.file.write_at(buf, self.offset(block)).await;
+                let norn_uring::BufResult(res, buf) =
+                    self.file.write_at(buf, self.offset(block)).await;
                 let res = match res {
                     Ok(n) if n == self.block_size => Ok(()),
                     Ok(n) => Err(io::Error::new(

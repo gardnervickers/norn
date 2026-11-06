@@ -1,5 +1,6 @@
 //! Norn TCP server for the in-memory protocol implementation.
 
+use norn_uring::BufResult;
 use std::cell::Cell;
 use std::future::Future;
 use std::io;
@@ -184,7 +185,7 @@ async fn discard_exact(socket: &TcpSocket) {
         if buffer.reset(RECV_BUFFER_LEN).is_err() {
             return;
         }
-        let (result, returned) = socket.recv(buffer).await;
+        let BufResult(result, returned) = socket.recv(buffer).await;
         buffer = returned;
         match result {
             Ok(received) if received != 0 => discarded += received,
@@ -725,7 +726,7 @@ async fn serve_exact_frames(
 
 async fn recv_exact(socket: &TcpSocket, mut buffer: RecvBuffer) -> io::Result<Option<RecvBuffer>> {
     while !buffer.is_full() {
-        let (result, returned) = socket.recv(buffer).await;
+        let BufResult(result, returned) = socket.recv(buffer).await;
         buffer = returned;
         let received = result?;
         if received == 0 {
@@ -741,7 +742,7 @@ async fn recv_exact(socket: &TcpSocket, mut buffer: RecvBuffer) -> io::Result<Op
 async fn send_all(socket: &TcpSocket, buffer: Vec<u8>) -> io::Result<Vec<u8>> {
     let mut cursor = BufCursor::new(buffer);
     while cursor.bytes_init() != 0 {
-        let (result, returned) = socket.send(cursor).await;
+        let BufResult(result, returned) = socket.send(cursor).await;
         cursor = returned;
         let sent = result?;
         if sent == 0 {
@@ -985,7 +986,7 @@ mod tests {
             for _ in 0..CONNECTIONS {
                 let (socket, _) = listener.accept().await.unwrap();
                 tasks.push(norn_executor::spawn(async move {
-                    let (result, _) = socket.recv(Vec::with_capacity(64)).await;
+                    let BufResult(result, _) = socket.recv(Vec::with_capacity(64)).await;
                     result.unwrap()
                 }));
             }

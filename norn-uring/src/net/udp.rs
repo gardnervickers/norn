@@ -1,4 +1,5 @@
 //! UDP Protocol Socket
+use crate::BufResult;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -226,7 +227,7 @@ impl UdpSocket {
         &self,
         buf: B,
         addr: SocketAddr,
-    ) -> impl std::future::Future<Output = (io::Result<usize>, B)> + WithOptions<SendOptions> + '_
+    ) -> impl std::future::Future<Output = BufResult<usize, B>> + WithOptions<SendOptions> + '_
     where
         B: StableBuf + 'static,
     {
@@ -242,7 +243,7 @@ impl UdpSocket {
     pub fn send<B>(
         &self,
         buf: B,
-    ) -> impl crate::Request<Output = (io::Result<usize>, B)> + WithOptions<SendOptions>
+    ) -> impl crate::Request<Output = BufResult<usize, B>> + WithOptions<SendOptions>
     where
         B: StableBuf + 'static,
     {
@@ -262,7 +263,7 @@ impl UdpSocket {
     pub fn send_zc<B>(
         &self,
         buf: B,
-    ) -> impl crate::Request<Output = (io::Result<SendZcResult>, B)> + WithOptions<SendOptions>
+    ) -> impl crate::Request<Output = BufResult<SendZcResult, B>> + WithOptions<SendOptions>
     where
         B: StableBuf + 'static,
     {
@@ -279,7 +280,7 @@ impl UdpSocket {
     pub fn recv_from<B>(
         &self,
         buf: B,
-    ) -> impl std::future::Future<Output = (io::Result<(usize, SocketAddr)>, B)>
+    ) -> impl std::future::Future<Output = BufResult<(usize, SocketAddr), B>>
            + WithOptions<RecvOptions>
            + '_
     where
@@ -297,7 +298,7 @@ impl UdpSocket {
     pub fn recv<B>(
         &self,
         buf: B,
-    ) -> impl crate::Request<Output = (io::Result<usize>, B)> + WithOptions<RecvOptions>
+    ) -> impl crate::Request<Output = BufResult<usize, B>> + WithOptions<RecvOptions>
     where
         B: StableBufMut + 'static,
     {
@@ -317,7 +318,7 @@ impl UdpSocket {
     pub fn send_msg_zc<B>(
         &self,
         buf: B,
-    ) -> impl crate::Request<Output = (io::Result<SendZcResult>, B)> + WithOptions<SendOptions>
+    ) -> impl crate::Request<Output = BufResult<SendZcResult, B>> + WithOptions<SendOptions>
     where
         B: StableBuf + 'static,
     {

@@ -1,5 +1,6 @@
 #![cfg(target_os = "linux")]
 
+use norn_uring::BufResult;
 use std::io;
 use std::pin::pin;
 
@@ -34,10 +35,10 @@ fn cancel_pending_cancels_only_requests_on_descriptor() -> Result<(), Box<dyn st
         // The receives are still queued in the SQ ahead of the cancellation.
         assert_eq!(receiver.as_uring_fd().cancel_pending().await?, 2);
 
-        let (result, buf) = first.await;
+        let BufResult(result, buf) = first.await;
         assert_canceled(result);
         assert_eq!(buf.capacity(), 16);
-        let (result, buf) = second.await;
+        let BufResult(result, buf) = second.await;
         assert_canceled(result);
         assert_eq!(buf.capacity(), 32);
 
@@ -45,8 +46,8 @@ fn cancel_pending_cancels_only_requests_on_descriptor() -> Result<(), Box<dyn st
         sender
             .send_to(b"still armed".to_vec(), other.local_addr()?)
             .await
-            .0?;
-        let (result, buf) = unrelated.await;
+            .drop_buf()?;
+        let BufResult(result, buf) = unrelated.await;
         assert_eq!(result?, (11, sender.local_addr()?));
         assert_eq!(&buf[..], b"still armed");
 
@@ -69,7 +70,10 @@ fn cancel_pending_ends_multishot_receive_without_consuming_later_data(
 
         {
             let mut stream = pin!(receiver.recv_from_ring_multi(&ring));
-            sender.send_to(b"first".to_vec(), receiver_addr).await.0?;
+            sender
+                .send_to(b"first".to_vec(), receiver_addr)
+                .await
+                .drop_buf()?;
             let (buf, addr) = stream.next().await.expect("multishot stream ended")?;
             assert_eq!(addr, sender.local_addr()?);
             assert_eq!(&buf[..], b"first");
@@ -80,8 +84,11 @@ fn cancel_pending_ends_multishot_receive_without_consuming_later_data(
             assert!(stream.next().await.is_none());
         }
 
-        sender.send_to(b"second".to_vec(), receiver_addr).await.0?;
-        let (result, buf) = receiver.recv_from(Vec::<u8>::with_capacity(16)).await;
+        sender
+            .send_to(b"second".to_vec(), receiver_addr)
+            .await
+            .drop_buf()?;
+        let BufResult(result, buf) = receiver.recv_from(Vec::<u8>::with_capacity(16)).await;
         assert_eq!(result?.0, 6);
         assert_eq!(&buf[..], b"second");
 
@@ -156,11 +163,11 @@ fn cancel_pending_skips_link_successors_not_yet_issued() -> Result<(), Box<dyn s
         sender
             .send_to(b"head".to_vec(), head.local_addr()?)
             .await
-            .0?;
+            .drop_buf()?;
         sender
             .send_to(b"tail".to_vec(), tail.local_addr()?)
             .await
-            .0?;
+            .drop_buf()?;
         let (first, second) = chain.await;
         assert!(first?.is_readable());
         assert!(second?.is_readable());

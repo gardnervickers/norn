@@ -70,16 +70,18 @@ pub(crate) use private::{AcceptsOptions, OptionsSealed};
 /// return a different request type:
 ///
 /// ```no_run
-/// # async fn f(file: &norn_uring::fs::File) {
+/// # async fn f(file: &norn_uring::fs::File) -> std::io::Result<()> {
 /// use std::time::Duration;
 /// use norn_uring::{fs::WriteOptions, Request, WithOptions};
 ///
 /// const DURABLE: WriteOptions = WriteOptions::new().dsync(true);
-/// let (res, buf) = file
+/// let (n, buf) = file
 ///     .write_at(b"record".to_vec(), 0)
 ///     .options(DURABLE)
 ///     .timeout(Duration::from_secs(1))
-///     .await;
+///     .await
+///     .buf_ok()?;
+/// # Ok(())
 /// # }
 /// ```
 pub trait WithOptions<O>: private::OptionsSealed + Sized {

@@ -9,11 +9,12 @@
 /// receive the same way as not setting any.
 ///
 /// ```no_run
-/// # async fn f(socket: &norn_uring::net::TcpSocket) {
+/// # async fn f(socket: &norn_uring::net::TcpSocket) -> std::io::Result<()> {
 /// use norn_uring::{net::RecvOptions, WithOptions};
 ///
 /// let header = RecvOptions::new().wait_all(true);
-/// let (res, buf) = socket.recv(vec![0; 16]).options(header).await;
+/// let (n, buf) = socket.recv(vec![0; 16]).options(header).await.buf_ok()?;
+/// # Ok(())
 /// # }
 /// ```
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]

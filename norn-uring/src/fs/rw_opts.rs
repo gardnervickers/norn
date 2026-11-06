@@ -18,10 +18,10 @@ const RWF_DONTCACHE: i32 = 0x0000_0080;
 ///
 /// ```no_run
 /// # async fn f(file: &norn_uring::fs::File) {
-/// use norn_uring::{fs::ReadOptions, WithOptions};
+/// use norn_uring::{fs::ReadOptions, BufResult, WithOptions};
 ///
 /// let cached_only = ReadOptions::new().nowait(true);
-/// let (res, buf) = file.read_at(vec![0; 4096], 0).options(cached_only).await;
+/// let BufResult(res, buf) = file.read_at(vec![0; 4096], 0).options(cached_only).await;
 /// # }
 /// ```
 ///
@@ -79,11 +79,12 @@ impl ReadOptions {
 /// built in a `const`:
 ///
 /// ```no_run
-/// # async fn f(file: &norn_uring::fs::File) {
+/// # async fn f(file: &norn_uring::fs::File) -> std::io::Result<()> {
 /// use norn_uring::{fs::WriteOptions, WithOptions};
 ///
 /// const DURABLE: WriteOptions = WriteOptions::new().dsync(true);
-/// let (res, buf) = file.write_at(b"record".to_vec(), 0).options(DURABLE).await;
+/// let (n, buf) = file.write_at(b"record".to_vec(), 0).options(DURABLE).await.buf_ok()?;
+/// # Ok(())
 /// # }
 /// ```
 ///

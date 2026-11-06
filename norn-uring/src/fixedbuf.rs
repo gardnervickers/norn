@@ -19,15 +19,13 @@
 //! let table = Handle::current().register_fixed_buffers(vec![vec![0u8; 4096]])?;
 //! let buf = table.try_acquire()?;
 //!
-//! let (result, mut buf) = file.read_fixed_at(buf, 0).await;
-//! let read = result?;
+//! let (read, mut buf) = file.read_fixed_at(buf, 0).await.buf_ok()?;
 //! consume(&buf[..read]);
 //!
 //! buf.set_payload(b"hello")?;
 //! let mut offset = 4096;
 //! while !buf.is_empty() {
-//!     let (result, returned) = file.write_fixed_at(buf, offset).await;
-//!     let written = result?;
+//!     let (written, returned) = file.write_fixed_at(buf, offset).await.buf_ok()?;
 //!     buf = returned;
 //!     if written == 0 {
 //!         return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into());

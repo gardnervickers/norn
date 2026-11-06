@@ -29,6 +29,7 @@
 //! - `STRESS_STOP_ON_FAILURE=1`: stop at the first failing seed.
 #![cfg(target_os = "linux")]
 
+use norn_uring::BufResult;
 use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::future::{poll_fn, Future};
@@ -825,7 +826,7 @@ async fn nop_task(mut rng: Rng, rounds: usize, ring_size: u32) {
 
 async fn send_all(sock: &TcpSocket, mut data: Vec<u8>) -> io::Result<()> {
     while !data.is_empty() {
-        let (res, mut back) = sock.send(data).await;
+        let BufResult(res, mut back) = sock.send(data).await;
         let n = res?;
         if n == 0 {
             return Err(io::Error::new(io::ErrorKind::WriteZero, "send returned 0"));
@@ -857,7 +858,7 @@ async fn echo_conn(sock: TcpSocket, ring: RecvBufRing, mut rng: Rng) -> io::Resu
         let buf = item?;
         if rng.chance(50) {
             let len = buf.len();
-            let (res, buf) = sock.send(buf).await;
+            let BufResult(res, buf) = sock.send(buf).await;
             let n = res?;
             if n < len {
                 let rest = buf[n..].to_vec();
@@ -970,7 +971,7 @@ async fn tcp_connector(
         }
         let mut got = Vec::with_capacity(len);
         while got.len() < len {
-            let (res, buf) = sock.recv(Vec::with_capacity(len - got.len())).await;
+            let BufResult(res, buf) = sock.recv(Vec::with_capacity(len - got.len())).await;
             match res {
                 Ok(0) => {
                     if strict {
@@ -1018,7 +1019,7 @@ async fn lingering(mut rng: Rng) {
     let server = Rc::new(server);
     let s2 = Rc::clone(&server);
     tspawn(async move {
-        let (_res, _buf) = s2.recv(Vec::with_capacity(64)).await;
+        let BufResult(_res, _buf) = s2.recv(Vec::with_capacity(64)).await;
     })
     .detach();
     // Pending accept.
