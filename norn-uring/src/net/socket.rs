@@ -56,6 +56,9 @@ impl MultishotBacklog {
 
     /// Count the items of one reaped completion, and pause the operation
     /// once its backlog reaches the limit while the kernel keeps it armed.
+    /// The count is what userspace has reaped, so the limit does not bound
+    /// what the kernel has produced: an accept can have taken the whole listen
+    /// backlog before the first completion is reaped.
     /// If the backlog still grows to twice the limit, request the
     /// cancellation again. `pause` must queue the cancellation without
     /// submitting it.
@@ -1700,6 +1703,13 @@ impl Singleshot for Accept {
 
 /// A multishot accept. The kernel keeps accepting while nothing consumes its
 /// connections, so it cancels itself once a limit of them wait to be yielded.
+///
+/// The limit is not a bound on held descriptors. The pause is requested when
+/// a completion is reaped, but the kernel's multishot accept loops while the
+/// listen queue is non-empty (`IORING_CQE_F_SOCK_NONEMPTY`) and accepts the
+/// whole queued backlog in one task-work run, before userspace reaps the
+/// first completion. The operation can hold about the limit plus the listen
+/// backlog, and a re-arm after a pause can take the whole backlog again.
 pub(crate) struct AcceptMulti {
     fd: NornFd,
     // The driver the accept is submitted to, which queues its pause.

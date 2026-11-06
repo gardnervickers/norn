@@ -316,8 +316,20 @@ impl TcpListener {
     ///
     /// The kernel keeps accepting while the stream is not polled, and each
     /// accepted connection holds a descriptor until it is yielded. Once 64
-    /// wait, the stream pauses its accept, and later connections stay in the
-    /// listen backlog until the consumer catches up.
+    /// wait, the stream pauses its accept, so connections that arrive after
+    /// the pause takes effect stay in the listen backlog until the consumer
+    /// catches up.
+    ///
+    /// The limit does not bound the descriptors the stream holds. The pause
+    /// is decided when completions are reaped, but the kernel's multishot
+    /// accept keeps looping while the listen queue is non-empty and accepts
+    /// the whole queued backlog in one pass, before the first completion is
+    /// visible. The stream can therefore hold about the limit plus the listen
+    /// backlog (and any connections that arrive during that pass), and each
+    /// re-arm after a pause can take the whole queued backlog again. A caller
+    /// that needs a hard bound on descriptors should size the backlog passed
+    /// to [`bind`](Self::bind) accordingly, or use
+    /// [`accept`](Self::accept), which takes one connection per request.
     /// [`incoming_with_limit`](Self::incoming_with_limit) sets another limit.
     ///
     /// An error is yielded as an item and does not end the stream; the next
@@ -335,9 +347,16 @@ impl TcpListener {
     /// pauses, so a consumer that falls behind holds a descriptor for every
     /// connection the kernel accepts.
     ///
-    /// Connections the kernel accepted before a pause took effect are still
-    /// yielded, so the stream can briefly hold more than `limit`. Otherwise
-    /// it behaves like [`incoming`](Self::incoming).
+    /// `limit` is when the pause is requested, not a bound on the descriptors
+    /// held. Connections the kernel accepted before the pause took effect are
+    /// still yielded, and that includes the whole listen backlog queued when
+    /// the accept is armed or re-armed: the kernel's multishot accept loops
+    /// while the listen queue is non-empty, so it accepts them all in one pass
+    /// before the first completion is reaped. The stream can hold about
+    /// `limit` plus the listen backlog (and connections that arrive during
+    /// that pass). For a hard bound, size the backlog passed to
+    /// [`bind`](Self::bind) or use [`accept`](Self::accept). Otherwise it
+    /// behaves like [`incoming`](Self::incoming).
     pub fn incoming_with_limit(
         &self,
         limit: Option<NonZeroUsize>,
