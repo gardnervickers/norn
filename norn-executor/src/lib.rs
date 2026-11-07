@@ -40,15 +40,20 @@
 use std::future::Future;
 use std::num::NonZeroUsize;
 use std::pin::pin;
+use std::sync::Arc;
 
+use norn_metrics::Padded;
 use norn_task::JoinHandle;
 
 const DEFAULT_TASK_POLL_BUDGET: NonZeroUsize = NonZeroUsize::new(32).unwrap();
 
 mod context;
+mod metrics;
 /// Parking abstractions and built-in park implementations.
 pub mod park;
 mod wakerfn;
+
+pub use metrics::{ExecutorMetrics, ExecutorSnapshot};
 
 /// A single-threaded executor for driving [`Future`]s to completion.
 ///
@@ -69,6 +74,7 @@ pub struct LocalExecutor<P: park::Park> {
     park: P,
     config: Config,
     root_notifier: Option<wakerfn::RootNotifier<P::Unparker>>,
+    counters: Arc<Padded<metrics::ExecutorCounters>>,
 }
 
 /// Configuration for [`LocalExecutor`] scheduling.
@@ -117,6 +123,7 @@ impl<P: park::Park> LocalExecutor<P> {
             park,
             config,
             root_notifier,
+            counters: Arc::default(),
         }
     }
 
@@ -127,6 +134,28 @@ impl<P: park::Park> LocalExecutor<P> {
         Handle {
             taskqueue: self.taskqueue.clone(),
         }
+    }
+
+    /// A view of this executor's scheduling counters and task counts that any
+    /// thread can read.
+    pub fn metrics(&self) -> ExecutorMetrics {
+        ExecutorMetrics {
+            counters: Arc::clone(&self.counters),
+            tasks: self.taskqueue.metrics(),
+        }
+    }
+
+    /// The metric sources of this executor and of every layer in its
+    /// [`park::Park`] stack, readable from any thread.
+    ///
+    /// The executor's [`ExecutorMetrics`] comes first, followed by whatever
+    /// each park layer adds in [`park::Park::metric_sources`]. Use
+    /// [`norn_metrics::Sources::get`] for one layer's typed view.
+    pub fn metric_sources(&self) -> norn_metrics::Sources {
+        let mut sources = norn_metrics::Sources::new();
+        sources.push(self.metrics());
+        self.park.metric_sources(&mut sources);
+        sources
     }
 
     /// Blocks the current thread until the provided [`Future`] has completed.
@@ -177,6 +206,10 @@ impl<P: park::Park> LocalExecutor<P> {
             None => wakerfn::root_notifier(self.park.unparker()),
         };
         let mut root = wakerfn::FutureHarness::new(fut, notifier);
+        let counters = &*self.counters;
+        // Running from here until return, unwinding included; parks below
+        // flip it off and back on.
+        let _running = metrics::Activity::flip(&counters.activity);
 
         loop {
             if let Some(result) = root.try_poll() {
@@ -184,11 +217,18 @@ impl<P: park::Park> LocalExecutor<P> {
                 return Ok(result);
             }
             let mut has_remaining_tasks = false;
-            let mut task_polls_remaining = self.config.task_poll_budget.get();
+            let budget = self.config.task_poll_budget.get();
+            // Published once per tick rather than per poll, before parking so
+            // a reader sees them while the executor waits, and on unwind.
+            let mut tick = metrics::TickPolls {
+                counter: &counters.polls,
+                polled: 0,
+            };
             while let Some(next) = self.taskqueue.next() {
+                // Counted before running, so a run that unwinds counts too.
+                tick.polled += 1;
                 next.run();
-                task_polls_remaining -= 1;
-                if task_polls_remaining == 0 {
+                if tick.polled == budget {
                     has_remaining_tasks = self.taskqueue.runnable() > 0;
                     break;
                 }
@@ -197,11 +237,23 @@ impl<P: park::Park> LocalExecutor<P> {
                     break;
                 }
             }
+            let budget_exhausted = tick.polled == budget && has_remaining_tasks;
+            drop(tick);
+            counters.ticks.incr();
+            if budget_exhausted {
+                counters.budget_exhausted.incr();
+            }
             let mut mode = park::ParkMode::NextCompletion;
             if root.is_notified() || has_remaining_tasks {
                 mode = park::ParkMode::NoPark;
+            } else {
+                counters.waiting_parks.incr();
             }
-            self.park.park(mode)?;
+            let parked = {
+                let _parked = metrics::Activity::flip(&counters.activity);
+                self.park.park(mode)
+            };
+            parked?;
         }
     }
 
@@ -295,9 +347,15 @@ impl<P: park::Park> Drop for LocalExecutor<P> {
         // `TaskQueue::shutdown` finishes every task and then re-raises the
         // first join-waker panic. Still shut the park down while the context
         // guard is alive, then resume the panic.
-        let tasks = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.taskqueue.shutdown();
-        }));
+        let tasks = {
+            // Task destructors are user code: count them as running, so a
+            // watchdog can see a shutdown that hangs in one. The park's own
+            // shutdown below waits for the kernel, which is not running.
+            let _running = metrics::Activity::flip(&self.counters.activity);
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.taskqueue.shutdown();
+            }))
+        };
         self.park.shutdown();
         if let Err(payload) = tasks {
             std::panic::resume_unwind(payload);
@@ -387,6 +445,84 @@ mod tests {
         }
 
         fn shutdown(&mut self) {}
+    }
+
+    /// Ticks and polls are published once per tick, and the running flag is
+    /// clear once `block_on` returns.
+    #[test]
+    fn metrics_count_ticks_and_polls() {
+        let mut executor = LocalExecutor::new(SpinPark);
+        let metrics = executor.metrics();
+        let polls = Rc::new(Cell::new(0));
+        let observed = Rc::clone(&polls);
+        executor.block_on(async move {
+            let handles: Vec<_> = (0..4)
+                .map(|_| {
+                    let polls = Rc::clone(&observed);
+                    spawn(async move {
+                        // Two polls: one pending yield, then completion.
+                        let mut yielded = false;
+                        std::future::poll_fn(|cx| {
+                            polls.set(polls.get() + 1);
+                            if yielded {
+                                return Poll::Ready(());
+                            }
+                            yielded = true;
+                            cx.waker().wake_by_ref();
+                            Poll::Pending
+                        })
+                        .await
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.await.unwrap();
+            }
+        });
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.polls, polls.get() as u64);
+        assert_eq!(snapshot.polls, 8);
+        // Woken tasks requeue behind the others, so one tick can poll all
+        // eight within the default budget.
+        assert!(snapshot.ticks >= 1, "{snapshot:?}");
+        assert!(!snapshot.running);
+        assert_eq!(snapshot.activity % 2, 0);
+        assert_eq!(snapshot.tasks.spawned, 4);
+        assert_eq!(snapshot.tasks.finished, 4);
+    }
+
+    /// The executor's own view comes first; a park layer without counters
+    /// adds nothing.
+    #[test]
+    fn metric_sources_start_with_the_executor() {
+        let mut executor = LocalExecutor::new(SpinPark);
+        executor.block_on(async { spawn(async {}).await.unwrap() });
+        let sources = executor.metric_sources();
+        assert_eq!(sources.len(), 1);
+        let snapshot = sources.get::<ExecutorMetrics>().unwrap().snapshot();
+        assert_eq!(snapshot.tasks.spawned, 1);
+    }
+
+    /// A budget smaller than the runnable set ends ticks early, and each such
+    /// tick is counted.
+    #[test]
+    fn metrics_count_budget_exhaustion() {
+        let config = Config {
+            task_poll_budget: NonZeroUsize::new(2).unwrap(),
+        };
+        let mut executor = LocalExecutor::new_with_config(SpinPark, config);
+        let metrics = executor.metrics();
+        executor.block_on(async {
+            let handles: Vec<_> = (0..5).map(|_| spawn(async {})).collect();
+            for handle in handles {
+                handle.await.unwrap();
+            }
+        });
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.polls, 5);
+        // Ticks one and two each run two of the five tasks and stop with
+        // tasks left; tick three runs the last one.
+        assert_eq!(snapshot.budget_exhausted, 2, "{snapshot:?}");
     }
 
     #[test]

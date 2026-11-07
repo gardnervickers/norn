@@ -92,6 +92,15 @@ impl TaskSet {
     /// If a join waker or a scheduler destructor panics, every remaining task
     /// is still shut down before the first panic is propagated.
     pub fn shutdown(&self) {
+        self.shutdown_counting(|| ());
+    }
+
+    /// [`TaskSet::shutdown`], calling `on_remove` once for each task it takes
+    /// out of the set, before cancelling that task.
+    ///
+    /// Shutdown can re-enter itself or complete a task through a destructor;
+    /// counting where each task leaves the set counts every task once.
+    pub(crate) fn shutdown_counting(&self, mut on_remove: impl FnMut()) {
         // Safety: `TaskSet` is `!Send` and only accessed from one thread. Each
         // mutable borrow ends before a task is cancelled or dropped, since both
         // operations may run arbitrary user destructors and re-enter this set.
@@ -106,6 +115,7 @@ impl TaskSet {
             let Some(task) = task else {
                 break;
             };
+            on_remove();
             // Dropping the popped task may run the scheduler's destructor, which
             // can panic too. Catch it separately from `shutdown`, so a panic in
             // each does not unwind through the other and abort.

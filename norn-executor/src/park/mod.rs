@@ -125,6 +125,20 @@ pub trait Park {
     /// registered with the park layer will be invoked after shutdown
     /// is triggered.
     fn shutdown(&mut self);
+
+    /// Add the metric sources of this layer, and of every layer it wraps, to
+    /// `sources`.
+    ///
+    /// [`LocalExecutor::metric_sources`] calls this to collect a runtime's
+    /// metrics in one place. The default adds nothing. A layer that keeps
+    /// counters adds its view; a layer that wraps another one must also
+    /// forward to `inner.metric_sources(sources)`, as the timer and channel
+    /// drivers do, or the layers below it go missing.
+    ///
+    /// [`LocalExecutor::metric_sources`]: crate::LocalExecutor::metric_sources
+    fn metric_sources(&self, sources: &mut norn_metrics::Sources) {
+        let _ = sources;
+    }
 }
 
 /// The [`Unpark`] trait provides a way to force a wakeup
