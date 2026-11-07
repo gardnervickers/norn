@@ -6,11 +6,3 @@ edition = "2021"
 [dependencies]
 norn-channel = { path = "../norn-channel" }
 norn-executor = { path = "../norn-executor" }
-
-[target.'cfg(target_os = "linux")'.dev-dependencies]
-futures-util = "0.3.29"
-io-uring = "0.7.13"
-libc = "0.2.149"
-norn-task = { path = "../norn-task" }
-norn-timer = { path = "../norn-timer" }
-norn-uring = { path = "../norn-uring" }

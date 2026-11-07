@@ -1226,14 +1226,8 @@ dependencies = [
 name = "norn-multicore"
 version = "0.1.0"
 dependencies = [
- "futures-util",
- "io-uring",
- "libc",
  "norn-channel",
  "norn-executor",
- "norn-task",
- "norn-timer",
- "norn-uring",
 ]
 
 [[package]]
