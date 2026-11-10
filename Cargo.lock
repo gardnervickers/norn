@@ -1226,6 +1226,7 @@ dependencies = [
 name = "norn-multicore"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "norn-channel",
  "norn-executor",
 ]
