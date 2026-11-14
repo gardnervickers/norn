@@ -6,12 +6,14 @@ mod incoming;
 mod options;
 mod ready;
 pub(crate) mod socket;
+mod steering;
 mod tcp;
 mod udp;
 mod unix;
 
 pub use options::{RecvOptions, SendOptions};
 pub use socket::{Event, RecvMsgRingBuf, SendZcResult, SendZcUsage};
+pub use steering::ReuseportCpuMap;
 pub use tcp::{
     TcpListener, TcpListenerOptions, TcpRecvBundleMulti, TcpRecvRingMulti, TcpSocket, TcpStream,
     TcpStreamReader, TcpStreamWriter,
