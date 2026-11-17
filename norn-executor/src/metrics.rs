@@ -12,7 +12,7 @@ pub(crate) struct ExecutorCounters {
     /// odd while running. Keeping both facts in one word lets a reader on
     /// another thread see them consistently.
     pub(crate) activity: Counter,
-    pub(crate) polls: Counter,
+    pub(crate) task_runs: Counter,
     pub(crate) budget_exhausted: Counter,
     pub(crate) waiting_parks: Counter,
 }
@@ -36,17 +36,17 @@ impl Drop for Activity<'_> {
     }
 }
 
-/// Publishes a tick's poll count when dropped, so the polls of a tick that
-/// unwinds are counted too.
-pub(crate) struct TickPolls<'a> {
+/// Publishes a tick's task-run count when dropped, including when the tick
+/// unwinds.
+pub(crate) struct TickTaskRuns<'a> {
     pub(crate) counter: &'a Counter,
-    pub(crate) polled: usize,
+    pub(crate) ran: usize,
 }
 
-impl Drop for TickPolls<'_> {
+impl Drop for TickTaskRuns<'_> {
     #[inline(always)]
     fn drop(&mut self) {
-        self.counter.add(self.polled as u64);
+        self.counter.add(self.ran as u64);
     }
 }
 
@@ -81,7 +81,7 @@ impl ExecutorMetrics {
         let activity = c.activity.get();
         ExecutorSnapshot {
             ticks: c.ticks.get(),
-            polls: c.polls.get(),
+            task_runs: c.task_runs.get(),
             budget_exhausted: c.budget_exhausted.get(),
             waiting_parks: c.waiting_parks.get(),
             running: activity % 2 == 1,
@@ -102,7 +102,7 @@ pub struct ExecutorSnapshot {
     pub ticks: u64,
     /// Task runs: one per `Runnable::run`, which polls the task's future
     /// unless the task was cancelled first.
-    pub polls: u64,
+    pub task_runs: u64,
     /// Ticks that ended because the task poll budget ran out while tasks were
     /// still runnable.
     pub budget_exhausted: u64,
@@ -138,10 +138,10 @@ impl Visit for ExecutorSnapshot {
             value: self.ticks,
         });
         f(Metric {
-            name: "norn_executor_polls_total",
+            name: "norn_executor_task_runs_total",
             help: "Task runs.",
             kind: Kind::Counter,
-            value: self.polls,
+            value: self.task_runs,
         });
         f(Metric {
             name: "norn_executor_budget_exhausted_total",

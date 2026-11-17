@@ -1,4 +1,4 @@
-//! Executor metrics stay right when a panic unwinds out of `block_on`.
+//! Executor metrics during polling, unwinding, and shutdown.
 
 use std::cell::{Cell, RefCell};
 use std::future::Future;
@@ -113,10 +113,10 @@ impl Wake for PanicOnWake {
     }
 }
 
-/// A join-waker panic unwinds out of `block_on` mid-tick; that tick's polls
-/// are still counted.
+/// A join-waker panic unwinds out of `block_on` mid-tick; that tick's task
+/// runs are still counted.
 #[test]
-fn polls_of_an_unwinding_tick_are_counted() {
+fn task_runs_of_an_unwinding_tick_are_counted() {
     let mut executor = LocalExecutor::new(SpinPark);
     let metrics = executor.metrics();
     let mut join = executor.handle().spawn(async {});
@@ -131,7 +131,7 @@ fn polls_of_an_unwinding_tick_are_counted() {
     assert!(ran.is_err());
     let snapshot = metrics.snapshot();
     assert_eq!(snapshot.tasks.finished, 1);
-    assert_eq!(snapshot.polls, 1, "{snapshot:?}");
+    assert_eq!(snapshot.task_runs, 1, "{snapshot:?}");
     assert!(!snapshot.running, "{snapshot:?}");
 }
 
@@ -167,7 +167,7 @@ impl Park for RecordShutdown {
     }
 }
 
-/// Records whether the executor reports running when this task is dropped.
+/// Records whether the executor reports running when dropped.
 struct RecordDrop {
     metrics: ExecutorMetrics,
     running_in_drop: Rc<Cell<Option<bool>>>,
@@ -178,6 +178,29 @@ impl Drop for RecordDrop {
         self.running_in_drop
             .set(Some(self.metrics.snapshot().running));
     }
+}
+
+impl Future for RecordDrop {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+        Poll::Ready(())
+    }
+}
+
+#[test]
+fn root_future_destructor_counts_as_running() {
+    let mut executor = LocalExecutor::new(SpinPark);
+    let metrics = executor.metrics();
+    let running_in_drop = Rc::new(Cell::new(None));
+
+    executor.block_on(RecordDrop {
+        metrics: metrics.clone(),
+        running_in_drop: Rc::clone(&running_in_drop),
+    });
+
+    assert_eq!(running_in_drop.get(), Some(true));
+    assert!(!metrics.snapshot().running);
 }
 
 /// Dropping tasks is user code and counts as running; the park layer's own

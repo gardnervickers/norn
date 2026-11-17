@@ -200,16 +200,16 @@ impl<P: park::Park> LocalExecutor<P> {
         F: Future,
     {
         let _g = self.enter();
+        let counters = &*self.counters;
+        // Declare the guard before pinning so it stays live through the root
+        // future's destructor, including during unwinding.
+        let _running = metrics::Activity::flip(&counters.activity);
         let fut = pin!(fut);
         let notifier = match self.root_notifier.take() {
             Some(notifier) => notifier,
             None => wakerfn::root_notifier(self.park.unparker()),
         };
         let mut root = wakerfn::FutureHarness::new(fut, notifier);
-        let counters = &*self.counters;
-        // Running from here until return, unwinding included; parks below
-        // flip it off and back on.
-        let _running = metrics::Activity::flip(&counters.activity);
 
         loop {
             if let Some(result) = root.try_poll() {
@@ -220,15 +220,15 @@ impl<P: park::Park> LocalExecutor<P> {
             let budget = self.config.task_poll_budget.get();
             // Published once per tick rather than per poll, before parking so
             // a reader sees them while the executor waits, and on unwind.
-            let mut tick = metrics::TickPolls {
-                counter: &counters.polls,
-                polled: 0,
+            let mut tick = metrics::TickTaskRuns {
+                counter: &counters.task_runs,
+                ran: 0,
             };
             while let Some(next) = self.taskqueue.next() {
                 // Counted before running, so a run that unwinds counts too.
-                tick.polled += 1;
+                tick.ran += 1;
                 next.run();
-                if tick.polled == budget {
+                if tick.ran == budget {
                     has_remaining_tasks = self.taskqueue.runnable() > 0;
                     break;
                 }
@@ -237,7 +237,7 @@ impl<P: park::Park> LocalExecutor<P> {
                     break;
                 }
             }
-            let budget_exhausted = tick.polled == budget && has_remaining_tasks;
+            let budget_exhausted = tick.ran == budget && has_remaining_tasks;
             drop(tick);
             counters.ticks.incr();
             if budget_exhausted {
@@ -447,10 +447,10 @@ mod tests {
         fn shutdown(&mut self) {}
     }
 
-    /// Ticks and polls are published once per tick, and the running flag is
+    /// Ticks and task runs are published once per tick, and the running flag is
     /// clear once `block_on` returns.
     #[test]
-    fn metrics_count_ticks_and_polls() {
+    fn metrics_count_ticks_and_task_runs() {
         let mut executor = LocalExecutor::new(SpinPark);
         let metrics = executor.metrics();
         let polls = Rc::new(Cell::new(0));
@@ -480,8 +480,8 @@ mod tests {
             }
         });
         let snapshot = metrics.snapshot();
-        assert_eq!(snapshot.polls, polls.get() as u64);
-        assert_eq!(snapshot.polls, 8);
+        assert_eq!(snapshot.task_runs, polls.get() as u64);
+        assert_eq!(snapshot.task_runs, 8);
         // Woken tasks requeue behind the others, so one tick can poll all
         // eight within the default budget.
         assert!(snapshot.ticks >= 1, "{snapshot:?}");
@@ -519,7 +519,7 @@ mod tests {
             }
         });
         let snapshot = metrics.snapshot();
-        assert_eq!(snapshot.polls, 5);
+        assert_eq!(snapshot.task_runs, 5);
         // Ticks one and two each run two of the five tasks and stop with
         // tasks left; tick three runs the last one.
         assert_eq!(snapshot.budget_exhausted, 2, "{snapshot:?}");
