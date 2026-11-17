@@ -47,6 +47,7 @@
 mod future_cell;
 mod header;
 mod join;
+mod metrics;
 mod schedule;
 mod state;
 mod task_cell;
@@ -62,4 +63,5 @@ mod tests;
 
 pub use future_cell::TaskError;
 pub use join::JoinHandle;
+pub use metrics::{TaskMetrics, TaskSnapshot};
 pub use schedule::{RegisteredTask, Runnable, Schedule};
