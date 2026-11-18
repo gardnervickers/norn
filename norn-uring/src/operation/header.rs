@@ -17,8 +17,8 @@ pub(crate) struct Header {
     /// Whether the link from this operation to the next one in its batch is
     /// an `IO_HARDLINK`.
     hard_link: Cell<bool>,
-    /// Whether dropping the operation's future leaves a submitted request to
-    /// run to its terminal completion instead of requesting its cancellation.
+    /// Whether the driver declines per-request cancellation, leaving a submitted
+    /// request to run to its terminal completion when its future is dropped.
     uncancellable: Cell<bool>,
     pub(crate) vtable: &'static VTable,
 }

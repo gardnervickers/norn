@@ -217,6 +217,11 @@ impl OpTarget {
         self.handle.is_complete()
     }
 
+    /// Whether the operation was marked [`Op::uncancellable`].
+    pub(crate) fn is_uncancellable(&self) -> bool {
+        self.handle.header().uncancellable()
+    }
+
     /// Cancel the operation where it waits, if its entry is still in the
     /// driver's overflow queue. Returns false once the entry has left it.
     pub(crate) fn cancel_if_queued(&self) -> bool {
@@ -333,7 +338,7 @@ pin_project_lite::pin_project! {
                         // completions must not wake the task that dropped it.
                         drop(header.take_waker());
                     }
-                    if inner.needs_cancel() && !header.uncancellable() {
+                    if inner.needs_cancel() {
                         this.reactor.cancel_op(
                             OpTarget {
                                 handle: inner.inner.inner.clone(),
@@ -523,9 +528,11 @@ where
     /// Let a submitted request run to its terminal completion when this future
     /// is dropped, instead of requesting its cancellation.
     ///
-    /// The request still retains its operation, and so every resource the
-    /// operation holds, until the driver reaps that completion. Shutdown's
-    /// cancel-all still matches it.
+    /// The driver declines every per-request cancellation of it, whether its
+    /// entry is in the overflow queue, the SQ, or the kernel. The request still
+    /// retains its operation, and so every resource the operation holds, until
+    /// the driver reaps that completion. Shutdown's cancel-all still matches
+    /// it.
     ///
     /// # Panics
     ///

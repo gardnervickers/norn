@@ -190,8 +190,6 @@ struct Shared {
     /// Each target retains its operation's identity until the cancellation is
     /// queued. Parks retry these after draining completions.
     deferred_cancels: RefCell<VecDeque<PendingCancel>>,
-    /// Set once shutdown has requested cancellation of every outstanding request.
-    cancel_all_requested: Cell<bool>,
     /// Set once a request with a hard link was submitted. Shutdown then
     /// cancels again after each completion, because a hard-linked request is
     /// issued only once the request before it ends.
@@ -705,18 +703,6 @@ impl Handle {
         self.shared.overflow.borrow().len()
     }
 
-    /// Whether shutdown may have cancelled any submitted request.
-    ///
-    /// `cancel_all` cancels with `IORING_ASYNC_CANCEL_ANY`, which matches every
-    /// submitted request and does not report which ones it hit, so this cannot
-    /// say whether a particular request was cancelled. It is set before the
-    /// cancel is issued and never cleared. After it is set, an `-ECANCELED`
-    /// completion therefore cannot be told apart from one the operation
-    /// produced on its own, and callers must treat it as "possibly cancelled".
-    pub(crate) fn cancel_all_requested(&self) -> bool {
-        self.shared.cancel_all_requested.get()
-    }
-
     /// Record that a request with a hard link is being submitted, so shutdown
     /// cancels its later requests as soon as they are issued.
     pub(crate) fn note_hard_link(&self) {
@@ -999,7 +985,6 @@ impl Driver {
                 receive_shutdown: Notify::default(),
                 status: Cell::new(Status::Running),
                 deferred_cancels: RefCell::new(VecDeque::new()),
-                cancel_all_requested: Cell::new(false),
                 hard_links: Cell::new(false),
                 cancel_retries: RefCell::new(Vec::new()),
                 submit_error: RefCell::new(None),
@@ -1235,15 +1220,15 @@ impl Driver {
         if user_data == Self::CLOSE_FD_TOKEN {
             trace!(target: LOG, "close_fd.token");
             self.shared.complete_in_flight();
-            // Nothing cancels this close by `user_data`, so `-ECANCELED` before
-            // shutdown is the file's `->flush` result. After shutdown's
-            // cancel-all the close may instead have been stopped before it ran.
-            // The descriptor is not closed again either way.
-            if cqe.result() == -libc::ECANCELED && self.shared.cancel_all_requested.get() {
+            // `-ECANCELED` may be the file's `->flush` result after the close
+            // ran, or io-wq may have failed the close before it ran (shutdown's
+            // cancel-all, or no worker thread could be created). The
+            // descriptor is not closed again either way.
+            if cqe.result() == -libc::ECANCELED {
                 warn!(
                     target: LOG,
-                    "close_fd.indeterminate: shutdown cancellation may have stopped a queued \
-                     close before it ran, and the descriptor may leak"
+                    "close_fd.indeterminate: a queued close reported ECANCELED; it may have \
+                     been cancelled before it ran, and the descriptor may leak"
                 );
             }
             return;
@@ -2337,10 +2322,13 @@ impl Shared {
     /// `predecessor` is the request linked immediately before `target`. If the
     /// cancellation finds nothing because the kernel has not yet issued
     /// `target`, it is retried once after the issue must have happened.
+    ///
+    /// A target marked [`Op::uncancellable`] is left to run, wherever its
+    /// entry is.
     fn cancel_op(self: &Rc<Self>, target: OpTarget, predecessor: Option<OpTarget>) {
         // A target still in the overflow queue is cancelled there, so it never
         // reaches the kernel.
-        if target.is_complete() || target.cancel_if_queued() {
+        if target.is_complete() || target.is_uncancellable() || target.cancel_if_queued() {
             return;
         }
         let cancel = PendingCancel {
@@ -2504,11 +2492,12 @@ impl Shared {
     /// reference to the descriptor is dropped, and every operation that uses it
     /// holds a reference until its terminal completion is reaped, so no request
     /// can still be using it. Closes queued before shutdown began are not
-    /// covered: shutdown's cancel-all can stop one still waiting in io-wq, and
-    /// because its `-ECANCELED` cannot be told apart from a `->flush` error
-    /// after the descriptor was removed, the driver only logs the possible
-    /// leak. Any other code that submits to a shutting-down ring without
-    /// waiting for the result has the same hazards.
+    /// covered: shutdown's cancel-all can stop one still waiting in io-wq, as
+    /// can io-wq failing to create a worker thread. Because that `-ECANCELED`
+    /// cannot be told apart from a `->flush` error after the descriptor was
+    /// removed, the driver only logs the possible leak. Any other code that
+    /// submits to a shutting-down ring without waiting for the result has the
+    /// same hazards.
     fn close_fd(&self, fd: types::Fd) -> Result<(), CloseFdError> {
         if self.shutdown_outcome().is_some() || self.status() != Status::Running {
             return Err(CloseFdError::NeverQueued(io::Error::other(
@@ -2556,11 +2545,11 @@ impl Shared {
     /// Cancel all outstanding requests synchronously.
     ///
     /// This matches with `CancelBuilder::any()`, not by descriptor or
-    /// `user_data`: every submitted request is a candidate. It sets
-    /// `cancel_all_requested`; see `Handle::cancel_all_requested` for what that
-    /// does and does not establish.
+    /// `user_data`: every submitted request is a candidate, including ones
+    /// marked [`Op::uncancellable`], and it does not report which requests it
+    /// hit. A request's `-ECANCELED` completion afterwards cannot be told apart
+    /// from one the operation produced on its own.
     pub(crate) fn cancel_all(&self) -> io::Result<()> {
-        self.cancel_all_requested.set(true);
         #[cfg(test)]
         {
             self.shutdown_test
