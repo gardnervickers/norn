@@ -116,10 +116,17 @@ The project is intentionally not general-purpose today; APIs are still in flux i
   - `Submitted` (handed to the driver: in the SQ, the overflow queue, or the
     kernel, or completed synthetically).
 - Dropping an operation whose entry is still in the overflow queue cancels it
-  there: it completes with `ECANCELED` without reaching the kernel, and so does
-  the rest of its linked group. Shutdown fails queued entries with the shutdown
-  error.
-- Dropping submitted `Op` attempts cancellation (`cancel(user_data)`).
+  there, unless it is `Op::uncancellable`: it completes with `ECANCELED`
+  without reaching the kernel, and so does the rest of its linked group.
+  Shutdown fails queued entries with the shutdown error.
+- Dropping submitted `Op` attempts cancellation (`cancel(user_data)`), unless
+  it was marked `Op::uncancellable`, which `Shared::cancel_op` declines for
+  every per-request path. The explicit descriptor close is marked so: a close
+  that reports `-ECANCELED` may have run (a `->flush` error after the kernel
+  removed the descriptor) or not (io-wq fails it on shutdown's cancel-all or
+  when it cannot create a worker thread), so it can never safely be repeated
+  by number. Every kernel `-ECANCELED` from a close marks the descriptor
+  closed, returns the error, and logs that the descriptor may have leaked.
   Cancellations that report ENOENT are not retried, except once for a later
   member of a linked batch: the kernel issues it from task work after its
   predecessor completes, so a drop can race ahead of that issue. ENOENT also

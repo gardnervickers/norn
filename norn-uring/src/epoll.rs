@@ -185,7 +185,9 @@ impl Epoll {
     /// # Errors
     ///
     /// Returns [`io::ErrorKind::WouldBlock`] while another owner or operation
-    /// retains the descriptor, or another I/O error if close fails.
+    /// retains the descriptor, or another I/O error if close fails. After an
+    /// `ECANCELED` error the descriptor may stay open; see
+    /// [`UringFd::close`](crate::UringFd::close).
     pub async fn close(self) -> io::Result<()> {
         self.fd.close().await
     }

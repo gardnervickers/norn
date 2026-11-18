@@ -86,7 +86,9 @@ impl UringFd {
     ///
     /// Returns [`io::ErrorKind::WouldBlock`] if an operation or another
     /// internal socket view still retains the descriptor. Other errors are
-    /// reported by the kernel close operation.
+    /// reported by the kernel close operation. After any error the runtime
+    /// considers the descriptor closed; after `ECANCELED` it may in fact stay
+    /// open, as described below.
     ///
     /// Dropping an in-flight operation (an unfinished write, or an `incoming()`
     /// stream) only requests its cancellation. The operation keeps its reference
@@ -95,6 +97,20 @@ impl UringFd {
     /// drop can still return `WouldBlock`. Yield to the driver (for example with
     /// [`noop`](crate::noop)) and retry, or let the last owner's drop close the
     /// descriptor.
+    ///
+    /// Once the close has been submitted, dropping the returned future does not
+    /// cancel it: the kernel still closes the descriptor. The descriptor is
+    /// released only through that close, never again by number.
+    ///
+    /// A close that reports `ECANCELED` may or may not have run. A file's
+    /// `->flush` can return it after the kernel removed the descriptor. A close
+    /// of a file with `->flush` (FUSE, NFS, or any regular file on overlayfs,
+    /// as in most containers) runs in the kernel's worker pool, which can also
+    /// fail it with `ECANCELED` without running it: when shutdown cancels every
+    /// request, or when the pool cannot create a worker thread (worker threads
+    /// count against `RLIMIT_NPROC`). The runtime cannot tell these apart, so
+    /// it returns the error, never closes the number again, and logs a warning
+    /// that the descriptor may have leaked.
     pub async fn close(self) -> io::Result<()> {
         self.inner.close().await
     }
@@ -156,9 +172,6 @@ struct Inner {
     fd: types::Fd,
     handle: Option<Handle>,
     closed: Cell<bool>,
-    /// Set when the runtime requests cancellation of an explicit close, and
-    /// cleared when the next explicit close starts.
-    close_canceled: Cell<bool>,
 }
 
 impl NornFd {
@@ -192,7 +205,6 @@ impl NornFd {
             fd,
             handle,
             closed: Cell::new(false),
-            close_canceled: Cell::new(false),
         };
         let inner = Rc::new(inner);
         Self { inner }
@@ -213,24 +225,16 @@ impl NornFd {
             ));
         }
         if let Some(handle) = &self.inner.handle {
-            // The flag describes only the close submitted below. A submitted
-            // close that is dropped is still reaped, which sets `closed`. The
-            // flag goes stale when the future is dropped before its entry
-            // reaches the SQ (while the push waits for space): the guard below
-            // set it, nothing was submitted, and the descriptor is still open.
-            // A genuine -ECANCELED from a later close would then look
-            // runtime-cancelled and trigger a close by fd number.
-            self.inner.close_canceled.set(false);
-            // Dropping this future before completion cancels a submitted close.
-            // Record that before its terminal CQE can be reaped.
-            let mut cancel = RecordCloseCancel(Some(&self.inner.close_canceled));
-            let result = handle
+            // The runtime never cancels a submitted close. A cancelled close
+            // would have to be repeated by number, which is safe only if the
+            // close is known not to have run, and its `-ECANCELED` does not say
+            // that; see `classify_close_completion`.
+            handle
                 .submit(CloseFd {
                     inner: Rc::clone(&self.inner),
                 })
-                .await;
-            cancel.0 = None;
-            result
+                .uncancellable()
+                .await
         } else {
             self.inner.close_direct_and_invalidate()
         }
@@ -250,21 +254,17 @@ impl Drop for Inner {
     }
 }
 
-struct RecordCloseCancel<'a>(Option<&'a Cell<bool>>);
-
-impl Drop for RecordCloseCancel<'_> {
-    fn drop(&mut self) {
-        if let Some(canceled) = self.0 {
-            canceled.set(true);
-        }
-    }
-}
-
 enum CloseResult {
     Closed,
+    /// The close never reached the kernel; the descriptor is still open.
     NeverSubmitted(io::Error),
-    Canceled(io::Error),
+    /// The kernel executed the close and reported an error. Linux removes the
+    /// descriptor before running `->flush`, so the number is released.
     KernelError(io::Error),
+    /// A kernel `-ECANCELED`: io-wq may have failed the close before it ran,
+    /// leaving the descriptor open, or it may have run with `->flush`
+    /// reporting `-ECANCELED`.
+    Indeterminate(io::Error),
 }
 
 impl Inner {
@@ -274,12 +274,22 @@ impl Inner {
                 self.closed.set(true);
                 Ok(())
             }
-            CloseResult::NeverSubmitted(_submit_err) | CloseResult::Canceled(_submit_err) => {
-                self.close_direct_and_invalidate()
-            }
+            CloseResult::NeverSubmitted(_submit_err) => self.close_direct_and_invalidate(),
             CloseResult::KernelError(err) => {
                 // Linux invalidates the descriptor when processing Close even if it reports a
                 // later error. Retrying by integer fd could close an unrelated reused fd.
+                self.closed.set(true);
+                Err(err)
+            }
+            CloseResult::Indeterminate(err) => {
+                // Closing by number could close a descriptor that reused it.
+                // Leaking the descriptor is the safe outcome.
+                warn!(
+                    target: "norn_uring::fd",
+                    "close.indeterminate: fd={} {err}; the close may have been cancelled \
+                     before it ran, and the descriptor may leak",
+                    self.fd.0
+                );
                 self.closed.set(true);
                 Err(err)
             }
@@ -326,29 +336,35 @@ struct CloseFd {
     inner: Rc<Inner>,
 }
 
-fn classify_close_completion(
-    result: crate::operation::CQEResult,
-    cancel_requested: bool,
-) -> CloseResult {
+/// Classify an explicit close's terminal completion.
+///
+/// In Linux 6.18, `io_close` removes the descriptor from the table
+/// (`file_close_fd_locked`) before `filp_close` runs `->flush`, so any error
+/// from an executed close leaves the number released. A close of a file with
+/// `->flush` is punted to io-wq, which can fail it with `-ECANCELED` without
+/// running it. A cancellation that finds it pending removes it, and one that
+/// finds it already taken by a worker sets `IO_WQ_WORK_CANCEL`, which
+/// `io_wq_submit_work` checks before issuing. io-wq also fails pending work
+/// when it cannot create its first worker (`io_wq_enqueue`,
+/// `create_worker_cont`). `-ECANCELED` is also a value `->flush` can return
+/// after the close ran (a FUSE server's FLUSH reply), so a kernel
+/// `-ECANCELED` cannot be attributed and is [`CloseResult::Indeterminate`].
+/// Only a synthetic completion, which never reached the kernel, leaves the
+/// descriptor to be closed by number.
+fn classify_close_completion(result: crate::operation::CQEResult) -> CloseResult {
     let synthetic = result.is_synthetic();
     match result.into_result() {
         Ok(_) => CloseResult::Closed,
         Err(err) if synthetic => CloseResult::NeverSubmitted(err),
-        // After the runtime cancels a close, `-ECANCELED` means the request did
-        // not execute. Once that terminal CQE arrives, the descriptor can be
-        // closed directly without racing the original SQE. Without such a
-        // cancellation it is the executed close's `->flush` result: the kernel
-        // has already removed the descriptor, as for any other kernel error.
-        Err(err) if cancel_requested && err.raw_os_error() == Some(libc::ECANCELED) => {
-            CloseResult::Canceled(err)
-        }
+        Err(err) if err.raw_os_error() == Some(libc::ECANCELED) => CloseResult::Indeterminate(err),
         Err(err) => CloseResult::KernelError(err),
     }
 }
 
 // Safety: `inner` retains the descriptor through the terminal CQE. `reap`
-// records a successful kernel close or closes directly after a synthetic or
-// runtime-canceled request, so the queued result owns no descriptor.
+// records that the kernel consumed or may have consumed the descriptor, or
+// closes it directly after a synthetic completion of a request that never
+// reached the kernel, so the queued result owns no descriptor.
 unsafe impl Operation for CloseFd {
     type Completion = io::Result<()>;
 
@@ -357,14 +373,8 @@ unsafe impl Operation for CloseFd {
     }
 
     unsafe fn reap(&mut self, result: crate::operation::CQEResult) -> Self::Completion {
-        let cancel_requested = self.inner.close_canceled.get()
-            || self
-                .inner
-                .handle
-                .as_ref()
-                .is_some_and(Handle::cancel_all_requested);
         self.inner
-            .finish_tracked_close(classify_close_completion(result, cancel_requested))
+            .finish_tracked_close(classify_close_completion(result))
     }
 }
 
@@ -492,42 +502,64 @@ mod tests {
 
     #[test]
     fn close_completion_distinguishes_submission_from_kernel_errors() {
-        let synthetic = classify_close_completion(
-            crate::operation::CQEResult::synthetic(Err(io::Error::from_raw_os_error(libc::EIO))),
-            false,
-        );
-        assert!(matches!(
-            synthetic,
-            CloseResult::NeverSubmitted(err) if err.raw_os_error() == Some(libc::EIO)
-        ));
+        let kernel_err = |errno| CQEResult::new(Err(io::Error::from_raw_os_error(errno)), 0);
 
-        let canceled = classify_close_completion(
-            crate::operation::CQEResult::new(Err(io::Error::from_raw_os_error(libc::ECANCELED)), 0),
-            true,
-        );
         assert!(matches!(
-            canceled,
-            CloseResult::Canceled(err) if err.raw_os_error() == Some(libc::ECANCELED)
+            classify_close_completion(CQEResult::new(Ok(0), 0)),
+            CloseResult::Closed
         ));
-
-        // Without a runtime cancellation, `-ECANCELED` came from the executed close.
-        let executed = classify_close_completion(
-            crate::operation::CQEResult::new(Err(io::Error::from_raw_os_error(libc::ECANCELED)), 0),
-            false,
-        );
+        // A synthetic completion never reached the kernel, even if it reports
+        // ECANCELED.
+        for errno in [libc::EIO, libc::ECANCELED] {
+            assert!(matches!(
+                classify_close_completion(CQEResult::synthetic(Err(io::Error::from_raw_os_error(errno)))),
+                CloseResult::NeverSubmitted(err) if err.raw_os_error() == Some(errno)
+            ));
+        }
+        // An executed close reporting an error released the descriptor.
         assert!(matches!(
-            executed,
-            CloseResult::KernelError(err) if err.raw_os_error() == Some(libc::ECANCELED)
-        ));
-
-        let kernel = classify_close_completion(
-            crate::operation::CQEResult::new(Err(io::Error::from_raw_os_error(libc::EIO)), 0),
-            true,
-        );
-        assert!(matches!(
-            kernel,
+            classify_close_completion(kernel_err(libc::EIO)),
             CloseResult::KernelError(err) if err.raw_os_error() == Some(libc::EIO)
         ));
+        // A kernel ECANCELED may or may not have run.
+        assert!(matches!(
+            classify_close_completion(kernel_err(libc::ECANCELED)),
+            CloseResult::Indeterminate(err) if err.raw_os_error() == Some(libc::ECANCELED)
+        ));
+    }
+
+    static WARNINGS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    struct WarningCapture;
+
+    impl log::Log for WarningCapture {
+        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+            metadata.level() <= log::Level::Warn
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            if self.enabled(record.metadata()) {
+                WARNINGS.lock().unwrap().push(record.args().to_string());
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    /// Install a warning-capturing logger. Call only from an isolated test:
+    /// its process runs no other test, so the global logger is still free.
+    fn capture_warnings() {
+        log::set_logger(&WarningCapture).expect("isolated test process has no logger");
+        log::set_max_level(log::LevelFilter::Warn);
+    }
+
+    fn warnings_containing(needle: &str) -> usize {
+        WARNINGS
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|line| line.contains(needle))
+            .count()
     }
 
     #[test]
@@ -557,14 +589,12 @@ mod tests {
         drop(fd);
         assert_open(read_end);
 
-        // Model the runtime cancelling the close before the kernel executed it.
-        close.inner.close_canceled.set(true);
-        // Safety: the test supplies this `CloseFd`'s unreaped terminal CQE.
+        // Model shutdown failing the close before it reached the kernel.
+        // Safety: the test supplies this `CloseFd`'s unreaped terminal completion.
         unsafe {
-            close.reap(crate::operation::CQEResult::new(
-                Err(io::Error::from_raw_os_error(libc::ECANCELED)),
-                0,
-            ))
+            close.reap(crate::operation::CQEResult::synthetic(Err(
+                io::Error::from_raw_os_error(libc::ECANCELED),
+            )))
         }
         .unwrap();
         assert_pipe_reader_closed(write_end);
@@ -614,6 +644,7 @@ mod tests {
     }
 
     fn terminal_close_error_does_not_close_reused_descriptor_isolated() {
+        capture_warnings();
         let [read_end, write_end] = pipe();
         let fd = NornFd::from_fd(read_end);
 
@@ -631,6 +662,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::EIO));
         assert_open(read_end);
+        assert_eq!(warnings_containing("close.indeterminate"), 0);
 
         drop(fd);
         unsafe {
@@ -648,6 +680,7 @@ mod tests {
     }
 
     fn executed_close_reporting_ecanceled_does_not_close_reused_descriptor_isolated() {
+        capture_warnings();
         let [read_end, write_end] = pipe();
         let fd = NornFd::from_fd(read_end);
         let mut close = CloseFd {
@@ -657,7 +690,7 @@ mod tests {
 
         // Model `io_close` removing the descriptor before `filp_close` returns
         // `-ECANCELED` from `->flush` (for example a FUSE FLUSH reply), followed by
-        // reuse of the integer descriptor. The runtime never requested cancellation.
+        // reuse of the integer descriptor. Nothing requested cancellation.
         assert_eq!(unsafe { libc::close(read_end) }, 0);
         assert_eq!(unsafe { libc::dup2(write_end, read_end) }, read_end);
         // Safety: the test supplies this `CloseFd`'s unreaped terminal CQE.
@@ -670,6 +703,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::ECANCELED));
         assert_open(read_end);
+        assert_eq!(warnings_containing("close.indeterminate"), 1);
 
         drop(close);
         unsafe {
@@ -679,12 +713,65 @@ mod tests {
     }
 
     #[test]
-    fn dropping_submitted_close_records_runtime_cancellation() {
+    fn shutdown_canceled_close_does_not_close_reused_descriptor() {
+        crate::test_util::run_isolated(
+            "fd::tests::shutdown_canceled_close_does_not_close_reused_descriptor",
+            shutdown_canceled_close_does_not_close_reused_descriptor_isolated,
+        );
+    }
+
+    fn shutdown_canceled_close_does_not_close_reused_descriptor_isolated() {
+        use norn_executor::park::Park;
+
+        capture_warnings();
+        let mut driver = crate::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let [read_end, write_end] = pipe();
+        let fd = NornFd::from_fd_on(read_end, driver.handle());
+        let mut close = CloseFd {
+            inner: Rc::clone(&fd.inner),
+        };
+        drop(fd);
+        // Shutdown requests cancellation of every outstanding request.
+        driver.shutdown();
+
+        // Model io-wq running the close before the cancel-all reached it: the
+        // descriptor is removed, `->flush` reports `-ECANCELED`, and the
+        // integer descriptor is reused. Had the cancel-all stopped the close
+        // instead, the completion would be the same.
+        assert_eq!(unsafe { libc::close(read_end) }, 0);
+        assert_eq!(unsafe { libc::dup2(write_end, read_end) }, read_end);
+        // Safety: the test supplies this `CloseFd`'s unreaped terminal CQE.
+        let err = unsafe {
+            close.reap(CQEResult::new(
+                Err(io::Error::from_raw_os_error(libc::ECANCELED)),
+                0,
+            ))
+        }
+        .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ECANCELED));
+        assert_open(read_end);
+        assert_eq!(warnings_containing("close.indeterminate"), 1);
+        assert!(
+            close.inner.closed.get(),
+            "dropping must not close it either"
+        );
+
+        drop(close);
+        assert_open(read_end);
+        unsafe {
+            libc::close(read_end);
+            libc::close(write_end);
+        }
+    }
+
+    #[test]
+    fn dropping_submitted_close_does_not_cancel_it() {
         use norn_executor::park::{Park, ParkMode};
         use std::future::Future;
         use std::task::{Context, Waker};
 
         let mut driver = crate::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let handle = driver.handle();
         let [read_end, write_end] = pipe();
         let fd = NornFd::from_fd_on(read_end, driver.handle());
         let inner = Rc::downgrade(&fd.inner);
@@ -694,49 +781,56 @@ mod tests {
             .as_mut()
             .poll(&mut Context::from_waker(Waker::noop()))
             .is_pending());
+        assert_eq!(handle.in_flight(), 1);
         drop(close);
 
-        // The submitted close retains the descriptor until its terminal CQE, and
-        // the cancellation is recorded before that CQE can be reaped.
+        // No cancellation is queued, so the close's own completion is the only
+        // result, and the operation retains the descriptor until it arrives.
+        assert_eq!(
+            handle.in_flight(),
+            1,
+            "a dropped close must not be cancelled"
+        );
         let retained = inner.upgrade().expect("submitted close retains descriptor");
-        assert!(retained.close_canceled.get());
         assert!(!retained.closed.get());
         drop(retained);
 
-        // A pipe has no `->flush`, so the kernel closes it inline before the
-        // cancellation can match it.
-        driver.park(ParkMode::NoPark).unwrap();
+        for _ in 0..16 {
+            if handle.in_flight() == 0 {
+                break;
+            }
+            driver.park(ParkMode::NoPark).unwrap();
+        }
+        assert_eq!(handle.in_flight(), 0);
+        assert!(
+            inner.upgrade().is_none(),
+            "the reaped close released the descriptor"
+        );
         assert_pipe_reader_closed(write_end);
         unsafe { libc::close(write_end) };
     }
 
     #[test]
-    fn starting_a_close_clears_a_stale_cancellation_flag() {
+    fn close_dropped_before_shutdown_still_closes_descriptor() {
         use std::future::Future;
         use std::task::{Context, Waker};
 
         let driver = crate::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
         let [read_end, write_end] = pipe();
         let fd = NornFd::from_fd_on(read_end, driver.handle());
-        // Model an earlier close future dropped before its entry reached the SQ:
-        // its guard set the flag, nothing was submitted, the descriptor is open.
-        fd.inner.close_canceled.set(true);
-        let inner = Rc::downgrade(&fd.inner);
 
         let mut close = Box::pin(async move { fd.close().await });
         assert!(close
             .as_mut()
             .poll(&mut Context::from_waker(Waker::noop()))
             .is_pending());
-
-        let submitted = inner.upgrade().expect("submitted close retains descriptor");
-        assert!(
-            !submitted.close_canceled.get(),
-            "a new close must not inherit the previous close's cancellation"
-        );
-        drop(submitted);
         drop(close);
+        // Shutdown submits the queued close, cancels everything, and reaps it.
+        // A pipe has no `->flush`, so the kernel closes it inline at submission,
+        // before the cancel-all.
         drop(driver);
+
+        assert_pipe_reader_closed(write_end);
         unsafe { libc::close(write_end) };
     }
 
