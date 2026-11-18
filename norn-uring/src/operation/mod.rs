@@ -311,12 +311,16 @@ unsafe impl Operation for AsyncCancel {
 /// A driver-internal zero-length timeout that orders a cancellation retry
 /// after task work on an SQPOLL ring.
 ///
-/// A pure timeout always completes from its timer callback by queueing task
-/// work on the task that issued it, which on an SQPOLL ring is the SQ thread.
-/// That thread runs its task work in the order it was queued. So once the
-/// driver reaps this request's CQE, every item queued on the SQ thread before
-/// the timer fired has run, including the issue of a linked request whose
-/// predecessor's CQE the driver had reaped before submitting this request.
+/// Once armed, a pure timeout completes from its timer callback by queueing
+/// task work on the task that issued it, which on an SQPOLL ring is the SQ
+/// thread. That thread runs its task work in the order it was queued. So once
+/// the driver reaps this request's CQE, every item queued on the SQ thread
+/// before the timer fired has run, including the issue of a linked request
+/// whose predecessor's CQE the driver had reaped before submitting this
+/// request. A timeout that fails before it is armed (for example `EFAULT`,
+/// `ENOMEM` or `EAGAIN` at preparation) completes inline at submission
+/// instead, without that ordering; the retry it gates then behaves as it did
+/// without a barrier.
 pub(crate) struct TaskWorkBarrier {
     timeout: io_uring::types::Timespec,
 }

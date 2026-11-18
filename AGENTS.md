@@ -65,7 +65,8 @@ The project is intentionally not general-purpose today; APIs are still in flux i
 - `Driver` owns ring + overflow queue + status (`Running`, `Closing`,
   `Draining`, `Shutdown`).
 - `Shared::in_flight` counts pushed entries (operations, cancellations, the
-  eventfd read, closes) until their terminal CQE is dispatched. Every new
+  SQPOLL cancel-retry task work barrier, the eventfd read, closes) until
+  their terminal CQE is dispatched. Every new
   internal SQE must post exactly one terminal CQE and be pushed through a
   counting helper; only the fallback drain barrier is uncounted.
 - `Driver::new` rejects `IORING_SETUP_IOPOLL` and kernels without

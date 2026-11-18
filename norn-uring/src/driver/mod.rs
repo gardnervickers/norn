@@ -2305,8 +2305,7 @@ impl Shared {
     /// Returns true when an SQPOLL ring's SQ has no free slot, because the
     /// kernel thread has not yet consumed the queued entries.
     fn sqpoll_sq_full(&self) -> bool {
-        let mut ring = self.ring.borrow_mut();
-        ring.params().is_setup_sqpoll() && ring.submission().is_full()
+        self.sqpoll && self.ring.borrow_mut().submission().is_full()
     }
 
     /// Returns true when queued work is waiting for SQ space.
@@ -2407,15 +2406,18 @@ impl Shared {
     ///   driver runs it with a non-blocking GETEVENTS enter, then sends the
     ///   retry. On a ring with `IORING_SETUP_TASKRUN_FLAG` the enter must leave
     ///   no task work pending, or the next park tries again.
-    /// - With SQPOLL, the task work belongs to the SQ thread, which runs it
-    ///   after the submissions of each loop iteration, so an enter by the
-    ///   driver does not run it and a retry sent at once can arrive first.
+    /// - With SQPOLL, the task work belongs to the SQ thread, so an enter by
+    ///   the driver does not run it, and a retry sent at once can reach the
+    ///   kernel first: since Linux 6.9 that thread runs task work after the
+    ///   submissions of each loop iteration (earlier kernels run it at the
+    ///   top of the loop, but the first retry can still race the issue).
     ///   The driver instead submits a [`TaskWorkBarrier`] and sends the retry
     ///   once the barrier's CQE is reaped. The barrier is submitted after the
     ///   predecessor's CQE was read, so after the SQ thread queued the issue;
-    ///   its own completion is task work queued on that thread later still,
-    ///   and that thread runs task work in the order it was queued. One
-    ///   barrier serves every retry that became due in the same park.
+    ///   its own completion is task work queued on the same list later still,
+    ///   and that list runs in the order it was queued, whenever the thread
+    ///   runs it. One barrier serves every retry that became due in the same
+    ///   park.
     ///
     /// Either way the retry reaches the kernel after the target was issued,
     /// so a second ENOENT means the target is issued but not cancellable
@@ -2426,9 +2428,12 @@ impl Shared {
     ///
     /// The ordering argument assumes the kernel issues the request from task
     /// work queued by the thread that flushed the predecessor's completion.
-    /// A predecessor that completes in an io-wq worker instead passes its
-    /// successor back to io-wq without task work, and neither mechanism
-    /// orders a retry after that hand-off.
+    /// When an io-wq worker drops the predecessor's last reference, the
+    /// worker instead passes the successor back to io-wq without task work,
+    /// and neither mechanism orders a retry after that hand-off. That happens
+    /// when the predecessor completes in the worker, and also when it was
+    /// punted to io-wq, armed a poll, and completed in task work while the
+    /// worker still held the last reference.
     ///
     /// Retries run only while the driver accepts work. Shutdown reclaims the
     /// remaining targets through synchronous cancellation and its re-cancels
@@ -5636,9 +5641,10 @@ mod tests {
     fn dropped_hard_linked_chain_is_cancelled_under_sqpoll() {
         // Dropping the chain cancels its issued head. The kernel then issues
         // each hard-linked successor in turn, from task work queued after the
-        // predecessor's CQE is posted. The SQ thread runs that task work only
-        // after the submissions of its next loop iteration, so a retry that
-        // arrives in that window finds nothing (ENOENT) again. Whether one
+        // predecessor's CQE is posted. Since Linux 6.9 the SQ thread runs
+        // that task work only after the submissions of its next loop
+        // iteration, so a retry that arrives in that window finds nothing
+        // (ENOENT) again. Whether one
         // does depends on scheduling, so the test runs many rounds; on an idle
         // 32-CPU machine the window was never hit, even without the barrier.
         // `dropped_hard_linked_chain_is_cancelled_behind_sqpoll_task_work`
