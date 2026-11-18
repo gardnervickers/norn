@@ -693,6 +693,12 @@ impl Handle {
         self.shared.close_fd(fd)
     }
 
+    /// The number of pushed entries whose terminal CQE has not been dispatched.
+    #[cfg(test)]
+    pub(crate) fn in_flight(&self) -> usize {
+        self.shared.in_flight()
+    }
+
     /// The number of entries waiting in the overflow queue.
     #[cfg(test)]
     pub(crate) fn queued_entries(&self) -> usize {
@@ -1229,6 +1235,17 @@ impl Driver {
         if user_data == Self::CLOSE_FD_TOKEN {
             trace!(target: LOG, "close_fd.token");
             self.shared.complete_in_flight();
+            // Nothing cancels this close by `user_data`, so `-ECANCELED` before
+            // shutdown is the file's `->flush` result. After shutdown's
+            // cancel-all the close may instead have been stopped before it ran.
+            // The descriptor is not closed again either way.
+            if cqe.result() == -libc::ECANCELED && self.shared.cancel_all_requested.get() {
+                warn!(
+                    target: LOG,
+                    "close_fd.indeterminate: shutdown cancellation may have stopped a queued \
+                     close before it ran, and the descriptor may leak"
+                );
+            }
             return;
         }
 
@@ -2487,7 +2504,10 @@ impl Shared {
     /// reference to the descriptor is dropped, and every operation that uses it
     /// holds a reference until its terminal completion is reaped, so no request
     /// can still be using it. Closes queued before shutdown began are not
-    /// covered. Any other code that submits to a shutting-down ring without
+    /// covered: shutdown's cancel-all can stop one still waiting in io-wq, and
+    /// because its `-ECANCELED` cannot be told apart from a `->flush` error
+    /// after the descriptor was removed, the driver only logs the possible
+    /// leak. Any other code that submits to a shutting-down ring without
     /// waiting for the result has the same hazards.
     fn close_fd(&self, fd: types::Fd) -> Result<(), CloseFdError> {
         if self.shutdown_outcome().is_some() || self.status() != Status::Running {

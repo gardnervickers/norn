@@ -333,7 +333,7 @@ pin_project_lite::pin_project! {
                         // completions must not wake the task that dropped it.
                         drop(header.take_waker());
                     }
-                    if inner.needs_cancel() {
+                    if inner.needs_cancel() && !header.uncancellable() {
                         this.reactor.cancel_op(
                             OpTarget {
                                 handle: inner.inner.inner.clone(),
@@ -517,6 +517,25 @@ where
             panic!("request options must be set before the request is first polled");
         };
         f(&mut handle.data_mut().expect("prepared operation has data"));
+        self
+    }
+
+    /// Let a submitted request run to its terminal completion when this future
+    /// is dropped, instead of requesting its cancellation.
+    ///
+    /// The request still retains its operation, and so every resource the
+    /// operation holds, until the driver reaps that completion. Shutdown's
+    /// cancel-all still matches it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the request has already been polled or linked.
+    #[track_caller]
+    pub(crate) fn uncancellable(self) -> Self {
+        let State::Prepared { handle } = &self.state else {
+            panic!("request options must be set before the request is first polled");
+        };
+        handle.inner.header().set_uncancellable();
         self
     }
 
@@ -1608,6 +1627,102 @@ mod tests {
 
         assert!(results.iter().all(|result| matches!(result, Ok(0))));
         assert_eq!(configured.get(), 4);
+    }
+
+    /// A terminal completion's result (an errno on failure) and whether it
+    /// was synthetic.
+    type Recorded = Rc<Cell<Option<(Result<u32, i32>, bool)>>>;
+
+    /// Records its terminal completion.
+    #[derive(Debug)]
+    struct RecordingNop(Recorded);
+
+    unsafe impl Operation for RecordingNop {
+        type Completion = ();
+
+        fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+            Ok(io_uring::opcode::Nop::new().build())
+        }
+
+        unsafe fn reap(&mut self, result: CQEResult) -> Self::Completion {
+            let synthetic = result.is_synthetic();
+            let raw = result
+                .into_result()
+                .map_err(|err| err.raw_os_error().expect("errno"));
+            self.0.set(Some((raw, synthetic)));
+        }
+    }
+
+    impl Singleshot for RecordingNop {
+        type Output = ();
+
+        fn complete(self, _completion: ()) {}
+    }
+
+    fn park_until(driver: &mut crate::Driver, done: impl Fn() -> bool) {
+        use norn_executor::park::{Park, ParkMode};
+        for _ in 0..16 {
+            if done() {
+                return;
+            }
+            driver.park(ParkMode::NoPark).unwrap();
+        }
+        assert!(done(), "operation did not complete");
+    }
+
+    #[test]
+    fn dropped_uncancellable_submitted_operation_is_not_cancelled() {
+        let mut driver = crate::Driver::new(io_uring::IoUring::builder(), 8).unwrap();
+        let handle = driver.handle();
+        let result = Rc::new(Cell::new(None));
+        let mut op = Box::pin(
+            handle
+                .submit(RecordingNop(Rc::clone(&result)))
+                .uncancellable(),
+        );
+        let waker = futures_test::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(Future::poll(op.as_mut(), &mut cx).is_pending());
+        assert_eq!(handle.in_flight(), 1);
+
+        drop(op);
+        assert_eq!(
+            handle.in_flight(),
+            1,
+            "dropping must not queue a cancellation"
+        );
+
+        park_until(&mut driver, || result.get().is_some());
+        assert_eq!(result.get(), Some((Ok(0), false)));
+        assert_eq!(handle.in_flight(), 0);
+    }
+
+    #[test]
+    fn dropped_uncancellable_queued_operation_still_reaches_the_kernel() {
+        let mut driver = crate::Driver::new(io_uring::IoUring::builder(), 1).unwrap();
+        let handle = driver.handle();
+        let waker = futures_test::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        // Fill the one-entry SQ so that the next operation waits in the
+        // driver's overflow queue.
+        let first = Rc::new(Cell::new(None));
+        let mut filler = Box::pin(handle.submit(RecordingNop(Rc::clone(&first))));
+        assert!(Future::poll(filler.as_mut(), &mut cx).is_pending());
+        let queued = Rc::new(Cell::new(None));
+        let mut op = Box::pin(
+            handle
+                .submit(RecordingNop(Rc::clone(&queued)))
+                .uncancellable(),
+        );
+        assert!(Future::poll(op.as_mut(), &mut cx).is_pending());
+        assert_eq!(handle.queued_entries(), 1);
+
+        drop(op);
+        park_until(&mut driver, || queued.get().is_some());
+        // A cancelled queued entry would complete synthetically with ECANCELED.
+        assert_eq!(queued.get(), Some((Ok(0), false)));
+        drop(filler);
+        park_until(&mut driver, || handle.in_flight() == 0);
     }
 
     #[test]
