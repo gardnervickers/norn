@@ -65,7 +65,8 @@ The project is intentionally not general-purpose today; APIs are still in flux i
 - `Driver` owns ring + overflow queue + status (`Running`, `Closing`,
   `Draining`, `Shutdown`).
 - `Shared::in_flight` counts pushed entries (operations, cancellations, the
-  eventfd read, closes) until their terminal CQE is dispatched. Every new
+  SQPOLL cancel-retry task work barrier, the eventfd read, closes) until
+  their terminal CQE is dispatched. Every new
   internal SQE must post exactly one terminal CQE and be pushed through a
   counting helper; only the fallback drain barrier is uncounted.
 - `Driver::new` rejects `IORING_SETUP_IOPOLL` and kernels without
@@ -122,9 +123,12 @@ The project is intentionally not general-purpose today; APIs are still in flux i
 - Dropping submitted `Op` attempts cancellation (`cancel(user_data)`).
   Cancellations that report ENOENT are not retried, except once for a later
   member of a linked batch: the kernel issues it from task work after its
-  predecessor completes, so a drop can race ahead of that issue. ENOENT also
-  means "issued but not cancellable" (e.g. a zero-copy send awaiting its
-  notification), so unbounded retries would spin the driver.
+  predecessor completes, so a drop can race ahead of that issue. The retry
+  waits until that task work must have run: a GETEVENTS enter runs it, or on
+  an SQPOLL ring (where the SQ thread runs it) a zero-length timeout acts as
+  a task work barrier. ENOENT also means "issued but not cancellable" (e.g. a
+  zero-copy send awaiting its notification), so unbounded retries would spin
+  the driver.
 - `Operation::reap` converts each kernel or synthetic completion into an owned
   value; dropping an unconsumed value releases any resources represented by it.
 - Submission failures (including a driver that stopped accepting work) are

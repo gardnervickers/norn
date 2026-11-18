@@ -243,3 +243,56 @@ fn dropped_linked_zc_send_awaiting_notification_does_not_spin_with_defer_taskrun
         "the driver spent {cpu:?} of CPU time during a 100 ms idle wait"
     );
 }
+
+/// An SQPOLL ring. Its kernel thread polls the SQ for up to its idle period
+/// after any submission, but that is the kernel thread's CPU time, not the
+/// runtime thread's, which is all these tests measure.
+fn sqpoll_builder() -> Option<io_uring::Builder> {
+    let mut builder = io_uring::IoUring::builder();
+    builder.setup_sqpoll(1000);
+    if let Err(err) = builder.build(2) {
+        eprintln!("skipping: the kernel refused an SQPOLL ring: {err}");
+        return None;
+    }
+    Some(builder)
+}
+
+#[test]
+fn dropped_zc_send_awaiting_notification_does_not_spin_with_sqpoll() {
+    let Some(builder) = sqpoll_builder() else {
+        return;
+    };
+    let (client, _server) = corked_client();
+    let cpu = idle_cpu_after_drop_with(builder, |handle, primary_seen| {
+        handle.submit(ZcSend {
+            fd: client.as_raw_fd(),
+            buf: vec![7; 100],
+            primary_seen,
+        })
+    });
+    assert!(
+        cpu < Duration::from_millis(30),
+        "the driver spent {cpu:?} of CPU time during a 100 ms idle wait"
+    );
+}
+
+#[test]
+fn dropped_linked_zc_send_awaiting_notification_does_not_spin_with_sqpoll() {
+    // On an SQPOLL ring the one retry waits for a task work barrier, and a
+    // second ENOENT still ends the attempt.
+    let Some(builder) = sqpoll_builder() else {
+        return;
+    };
+    let (client, _server) = corked_client();
+    let cpu = idle_cpu_after_drop_with(builder, |handle, primary_seen| {
+        handle.submit(Nop).then(handle.submit(ZcSend {
+            fd: client.as_raw_fd(),
+            buf: vec![7; 100],
+            primary_seen,
+        }))
+    });
+    assert!(
+        cpu < Duration::from_millis(30),
+        "the driver spent {cpu:?} of CPU time during a 100 ms idle wait"
+    );
+}

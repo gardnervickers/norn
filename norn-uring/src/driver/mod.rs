@@ -19,7 +19,9 @@ use crate::bufring::{
     ReserveError as ReserveBufRingError,
 };
 use crate::error::SubmitError;
-use crate::operation::{reap_operation, AsyncCancel, ConfiguredEntry, Op, OpTarget, Operation};
+use crate::operation::{
+    reap_operation, AsyncCancel, ConfiguredEntry, Op, OpTarget, Operation, TaskWorkBarrier,
+};
 use crate::registered_buffers::Registry as RegisteredBuffers;
 pub(crate) use crate::registered_buffers::{
     Generation as FixedBufGeneration, Release as FixedBufRelease,
@@ -200,9 +202,13 @@ struct Shared {
     ///
     /// A request linked behind another is invisible to cancellation until the
     /// kernel issues it, which happens in task work after its predecessor
-    /// completes. Each entry is cancelled once more, after that point. Unlike
-    /// `deferred_cancels`, these do not represent SQ demand.
+    /// completes. Each entry is cancelled once more, after that point (on an
+    /// SQPOLL ring, after a task work barrier). Unlike `deferred_cancels`,
+    /// these do not represent SQ demand.
     cancel_retries: RefCell<Vec<CancelRetry>>,
+    /// Whether the ring was set up with `IORING_SETUP_SQPOLL`, whose kernel
+    /// thread runs the task work that issues linked requests.
+    sqpoll: bool,
     submit_error: RefCell<Option<(io::ErrorKind, String)>>,
     shutdown_outcome: Cell<Option<ShutdownOutcome>>,
     /// Entries pushed to the SQ whose terminal CQE has not been dispatched.
@@ -332,6 +338,9 @@ pub(crate) struct CancelRetry {
     shared: Weak<Shared>,
     target: Option<OpTarget>,
     predecessor: OpTarget,
+    /// On an SQPOLL ring, the task work barrier submitted once the
+    /// predecessor completed. The retry waits for it to complete.
+    barrier: Option<OpTarget>,
 }
 
 impl CancelRetry {
@@ -985,6 +994,7 @@ impl Driver {
         Self::check_setup(&ring)?;
         let capabilities = crate::ring::Capabilities::probe(&ring)?;
         let cq_size = ring.params().cq_entries();
+        let sqpoll = ring.params().is_setup_sqpoll();
         Ok(Self {
             options,
             shared: Rc::new(Shared {
@@ -996,6 +1006,7 @@ impl Driver {
                 cancel_all_requested: Cell::new(false),
                 hard_links: Cell::new(false),
                 cancel_retries: RefCell::new(Vec::new()),
+                sqpoll,
                 submit_error: RefCell::new(None),
                 shutdown_outcome: Cell::new(None),
                 in_flight: Cell::new(0),
@@ -2294,8 +2305,7 @@ impl Shared {
     /// Returns true when an SQPOLL ring's SQ has no free slot, because the
     /// kernel thread has not yet consumed the queued entries.
     fn sqpoll_sq_full(&self) -> bool {
-        let mut ring = self.ring.borrow_mut();
-        ring.params().is_setup_sqpoll() && ring.submission().is_full()
+        self.sqpoll && self.ring.borrow_mut().submission().is_full()
     }
 
     /// Returns true when queued work is waiting for SQ space.
@@ -2354,6 +2364,7 @@ impl Shared {
             shared: Rc::downgrade(self),
             target: None,
             predecessor,
+            barrier: None,
         });
         let entry = AsyncCancel::entry(cancel.target.clone(), retry);
         match self.try_push(entry) {
@@ -2386,17 +2397,43 @@ impl Shared {
 
     /// Issue each due retry of a linked request's cancellation.
     ///
-    /// A linked request is issued from task work queued when its predecessor
-    /// completes. A retry is therefore due once the predecessor's terminal CQE
-    /// has been reaped. Before sending it, the driver runs pending task work
-    /// with a non-blocking GETEVENTS enter, so the retry reaches the kernel
-    /// after the target was issued; a second ENOENT then means the target is
-    /// issued but not cancellable, and there is no further retry.
+    /// A linked request is issued from task work that the kernel queues after
+    /// it posts the predecessor's terminal CQE. A retry is therefore possible
+    /// only once that CQE has been reaped, and is sent only once the task work
+    /// queued before that point must have run:
     ///
-    /// Under SQPOLL, the kernel's SQ thread may run that task work instead of
-    /// the enter, so the retry can still arrive before the target is issued.
-    /// The target then runs until it completes on its own or shutdown cancels
-    /// it. This is suspected from the kernel source, not reproduced.
+    /// - Without SQPOLL, the task work belongs to the driver's thread. The
+    ///   driver runs it with a non-blocking GETEVENTS enter, then sends the
+    ///   retry. On a ring with `IORING_SETUP_TASKRUN_FLAG` the enter must leave
+    ///   no task work pending, or the next park tries again.
+    /// - With SQPOLL, the task work belongs to the SQ thread, so an enter by
+    ///   the driver does not run it, and a retry sent at once can reach the
+    ///   kernel first: since Linux 6.9 that thread runs task work after the
+    ///   submissions of each loop iteration (earlier kernels run it at the
+    ///   top of the loop, but the first retry can still race the issue).
+    ///   The driver instead submits a [`TaskWorkBarrier`] and sends the retry
+    ///   once the barrier's CQE is reaped. The barrier is submitted after the
+    ///   predecessor's CQE was read, so after the SQ thread queued the issue;
+    ///   its own completion is task work queued on the same list later still,
+    ///   and that list runs in the order it was queued, whenever the thread
+    ///   runs it. One barrier serves every retry that became due in the same
+    ///   park.
+    ///
+    /// Either way the retry reaches the kernel after the target was issued,
+    /// so a second ENOENT means the target is issued but not cancellable
+    /// (such as a zero-copy send awaiting its notification), and there is no
+    /// further retry. Each linked target therefore costs at most one retry,
+    /// plus at most one barrier on an SQPOLL ring, so a target that cannot be
+    /// cancelled cannot make the driver spin.
+    ///
+    /// The ordering argument assumes the kernel issues the request from task
+    /// work queued by the thread that flushed the predecessor's completion.
+    /// When an io-wq worker drops the predecessor's last reference, the
+    /// worker instead passes the successor back to io-wq without task work,
+    /// and neither mechanism orders a retry after that hand-off. That happens
+    /// when the predecessor completes in the worker, and also when it was
+    /// punted to io-wq, armed a poll, and completed in task work while the
+    /// worker still held the last reference.
     ///
     /// Retries run only while the driver accepts work. Shutdown reclaims the
     /// remaining targets through synchronous cancellation and its re-cancels
@@ -2421,19 +2458,39 @@ impl Shared {
         }
         let mut waiting = Vec::new();
         let mut due = Vec::new();
+        let mut need_barrier = Vec::new();
         for retry in retries {
             let target = retry.target.as_ref().expect("scheduled retry has a target");
             if target.is_complete() {
                 continue;
             }
-            if retry.predecessor.is_complete() {
+            if !retry.predecessor.is_complete() {
+                waiting.push(retry);
+            } else if !self.sqpoll {
                 due.push(retry);
             } else {
+                match &retry.barrier {
+                    None => need_barrier.push(retry),
+                    Some(barrier) if barrier.is_complete() => due.push(retry),
+                    Some(_) => waiting.push(retry),
+                }
+            }
+        }
+        if !need_barrier.is_empty() {
+            // The barrier is pushed into the SQ, or queued behind the entries
+            // waiting for room; either way it reaches the kernel after this
+            // point, which is after every predecessor CQE reaped so far.
+            let (entry, barrier) = TaskWorkBarrier::entry();
+            self.push_or_queue(entry);
+            for mut retry in need_barrier {
+                retry.barrier = Some(barrier.clone());
                 waiting.push(retry);
             }
         }
         if !due.is_empty() {
-            if self.run_task_work() {
+            // On an SQPOLL ring the barrier already ordered the retry after
+            // the SQ thread's task work, which an enter here would not run.
+            if self.sqpoll || self.run_task_work() {
                 for mut retry in due {
                     let target = retry.target.take().expect("scheduled retry has a target");
                     self.cancel_op(target, None);
@@ -5426,6 +5483,204 @@ mod tests {
         assert!(
             elapsed < Duration::from_millis(500),
             "released only after {elapsed:?} ({parks} parks): the retry waited for an unrelated wake"
+        );
+    }
+
+    /// Never-ready reads on a raw ring that shares the driver's SQ thread.
+    ///
+    /// Cancelling them all at once queues one task work item per read on that
+    /// thread, which the driver never reaps a completion for.
+    struct SqpollBacklog {
+        ring: io_uring::IoUring,
+        _sockets: Vec<(UnixStream, UnixStream)>,
+        /// Boxed so each read's buffer keeps its address as the list grows.
+        _bufs: Vec<Box<[u8]>>,
+    }
+
+    impl SqpollBacklog {
+        fn new(ring: io_uring::IoUring, reads: usize) -> Self {
+            let mut backlog = Self {
+                ring,
+                _sockets: Vec::new(),
+                _bufs: Vec::new(),
+            };
+            backlog.arm(reads);
+            backlog
+        }
+
+        fn arm(&mut self, reads: usize) {
+            for _ in 0..reads {
+                let (reader, writer) = UnixStream::pair().unwrap();
+                let mut buf = vec![0u8; 8].into_boxed_slice();
+                let read = opcode::Read::new(
+                    types::Fd(reader.as_raw_fd()),
+                    buf.as_mut_ptr(),
+                    buf.len() as u32,
+                )
+                .build()
+                .user_data(1);
+                // Safety: the socket and buffer live in `self` until every
+                // read has completed (see `cancel_and_reap`).
+                unsafe { self.ring.submission().push(&read) }.unwrap();
+                self._sockets.push((reader, writer));
+                self._bufs.push(buf);
+            }
+            self.ring.submit().unwrap();
+        }
+
+        /// Queue one cancellation of every read without waking the SQ thread.
+        fn queue_cancel_all(&mut self) {
+            let cancel = opcode::AsyncCancel2::new(types::CancelBuilder::any())
+                .build()
+                .user_data(2);
+            // Safety: the cancellation references no memory.
+            unsafe { self.ring.submission().push(&cancel) }.unwrap();
+        }
+
+        /// Wake the SQ thread if needed and reap every completion: the
+        /// cancellation's and one per read.
+        fn cancel_and_reap(&mut self) {
+            let mut left = self._bufs.len() + 1;
+            while left > 0 {
+                self.ring.submit_and_wait(1).unwrap();
+                left -= self.ring.completion().count();
+            }
+            self._sockets.clear();
+            self._bufs.clear();
+        }
+    }
+
+    /// Drop a three-request `then_always` chain of never-ready reads on an
+    /// SQPOLL ring `rounds` times, and return each round that left a member in
+    /// flight for 200 ms, with which members were released.
+    ///
+    /// With a non-zero `backlog`, each round first lets the SQ thread go idle,
+    /// then queues the chain's cancellations and one cancellation of `backlog`
+    /// reads on another ring attached to the same SQ thread, so that one
+    /// wakeup submits them in one loop iteration, the driver's first. That
+    /// thread runs at most 32 task work items per iteration
+    /// (`IORING_TW_CAP_ENTRIES_VALUE` in Linux 6.18), in FIFO order, so the
+    /// issue of the head's successor, queued when the head's completion is
+    /// flushed, waits behind the reads' completions for several iterations.
+    fn sqpoll_chain_drop_leaks(rounds: usize, backlog: usize) -> Option<Vec<(usize, Vec<bool>)>> {
+        // A short idle period, so a round can start with the SQ thread asleep.
+        const IDLE_MS: u32 = 1;
+        let mut builder = io_uring::IoUring::builder();
+        builder.setup_sqpoll(IDLE_MS);
+        let other = match builder.build(512) {
+            Ok(ring) => ring,
+            Err(err) => {
+                eprintln!("skipping: the kernel refused an SQPOLL ring: {err}");
+                return None;
+            }
+        };
+        // The driver's ring attaches last, so the SQ thread visits it first.
+        builder.setup_attach_wq(other.as_raw_fd());
+        let mut driver = match Driver::new(builder, 16) {
+            Ok(driver) => driver,
+            Err(err) => {
+                eprintln!("skipping: the kernel refused an attached SQPOLL ring: {err}");
+                return None;
+            }
+        };
+        let mut other = SqpollBacklog::new(other, 0);
+        let handle = driver.handle();
+        let waker = futures_test::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut leaks = Vec::new();
+        for round in 0..rounds {
+            other.arm(backlog);
+            let dropped: [Arc<AtomicBool>; 3] = Default::default();
+            let mut chain = Box::pin(
+                long_lived_read(&handle, &dropped[0])
+                    .then_always(long_lived_read(&handle, &dropped[1]))
+                    .then_always(long_lived_read(&handle, &dropped[2])),
+            );
+            assert!(chain.as_mut().poll(&mut cx).is_pending());
+            driver.park(ParkMode::NoPark).unwrap();
+            if backlog > 0 {
+                // Let the SQ thread arm every read, then go to sleep.
+                while driver.shared.pending_submissions() > 0 {
+                    std::thread::yield_now();
+                }
+                std::thread::sleep(Duration::from_millis(50));
+                other.queue_cancel_all();
+            }
+            // Dropping never enters the kernel, so the next park wakes the SQ
+            // thread for both rings' cancellations at once.
+            drop(chain);
+
+            let released = || dropped.iter().map(|d| d.load(Ordering::Acquire));
+            let deadline = Instant::now() + Duration::from_millis(200);
+            // Busy parks, as a loaded executor would run, reap each CQE as
+            // soon as it is posted.
+            while !released().all(|r| r) && Instant::now() < deadline {
+                driver.park(ParkMode::NoPark).unwrap();
+            }
+            if !released().all(|r| r) {
+                leaks.push((round, released().collect()));
+            }
+            if backlog > 0 {
+                other.cancel_and_reap();
+            }
+        }
+        let retrying = !driver.shared.cancel_retries.borrow().is_empty();
+        drop(handle);
+        assert_eq!(
+            driver.shutdown_with_outcome(),
+            ShutdownOutcome::CleanDrained
+        );
+        assert!(
+            !retrying || !leaks.is_empty(),
+            "a completed target must not be retried"
+        );
+        Some(leaks)
+    }
+
+    #[test]
+    fn dropped_hard_linked_chain_is_cancelled_under_sqpoll() {
+        // Dropping the chain cancels its issued head. The kernel then issues
+        // each hard-linked successor in turn, from task work queued after the
+        // predecessor's CQE is posted. Since Linux 6.9 the SQ thread runs
+        // that task work only after the submissions of its next loop
+        // iteration, so a retry that arrives in that window finds nothing
+        // (ENOENT) again. Whether one
+        // does depends on scheduling, so the test runs many rounds; on an idle
+        // 32-CPU machine the window was never hit, even without the barrier.
+        // `dropped_hard_linked_chain_is_cancelled_behind_sqpoll_task_work`
+        // opens it deterministically.
+        const ROUNDS: usize = 50;
+        let Some(leaks) = sqpoll_chain_drop_leaks(ROUNDS, 0) else {
+            return;
+        };
+        assert!(
+            leaks.is_empty(),
+            "{} of {ROUNDS} rounds left a dropped request in flight \
+             (round, released per member): {leaks:?}",
+            leaks.len()
+        );
+    }
+
+    #[test]
+    fn dropped_hard_linked_chain_is_cancelled_behind_sqpoll_task_work() {
+        // The first task work pass completes the head and 31 of the 160 other
+        // reads, then queues the issue of the chain's second request behind
+        // the other 129, so it runs five passes later. A retry sent as soon as
+        // the head's CQE is reaped arrives in between and finds nothing; one
+        // that waits for a task work barrier, queued behind the issue, does
+        // not. Without the barrier every round leaked on an idle machine.
+        // Heavy CPU contention can delay the driver past those passes, so
+        // under load the test may pass without the barrier, but not fail
+        // with it.
+        const ROUNDS: usize = 10;
+        let Some(leaks) = sqpoll_chain_drop_leaks(ROUNDS, 160) else {
+            return;
+        };
+        assert!(
+            leaks.is_empty(),
+            "{} of {ROUNDS} rounds left a dropped request in flight \
+             (round, released per member): {leaks:?}",
+            leaks.len()
         );
     }
 }
