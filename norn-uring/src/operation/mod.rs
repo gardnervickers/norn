@@ -308,6 +308,54 @@ unsafe impl Operation for AsyncCancel {
     }
 }
 
+/// A driver-internal zero-length timeout that orders a cancellation retry
+/// after task work on an SQPOLL ring.
+///
+/// A pure timeout always completes from its timer callback by queueing task
+/// work on the task that issued it, which on an SQPOLL ring is the SQ thread.
+/// That thread runs its task work in the order it was queued. So once the
+/// driver reaps this request's CQE, every item queued on the SQ thread before
+/// the timer fired has run, including the issue of a linked request whose
+/// predecessor's CQE the driver had reaped before submitting this request.
+pub(crate) struct TaskWorkBarrier {
+    timeout: io_uring::types::Timespec,
+}
+
+impl TaskWorkBarrier {
+    /// Build a detached submission entry, and a target that reports when it
+    /// has completed.
+    pub(crate) fn entry() -> (ConfiguredEntry, OpTarget) {
+        let handle = TypedHandle::new(Self {
+            timeout: io_uring::types::Timespec::new(),
+        });
+        let entry = handle
+            .data_mut()
+            .expect("new barrier missing data")
+            .configure()
+            .expect("barrier configuration is infallible");
+        let target = OpTarget {
+            handle: handle.untyped(),
+        };
+        (ConfiguredEntry::new(handle.untyped(), entry), target)
+    }
+}
+
+// Safety: the entry points at `timeout`, which lives in the operation's
+// allocation; the kernel reads it when it prepares the request, before the
+// terminal CQE.
+unsafe impl Operation for TaskWorkBarrier {
+    type Completion = ();
+
+    fn configure(&mut self) -> io::Result<io_uring::squeue::Entry> {
+        Ok(io_uring::opcode::Timeout::new(&self.timeout).build())
+    }
+
+    unsafe fn reap(&mut self, _result: CQEResult) -> Self::Completion {
+        // Expiry (ETIME) is the expected result. Any other end, such as a
+        // shutdown cancellation, also ends the wait for it.
+    }
+}
+
 pin_project_lite::pin_project! {
     /// A lazily-submitted `io_uring` operation.
     #[must_use = "future does nothing unless you `.await` or poll them"]

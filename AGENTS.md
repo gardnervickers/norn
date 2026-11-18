@@ -122,9 +122,12 @@ The project is intentionally not general-purpose today; APIs are still in flux i
 - Dropping submitted `Op` attempts cancellation (`cancel(user_data)`).
   Cancellations that report ENOENT are not retried, except once for a later
   member of a linked batch: the kernel issues it from task work after its
-  predecessor completes, so a drop can race ahead of that issue. ENOENT also
-  means "issued but not cancellable" (e.g. a zero-copy send awaiting its
-  notification), so unbounded retries would spin the driver.
+  predecessor completes, so a drop can race ahead of that issue. The retry
+  waits until that task work must have run: a GETEVENTS enter runs it, or on
+  an SQPOLL ring (where the SQ thread runs it) a zero-length timeout acts as
+  a task work barrier. ENOENT also means "issued but not cancellable" (e.g. a
+  zero-copy send awaiting its notification), so unbounded retries would spin
+  the driver.
 - `Operation::reap` converts each kernel or synthetic completion into an owned
   value; dropping an unconsumed value releases any resources represented by it.
 - Submission failures (including a driver that stopped accepting work) are
